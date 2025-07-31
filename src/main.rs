@@ -3,6 +3,7 @@ use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::{PROTOCOL_N2N_CHAIN_SYNC};
 use pallas_network::multiplexer;
 use pallas_network::miniprotocols::chainsync;
+use pallas_network::miniprotocols::chainsync::NextResponse;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -33,6 +34,20 @@ async fn main() {
         let chainsync = peer_client.chainsync();
         let intersect_result = chainsync.intersect_origin().await;
         println!("Intersect result {:?}", intersect_result);
+        loop {
+            let resp = chainsync.request_or_await_next().await.unwrap();
+            match resp {
+                NextResponse::RollForward(content, tip) => {
+                    println!("RollForward({:?}, {:?})", content, tip);
+                },
+                NextResponse::RollBackward(point, tip) => {
+                    println!("RollBackward({:?}, {:?})", point, tip);
+                },
+                NextResponse::Await => {
+                    println!("Await");
+                }
+            }
+        }
     });
     handle.await;
 }
