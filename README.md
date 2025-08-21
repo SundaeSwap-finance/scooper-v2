@@ -1,1 +1,1 @@
-cargo run -- --addr IP:PORT --name buko --magic 2
+cargo run -- --addr IP:PORT --magic 2
