@@ -1,19 +1,14 @@
 use clap::Parser;
+use hex;
+use pallas_codec::minicbor;
+use pallas_crypto::hash::{Hash, Hasher};
 use pallas_network::facades::PeerClient;
-use pallas_network::miniprotocols::{PROTOCOL_N2N_CHAIN_SYNC};
-use pallas_network::multiplexer;
-use pallas_network::miniprotocols::chainsync;
-use pallas_network::miniprotocols::chainsync::NextResponse;
-use tokio::sync::mpsc;
+use pallas_network::miniprotocols::Point;
+use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
+use pallas_primitives::alonzo;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long)]
-    name: String,
-
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
-
     #[arg(short, long)]
     addr: String,
 
@@ -21,24 +16,37 @@ struct Args {
     magic: u64,
 }
 
+const HEADER_HASH_SIZE: usize = 32;
+fn hash_header_content(header_content: &HeaderContent) -> Hash<HEADER_HASH_SIZE> {
+    Hasher::<{ HEADER_HASH_SIZE * 8 }>::hash(&header_content.cbor)
+}
+
+fn decode_header_point(header_content: &HeaderContent) -> Result<Point, String> {
+    let as_alonzo_header: Result<alonzo::Header, minicbor::decode::Error> =
+        minicbor::decode(&header_content.cbor);
+    if let Ok(alonzo_header) = as_alonzo_header {
+        let slot = alonzo_header.header_body.slot;
+        let header_hash = hash_header_content(header_content);
+        return Ok(Point::Specific(slot, header_hash.to_vec()));
+    }
+    return Err("cannot decode header point".to_owned());
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    for _ in 0..args.count {
-        println!("Hello {}!", args.name);
-    }
-
     let handle = tokio::spawn(async move {
         let mut peer_client = PeerClient::connect(args.addr, args.magic).await.unwrap();
-        let chainsync = peer_client.chainsync();
-        let intersect_result = chainsync.intersect_origin().await;
+        let intersect_result = peer_client.chainsync().intersect_origin().await;
         println!("Intersect result {:?}", intersect_result);
         loop {
-            let resp = chainsync.request_or_await_next().await.unwrap();
+            let resp = peer_client.chainsync().request_or_await_next().await.unwrap();
             match resp {
                 NextResponse::RollForward(content, tip) => {
-                    println!("RollForward({:?}, {:?})", content, tip);
+                    let point = decode_header_point(&content).unwrap();
+                    let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
+                    println!("RollForward({}, {:?})", hex::encode(resp), tip);
                 },
                 NextResponse::RollBackward(point, tip) => {
                     println!("RollBackward({:?}, {:?})", point, tip);
@@ -49,5 +57,5 @@ async fn main() {
             }
         }
     });
-    handle.await;
+    let _ = handle.await;
 }
