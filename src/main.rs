@@ -1,11 +1,8 @@
 use clap::Parser;
-use hex;
-use pallas_codec::minicbor;
-use pallas_crypto::hash::{Hash, Hasher};
 use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::Point;
 use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
-use pallas_primitives::alonzo;
+use pallas_traverse;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -16,39 +13,26 @@ struct Args {
     magic: u64,
 }
 
-const HEADER_HASH_SIZE: usize = 32;
-fn hash_header_content(header_content: &HeaderContent) -> Hash<HEADER_HASH_SIZE> {
-    Hasher::<{ HEADER_HASH_SIZE * 8 }>::hash(&header_content.cbor)
+fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
+    let header =
+        pallas_traverse::MultiEraHeader::decode(
+            header_content.variant,
+            header_content.byron_prefix.map(|x| x.0),
+            &header_content.cbor
+        );
+    header.map(|h| {
+        let slot = h.slot();
+        let header_hash = h.hash();
+        Point::Specific(slot, header_hash.to_vec())
+    })
 }
 
-fn decode_header_point(header_content: &HeaderContent) -> Result<Point, String> {
-    let as_alonzo_header: Result<alonzo::Header, minicbor::decode::Error> =
-        minicbor::decode(&header_content.cbor);
-    if let Ok(alonzo_header) = as_alonzo_header {
-        let slot = alonzo_header.header_body.slot;
-        let header_hash = hash_header_content(header_content);
-        return Ok(Point::Specific(slot, header_hash.to_vec()));
-    }
-    return Err("cannot decode header point".to_owned());
-}
-
-type BlockWrapper = (u16, alonzo::Block);
-
-fn decode_alonzo_block(content: &[u8]) -> Option<alonzo::Block> {
-    let as_alonzo_block: Result<BlockWrapper, minicbor::decode::Error> =
-        minicbor::decode(content);
-    match as_alonzo_block {
-        Ok(b) => Some(b.1),
-        Err(_) => None,
-    }
-}
-
-fn handle_alonzo_block(block: alonzo::Block) {
-    for body in block.transaction_bodies {
-        for input in body.inputs {
+fn handle_block(block: pallas_traverse::MultiEraBlock) {
+    for body in block.txs() {
+        for input in body.inputs() {
             println!("Spent {:?}", input);
         }
-        for output in body.outputs {
+        for output in body.outputs() {
             println!("Produced {:?}", output);
         }
     }
@@ -65,13 +49,12 @@ async fn main() {
         loop {
             let resp = peer_client.chainsync().request_or_await_next().await.unwrap();
             match resp {
-                NextResponse::RollForward(content, tip) => {
+                NextResponse::RollForward(content, _tip) => {
                     let point = decode_header_point(&content).unwrap();
                     let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
-                    if let Some(alonzo_block) = decode_alonzo_block(&resp) {
-                        handle_alonzo_block(alonzo_block);
-                    } else {
-                        println!("RollForward({}, {:?})", hex::encode(resp), tip);
+                    match pallas_traverse::MultiEraBlock::decode(&resp) {
+                        Ok(block) => handle_block(block),
+                        Err(e) => println!("Error decoding block: {:?}", e),
                     }
                 },
                 NextResponse::RollBackward(point, tip) => {
