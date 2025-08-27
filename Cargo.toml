@@ -7,6 +7,8 @@ repository = "https://github.com/rrruko/scooper-v2"
 [dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
 hex = "0.4.3"
+minicbor = { version = "2.1.1", features = ["alloc", "derive"] }
+num-bigint = "0.4.6"
 pallas-codec = "0.33.0"
 pallas-crypto = "0.33.0"
 pallas-network = "0.33.0"
