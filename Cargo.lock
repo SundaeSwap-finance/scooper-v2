@@ -627,6 +627,7 @@ dependencies = [
  "hex",
  "minicbor 2.1.1",
  "num-bigint",
+ "pallas-addresses",
  "pallas-codec",
  "pallas-crypto",
  "pallas-network",

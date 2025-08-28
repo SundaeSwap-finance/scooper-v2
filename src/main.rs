@@ -1,10 +1,14 @@
 use clap::Parser;
+use num_bigint::BigInt;
+use pallas_addresses::Address;
 use pallas_network::facades::PeerClient;
-use pallas_primitives::conway::{PseudoDatumOption};
-use pallas_primitives::TransactionInput;
-use pallas_network::miniprotocols::Point;
 use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
-use pallas_traverse::{MultiEraOutput};
+use pallas_network::miniprotocols::Point;
+use pallas_primitives::conway::{
+    DatumOption, MintedScriptRef, NativeScript, PseudoDatumOption, PseudoScript,
+};
+use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
+use pallas_traverse::MultiEraOutput;
 use std::collections::BTreeMap;
 
 mod multisig;
@@ -12,68 +16,129 @@ mod sundaev3;
 
 use sundaev3::{Ident, PoolDatum};
 
-
-#[derive(Parser, Debug)]
+#[derive(clap::Parser, Debug)]
 struct Args {
     #[arg(short, long)]
     addr: String,
 
     #[arg(short, long)]
     magic: u64,
+
+    #[command(subcommand)]
+    command: Commands,
 }
 
-// Hard to make lifetimes work here...
+#[derive(Clone, Debug)]
+struct BlockHash(Vec<u8>);
 
-//#[derive(Clone)]
-//struct UTxOWithDatum<'b, T> {
-//    input: TransactionInput,
-//    output: MultiEraOutput<'b>,
-//    datum: T,
-//}
-//
-//fn get_utxo_datum<'b, 'd, T>(output: MultiEraOutput<'b>) -> Option<T> where T: minicbor::Decode<'d, ()> {
-//    let d = output.datum();
-//    match d {
-//        Some(PseudoDatumOption::Data(bytes)) => {
-//            let datum: Result<T, _> = minicbor::decode(bytes.raw_cbor());
-//            match datum {
-//                Ok(datum) => Some(datum),
-//                Err(_) => None,
-//            }
-//        }
-//        _ => None
-//    }
-//}
-//
-//// TODO: Check tx witnesses for datum
-//fn make_utxo_with_datum<'b, T>(input: TransactionInput, output: MultiEraOutput<'b>) -> Option<UTxOWithDatum<'b, T>> where T: minicbor::Decode<'b, ()> + Clone {
-//    let d: Option<T> = get_utxo_datum(output.clone());
-//    match d {
-//        Some(d) => {
-//            Some(UTxOWithDatum {
-//                input,
-//                output: output,
-//                datum: d.clone(),
-//            })
-//        }
-//        _ => None
-//    }
-//}
+const BLOCK_HASH_SIZE: usize = 32;
+
+fn parse_block_hash(bh: &str) -> Result<BlockHash, String> {
+    let bytes = hex::decode(bh).map_err(|e| e.to_string())?;
+    if bytes.len() == BLOCK_HASH_SIZE {
+        Ok(BlockHash(bytes.to_vec()))
+    } else {
+        Err(format!("Expected length {} for block hash, but got {}", BLOCK_HASH_SIZE, bytes.len()))
+    }
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    SyncFromOrigin,
+    SyncFromPoint {
+        #[arg(short, long)]
+        slot: u64,
+
+        #[arg(short, long, value_parser=parse_block_hash)]
+        block_hash: BlockHash,
+    }
+}
+
+// Custom UTxO types
+type Bytes = Vec<u8>;
+
+enum ScriptRef {
+    NativeScript(NativeScript),
+    PlutusV1Script(PlutusScript<1>),
+    PlutusV2Script(PlutusScript<2>),
+    PlutusV3Script(PlutusScript<3>),
+}
+
+struct Value(BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
+
+enum Datum {
+    None,
+    Hash(Bytes),
+    Data(Bytes),
+}
+
+// Would be convenient to parameterize this by the type of the decoded datum, with
+// an 'Any' type that always succeeds at decoding and functions
+//   TransactionOutput<T> -> TransactionOutput<Any>
+//   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
+struct TransactionOutput {
+    address: Address,
+    value: Value,
+    datum: Datum,
+    script_ref: Option<ScriptRef>,
+}
+
+fn convert_datum<'b>(datum: Option<PseudoDatumOption<KeepRaw<'_, PlutusData>>>) -> Datum {
+    match datum {
+        None => Datum::None,
+        Some(PseudoDatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
+        Some(PseudoDatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
+    }
+}
+
+fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
+    let mut result = BTreeMap::new();
+    value.coin();
+    for policy in value.assets() {
+        let mut p_map = BTreeMap::new();
+        let pol = policy.policy();
+        for asset in policy.assets() {
+            let tok = asset.name();
+            p_map.insert(tok.to_vec(), asset.any_coin());
+        }
+        result.insert(pol.to_vec(), p_map);
+    }
+    Value(result)
+}
+
+fn convert_script_ref(script_ref: MintedScriptRef) -> ScriptRef {
+    match script_ref {
+        PseudoScript::NativeScript(n) => ScriptRef::NativeScript(n.unwrap()),
+        PseudoScript::PlutusV1Script(s) => ScriptRef::PlutusV1Script(s),
+        PseudoScript::PlutusV2Script(s) => ScriptRef::PlutusV2Script(s),
+        PseudoScript::PlutusV3Script(s) => ScriptRef::PlutusV3Script(s),
+    }
+}
+
+fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOutput {
+    let address = output.address().unwrap();
+    let datum = convert_datum(output.datum());
+    let value = convert_value(output.value());
+    let script_ref = output.script_ref().map(convert_script_ref);
+    TransactionOutput {
+        address,
+        datum,
+        value,
+        script_ref,
+    }
+}
 
 struct SundaeV3Index {
-    //pools: BTreeMap<Ident, UTxOWithDatum<'b, PoolDatum>>,
-    pools: BTreeMap<(), ()>,
-    //orders: BTreeMap<Ident, Vec<UTxOWithDatum<'b, ()>>>,
-    orders: BTreeMap<(), ()>,
+    pools: BTreeMap<Ident, TransactionOutput>,
+    orders: BTreeMap<Ident, TransactionOutput>,
 }
 
 fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
-    let header =
-        pallas_traverse::MultiEraHeader::decode(
-            header_content.variant,
-            header_content.byron_prefix.map(|x| x.0),
-            &header_content.cbor
-        );
+    let header = pallas_traverse::MultiEraHeader::decode(
+        header_content.variant,
+        header_content.byron_prefix.map(|x| x.0),
+        &header_content.cbor,
+    );
     header.map(|h| {
         let slot = h.slot();
         let header_hash = h.hash();
@@ -82,25 +147,34 @@ fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_t
 }
 
 fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
-    for body in block.txs() {
-        let this_tx_hash = body.hash();
-        for (ix, output) in body.outputs().iter().enumerate() {
-            println!("Produced {:?}", output);
+    for tx in block.txs() {
+        let this_tx_hash = tx.hash();
+        for (ix, output) in tx.outputs().iter().enumerate() {
             let this_input = TransactionInput {
                 transaction_id: this_tx_hash,
                 index: ix as u64,
             };
-            //let p: Option<UTxOWithDatum<PoolDatum>> =
-            //    make_utxo_with_datum::<PoolDatum>(
-            //        this_input,
-            //        output.clone(),
-            //    );
-            //match p {
-            //    Some(pool_utxo) => {
-            //        index.pools.insert(pool_utxo.datum.ident.clone(), pool_utxo.clone());
-            //    }
-            //    _ => {}
-            //}
+            // TODO: Don't need to convert every single utxo, we can inspect the address
+            // and datum first to decide if we are interested
+            // TODO: Get datums from the witness set to support hash datums
+            let p: TransactionOutput = convert_transaction_output(&output);
+            match p.datum {
+                Datum::Data(ref inline) => {
+                    let pd: Result<PoolDatum, _> = minicbor::decode(inline);
+                    match pd {
+                        Ok(pd) => {
+                            println!("{}#{}: pool with datum {}",
+                                hex::encode(this_tx_hash),
+                                ix,
+                                hex::encode(inline),
+                            );
+                            index.pools.insert(pd.ident.clone(), p);
+                        }
+                        _ => {}
+                    }
+                }
+                Datum::None | Datum::Hash(_) => {}
+            }
         }
     }
 }
@@ -111,12 +185,10 @@ async fn main() {
 
     let handle = tokio::spawn(async move {
         let mut peer_client = PeerClient::connect(args.addr, args.magic).await.unwrap();
-        let points = vec![
-            Point::Specific(
-                88547961,
-                hex::decode("f5b08a0a1334f0a8c7fd0978ef7a8d44161962c90b3ac4f9267955e2d06a42fc").unwrap()
-            )
-        ];
+        let points = match args.command {
+            Commands::SyncFromOrigin => vec![Point::Origin],
+            Commands::SyncFromPoint{ slot, block_hash } => vec![Point::Specific(slot, block_hash.0)]
+        };
         let intersect_result = peer_client.chainsync().find_intersect(points).await;
         println!("Intersect result {:?}", intersect_result);
         let mut index = SundaeV3Index {
@@ -124,7 +196,11 @@ async fn main() {
             orders: BTreeMap::new(),
         };
         loop {
-            let resp = peer_client.chainsync().request_or_await_next().await.unwrap();
+            let resp = peer_client
+                .chainsync()
+                .request_or_await_next()
+                .await
+                .unwrap();
             match resp {
                 NextResponse::RollForward(content, _tip) => {
                     let point = decode_header_point(&content).unwrap();
@@ -133,10 +209,10 @@ async fn main() {
                         Ok(block) => handle_block(&mut index, block),
                         Err(e) => println!("Error decoding block: {:?}", e),
                     }
-                },
+                }
                 NextResponse::RollBackward(point, tip) => {
                     println!("RollBackward({:?}, {:?})", point, tip);
-                },
+                }
                 NextResponse::Await => {
                     println!("Await");
                 }
@@ -145,33 +221,3 @@ async fn main() {
     });
     let _ = handle.await;
 }
-
-// Might be helpful to define our own more ergonomic types for transaction outputs, to avoid
-// lifetime issues:
-//
-//struct DatumOption {
-//    Hash(DatumHash),
-//    Data(PlutusData),
-//}
-//
-//enum ScriptRef {
-//    NativeScript(NativeScript),
-//    PlutusV1Script(PlutusScript<1>),
-//    PlutusV2Script(PlutusScript<2>),
-//}
-//
-//struct TransactionOutput {
-//    address: Address,
-//    value: alonzo::Value,
-//    datum_option: Option<DatumOption>,
-//    script_ref: ScriptRef,
-//}
-//
-//fn convert_transaction_output(output: MultiEraOutput<'b>) -> Result<TransactionOutput, String> {
-//    let a = output.address()?;
-//    let v = output.value()?;
-//    TransactionOutput {
-//         address: output.address().clone(),
-//         value: convert_multi_era_value(v),
-//
-//}
