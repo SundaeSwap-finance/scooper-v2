@@ -5,11 +5,11 @@ use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
 use pallas_network::miniprotocols::Point;
 use pallas_primitives::conway::{
-    DatumOption, MintedScriptRef, NativeScript, PseudoDatumOption, PseudoScript,
+    DatumOption, MintedScriptRef, NativeScript,
 };
 use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
 use pallas_traverse::MultiEraOutput;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 mod multisig;
 mod sundaev3;
@@ -83,11 +83,11 @@ struct TransactionOutput {
     script_ref: Option<ScriptRef>,
 }
 
-fn convert_datum<'b>(datum: Option<PseudoDatumOption<KeepRaw<'_, PlutusData>>>) -> Datum {
+fn convert_datum<'b>(datum: Option<DatumOption>) -> Datum {
     match datum {
         None => Datum::None,
-        Some(PseudoDatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
-        Some(PseudoDatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
+        Some(DatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
+        Some(DatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
     }
 }
 
@@ -106,12 +106,12 @@ fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     Value(result)
 }
 
-fn convert_script_ref(script_ref: MintedScriptRef) -> ScriptRef {
+fn convert_script_ref(script_ref: pallas_primitives::conway::ScriptRef) -> ScriptRef {
     match script_ref {
-        PseudoScript::NativeScript(n) => ScriptRef::NativeScript(n.unwrap()),
-        PseudoScript::PlutusV1Script(s) => ScriptRef::PlutusV1Script(s),
-        PseudoScript::PlutusV2Script(s) => ScriptRef::PlutusV2Script(s),
-        PseudoScript::PlutusV3Script(s) => ScriptRef::PlutusV3Script(s),
+        pallas_primitives::conway::ScriptRef::NativeScript(n) => ScriptRef::NativeScript(n.unwrap()),
+        pallas_primitives::conway::ScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1Script(s),
+        pallas_primitives::conway::ScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2Script(s),
+        pallas_primitives::conway::ScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3Script(s),
     }
 }
 
@@ -130,7 +130,7 @@ fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOut
 
 struct SundaeV3Index {
     pools: BTreeMap<Ident, TransactionOutput>,
-    orders: BTreeMap<Ident, (TransactionInput, TransactionOutput)>,
+    orders: BTreeMap<Option<Ident>, (TransactionInput, TransactionOutput)>,
 }
 
 fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
@@ -148,17 +148,33 @@ fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_t
 
 fn summarize_protocol_state(index: &SundaeV3Index) {
     println!("Known pools:");
+    let mut known_pool_ids = HashSet::new();
     for (ident, _p) in &index.pools {
+        known_pool_ids.insert(ident);
         println!("  {}", ident);
         for (o_ident, o) in &index.orders {
-            if ident == o_ident {
+            if Some(ident) == o_ident.as_ref() {
                 println!("    {:?}", o.0);
             }
+        }
+    }
+
+    println!("Orphan orders:");
+    for (o_ident, o) in &index.orders {
+        if let Some(oi) = o_ident {
+            if !known_pool_ids.contains(oi) {
+                println!("  {:?}", o.0);
+            }
+        } else {
+            println!("  {:?}", o.0);
         }
     }
 }
 
 fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
+    if block.number() % 1000 == 0 {
+        println!("Block height: {}", block.number());
+    }
     for tx in block.txs() {
         let this_tx_hash = tx.hash();
         for (ix, output) in tx.outputs().iter().enumerate() {
@@ -233,7 +249,6 @@ async fn main() {
                 NextResponse::RollForward(content, _tip) => {
                     let point = decode_header_point(&content).unwrap();
                     let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
-                    println!("raw block: {}", hex::encode(&resp));
                     match pallas_traverse::MultiEraBlock::decode(&resp) {
                         Ok(block) => handle_block(&mut index, block),
                         Err(e) => println!("Error decoding block: {:?}", e),
@@ -255,24 +270,20 @@ async fn main() {
 mod tests {
     use super::*;
     use pallas_traverse::MultiEraBlock;
-    use pallas_primitives::babbage::{HeaderBody, MintedHeaderBody, MintedHeader, PseudoHeader};
-    use pallas_primitives::conway::{MintedBlock};
+    use pallas_primitives::TransactionIndex;
+    use pallas_primitives::conway::{AuxiliaryData, Block, Header, WitnessSet, TransactionBody};
     use pallas_primitives::{KeyValuePairs, MaybeIndefArray};
 
-    fn make_block<'b>() -> MultiEraBlock<'b> {
-        todo!()
-    }
-
     #[test]
-    fn test_do_stuff() {
+    fn test_ingest_block() {
         let mut index = SundaeV3Index {
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
         };
-        let block = make_block();
-            //.add_mint_pool_tx();
-            //.add_list_order_tx();
+        let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
+        let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
         handle_block(&mut index, block);
         assert_eq!(index.pools.len(), 1);
+        assert_eq!(index.orders.len(), 0);
     }
 }

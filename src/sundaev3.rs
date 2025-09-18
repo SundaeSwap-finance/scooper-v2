@@ -12,8 +12,15 @@ use std::ops::Deref;
 
 use crate::multisig::Multisig;
 
-#[derive(Clone, Debug, Decode, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ident(#[n(0)] Vec<u8>);
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Ident(Vec<u8>);
+
+impl<'b, C> minicbor::decode::Decode<'b, C> for Ident {
+    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let b = decoder.bytes()?;
+        Ok(Ident(b.to_vec()))
+    }
+}
 
 impl fmt::Display for Ident {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -321,6 +328,38 @@ impl<'b, C> minicbor::decode::Decode<'b, C> for Order {
                     return Ok(Order::Swap(give, take));
                 })
             },
+            123 => {
+                with_array(decoder, |d| {
+                    let assets = d.decode()?;
+                    return Ok(Order::Deposit(assets))
+                })
+            },
+            124 => {
+                with_array(decoder, |d| {
+                    let amount = d.decode()?;
+                    return Ok(Order::Withdrawal(amount))
+                })
+            },
+            125 => {
+                with_array(decoder, |d| {
+                    let assets = d.decode()?;
+                    return Ok(Order::Donation(assets))
+                })
+            },
+            126 => {
+                with_array(decoder, |d| {
+                    let asset = with_array(d, |d2| {
+                        let policy = d2.decode()?;
+                        let token = d2.decode()?;
+                        Ok(AssetClass {
+                            policy,
+                            token
+                        })
+                    })?;
+                    return Ok(Order::Record(asset))
+                })
+            },
+
             _ => todo!()
         }
     }
@@ -328,13 +367,91 @@ impl<'b, C> minicbor::decode::Decode<'b, C> for Order {
  
 #[derive(Debug, PartialEq)]
 pub struct OrderDatum {
-    pub ident: Ident,
+    pub ident: Option<Ident>,
     pub owner: Multisig,
     pub scoop_fee: i128,
-    pub destination: PlutusAddress,
+    pub destination: Destination,
     pub action: Order,
     pub extra: AnyCbor,
 }
+
+#[derive(Debug, PartialEq)]
+pub enum Destination {
+    Fixed(FixedDestination),
+    SelfDestination,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AikenDatum {
+    NoDatum,
+    DatumHash(Vec<u8>),
+    InlineDatum(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct FixedDestination {
+    pub address: PlutusAddress,
+    pub datum: AikenDatum,
+}
+
+impl<'b, C> minicbor::decode::Decode<'b, C> for FixedDestination {
+    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        with_array(decoder, |d| {
+            let address = d.decode()?;
+            let datum = d.decode()?;
+            return Ok(FixedDestination {
+                address,
+                datum,
+            })
+        })
+    }
+}
+
+impl<'b, C> minicbor::decode::Decode<'b, C> for AikenDatum {
+    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        match decoder.tag()?.as_u64() {
+            121 => {
+                let _ = decoder.skip()?;
+                Ok(AikenDatum::NoDatum)
+            }
+            122 => {
+                let _ = decoder.array()?;
+                let dh = decoder.bytes()?;
+                Ok(AikenDatum::DatumHash(dh.to_vec()))
+            }
+            123 => {
+                let _ = decoder.array()?;
+                let d = decoder.bytes()?;
+                Ok(AikenDatum::InlineDatum(d.to_vec()))
+            }
+            _ => {
+                Err(minicbor::decode::Error::message("wrong tag for destination"))
+            }
+        }
+    }
+}
+
+
+
+impl<'b, C> minicbor::decode::Decode<'b, C> for Destination {
+    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        match decoder.tag()?.as_u64() {
+            121 => {
+                let fixed = decoder.decode()?;
+                Ok(Destination::Fixed(fixed))
+            }
+            122 => {
+                let _ = decoder.skip()?;
+                Ok(Destination::SelfDestination)
+            }
+            _ => {
+                Err(minicbor::decode::Error::message("wrong tag for destination"))
+            }
+        }
+    }
+}
+
+
 
 // AnyCbor copied from pallas_codec
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -399,7 +516,7 @@ impl<'b, C> minicbor::decode::Decode<'b, C> for OrderDatum {
         match tag.as_u64() {
             121 => {
                 let _ = decoder.array()?;
-                let ident = decoder.bytes()?;
+                let ident = decoder.decode()?;
                 let owner = decoder.decode()?;
                 let scoop_fee = decoder.int()?;
                 let destination = decoder.decode()?;
@@ -407,7 +524,7 @@ impl<'b, C> minicbor::decode::Decode<'b, C> for OrderDatum {
                 let extra = decoder.decode()?;
                 let _break = decoder.skip()?;
                 Ok(OrderDatum {
-                    ident: Ident(ident.to_vec()),
+                    ident: plutus_option_to_option(ident),
                     owner,
                     scoop_fee: i128::from(scoop_fee),
                     destination,
@@ -514,18 +631,21 @@ mod tests {
 
     #[test]
     fn test_decode_orderdatum() {
-        let od_bytes = hex::decode("d8799f581c99999999999999999999999999999999999999999999999999999999d8799f581c88888888888888888888888888888888888888888888888888888888ff0ad8799fd8799f581c77777777777777777777777777777777777777777777777777777777ffd87a80ffd87a9f9f4100410102ff9f4103410405ffffd87980ff").unwrap();
+        let od_bytes = hex::decode("d8799fd8799f581c99999999999999999999999999999999999999999999999999999999ffd8799f581c88888888888888888888888888888888888888888888888888888888ff0ad8799fd8799fd8799f581c77777777777777777777777777777777777777777777777777777777ffd87a80ffd87980ffd87a9f9f4100410102ff9f4103410405ffffd87980ff").unwrap();
         let od: OrderDatum = minicbor::decode(&od_bytes).unwrap();
         let expected_ident = hex::decode("99999999999999999999999999999999999999999999999999999999").unwrap();
         let expected_signature = hex::decode("88888888888888888888888888888888888888888888888888888888").unwrap();
         let expected_vkey = hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
-        assert_eq!(od.ident.0, expected_ident);
+        assert_eq!(od.ident.unwrap().0, expected_ident);
         assert_eq!(od.owner, Multisig::Signature(expected_signature));
         assert_eq!(od.scoop_fee, 10);
-        assert_eq!(od.destination, PlutusAddress {
-            payment_credential: Credential::VerificationKey(expected_vkey),
-            stake_credential: None,
-        });
+        assert_eq!(od.destination, Destination::Fixed(FixedDestination {
+            address: PlutusAddress {
+                payment_credential: Credential::VerificationKey(expected_vkey),
+                stake_credential: None,
+            },
+            datum: AikenDatum::NoDatum,
+        }));
         assert_eq!(od.action, Order::Swap(
             SingletonValue {
                 asset_class: AssetClass {
@@ -543,6 +663,14 @@ mod tests {
             }
         ));
         assert_eq!(od.extra, AnyCbor { inner: vec![0xd8, 0x79, 0x80] });
+    }
+
+    #[test]
+    fn test_decode_orderdatum_2() {
+        let od_bytes = hex::decode("d8799fd8799f581c12d88c7f234493742d583c219101050b39e925d715a93060752d60d3ffd8799f581c621be66c7f488b22f66003fff0b7427c30f70da678c532b7233d85caff1a00138800d8799fd8799fd8799f581c1c1381a51312b9da9782b3f507af94bab78780f85196007fad5fbde3ffd8799fd8799fd8799f581c621be66c7f488b22f66003fff0b7427c30f70da678c532b7233d85caffffffffd8799fffffd87a9f9f581cac597ca62a32cab3f4766c8f9cd577e50ebb1d00383ec7fa3990b01646435241574a551a0002113eff9f40401a066b2bc2ffff43d87980ff").unwrap();
+        let od: OrderDatum = minicbor::decode(&od_bytes).unwrap();
+        let expected_ident = hex::decode("12d88c7f234493742d583c219101050b39e925d715a93060752d60d3").unwrap();
+        assert_eq!(od.ident.unwrap().0, expected_ident);
     }
 
     #[test]
