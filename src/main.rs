@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 mod multisig;
 mod sundaev3;
 
-use sundaev3::{Ident, PoolDatum};
+use sundaev3::{Ident, OrderDatum, PoolDatum};
 
 #[derive(clap::Parser, Debug)]
 struct Args {
@@ -130,7 +130,7 @@ fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOut
 
 struct SundaeV3Index {
     pools: BTreeMap<Ident, TransactionOutput>,
-    orders: BTreeMap<Ident, TransactionOutput>,
+    orders: BTreeMap<Ident, (TransactionInput, TransactionOutput)>,
 }
 
 fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
@@ -144,6 +144,18 @@ fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_t
         let header_hash = h.hash();
         Point::Specific(slot, header_hash.to_vec())
     })
+}
+
+fn summarize_protocol_state(index: &SundaeV3Index) {
+    println!("Known pools:");
+    for (ident, _p) in &index.pools {
+        println!("  {}", ident);
+        for (o_ident, o) in &index.orders {
+            if ident == o_ident {
+                println!("    {:?}", o.0);
+            }
+        }
+    }
 }
 
 fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
@@ -169,6 +181,22 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
                                 hex::encode(inline),
                             );
                             index.pools.insert(pd.ident.clone(), p);
+                            summarize_protocol_state(index);
+                            return;
+                        }
+                        _ => {}
+                    }
+                    let od: Result<OrderDatum, _> = minicbor::decode(inline);
+                    match od {
+                        Ok(od) => {
+                            println!("{}#{}: order with datum {}",
+                                hex::encode(this_tx_hash),
+                                ix,
+                                hex::encode(inline),
+                            );
+                            index.orders.insert(od.ident.clone(), (this_input, p));
+                            summarize_protocol_state(index);
+                            return;
                         }
                         _ => {}
                     }
@@ -205,6 +233,7 @@ async fn main() {
                 NextResponse::RollForward(content, _tip) => {
                     let point = decode_header_point(&content).unwrap();
                     let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
+                    println!("raw block: {}", hex::encode(&resp));
                     match pallas_traverse::MultiEraBlock::decode(&resp) {
                         Ok(block) => handle_block(&mut index, block),
                         Err(e) => println!("Error decoding block: {:?}", e),
@@ -220,4 +249,30 @@ async fn main() {
         }
     });
     let _ = handle.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pallas_traverse::MultiEraBlock;
+    use pallas_primitives::babbage::{HeaderBody, MintedHeaderBody, MintedHeader, PseudoHeader};
+    use pallas_primitives::conway::{MintedBlock};
+    use pallas_primitives::{KeyValuePairs, MaybeIndefArray};
+
+    fn make_block<'b>() -> MultiEraBlock<'b> {
+        todo!()
+    }
+
+    #[test]
+    fn test_do_stuff() {
+        let mut index = SundaeV3Index {
+            pools: BTreeMap::new(),
+            orders: BTreeMap::new(),
+        };
+        let block = make_block();
+            //.add_mint_pool_tx();
+            //.add_list_order_tx();
+        handle_block(&mut index, block);
+        assert_eq!(index.pools.len(), 1);
+    }
 }

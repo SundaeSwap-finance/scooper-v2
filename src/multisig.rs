@@ -1,7 +1,7 @@
 use minicbor::decode::{Decode, Decoder, Error};
 use num_bigint::BigUint;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Multisig {
     Signature(Vec<u8>),
     AllOf(Vec<Box<Multisig>>),
