@@ -1,11 +1,10 @@
 use clap::Parser;
-use num_bigint::BigInt;
 use pallas_addresses::Address;
 use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
 use pallas_network::miniprotocols::Point;
 use pallas_primitives::conway::{
-    DatumOption, MintedScriptRef, NativeScript,
+    DatumOption, NativeScript,
 };
 use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
 use pallas_traverse::MultiEraOutput;
@@ -93,7 +92,9 @@ fn convert_datum<'b>(datum: Option<DatumOption>) -> Datum {
 
 fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     let mut result = BTreeMap::new();
-    value.coin();
+    let mut ada_policy = BTreeMap::new();
+    ada_policy.insert(vec![], value.coin().into());
+    result.insert(vec![], ada_policy);
     for policy in value.assets() {
         let mut p_map = BTreeMap::new();
         let pol = policy.policy();
@@ -269,10 +270,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pallas_traverse::MultiEraBlock;
-    use pallas_primitives::TransactionIndex;
-    use pallas_primitives::conway::{AuxiliaryData, Block, Header, WitnessSet, TransactionBody};
-    use pallas_primitives::{KeyValuePairs, MaybeIndefArray};
 
     #[test]
     fn test_ingest_block() {
@@ -282,8 +279,19 @@ mod tests {
         };
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
+        let ada_policy: Vec<u8> = vec![];
+        let ada_token: Vec<u8> = vec![];
+        let pool_policy: Vec<u8> = vec![68, 161, 235, 45, 159, 88, 173, 212, 235, 25, 50, 189, 0, 72, 230, 161, 148, 126, 133, 227, 254, 79, 50, 149, 106, 17, 4, 20];
+        let pool_token: Vec<u8> = vec![0, 13, 225, 64, 50, 196, 63, 9, 111, 160, 86, 38, 218, 30, 173, 147, 131, 121, 60, 205, 123, 186, 106, 27, 37, 158, 119, 89, 119, 102, 174, 232];
+        let coin_b_policy: Vec<u8> = vec![145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248, 129, 142, 76, 122, 197, 209, 0, 74, 22];
+        let coin_b_token: Vec<u8> = vec![77, 121, 85, 83, 68];
         handle_block(&mut index, block);
         assert_eq!(index.pools.len(), 1);
+        let first_pool = index.pools.first_entry().unwrap();
+        let pool_value = &first_pool.get().value.0;
+        assert_eq!(pool_value[&ada_policy][&ada_token], 6181255175);
+        assert_eq!(pool_value[&pool_policy][&pool_token], 1);
+        assert_eq!(pool_value[&coin_b_policy][&coin_b_token], 6397550387);
         assert_eq!(index.orders.len(), 0);
     }
 }
