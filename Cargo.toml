@@ -7,7 +7,7 @@ repository = "https://github.com/rrruko/scooper-v2"
 [dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
 hex = "0.4.3"
-minicbor = { version = "2.1.1", features = ["alloc", "derive"] }
+minicbor = { version = "0.26.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 pallas-addresses = "1.0.0-alpha.2"
 pallas-codec = "1.0.0-alpha.2"
@@ -16,6 +16,8 @@ pallas-network = "1.0.0-alpha.2"
 pallas-primitives = "1.0.0-alpha.2"
 pallas-traverse = "1.0.0-alpha.2"
 tokio = { version = "1.46.1", features = ["full"] }
+#plutus-parser = { version = "0.1.0", default-features = false, features = ["pallas-v1", "derive"] }
+plutus-parser = { path = "../plutus-parser/packages/plutus-parser", default-features = false, features = ["pallas-v1", "derive"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

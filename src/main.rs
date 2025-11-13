@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 mod multisig;
 mod sundaev3;
 
+use plutus_parser::AsPlutus;
 use sundaev3::{Ident, OrderDatum, PoolDatum};
 
 #[derive(clap::Parser, Debug)]
@@ -152,7 +153,7 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
     let mut known_pool_ids = HashSet::new();
     for (ident, _p) in &index.pools {
         known_pool_ids.insert(ident);
-        println!("  {}", ident);
+        println!("  {:?}", ident);
         for (o_ident, o) in &index.orders {
             if Some(ident) == o_ident.as_ref() {
                 println!("    {:?}", o.0);
@@ -189,7 +190,8 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
             let p: TransactionOutput = convert_transaction_output(&output);
             match p.datum {
                 Datum::Data(ref inline) => {
-                    let pd: Result<PoolDatum, _> = minicbor::decode(inline);
+                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                    let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
                     match pd {
                         Ok(pd) => {
                             println!("{}#{}: pool with datum {}",
@@ -203,7 +205,8 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
                         }
                         _ => {}
                     }
-                    let od: Result<OrderDatum, _> = minicbor::decode(inline);
+                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                    let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
                     match od {
                         Ok(od) => {
                             println!("{}#{}: order with datum {}",
