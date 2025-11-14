@@ -1,52 +1,37 @@
 use hex::encode;
 use minicbor::decode::{Decoder};
-use minicbor::Decode;
-use num_bigint::BigInt;
+use minicbor::{Encode, Decode};
+use pallas_primitives::BigInt;
 use pallas_primitives::PlutusData;
 use std::fmt;
+use std::ops::Deref;
+
+use plutus_parser::AsPlutus;
 
 use crate::multisig::Multisig;
 
-#[derive(Clone, Decode, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ident(#[n(0)] Vec<u8>);
+//#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub type Ident = Vec<u8>;
 
-impl fmt::Display for Ident {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
-    }
-}
+//impl fmt::Display for Ident {
+//    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//        write!(f, "{}", hex::encode(&self.0))
+//    }
+//}
 
-#[derive(Clone)]
-pub struct AssetClass {
-    policy: Vec<u8>,
-    token: Vec<u8>,
-}
+//#[derive(Clone, AsPlutus, Debug, PartialEq)]
+pub type AssetClass = (Vec<u8>, Vec<u8>);
 
-// TODO: Use AsPlutus
-// TODO: This code is imprecise because it uses skip assuming that a list break is present
-impl<'b, C> minicbor::decode::Decode<'b, C> for AssetClass {
-    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
-        let _ = decoder.array()?;
-        let policy = decoder.bytes()?;
-        let token = decoder.bytes()?;
-        let _break = decoder.skip()?;
-        Ok(AssetClass {
-            policy: policy.to_vec(),
-            token: token.to_vec(),
-        })
-    }
-}
-
-#[derive(Clone)]
+#[derive(AsPlutus, Clone)]
 pub struct PoolDatum {
     pub ident: Ident,
     pub assets: (AssetClass, AssetClass),
-    pub circulating_lp: i128,
-    pub bid_fees_per_10_thousand: i128,
-    pub ask_fees_per_10_thousand: i128,
+    pub circulating_lp: BigInt,
+    pub bid_fees_per_10_thousand: BigInt,
+    pub ask_fees_per_10_thousand: BigInt,
     pub fee_manager: Option<Multisig>,
-    pub market_open: i128,
-    pub protocol_fees: i128,
+    pub market_open: BigInt,
+    pub protocol_fees: BigInt,
 }
 
 enum PlutusOption<T> {
@@ -61,99 +46,39 @@ fn plutus_option_to_option<T>(p: PlutusOption<T>) -> Option<T> {
     }
 }
 
-// TODO: Use AsPlutus
-// TODO: This code is imprecise because it uses skip assuming that a list break is present
-impl<'b, C, T: Decode<'b, C>> minicbor::decode::Decode<'b, C> for PlutusOption<T> {
-    fn decode(decoder: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
-        let tag = decoder.tag()?;
-        match tag.as_u64() {
-            121 => {
-                let _ = decoder.array()?;
-                let content: T = T::decode(decoder, ctx)?;
-                let _break = decoder.skip()?;
-                Ok(PlutusOption::PlutusSome(content))
-            }
-            122 => {
-                match decoder.array()? {
-                    Some(0) => Ok(PlutusOption::PlutusNone),
-                    None => Ok(PlutusOption::PlutusNone),
-                    _ => Err(minicbor::decode::Error::message(format!("misformed plutus option None"))),
-                }
-            }
-            _ => Err(minicbor::decode::Error::message(format!("misformed plutus option (wrong tag)")))
-        }
-    }
-}
-
-// TODO: Use AsPlutus
-// TODO: This code is imprecise because it uses skip assuming that a list break is present
-impl<'b, C> minicbor::decode::Decode<'b, C> for PoolDatum {
-    fn decode(decoder: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
-        let tag = decoder.tag()?;
-        match tag.as_u64() {
-            121 => {
-                let _ = decoder.array()?;
-                let ident = decoder.bytes()?;
-                let _ = decoder.array()?;
-                let asset_a = decoder.decode()?;
-                let asset_b = decoder.decode()?;
-                let _break = decoder.skip()?;
-                let circulating_lp = decoder.int()?;
-                let bid_fees_per_10_thousand = decoder.int()?;
-                let ask_fees_per_10_thousand = decoder.int()?;
-                let fee_manager = decoder.decode()?;
-                let market_open = decoder.int()?;
-                let protocol_fees = decoder.int()?;
-                let _break = decoder.skip()?;
-                Ok(PoolDatum {
-                    ident: Ident(ident.to_vec()),
-                    assets: (asset_a, asset_b),
-                    circulating_lp: i128::from(circulating_lp),
-                    bid_fees_per_10_thousand: i128::from(bid_fees_per_10_thousand),
-                    ask_fees_per_10_thousand: i128::from(ask_fees_per_10_thousand),
-                    fee_manager: plutus_option_to_option(fee_manager),
-                    market_open: i128::from(market_open),
-                    protocol_fees: i128::from(protocol_fees),
-                })
-            },
-            x => {
-                let m = format!("wrong wrapper tag {} for PoolDatum", x);
-                return Err(minicbor::decode::Error::message(m));
-            }
-        }
-    }
-}
-
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum PoolRedeemer {
     PoolScoop(PoolScoop),
     Manage,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct SSEBytes(Vec<u8>);
 
 // When constructing a pool scoop redeemer we don't construct SSEs because they will be
 // retrieved from a database. So it's better to represent them here as raw bytes.
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct PoolScoop {
     signatory_index: BigInt,
     scooper_index: BigInt,
     input_order: Vec<(BigInt, Option<SSEBytes>, BigInt)>,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct SignedStrategyExecution {
     execution: StrategyExecution,
     signature: Option<Vec<u8>>,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum StrategyAuthorization {
     Signature(Vec<u8>),
     Script(Vec<u8>),
 }
 
-pub struct SingletonValue {
-    asset_class: AssetClass,
-    quantity: BigInt,
-}
+pub type SingletonValue = (Vec<u8>, Vec<u8>, BigInt);
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum Order {
     Strategy(StrategyAuthorization),
     Swap(SingletonValue, SingletonValue),
@@ -163,46 +88,129 @@ pub enum Order {
     Record(AssetClass),
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
+pub struct OrderDatum {
+    pub ident: Option<Ident>,
+    pub owner: Multisig,
+    pub scoop_fee: BigInt,
+    pub destination: Destination,
+    pub action: Order,
+    pub extra: AnyPlutusData,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum Destination {
+    Fixed(PlutusAddress, AikenDatum),
+    SelfDestination,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum AikenDatum {
+    NoDatum,
+    DatumHash(Vec<u8>),
+    InlineDatum(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct AnyPlutusData {
+    inner: PlutusData,
+}
+
+impl AsPlutus for AnyPlutusData {
+    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        Ok(AnyPlutusData { inner: data })
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        self.inner
+    }
+}
+
+//#[derive(AsPlutus, Debug, PartialEq)]
+//pub struct FixedDestination {
+//    pub address: PlutusAddress,
+//    pub datum: AikenDatum,
+//}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub struct PlutusAddress {
+    pub payment_credential: PaymentCredential,
+    pub stake_credential: Option<StakeCredential>,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum Credential {
+    VerificationKey(VerificationKeyHash),
+    Script(ScriptHash),
+}
+
+type VerificationKeyHash = Vec<u8>;
+type ScriptHash = Vec<u8>;
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum Referenced<T: AsPlutus> {
+    Inline(T),
+    Pointer(StakePointer),
+}
+
+type PaymentCredential = Credential;
+type StakeCredential = Referenced<Credential>;
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub struct StakePointer {
+    pub slot_number: BigInt,
+    pub transaction_index: BigInt,
+    pub certificate_index: BigInt,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct OutputReference {
     transaction_id: Vec<u8>,
     transaction_ix: u64,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum ValidityBound {
     NegativeInfinity,
     Finite(BigInt),
     PositiveInfinity,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct ValidityRange {
     validity_range_lower_bound: ValidityBound,
     validity_range_upper_bound: ValidityBound,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct StrategyExecution {
     tx_ref: OutputReference,
     validity_range: ValidityRange,
     details: Order,
-    extensions: PlutusData,
+    extensions: bool, // PlutusData
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum PoolMintRedeemer {
     MintLP(Ident),
     CreatePool(CreatePool),
     BurnPool(Ident),
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct CreatePool {
     assets: (AssetClass, AssetClass),
     pool_output: BigInt,
     metadata_output: BigInt,
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub enum ManageRedeemer {
     WithdrawFees(WithdrawFees),
     UpdatePoolFees(BigInt),
 }
 
+#[derive(AsPlutus, Debug, PartialEq)]
 pub struct WithdrawFees {
     amount: BigInt,
     treasury_output: BigInt,
@@ -214,10 +222,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_decode_singletonvalue() {
+        let bytes = hex::decode("9f4100410102ff").unwrap();
+        let pd: PlutusData = minicbor::decode(&bytes).unwrap();
+        let singleton: SingletonValue = AsPlutus::from_plutus(pd).unwrap();
+        assert_eq!(singleton.2, BigInt::Int(2.into()));
+    }
+
+    #[test]
+    fn test_decode_swap() {
+        let bytes = hex::decode("d87a9f9f4100410102ff9f4103410405ffff").unwrap();
+        let pd: PlutusData = minicbor::decode(&bytes).unwrap();
+        let order: Order = AsPlutus::from_plutus(pd).unwrap();
+    }
+
+    #[test]
+    fn test_decode_orderdatum() {
+        let od_bytes = hex::decode("d8799fd8799f581c99999999999999999999999999999999999999999999999999999999ffd8799f581c88888888888888888888888888888888888888888888888888888888ff0ad8799fd8799fd8799f581c77777777777777777777777777777777777777777777777777777777ffd87a80ffd87980ffd87a9f9f4100410102ff9f4103410405ffffd87980ff").unwrap();
+        let order_pd: PlutusData = minicbor::decode(&od_bytes).unwrap();
+        println!("{:?}", order_pd);
+        let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
+        let expected_ident = hex::decode("99999999999999999999999999999999999999999999999999999999").unwrap();
+        let expected_signature = hex::decode("88888888888888888888888888888888888888888888888888888888").unwrap();
+        let expected_vkey = hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
+        assert_eq!(order.ident.unwrap(), expected_ident);
+        assert_eq!(order.owner, Multisig::Signature(expected_signature));
+        assert_eq!(order.scoop_fee, BigInt::Int(10.into()));
+        assert_eq!(order.destination, Destination::Fixed(
+            PlutusAddress {
+                payment_credential: Credential::VerificationKey(expected_vkey),
+                stake_credential: None,
+            },
+            AikenDatum::NoDatum,
+        ));
+        assert_eq!(order.action, Order::Swap(
+            (
+                vec![0],
+                vec![1],
+                BigInt::Int(2.into()),
+            ),
+            (
+                vec![3],
+                vec![4],
+                BigInt::Int(5.into()),
+            )
+        ));
+        assert_eq!(order.extra,
+            AnyPlutusData {
+                inner: PlutusData::Constr(pallas_primitives::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_orderdatum_2() {
+        let od_bytes = hex::decode("d8799fd8799f581c12d88c7f234493742d583c219101050b39e925d715a93060752d60d3ffd8799f581c621be66c7f488b22f66003fff0b7427c30f70da678c532b7233d85caff1a00138800d8799fd8799fd8799f581c1c1381a51312b9da9782b3f507af94bab78780f85196007fad5fbde3ffd8799fd8799fd8799f581c621be66c7f488b22f66003fff0b7427c30f70da678c532b7233d85caffffffffd8799fffffd87a9f9f581cac597ca62a32cab3f4766c8f9cd577e50ebb1d00383ec7fa3990b01646435241574a551a0002113eff9f40401a066b2bc2ffff43d87980ff").unwrap();
+        let order_pd: PlutusData = minicbor::decode(&od_bytes).unwrap();
+        let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
+        let expected_ident = hex::decode("12d88c7f234493742d583c219101050b39e925d715a93060752d60d3").unwrap();
+        assert_eq!(order.ident.unwrap(), expected_ident);
+    }
+
+    #[test]
     fn test_decode_pooldatum() {
-        let pd_bytes = hex::decode("D8799F581CBA228444515FBEFD2C8725338E49589F206C7F18A33E002B157AAC3C9F9F4040FF9F581C99B071CE8580D6A3A11B4902145ADB8BFD0D2A03935AF8CF66403E1546534245525259FFFF1A01C9C3801901F41901F4D8799FD87F9F581CE8DC0595C8D3A7E2C0323A11F5519C32D3B3FB7A994519E38B698B5DFFFF001A003D0900FF").unwrap();
-        let pd: PoolDatum = minicbor::decode(&pd_bytes).unwrap();
+        let pd_bytes = hex::decode("d8799f581cba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c9f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546534245525259ffff1a01c9c3801901f41901f4d8799fd87f9f581ce8dc0595c8d3a7e2c0323a11f5519c32d3b3fb7a994519e38b698b5dffff001a003d0900ff").unwrap();
+        let pool_pd: PlutusData = minicbor::decode(&pd_bytes).unwrap();
+        let pool: PoolDatum = AsPlutus::from_plutus(pool_pd).unwrap();
         let expected_ident = hex::decode("ba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c").unwrap();
-        assert_eq!(pd.ident.0, expected_ident);
+        assert_eq!(pool.ident, expected_ident);
     }
 }

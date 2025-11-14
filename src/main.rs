@@ -1,20 +1,20 @@
 use clap::Parser;
-use num_bigint::BigInt;
 use pallas_addresses::Address;
 use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
 use pallas_network::miniprotocols::Point;
 use pallas_primitives::conway::{
-    DatumOption, MintedScriptRef, NativeScript, PseudoDatumOption, PseudoScript,
+    DatumOption, NativeScript,
 };
 use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
 use pallas_traverse::MultiEraOutput;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 mod multisig;
 mod sundaev3;
 
-use sundaev3::{Ident, PoolDatum};
+use plutus_parser::AsPlutus;
+use sundaev3::{Ident, OrderDatum, PoolDatum};
 
 #[derive(clap::Parser, Debug)]
 struct Args {
@@ -83,17 +83,19 @@ struct TransactionOutput {
     script_ref: Option<ScriptRef>,
 }
 
-fn convert_datum<'b>(datum: Option<PseudoDatumOption<KeepRaw<'_, PlutusData>>>) -> Datum {
+fn convert_datum<'b>(datum: Option<DatumOption>) -> Datum {
     match datum {
         None => Datum::None,
-        Some(PseudoDatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
-        Some(PseudoDatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
+        Some(DatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
+        Some(DatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
     }
 }
 
 fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     let mut result = BTreeMap::new();
-    value.coin();
+    let mut ada_policy = BTreeMap::new();
+    ada_policy.insert(vec![], value.coin().into());
+    result.insert(vec![], ada_policy);
     for policy in value.assets() {
         let mut p_map = BTreeMap::new();
         let pol = policy.policy();
@@ -106,12 +108,12 @@ fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     Value(result)
 }
 
-fn convert_script_ref(script_ref: MintedScriptRef) -> ScriptRef {
+fn convert_script_ref(script_ref: pallas_primitives::conway::ScriptRef) -> ScriptRef {
     match script_ref {
-        PseudoScript::NativeScript(n) => ScriptRef::NativeScript(n.unwrap()),
-        PseudoScript::PlutusV1Script(s) => ScriptRef::PlutusV1Script(s),
-        PseudoScript::PlutusV2Script(s) => ScriptRef::PlutusV2Script(s),
-        PseudoScript::PlutusV3Script(s) => ScriptRef::PlutusV3Script(s),
+        pallas_primitives::conway::ScriptRef::NativeScript(n) => ScriptRef::NativeScript(n.unwrap()),
+        pallas_primitives::conway::ScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1Script(s),
+        pallas_primitives::conway::ScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2Script(s),
+        pallas_primitives::conway::ScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3Script(s),
     }
 }
 
@@ -130,7 +132,7 @@ fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOut
 
 struct SundaeV3Index {
     pools: BTreeMap<Ident, TransactionOutput>,
-    orders: BTreeMap<Ident, TransactionOutput>,
+    orders: BTreeMap<Option<Ident>, (TransactionInput, TransactionOutput)>,
 }
 
 fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
@@ -146,7 +148,35 @@ fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_t
     })
 }
 
+fn summarize_protocol_state(index: &SundaeV3Index) {
+    println!("Known pools:");
+    let mut known_pool_ids = HashSet::new();
+    for (ident, _p) in &index.pools {
+        known_pool_ids.insert(ident);
+        println!("  {:?}", ident);
+        for (o_ident, o) in &index.orders {
+            if Some(ident) == o_ident.as_ref() {
+                println!("    {:?}", o.0);
+            }
+        }
+    }
+
+    println!("Orphan orders:");
+    for (o_ident, o) in &index.orders {
+        if let Some(oi) = o_ident {
+            if !known_pool_ids.contains(oi) {
+                println!("  {:?}", o.0);
+            }
+        } else {
+            println!("  {:?}", o.0);
+        }
+    }
+}
+
 fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
+    if block.number() % 1000 == 0 {
+        println!("Block height: {}", block.number());
+    }
     for tx in block.txs() {
         let this_tx_hash = tx.hash();
         for (ix, output) in tx.outputs().iter().enumerate() {
@@ -160,7 +190,8 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
             let p: TransactionOutput = convert_transaction_output(&output);
             match p.datum {
                 Datum::Data(ref inline) => {
-                    let pd: Result<PoolDatum, _> = minicbor::decode(inline);
+                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                    let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
                     match pd {
                         Ok(pd) => {
                             println!("{}#{}: pool with datum {}",
@@ -169,6 +200,23 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
                                 hex::encode(inline),
                             );
                             index.pools.insert(pd.ident.clone(), p);
+                            summarize_protocol_state(index);
+                            return;
+                        }
+                        _ => {}
+                    }
+                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                    let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
+                    match od {
+                        Ok(od) => {
+                            println!("{}#{}: order with datum {}",
+                                hex::encode(this_tx_hash),
+                                ix,
+                                hex::encode(inline),
+                            );
+                            index.orders.insert(od.ident.clone(), (this_input, p));
+                            summarize_protocol_state(index);
+                            return;
                         }
                         _ => {}
                     }
@@ -220,4 +268,33 @@ async fn main() {
         }
     });
     let _ = handle.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ingest_block() {
+        let mut index = SundaeV3Index {
+            pools: BTreeMap::new(),
+            orders: BTreeMap::new(),
+        };
+        let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
+        let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
+        let ada_policy: Vec<u8> = vec![];
+        let ada_token: Vec<u8> = vec![];
+        let pool_policy: Vec<u8> = vec![68, 161, 235, 45, 159, 88, 173, 212, 235, 25, 50, 189, 0, 72, 230, 161, 148, 126, 133, 227, 254, 79, 50, 149, 106, 17, 4, 20];
+        let pool_token: Vec<u8> = vec![0, 13, 225, 64, 50, 196, 63, 9, 111, 160, 86, 38, 218, 30, 173, 147, 131, 121, 60, 205, 123, 186, 106, 27, 37, 158, 119, 89, 119, 102, 174, 232];
+        let coin_b_policy: Vec<u8> = vec![145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248, 129, 142, 76, 122, 197, 209, 0, 74, 22];
+        let coin_b_token: Vec<u8> = vec![77, 121, 85, 83, 68];
+        handle_block(&mut index, block);
+        assert_eq!(index.pools.len(), 1);
+        let first_pool = index.pools.first_entry().unwrap();
+        let pool_value = &first_pool.get().value.0;
+        assert_eq!(pool_value[&ada_policy][&ada_token], 6181255175);
+        assert_eq!(pool_value[&pool_policy][&pool_token], 1);
+        assert_eq!(pool_value[&coin_b_policy][&coin_b_token], 6397550387);
+        assert_eq!(index.orders.len(), 0);
+    }
 }

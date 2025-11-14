@@ -5,7 +5,7 @@ https://discourse.nixos.org/t/how-can-i-set-up-my-rust-programming-environment/4
 let
   rust_overlay = import (builtins.fetchTarball "https://github.com/oxalica/rust-overlay/archive/master.tar.gz");
   pkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
-  rustVersion = "2025-06-10"; # "1.88.0";
+  rustVersion = "2025-11-12";
   rust = pkgs.rust-bin.nightly.${rustVersion}.default.override {
     extensions = [
       "rust-src" # for rust-analyzer
