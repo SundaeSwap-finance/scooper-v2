@@ -11,10 +11,14 @@ use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
 use pallas_traverse::MultiEraOutput;
 use std::collections::BTreeMap;
 
+mod acropolis;
 mod multisig;
 mod sundaev3;
 
 use sundaev3::{Ident, PoolDatum};
+
+use crate::acropolis::core::Process;
+use crate::acropolis::indexer::{ChainIndexer, ManagedChainIndex, ManagedIndex};
 
 #[derive(clap::Parser, Debug)]
 struct Args {
@@ -133,49 +137,51 @@ struct SundaeV3Index {
     orders: BTreeMap<Ident, TransactionOutput>,
 }
 
-fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
-    let header = pallas_traverse::MultiEraHeader::decode(
-        header_content.variant,
-        header_content.byron_prefix.map(|x| x.0),
-        &header_content.cbor,
-    );
-    header.map(|h| {
-        let slot = h.slot();
-        let header_hash = h.hash();
-        Point::Specific(slot, header_hash.to_vec())
-    })
+#[derive(Default)]
+struct PoolIndex {
+    pools: BTreeMap<Ident, TransactionOutput>,
 }
-
-fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
-    for tx in block.txs() {
-        let this_tx_hash = tx.hash();
-        for (ix, output) in tx.outputs().iter().enumerate() {
-            let this_input = TransactionInput {
-                transaction_id: this_tx_hash,
-                index: ix as u64,
-            };
-            // TODO: Don't need to convert every single utxo, we can inspect the address
-            // and datum first to decide if we are interested
-            // TODO: Get datums from the witness set to support hash datums
+impl ManagedIndex for PoolIndex {
+    fn name(&self) -> String {
+        "pools".into()
+    }
+}
+impl ManagedChainIndex for PoolIndex {
+    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx<'_>) -> anyhow::Result<()> {
+        for output in tx.outputs() {
             let p: TransactionOutput = convert_transaction_output(&output);
-            match p.datum {
-                Datum::Data(ref inline) => {
-                    let pd: Result<PoolDatum, _> = minicbor::decode(inline);
-                    match pd {
-                        Ok(pd) => {
-                            println!("{}#{}: pool with datum {}",
-                                hex::encode(this_tx_hash),
-                                ix,
-                                hex::encode(inline),
-                            );
-                            index.pools.insert(pd.ident.clone(), p);
-                        }
-                        _ => {}
-                    }
-                }
-                Datum::None | Datum::Hash(_) => {}
+            let datum = match &p.datum {
+                Datum::Data(d) => d,
+                _ => { continue; }
+            };
+            if let Ok(pd) = minicbor::decode::<PoolDatum>(datum) {
+                self.pools.insert(pd.ident.clone(), p);
             }
         }
+        Ok(())
+    }
+
+    async fn handle_rollback(&mut self, info: &acropolis::core::BlockInfo) -> anyhow::Result<()> {
+        todo!()
+    }
+}
+
+#[derive(Default)]
+struct OrderIndex {
+    orders: BTreeMap<Ident, TransactionOutput>,
+}
+impl ManagedIndex for OrderIndex {
+    fn name(&self) -> String {
+        "orders".into()
+    }
+}
+impl ManagedChainIndex for OrderIndex {
+    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx<'_>) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn handle_rollback(&mut self, info: &acropolis::core::BlockInfo) -> anyhow::Result<()> {
+        todo!()
     }
 }
 
@@ -184,40 +190,17 @@ async fn main() {
     let args = Args::parse();
 
     let handle = tokio::spawn(async move {
-        let mut peer_client = PeerClient::connect(args.addr, args.magic).await.unwrap();
-        let points = match args.command {
-            Commands::SyncFromOrigin => vec![Point::Origin],
-            Commands::SyncFromPoint{ slot, block_hash } => vec![Point::Specific(slot, block_hash.0)]
+        let mut indexer = ChainIndexer::new();
+        let point = match args.command {
+            Commands::SyncFromOrigin => Point::Origin,
+            Commands::SyncFromPoint{ slot, block_hash } => Point::Specific(slot, block_hash.0)
         };
-        let intersect_result = peer_client.chainsync().find_intersect(points).await;
-        println!("Intersect result {:?}", intersect_result);
-        let mut index = SundaeV3Index {
-            pools: BTreeMap::new(),
-            orders: BTreeMap::new(),
-        };
-        loop {
-            let resp = peer_client
-                .chainsync()
-                .request_or_await_next()
-                .await
-                .unwrap();
-            match resp {
-                NextResponse::RollForward(content, _tip) => {
-                    let point = decode_header_point(&content).unwrap();
-                    let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
-                    match pallas_traverse::MultiEraBlock::decode(&resp) {
-                        Ok(block) => handle_block(&mut index, block),
-                        Err(e) => println!("Error decoding block: {:?}", e),
-                    }
-                }
-                NextResponse::RollBackward(point, tip) => {
-                    println!("RollBackward({:?}, {:?})", point, tip);
-                }
-                NextResponse::Await => {
-                    println!("Await");
-                }
-            }
-        }
+        indexer.add_index(PoolIndex::default(), point.clone(), false);
+        indexer.add_index(OrderIndex::default(), point.clone(), false);
+        
+        let mut process = Process::create();
+        process.register(indexer);
+        process.run().await.unwrap();
     });
     let _ = handle.await;
 }
