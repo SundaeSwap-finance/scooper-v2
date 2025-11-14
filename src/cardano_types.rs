@@ -1,6 +1,6 @@
 use pallas_addresses::Address;
-use pallas_primitives::PlutusScript;
 use pallas_primitives::conway::{DatumOption, NativeScript};
+use pallas_primitives::{PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
 
 use std::collections::BTreeMap;
@@ -22,10 +22,22 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
     token: vec![],
 };
 
-#[derive(AsPlutus, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
+}
+
+impl AsPlutus for AssetClass {
+    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let (policy, token) = AsPlutus::from_plutus(data)?;
+        Ok(AssetClass { policy, token })
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        let tuple = (self.policy, self.token);
+        tuple.to_plutus()
+    }
 }
 
 impl AssetClass {

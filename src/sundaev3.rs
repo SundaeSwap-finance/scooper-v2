@@ -1,8 +1,8 @@
-use std::fmt;
 use pallas_primitives::{BigInt, PlutusData};
 use plutus_parser::AsPlutus;
+use std::fmt;
 
-use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass as CardanoAssetClass, Value};
+use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass, Value};
 use crate::multisig::Multisig;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -24,8 +24,6 @@ impl fmt::Display for Ident {
     }
 }
 
-
-
 impl std::ops::Deref for Ident {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
@@ -42,10 +40,7 @@ impl AsPlutus for Ident {
     fn to_plutus(self) -> PlutusData {
         self.0.to_plutus()
     }
-
 }
-
-pub type AssetClass = (Vec<u8>, Vec<u8>);
 
 #[derive(AsPlutus, Clone)]
 pub struct PoolDatum {
@@ -242,12 +237,9 @@ pub struct StrategyExecution {
 //    pool_input: BigInt,
 //}
 
-pub fn get_pool_asset_pair(
-    pool_policy: &[u8],
-    v: &Value,
-) -> Option<(CardanoAssetClass, crate::cardano_types::AssetClass)> {
-    let mut native_token_a: Option<CardanoAssetClass> = None;
-    let mut native_token_b: Option<CardanoAssetClass> = None;
+pub fn get_pool_asset_pair(pool_policy: &[u8], v: &Value) -> Option<(AssetClass, AssetClass)> {
+    let mut native_token_a = None;
+    let mut native_token_b = None;
     let ada_policy: &[u8] = &[];
     for (policy, assets) in &v.0 {
         if policy == pool_policy {
@@ -258,12 +250,12 @@ pub fn get_pool_asset_pair(
         }
         for asset in assets.keys() {
             if native_token_a.is_none() {
-                native_token_a = Some(CardanoAssetClass {
+                native_token_a = Some(AssetClass {
                     policy: policy.clone(),
                     token: asset.clone(),
                 });
             } else {
-                native_token_b = Some(CardanoAssetClass {
+                native_token_b = Some(AssetClass {
                     policy: policy.clone(),
                     token: asset.clone(),
                 });

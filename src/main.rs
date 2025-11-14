@@ -99,8 +99,7 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
         println!("  Pool ID: {}", ident);
         println!(
             "  Assets: ({}, {})",
-            AssetClass::from_pair(p.pool_datum.assets.0.clone()),
-            AssetClass::from_pair(p.pool_datum.assets.1.clone()),
+            p.pool_datum.assets.0, p.pool_datum.assets.1,
         );
         if let Some(price) = sundaev3::get_pool_price(pool_policy.as_ref(), &p.value) {
             println!("  Price: {price}");
