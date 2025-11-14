@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use clap::Parser;
 use num_bigint::BigInt;
 use pallas_addresses::Address;
@@ -8,8 +9,8 @@ use pallas_primitives::conway::{
     DatumOption, MintedScriptRef, NativeScript, PseudoDatumOption, PseudoScript,
 };
 use pallas_primitives::{KeepRaw, PlutusData, PlutusScript, TransactionInput};
-use pallas_traverse::MultiEraOutput;
-use std::collections::BTreeMap;
+use pallas_traverse::{MultiEraOutput, OutputRef};
+use std::collections::{BTreeMap, HashSet};
 
 mod acropolis;
 mod multisig;
@@ -18,7 +19,7 @@ mod sundaev3;
 use sundaev3::{Ident, PoolDatum};
 
 use crate::acropolis::core::Process;
-use crate::acropolis::indexer::{ChainIndexer, ManagedChainIndex, ManagedIndex};
+use crate::acropolis::indexer::{ChainIndexer, InMemoryCursorStore, ManagedIndex};
 
 #[derive(clap::Parser, Debug)]
 struct Args {
@@ -132,22 +133,27 @@ fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOut
     }
 }
 
-struct SundaeV3Index {
+struct PoolIndex {
+    // Pretend this is something persistent like a database.
     pools: BTreeMap<Ident, TransactionOutput>,
-    orders: BTreeMap<Ident, TransactionOutput>,
 }
 
-#[derive(Default)]
-struct PoolIndex {
-    pools: BTreeMap<Ident, TransactionOutput>,
+impl PoolIndex {
+    fn new() -> Self {
+        Self { pools: BTreeMap::new() }
+    }
 }
+
+// Managed indexes are written in an "event handler" style.
+// They react to a stream of events, starting at a configured point on the chain.
+// Each index can be somewhere different on-chain, so they should be granular.
+#[async_trait]
 impl ManagedIndex for PoolIndex {
     fn name(&self) -> String {
         "pools".into()
     }
-}
-impl ManagedChainIndex for PoolIndex {
-    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx<'_>) -> anyhow::Result<()> {
+
+    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx) -> anyhow::Result<()> {
         for output in tx.outputs() {
             let p: TransactionOutput = convert_transaction_output(&output);
             let datum = match &p.datum {
@@ -155,9 +161,11 @@ impl ManagedChainIndex for PoolIndex {
                 _ => { continue; }
             };
             if let Ok(pd) = minicbor::decode::<PoolDatum>(datum) {
+                // In reality, this would probably be updating a DB
                 self.pools.insert(pd.ident.clone(), p);
             }
         }
+        // This method is fallible; if it fails, the indexer will stop updating this index
         Ok(())
     }
 
@@ -166,22 +174,61 @@ impl ManagedChainIndex for PoolIndex {
     }
 }
 
-#[derive(Default)]
 struct OrderIndex {
+    // Pretend this is something persistent like a database.
     orders: BTreeMap<Ident, TransactionOutput>,
 }
+
+impl OrderIndex {
+    fn new() -> Self {
+        Self { orders: BTreeMap::new() }
+    }
+}
+
+#[async_trait]
 impl ManagedIndex for OrderIndex {
     fn name(&self) -> String {
         "orders".into()
     }
-}
-impl ManagedChainIndex for OrderIndex {
-    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx<'_>) -> anyhow::Result<()> {
-        todo!()
+
+    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn handle_rollback(&mut self, info: &acropolis::core::BlockInfo) -> anyhow::Result<()> {
         todo!()
+    }
+}
+
+struct WalletIndex {
+    address: Address,
+    utxos: Vec<(OutputRef, Value)>,
+}
+impl WalletIndex {
+    fn new(address: Address) -> Self {
+        Self {
+            address,
+            utxos: vec![],
+        }
+    }
+}
+
+#[async_trait]
+impl ManagedIndex for WalletIndex {
+    fn name(&self) -> String {
+        "wallet".into()
+    }
+
+    async fn handle_onchain_tx(&mut self, info: &acropolis::core::BlockInfo, tx: &pallas_traverse::MultiEraTx) -> anyhow::Result<()> {
+        let spent = tx.inputs().iter().map(|i| i.output_ref()).collect::<HashSet<_>>();
+        self.utxos.retain(|u| !spent.contains(&u.0));
+        for (out_idx, output) in tx.outputs().iter().enumerate() {
+            if output.address().is_ok_and(|a| a == self.address) {
+                let ref_ = OutputRef::new(tx.hash(), out_idx as u64);
+                self.utxos.push((ref_, convert_value(output.value())));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -190,13 +237,13 @@ async fn main() {
     let args = Args::parse();
 
     let handle = tokio::spawn(async move {
-        let mut indexer = ChainIndexer::new();
+        let mut indexer = ChainIndexer::new(InMemoryCursorStore::new(vec![]));
         let point = match args.command {
             Commands::SyncFromOrigin => Point::Origin,
             Commands::SyncFromPoint{ slot, block_hash } => Point::Specific(slot, block_hash.0)
         };
-        indexer.add_index(PoolIndex::default(), point.clone(), false);
-        indexer.add_index(OrderIndex::default(), point.clone(), false);
+        indexer.add_index(PoolIndex::new(), point.clone(), false);
+        indexer.add_index(OrderIndex::new(), point.clone(), false);
         
         let mut process = Process::create();
         process.register(indexer);
