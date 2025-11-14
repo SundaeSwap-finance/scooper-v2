@@ -96,7 +96,7 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
             _ => continue,
         };
         known_pool_ids.insert(ident);
-        println!("  Pool ID: {:?}", ident);
+        println!("  Pool ID: {}", ident);
         println!(
             "  Assets: ({}, {})",
             AssetClass::from_pair(p.pool_datum.assets.0.clone()),
@@ -251,7 +251,7 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
         if let Some(pool_id) = req.uri().path().strip_prefix("/pool/") {
             let index_lock = self.index.lock().unwrap();
             let id_bytes = hex::decode(pool_id).unwrap();
-            let ident = id_bytes;
+            let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
                 let mut response = String::new();
                 for (tx_in, _) in orders {
@@ -273,7 +273,7 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
                 let mut response = String::new();
                 let index_lock = self.index.lock().unwrap();
                 for pool_id in index_lock.pools.keys() {
-                    response += &format!("{}\n", hex::encode(pool_id));
+                    response += &format!("{pool_id}\n");
                 }
                 mk_response(response)
             }

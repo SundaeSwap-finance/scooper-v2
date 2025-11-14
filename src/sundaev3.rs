@@ -1,11 +1,50 @@
+use std::fmt;
 use pallas_primitives::{BigInt, PlutusData};
 use plutus_parser::AsPlutus;
-use std::fmt;
 
 use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass as CardanoAssetClass, Value};
 use crate::multisig::Multisig;
 
-pub type Ident = Vec<u8>;
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Ident(Vec<u8>);
+
+impl Ident {
+    pub fn new(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn to_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for Ident {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
+    }
+}
+
+
+
+impl std::ops::Deref for Ident {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsPlutus for Ident {
+    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let bytes: Vec<u8> = AsPlutus::from_plutus(data)?;
+        Ok(Ident(bytes))
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        self.0.to_plutus()
+    }
+
+}
+
 pub type AssetClass = (Vec<u8>, Vec<u8>);
 
 #[derive(AsPlutus, Clone)]
@@ -282,7 +321,7 @@ mod tests {
             hex::decode("88888888888888888888888888888888888888888888888888888888").unwrap();
         let expected_vkey =
             hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
-        assert_eq!(order.ident.unwrap(), expected_ident);
+        assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
         assert_eq!(order.owner, Multisig::Signature(expected_signature));
         assert_eq!(order.scoop_fee, BigInt::Int(10.into()));
         assert_eq!(
@@ -321,7 +360,7 @@ mod tests {
         let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
         let expected_ident =
             hex::decode("12d88c7f234493742d583c219101050b39e925d715a93060752d60d3").unwrap();
-        assert_eq!(order.ident.unwrap(), expected_ident);
+        assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
     }
 
     #[test]
@@ -331,6 +370,6 @@ mod tests {
         let pool: PoolDatum = AsPlutus::from_plutus(pool_pd).unwrap();
         let expected_ident =
             hex::decode("ba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c").unwrap();
-        assert_eq!(pool.ident, expected_ident);
+        assert_eq!(pool.ident.to_bytes(), expected_ident);
     }
 }
