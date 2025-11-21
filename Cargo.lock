@@ -714,7 +714,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "plutus-parser"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f8ab185bb73459ac8d64d8781ab5811776a6288e762a66422c14fa554a61c86"
 dependencies = [
  "indexmap",
  "pallas-primitives",
@@ -724,7 +726,9 @@ dependencies = [
 
 [[package]]
 name = "plutus-parser-derive"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c514bd62b0a3506635935f1d7484d193c1d92fa0197e676c5cf1371d502d9b60"
 dependencies = [
  "proc-macro2",
  "quote",
