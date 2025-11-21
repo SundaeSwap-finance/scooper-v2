@@ -6,6 +6,7 @@ repository = "https://github.com/rrruko/scooper-v2"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4.5.41", features = ["derive"] }
 hex = "0.4.3"
 minicbor = { version = "0.26.0", features = ["alloc", "derive"] }

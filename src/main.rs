@@ -1,16 +1,17 @@
 use anyhow::{Result, bail};
+use async_trait::async_trait;
 use clap::Parser;
-use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::Point;
-use pallas_network::miniprotocols::chainsync::{HeaderContent, NextResponse};
 use pallas_primitives::PlutusData;
+use pallas_traverse::MultiEraTx;
+use tokio::sync::Mutex;
 
 use std::collections::{BTreeMap, HashSet};
-use tracing::{Level, event};
+use tracing::{Level, event, warn};
 
 use std::sync::Arc;
-use std::sync::Mutex;
 
+mod acropolis;
 mod cardano_types;
 mod multisig;
 mod sundaev3;
@@ -27,6 +28,8 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::TcpListener;
+
+use crate::acropolis::{BlockInfo, Indexer, ManagedIndex};
 
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
@@ -73,17 +76,6 @@ enum Commands {
 struct SundaeV3Index {
     pools: BTreeMap<Ident, SundaeV3Pool>,
     orders: BTreeMap<Option<Ident>, Vec<(TransactionInput, TransactionOutput)>>,
-}
-
-fn decode_header_point(header_content: &HeaderContent) -> Result<Point> {
-    let header = pallas_traverse::MultiEraHeader::decode(
-        header_content.variant,
-        header_content.byron_prefix.map(|x| x.0),
-        &header_content.cbor,
-    )?;
-    let slot = header.slot();
-    let header_hash = header.hash();
-    Ok(Point::Specific(slot, header_hash.to_vec()))
 }
 
 fn summarize_protocol_state(index: &SundaeV3Index) {
@@ -139,12 +131,19 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
     println!();
 }
 
-fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
-    if block.number().is_multiple_of(1000) {
-        event!(Level::INFO, "Block height: {}", block.number());
+struct SundaeV3Indexer {
+    state: Arc<Mutex<SundaeV3Index>>,
+}
+
+#[async_trait]
+impl ManagedIndex for SundaeV3Indexer {
+    fn name(&self) -> String {
+        "sundae-v3".to_string()
     }
-    for tx in block.txs() {
+
+    async fn handle_onchain_tx(&mut self, _info: &BlockInfo, tx: &MultiEraTx) -> Result<()> {
         let this_tx_hash = tx.hash();
+        let mut index = self.state.lock().await;
         for (ix, output) in tx.outputs().iter().enumerate() {
             let this_input = TransactionInput(pallas_primitives::TransactionInput {
                 transaction_id: this_tx_hash,
@@ -168,8 +167,8 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
                         index.pools.insert(pool_id, pool_record);
 
                         event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                        summarize_protocol_state(index);
-                        return;
+                        summarize_protocol_state(&index);
+                        return Ok(());
                     }
 
                     let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
@@ -179,13 +178,19 @@ fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock
                         this_pool_orders.push((this_input, tx_out));
 
                         event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                        summarize_protocol_state(index);
-                        return;
+                        summarize_protocol_state(&index);
+                        return Ok(());
                     }
                 }
                 Datum::None | Datum::Hash(_) => {}
             }
         }
+        Ok(())
+    }
+
+    async fn handle_rollback(&mut self, info: &BlockInfo) -> Result<()> {
+        warn!("rolling back to {}:{}", info.slot, info.hash);
+        Ok(())
     }
 }
 
@@ -193,45 +198,26 @@ async fn do_scoops(
     args: Args,
     mut abort: tokio::sync::broadcast::Receiver<()>,
     index: Arc<Mutex<SundaeV3Index>>,
-) {
-    let mut peer_client = PeerClient::connect(args.addr, args.magic).await.unwrap();
-    let points = match args.command {
-        Commands::SyncFromOrigin => vec![Point::Origin],
-        Commands::SyncFromPoint { slot, block_hash } => vec![Point::Specific(slot, block_hash.0)],
+) -> Result<()> {
+    let start = match args.command {
+        Commands::SyncFromOrigin => Point::Origin,
+        Commands::SyncFromPoint { slot, block_hash } => Point::Specific(slot, block_hash.0),
     };
-    let intersect_result = peer_client.chainsync().find_intersect(points).await;
-    event!(Level::DEBUG, "Intersect result {:?}", intersect_result);
-    loop {
-        if let Ok(()) = abort.try_recv() {
-            return;
+
+    let index = SundaeV3Indexer { state: index };
+    let mut indexer = Indexer::new(&args.addr, args.magic);
+    indexer.add_index(index, start, false);
+    tokio::select! {
+        res = indexer.run() => {
+            res
         }
-        let resp = peer_client
-            .chainsync()
-            .request_or_await_next()
-            .await
-            .unwrap();
-        match resp {
-            NextResponse::RollForward(content, _tip) => {
-                let point = decode_header_point(&content).unwrap();
-                let resp = peer_client.blockfetch().fetch_single(point).await.unwrap();
-                match pallas_traverse::MultiEraBlock::decode(&resp) {
-                    Ok(block) => {
-                        let mut index_lock = index.lock().unwrap();
-                        handle_block(&mut index_lock, block)
-                    }
-                    Err(e) => event!(Level::DEBUG, "Error decoding block: {:?}", e),
-                }
-            }
-            NextResponse::RollBackward(point, tip) => {
-                event!(Level::DEBUG, "RollBackward({:?}, {:?})", point, tip);
-            }
-            NextResponse::Await => {
-                event!(Level::DEBUG, "Await");
-            }
+        _ = abort.recv() => {
+            Ok(())
         }
     }
 }
 
+#[derive(Clone)]
 struct AdminServer {
     index: Arc<Mutex<SundaeV3Index>>,
     kill_tx: tokio::sync::broadcast::Sender<()>,
@@ -243,11 +229,18 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<IncomingBody>) -> Self::Future {
-        let mk_response =
-            |s: String| Ok(Response::builder().body(Full::new(Bytes::from(s))).unwrap());
+        let me = self.clone();
+        Box::pin(async move {
+            let s = me.do_call(req).await;
+            Ok(Response::builder().body(Full::new(Bytes::from(s))).unwrap())
+        })
+    }
+}
 
+impl AdminServer {
+    async fn do_call(&self, req: Request<IncomingBody>) -> String {
         if let Some(pool_id) = req.uri().path().strip_prefix("/pool/") {
-            let index_lock = self.index.lock().unwrap();
+            let index_lock = self.index.lock().await;
             let id_bytes = hex::decode(pool_id).unwrap();
             let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
@@ -255,29 +248,28 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
                 for (tx_in, _) in orders {
                     response += &format!("{tx_in}\n");
                 }
-                return Box::pin(async move { mk_response(response) });
+                return response;
             } else {
-                return Box::pin(async move { mk_response("No such pool".into()) });
+                return "No such pool".into();
             }
         }
 
-        let res = match req.uri().path() {
+        match req.uri().path() {
             "/resync-from-kupo" => {
                 let _ = self.kill_tx.send(());
-                mk_response("resync".into())
+                "resync".into()
             }
-            "/health" => mk_response("health".into()),
+            "/health" => "health".into(),
             "/pools" => {
                 let mut response = String::new();
-                let index_lock = self.index.lock().unwrap();
+                let index_lock = self.index.lock().await;
                 for pool_id in index_lock.pools.keys() {
                     response += &format!("{pool_id}\n");
                 }
-                mk_response(response)
+                response
             }
-            _ => mk_response("unknown".into()),
-        };
-        Box::pin(async { res })
+            _ => "unknown".into(),
+        }
     }
 }
 
@@ -299,9 +291,12 @@ async fn main() {
         loop {
             let kill_rx2 = kill_tx.subscribe();
             let args2 = args.clone();
+            {
+                let mut lock = index.lock().await;
+                lock.pools.clear();
+                lock.orders.clear();
+            }
             let index2 = index.clone();
-            index.lock().unwrap().pools.clear();
-            index.lock().unwrap().orders.clear();
             let do_scoops_handle = tokio::spawn(async move {
                 event!(Level::DEBUG, "Doing scoops");
                 let _ = do_scoops(args2, kill_rx2, index2).await;
@@ -338,13 +333,29 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use pallas_traverse::MultiEraBlock;
+
     use super::*;
 
-    #[test]
-    fn test_ingest_block() {
-        let mut index = SundaeV3Index {
+    async fn handle_block(indexer: &mut SundaeV3Indexer, block: MultiEraBlock<'_>) -> Result<()> {
+        let info = BlockInfo {
+            slot: block.slot(),
+            hash: acropolis::BlockHash::new(*block.hash()),
+        };
+        for tx in block.txs() {
+            indexer.handle_onchain_tx(&info, &tx).await?
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ingest_block() {
+        let state = Arc::new(Mutex::new(SundaeV3Index {
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
+        }));
+        let mut indexer = SundaeV3Indexer {
+            state: state.clone(),
         };
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
@@ -363,7 +374,8 @@ mod tests {
             129, 142, 76, 122, 197, 209, 0, 74, 22,
         ];
         let coin_b_token: Vec<u8> = vec![77, 121, 85, 83, 68];
-        handle_block(&mut index, block);
+        handle_block(&mut indexer, block).await.unwrap();
+        let mut index = state.lock().await;
         assert_eq!(index.pools.len(), 1);
         let first_pool = index.pools.first_entry().unwrap();
         let pool_value = &first_pool.get().value.0;
