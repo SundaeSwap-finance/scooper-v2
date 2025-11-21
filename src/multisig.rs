@@ -1,6 +1,5 @@
-use minicbor::decode::{Decode, Decoder, Error};
-use plutus_parser::AsPlutus;
 use pallas_primitives::BigInt;
+use plutus_parser::AsPlutus;
 
 #[derive(AsPlutus, Clone, Debug, PartialEq, Eq)]
 pub enum Multisig {
