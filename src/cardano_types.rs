@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, NativeScript};
 use pallas_primitives::{PlutusData, PlutusScript};

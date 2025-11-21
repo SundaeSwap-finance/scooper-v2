@@ -14,7 +14,7 @@ mod cardano_types;
 mod multisig;
 mod sundaev3;
 
-use cardano_types::{AssetClass, Datum, TransactionInput, TransactionOutput};
+use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use plutus_parser::AsPlutus;
 use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool};
 
@@ -141,7 +141,7 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
 }
 
 fn handle_block(index: &mut SundaeV3Index, block: pallas_traverse::MultiEraBlock) {
-    if block.number() % 1000 == 0 {
+    if block.number().is_multiple_of(1000) {
         event!(Level::INFO, "Block height: {}", block.number());
     }
     for tx in block.txs() {
@@ -334,8 +334,7 @@ async fn main() {
         }
     });
 
-    manager_handle.await.unwrap();
-    admin_server_handle.await.unwrap();
+    tokio::try_join!(manager_handle, admin_server_handle).unwrap();
 }
 
 #[cfg(test)]
