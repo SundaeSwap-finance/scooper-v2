@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use pallas_primitives::{BigInt, PlutusData};
 use plutus_parser::AsPlutus;
 use std::fmt;

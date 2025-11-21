@@ -16,8 +16,7 @@ pallas-network = "1.0.0-alpha.2"
 pallas-primitives = "1.0.0-alpha.2"
 pallas-traverse = "1.0.0-alpha.2"
 tokio = { version = "1.46.1", features = ["full"] }
-#plutus-parser = { version = "0.1.0", default-features = false, features = ["pallas-v1", "derive"] }
-plutus-parser = { path = "../plutus-parser/packages/plutus-parser", default-features = false, features = ["pallas-v1", "derive"] }
+plutus-parser = { version = "0.2.0", default-features = false, features = ["pallas-v1", "derive"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = [
   "env-filter",
