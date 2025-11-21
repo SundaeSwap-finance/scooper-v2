@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use clap::Parser;
 use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::Point;
@@ -44,16 +45,16 @@ struct BlockHash(Vec<u8>);
 
 const BLOCK_HASH_SIZE: usize = 32;
 
-fn parse_block_hash(bh: &str) -> Result<BlockHash, String> {
-    let bytes = hex::decode(bh).map_err(|e| e.to_string())?;
+fn parse_block_hash(bh: &str) -> Result<BlockHash> {
+    let bytes = hex::decode(bh)?;
     if bytes.len() == BLOCK_HASH_SIZE {
         Ok(BlockHash(bytes.to_vec()))
     } else {
-        Err(format!(
+        bail!(
             "Expected length {} for block hash, but got {}",
             BLOCK_HASH_SIZE,
             bytes.len()
-        ))
+        )
     }
 }
 
@@ -74,17 +75,15 @@ struct SundaeV3Index {
     orders: BTreeMap<Option<Ident>, Vec<(TransactionInput, TransactionOutput)>>,
 }
 
-fn decode_header_point(header_content: &HeaderContent) -> Result<Point, pallas_traverse::Error> {
+fn decode_header_point(header_content: &HeaderContent) -> Result<Point> {
     let header = pallas_traverse::MultiEraHeader::decode(
         header_content.variant,
         header_content.byron_prefix.map(|x| x.0),
         &header_content.cbor,
-    );
-    header.map(|h| {
-        let slot = h.slot();
-        let header_hash = h.hash();
-        Point::Specific(slot, header_hash.to_vec())
-    })
+    )?;
+    let slot = header.slot();
+    let header_hash = header.hash();
+    Ok(Point::Specific(slot, header_hash.to_vec()))
 }
 
 fn summarize_protocol_state(index: &SundaeV3Index) {
