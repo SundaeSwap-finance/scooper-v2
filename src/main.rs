@@ -7,6 +7,8 @@ use pallas_traverse::MultiEraTx;
 use tokio::sync::Mutex;
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use tracing::{Level, event, warn};
 
 use std::sync::Arc;
@@ -16,7 +18,10 @@ mod cardano_types;
 mod multisig;
 mod sundaev3;
 
+use serde::Deserialize;
+
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
+use pallas_addresses::Address;
 use plutus_parser::AsPlutus;
 use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool};
 
@@ -31,6 +36,38 @@ use tokio::net::TcpListener;
 
 use crate::acropolis::{BlockInfo, Indexer, ManagedIndex};
 
+#[derive(Deserialize)]
+struct SundaeV3Protocol {
+    #[serde(deserialize_with = "deserialize_address")]
+    order_address: Address,
+    #[serde(deserialize_with = "deserialize_address")]
+    pool_address: Address,
+}
+
+struct AddressVisitor;
+
+impl<'de> serde::de::Visitor<'de> for AddressVisitor {
+    type Value = Address;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a bech32-encoded address")
+    }
+
+    fn visit_str<E>(self, bech32: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Address::from_bech32(bech32).map_err(|e| E::custom(e.to_string()))
+    }
+}
+
+fn deserialize_address<'de, D>(deserializer: D) -> Result<Address, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_str(AddressVisitor)
+}
+
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
     #[arg(short, long)]
@@ -38,6 +75,9 @@ struct Args {
 
     #[arg(short, long)]
     magic: u64,
+
+    #[arg(short, long)]
+    protocol: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
@@ -73,15 +113,77 @@ enum Commands {
     },
 }
 
+struct SundaeV3Order {
+    input: TransactionInput,
+    output: TransactionOutput,
+    slot: u64,
+}
+
+// Invariant: The items of the vector are sorted with respect to the slot to support rollbacks
+#[derive(Default)]
+struct SundaeV3PoolOrders {
+    orders: Vec<SundaeV3Order>,
+}
+
+impl SundaeV3PoolOrders {
+    fn insert(&mut self, order: SundaeV3Order) {
+        self.orders.push(order)
+    }
+
+    // TODO: Should this be `<=` ?
+    fn rollback(&mut self, slot: u64) {
+        self.orders.retain(|o| o.slot < slot);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.orders.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct SundaeV3PoolStates {
+    states: Vec<(SundaeV3Pool, u64)>,
+}
+
+impl SundaeV3PoolStates {
+    fn latest(&self) -> &SundaeV3Pool {
+        &self.states.last().unwrap().0
+    }
+
+    fn insert(&mut self, pool: SundaeV3Pool, slot: u64) {
+        if self.states.is_empty() {
+            self.states.push((pool, slot));
+        } else {
+            for i in 0..self.states.len() - 1 {
+                if self.states[i].1 > slot {
+                    self.states.insert(i, (pool, slot));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn rollback(&mut self, slot: u64) {
+        self.states
+            .retain(|(_state, state_slot)| *state_slot < slot);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+}
+
 struct SundaeV3Index {
-    pools: BTreeMap<Ident, SundaeV3Pool>,
-    orders: BTreeMap<Option<Ident>, Vec<(TransactionInput, TransactionOutput)>>,
+    pools: BTreeMap<Ident, SundaeV3PoolStates>,
+    orders: BTreeMap<Option<Ident>, SundaeV3PoolOrders>,
 }
 
 fn summarize_protocol_state(index: &SundaeV3Index) {
     println!("Known pools:");
     let mut known_pool_ids = HashSet::new();
-    for (ident, p) in &index.pools {
+    for (ident, pools) in &index.pools {
+        let p = pools.latest();
         let pool_policy = match &p.address {
             pallas_addresses::Address::Shelley(a) => a.payment().as_hash(),
             _ => continue,
@@ -104,8 +206,8 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
                 if orders.is_empty() {
                     println!("    No orders");
                 } else {
-                    for o in orders {
-                        println!("    Order: {}", o.0);
+                    for o in &orders.orders {
+                        println!("    Order: {}", o.input);
                     }
                 }
             }
@@ -119,8 +221,8 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
     let orphan_orders = index.orders.get(&None);
     match orphan_orders {
         Some(orders) => {
-            for o in orders {
-                println!("  {}: {:?}", o.0, 0.1);
+            for o in &orders.orders {
+                println!("  {}: {:?}", o.input, o.output);
             }
         }
         None => {
@@ -133,6 +235,16 @@ fn summarize_protocol_state(index: &SundaeV3Index) {
 
 struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3Index>>,
+    protocol: SundaeV3Protocol,
+}
+
+fn payment_part_equal(a: &Address, b: &Address) -> bool {
+    if let Address::Shelley(s_a) = a
+        && let Address::Shelley(s_b) = b
+    {
+        return s_a.payment() == s_b.payment();
+    }
+    false
 }
 
 #[async_trait]
@@ -141,48 +253,60 @@ impl ManagedIndex for SundaeV3Indexer {
         "sundae-v3".to_string()
     }
 
-    async fn handle_onchain_tx(&mut self, _info: &BlockInfo, tx: &MultiEraTx) -> Result<()> {
+    async fn handle_onchain_tx(&mut self, info: &BlockInfo, tx: &MultiEraTx) -> Result<()> {
         let this_tx_hash = tx.hash();
         let mut index = self.state.lock().await;
         for (ix, output) in tx.outputs().iter().enumerate() {
-            let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                transaction_id: this_tx_hash,
-                index: ix as u64,
-            });
-            // TODO: Don't need to convert every single utxo, we can inspect the address
-            // and datum first to decide if we are interested
-            // TODO: Get datums from the witness set to support hash datums
-            let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
-            match tx_out.datum {
-                Datum::Data(ref inline) => {
-                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                    let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
-                    if let Ok(pd) = pd {
-                        let pool_id = pd.ident.clone();
-                        let pool_record = SundaeV3Pool {
-                            address: tx_out.address,
-                            value: tx_out.value,
-                            pool_datum: pd,
-                        };
-                        index.pools.insert(pool_id, pool_record);
+            let address = output.address()?;
+            if payment_part_equal(&address, &self.protocol.pool_address) {
+                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
+                match tx_out.datum {
+                    Datum::Data(ref inline) => {
+                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                        let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
+                        if let Ok(pd) = pd {
+                            let pool_id = pd.ident.clone();
+                            let pool_record = SundaeV3Pool {
+                                address: tx_out.address,
+                                value: tx_out.value,
+                                pool_datum: pd,
+                            };
+                            let this_pool = index.pools.entry(pool_id).or_default();
+                            this_pool.insert(pool_record, info.slot);
 
-                        event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                        summarize_protocol_state(&index);
-                        return Ok(());
+                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
+                            summarize_protocol_state(&index);
+                            return Ok(());
+                        }
                     }
-
-                    let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                    let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
-                    if let Ok(od) = od {
-                        let this_pool_orders = index.orders.entry(od.ident.clone()).or_default();
-                        this_pool_orders.push((this_input, tx_out));
-
-                        event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                        summarize_protocol_state(&index);
-                        return Ok(());
-                    }
+                    Datum::None | Datum::Hash(_) => {}
                 }
-                Datum::None | Datum::Hash(_) => {}
+            } else if payment_part_equal(&address, &self.protocol.order_address) {
+                let this_input = TransactionInput(pallas_primitives::TransactionInput {
+                    transaction_id: this_tx_hash,
+                    index: ix as u64,
+                });
+                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
+                match tx_out.datum {
+                    Datum::Data(ref inline) => {
+                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
+                        let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
+                        if let Ok(od) = od {
+                            let this_pool_orders =
+                                index.orders.entry(od.ident.clone()).or_default();
+                            this_pool_orders.insert(SundaeV3Order {
+                                input: this_input,
+                                output: tx_out,
+                                slot: info.slot,
+                            });
+
+                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
+                            summarize_protocol_state(&index);
+                            return Ok(());
+                        }
+                    }
+                    Datum::None | Datum::Hash(_) => {}
+                }
             }
         }
         Ok(())
@@ -190,6 +314,13 @@ impl ManagedIndex for SundaeV3Indexer {
 
     async fn handle_rollback(&mut self, info: &BlockInfo) -> Result<()> {
         warn!("rolling back to {}:{}", info.slot, info.hash);
+        let mut index = self.state.lock().await;
+        for pool in index.pools.values_mut() {
+            pool.rollback(info.slot);
+        }
+        for pool_orders in index.orders.values_mut() {
+            pool_orders.rollback(info.slot);
+        }
         Ok(())
     }
 }
@@ -204,7 +335,13 @@ async fn do_scoops(
         Commands::SyncFromPoint { slot, block_hash } => Point::Specific(slot, block_hash.0),
     };
 
-    let index = SundaeV3Indexer { state: index };
+    let protocol_file = fs::File::open(args.protocol)?;
+    let protocol: SundaeV3Protocol = serde_json::from_reader(protocol_file)?;
+    let index = SundaeV3Indexer {
+        state: index,
+        protocol,
+    };
+
     let mut indexer = Indexer::new(&args.addr, args.magic);
     indexer.add_index(index, start, false);
     tokio::select! {
@@ -245,8 +382,8 @@ impl AdminServer {
             let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
                 let mut response = String::new();
-                for (tx_in, _) in orders {
-                    response += &format!("{tx_in}\n");
+                for order in &orders.orders {
+                    response += &format!("{}\n", order.input);
                 }
                 return response;
             } else {
@@ -274,6 +411,7 @@ impl AdminServer {
 }
 
 #[tokio::main]
+#[allow(unreachable_code)]
 async fn main() {
     let args = Args::parse();
 
@@ -299,7 +437,13 @@ async fn main() {
             let index2 = index.clone();
             let do_scoops_handle = tokio::spawn(async move {
                 event!(Level::DEBUG, "Doing scoops");
-                let _ = do_scoops(args2, kill_rx2, index2).await;
+                match do_scoops(args2, kill_rx2, index2).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        println!("Scooper thread died: {}", e);
+                    }
+                }
             });
             do_scoops_handle.await.unwrap();
         }
@@ -354,8 +498,11 @@ mod tests {
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
         }));
+        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer {
             state: state.clone(),
+            protocol,
         };
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
@@ -378,10 +525,53 @@ mod tests {
         let mut index = state.lock().await;
         assert_eq!(index.pools.len(), 1);
         let first_pool = index.pools.first_entry().unwrap();
-        let pool_value = &first_pool.get().value.0;
+        let pool_value = &first_pool.get().latest().value.0;
         assert_eq!(pool_value[&ada_policy][&ada_token], 6181255175);
         assert_eq!(pool_value[&pool_policy][&pool_token], 1);
         assert_eq!(pool_value[&coin_b_policy][&coin_b_token], 6397550387);
         assert_eq!(index.orders.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rollback() {
+        let state = Arc::new(Mutex::new(SundaeV3Index {
+            pools: BTreeMap::new(),
+            orders: BTreeMap::new(),
+        }));
+        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let mut indexer = SundaeV3Indexer {
+            state: state.clone(),
+            protocol,
+        };
+        let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
+        let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
+        let block_info = BlockInfo {
+            slot: block.slot(),
+            hash: acropolis::BlockHash::new(*block.hash()),
+        };
+
+        let pool_id = Ident::new(
+            &hex::decode("32c43f096fa05626da1ead9383793ccd7bba6a1b259e77597766aee8").unwrap(),
+        );
+
+        handle_block(&mut indexer, block).await.unwrap();
+        {
+            // The block contains a pool scoop, which results in a pool state being recorded.
+            let index = state.lock().await;
+            let pool = index.pools.get(&pool_id).unwrap();
+            let pool_states_empty = pool.is_empty();
+            assert_eq!(pool_states_empty, false);
+        }
+
+        indexer.handle_rollback(&block_info).await.unwrap();
+        {
+            // After rollback, the states for this pool have been deleted,
+            // though the map entry for the pool still exists.
+            let index = state.lock().await;
+            let pool = index.pools.get(&pool_id).unwrap();
+            let pool_states_empty = pool.is_empty();
+            assert_eq!(pool_states_empty, true);
+        }
     }
 }

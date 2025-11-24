@@ -12,6 +12,7 @@ use plutus_parser::AsPlutus;
 
 pub type Bytes = Vec<u8>;
 
+#[derive(Debug)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -66,6 +67,7 @@ impl fmt::Display for AssetClass {
     }
 }
 
+#[derive(Debug)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
 
 impl Value {
@@ -79,6 +81,7 @@ impl Value {
     }
 }
 
+#[derive(Debug)]
 pub enum Datum {
     None,
     Hash(Bytes),
@@ -89,6 +92,7 @@ pub enum Datum {
 // an 'Any' type that always succeeds at decoding and functions
 //   TransactionOutput<T> -> TransactionOutput<Any>
 //   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
+#[derive(Debug)]
 pub struct TransactionOutput {
     pub address: Address,
     pub value: Value,
