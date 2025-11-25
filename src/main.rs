@@ -6,7 +6,7 @@ use pallas_primitives::PlutusData;
 use pallas_traverse::MultiEraTx;
 use tokio::sync::Mutex;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{Level, event, warn};
@@ -16,6 +16,7 @@ use std::sync::Arc;
 mod acropolis;
 mod cardano_types;
 mod multisig;
+mod serde_compat;
 mod sundaev3;
 
 use serde::Deserialize;
@@ -38,34 +39,10 @@ use crate::acropolis::{BlockInfo, Indexer, ManagedIndex};
 
 #[derive(Deserialize)]
 struct SundaeV3Protocol {
-    #[serde(deserialize_with = "deserialize_address")]
+    #[serde(deserialize_with = "serde_compat::deserialize_address")]
     order_address: Address,
-    #[serde(deserialize_with = "deserialize_address")]
+    #[serde(deserialize_with = "serde_compat::deserialize_address")]
     pool_address: Address,
-}
-
-struct AddressVisitor;
-
-impl<'de> serde::de::Visitor<'de> for AddressVisitor {
-    type Value = Address;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a bech32-encoded address")
-    }
-
-    fn visit_str<E>(self, bech32: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Address::from_bech32(bech32).map_err(|e| E::custom(e.to_string()))
-    }
-}
-
-fn deserialize_address<'de, D>(deserializer: D) -> Result<Address, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserializer.deserialize_str(AddressVisitor)
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -115,6 +92,7 @@ enum Commands {
 
 struct SundaeV3Order {
     input: TransactionInput,
+    #[allow(unused)]
     output: TransactionOutput,
     slot: u64,
 }
@@ -134,10 +112,6 @@ impl SundaeV3PoolOrders {
     fn rollback(&mut self, slot: u64) {
         self.orders.retain(|o| o.slot < slot);
     }
-
-    fn is_empty(&self) -> bool {
-        self.orders.is_empty()
-    }
 }
 
 #[derive(Default)]
@@ -146,6 +120,7 @@ struct SundaeV3PoolStates {
 }
 
 impl SundaeV3PoolStates {
+    #[cfg(test)]
     fn latest(&self) -> &SundaeV3Pool {
         &self.states.last().unwrap().0
     }
@@ -177,60 +152,6 @@ impl SundaeV3PoolStates {
 struct SundaeV3Index {
     pools: BTreeMap<Ident, SundaeV3PoolStates>,
     orders: BTreeMap<Option<Ident>, SundaeV3PoolOrders>,
-}
-
-fn summarize_protocol_state(index: &SundaeV3Index) {
-    println!("Known pools:");
-    let mut known_pool_ids = HashSet::new();
-    for (ident, pools) in &index.pools {
-        let p = pools.latest();
-        let pool_policy = match &p.address {
-            pallas_addresses::Address::Shelley(a) => a.payment().as_hash(),
-            _ => continue,
-        };
-        known_pool_ids.insert(ident);
-        println!("  Pool ID: {}", ident);
-        println!(
-            "  Assets: ({}, {})",
-            p.pool_datum.assets.0, p.pool_datum.assets.1,
-        );
-        if let Some(price) = sundaev3::get_pool_price(pool_policy.as_ref(), &p.value) {
-            println!("  Price: {price}");
-        } else {
-            println!("  Price: N/A");
-        }
-        let i = Some(ident);
-        let this_pool_orders = index.orders.get(&i.cloned());
-        match this_pool_orders {
-            Some(orders) => {
-                if orders.is_empty() {
-                    println!("    No orders");
-                } else {
-                    for o in &orders.orders {
-                        println!("    Order: {}", o.input);
-                    }
-                }
-            }
-            None => {
-                println!("    No orders");
-            }
-        }
-    }
-
-    println!("Orphan orders:");
-    let orphan_orders = index.orders.get(&None);
-    match orphan_orders {
-        Some(orders) => {
-            for o in &orders.orders {
-                println!("  {}: {:?}", o.input, o.output);
-            }
-        }
-        None => {
-            println!("  None");
-        }
-    }
-
-    println!();
 }
 
 struct SundaeV3Indexer {
@@ -275,7 +196,6 @@ impl ManagedIndex for SundaeV3Indexer {
                             this_pool.insert(pool_record, info.slot);
 
                             event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            summarize_protocol_state(&index);
                             return Ok(());
                         }
                     }
@@ -301,7 +221,6 @@ impl ManagedIndex for SundaeV3Indexer {
                             });
 
                             event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            summarize_protocol_state(&index);
                             return Ok(());
                         }
                     }
@@ -413,6 +332,7 @@ impl AdminServer {
 #[tokio::main]
 #[allow(unreachable_code)]
 async fn main() {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
@@ -561,7 +481,7 @@ mod tests {
             let index = state.lock().await;
             let pool = index.pools.get(&pool_id).unwrap();
             let pool_states_empty = pool.is_empty();
-            assert_eq!(pool_states_empty, false);
+            assert!(!pool_states_empty);
         }
 
         indexer.handle_rollback(&block_info).await.unwrap();
@@ -571,7 +491,7 @@ mod tests {
             let index = state.lock().await;
             let pool = index.pools.get(&pool_id).unwrap();
             let pool_states_empty = pool.is_empty();
-            assert_eq!(pool_states_empty, true);
+            assert!(pool_states_empty);
         }
     }
 }
