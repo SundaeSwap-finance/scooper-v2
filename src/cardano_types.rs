@@ -67,7 +67,7 @@ impl fmt::Display for AssetClass {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
 
 impl Value {

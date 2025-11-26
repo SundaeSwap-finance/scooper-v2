@@ -278,6 +278,7 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value) -> Option<f64> {
     Some((quantity_a as f64) / (quantity_b as f64))
 }
 
+#[derive(Clone)]
 pub struct SundaeV3Pool {
     pub address: pallas_addresses::Address,
     pub value: Value,

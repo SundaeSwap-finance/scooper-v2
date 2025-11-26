@@ -97,15 +97,72 @@ struct SundaeV3Order {
     slot: u64,
 }
 
+struct SortedVec<T> {
+    contents: Vec<T>,
+    compare: fn(&T, &T) -> std::cmp::Ordering,
+}
+
+impl<T> SortedVec<T> {
+    fn new() -> Self
+    where
+        T: Ord,
+    {
+        SortedVec {
+            contents: vec![],
+            compare: |a, b| a.cmp(b),
+        }
+    }
+
+    fn insert(&mut self, elem: T) {
+        if self.contents.is_empty() {
+            self.contents.push(elem);
+        } else {
+            for i in 0..self.contents.len() {
+                if (self.compare)(&self.contents[i], &elem) == std::cmp::Ordering::Greater {
+                    self.contents.insert(i, elem);
+                    return;
+                }
+            }
+            self.contents.insert(self.contents.len(), elem);
+        }
+    }
+
+    fn retain<F>(&mut self, condition: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.contents.retain(condition);
+    }
+}
+
+impl<T> Default for SortedVec<T>
+where
+    T: Ord,
+{
+    fn default() -> Self {
+        SortedVec::new()
+    }
+}
+
 // Invariant: The items of the vector are sorted with respect to the slot to support rollbacks
-#[derive(Default)]
 struct SundaeV3PoolOrders {
-    orders: Vec<SundaeV3Order>,
+    orders: SortedVec<SundaeV3Order>,
+}
+
+impl Default for SundaeV3PoolOrders {
+    fn default() -> Self {
+        SundaeV3PoolOrders {
+            orders: SortedVec {
+                contents: vec![],
+                compare: |a, b| a.slot.cmp(&b.slot),
+            },
+        }
+    }
 }
 
 impl SundaeV3PoolOrders {
     fn insert(&mut self, order: SundaeV3Order) {
-        self.orders.push(order)
+        self.orders.insert(order)
     }
 
     // TODO: Should this be `<=` ?
@@ -114,28 +171,34 @@ impl SundaeV3PoolOrders {
     }
 }
 
-#[derive(Default)]
 struct SundaeV3PoolStates {
-    states: Vec<(SundaeV3Pool, u64)>,
+    states: SortedVec<(SundaeV3Pool, u64)>,
+}
+
+impl Default for SundaeV3PoolStates {
+    fn default() -> Self {
+        SundaeV3PoolStates {
+            states: SortedVec {
+                contents: vec![],
+                compare: |a, b| a.1.cmp(&b.1),
+            },
+        }
+    }
 }
 
 impl SundaeV3PoolStates {
     #[cfg(test)]
     fn latest(&self) -> &SundaeV3Pool {
-        &self.states.last().unwrap().0
+        &self.states.contents.last().unwrap().0
+    }
+
+    #[cfg(test)]
+    fn latest_with_slot(&self) -> &(SundaeV3Pool, u64) {
+        self.states.contents.last().unwrap()
     }
 
     fn insert(&mut self, pool: SundaeV3Pool, slot: u64) {
-        if self.states.is_empty() {
-            self.states.push((pool, slot));
-        } else {
-            for i in 0..self.states.len() - 1 {
-                if self.states[i].1 > slot {
-                    self.states.insert(i, (pool, slot));
-                    break;
-                }
-            }
-        }
+        self.states.insert((pool, slot))
     }
 
     fn rollback(&mut self, slot: u64) {
@@ -145,7 +208,7 @@ impl SundaeV3PoolStates {
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.states.contents.is_empty()
     }
 }
 
@@ -301,7 +364,7 @@ impl AdminServer {
             let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
                 let mut response = String::new();
-                for order in &orders.orders {
+                for order in &orders.orders.contents {
                     response += &format!("{}\n", order.input);
                 }
                 return response;
@@ -397,6 +460,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use pallas_codec::utils::Int;
     use pallas_traverse::MultiEraBlock;
 
     use super::*;
@@ -493,5 +557,62 @@ mod tests {
             let pool_states_empty = pool.is_empty();
             assert!(pool_states_empty);
         }
+    }
+
+    fn make_lovelace_value(lovelace: i128) -> cardano_types::Value {
+        let mut m = BTreeMap::new();
+        let mut lovelace_quantity = BTreeMap::new();
+        lovelace_quantity.insert(vec![], lovelace);
+        m.insert(vec![], lovelace_quantity);
+        cardano_types::Value(m)
+    }
+
+    #[tokio::test]
+    async fn pools_maintains_sorted() {
+        let payment_cred_1 = [0; 28];
+        let mut address_1 = [0; 29];
+        address_1[0] = 0x60;
+        address_1[1..].clone_from_slice(&payment_cred_1);
+
+        let address_1 = pallas_addresses::Address::from_bytes(&address_1).unwrap();
+        let value_1 = make_lovelace_value(1000000);
+        let pool_datum_1 = PoolDatum {
+            ident: Ident::new(&[]),
+            assets: (
+                cardano_types::AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                cardano_types::AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+            ),
+            circulating_lp: pallas_primitives::BigInt::Int(Int::from(0)),
+            ask_fees_per_10_thousand: pallas_primitives::BigInt::Int(Int::from(0)),
+            bid_fees_per_10_thousand: pallas_primitives::BigInt::Int(Int::from(0)),
+            fee_manager: None,
+            market_open: pallas_primitives::BigInt::Int(Int::from(0)),
+            protocol_fees: pallas_primitives::BigInt::Int(Int::from(0)),
+        };
+        let pool = SundaeV3Pool {
+            address: address_1,
+            value: value_1,
+            pool_datum: pool_datum_1,
+        };
+        let mut pools = SundaeV3PoolStates {
+            states: SortedVec {
+                contents: vec![],
+                compare: |a, b| a.1.cmp(&b.1),
+            },
+        };
+        pools.insert(pool.clone(), 1);
+        pools.insert(pool.clone(), 0);
+        let (_latest_pool, slot) = pools.latest_with_slot();
+        assert_eq!(*slot, 1);
+
+        pools.insert(pool.clone(), 2);
+        let (_latest_pool, slot) = pools.latest_with_slot();
+        assert_eq!(*slot, 2);
     }
 }
