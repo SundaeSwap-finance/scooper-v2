@@ -178,7 +178,7 @@ struct SundaeV3PoolStates {
 impl SundaeV3PoolStates {
     #[cfg(test)]
     fn latest(&self) -> &SundaeV3Pool {
-        &self.states.contents.last().unwrap()
+        self.states.contents.last().unwrap()
     }
 
     fn insert(&mut self, pool: SundaeV3Pool) {
