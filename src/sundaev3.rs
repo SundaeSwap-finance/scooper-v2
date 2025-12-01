@@ -3,9 +3,11 @@
 use pallas_primitives::{BigInt, PlutusData};
 use plutus_parser::AsPlutus;
 use std::fmt;
+use std::rc::Rc;
 
-use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass, Value};
+use crate::cardano_types::{ADA_ASSET_CLASS, ADA_POLICY, ADA_TOKEN, AssetClass, Value};
 use crate::multisig::Multisig;
+use crate::value;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -120,6 +122,87 @@ pub struct OrderDatum {
     pub extra: AnyPlutusData,
 }
 
+// TODO: Replace uses of this with code that doesn't fail
+fn get_bigint(b: BigInt) -> Option<i128> {
+    match b {
+        BigInt::Int(i) => Some(i128::from(i)),
+        _ => None,
+    }
+}
+
+const ADA_RIDER: i128 = 2000000;
+
+fn validate_order_value(datum: OrderDatum, value: Value) -> bool {
+    let scoop_fee = match get_bigint(datum.scoop_fee) {
+        Some(i) => i,
+        None => return false,
+    };
+    match datum.action {
+        Order::Strategy(_) => true,
+        Order::Swap(a, b) => {
+            // 1. If offering ada, must offer enough to cover offer plus rider and scoop fee
+            // 2. Declared amount of offered coin must not exceed actual amount
+            // 3. Gives must not be zero
+            let gives = a.2;
+            let gives_asset = AssetClass::from_pair((a.0, a.1));
+            let actual_amount = value.get_asset_class(&gives_asset);
+            let actual_ada = value.get_asset_class(&ADA_ASSET_CLASS);
+            let gives_ada = 0;
+            let actual_amount = if gives_asset == ADA_ASSET_CLASS {
+                actual_amount - (ADA_RIDER + scoop_fee)
+            } else {
+                actual_amount
+            };
+            let gives_sufficient_ada = actual_ada >= gives_ada + ADA_RIDER + scoop_fee;
+            let declared_does_not_exceed_actual = if let Some(gives) = get_bigint(gives) {
+                gives <= actual_amount
+            } else {
+                false
+            };
+            gives_sufficient_ada && declared_does_not_exceed_actual
+        }
+        Order::Deposit((a, b)) => {
+            // 1. Cannot deposit 0 tokens
+            let gives_a = a.2;
+            let gives_b = b.2;
+            let asset_a = AssetClass::from_pair((a.0, a.1));
+            let asset_b = AssetClass::from_pair((b.0, b.1));
+            match (get_bigint(gives_a), get_bigint(gives_b)) {
+                (Some(g_a), Some(g_b)) => {
+                    g_a > value.get_asset_class(&asset_a) && g_b > value.get_asset_class(&asset_b)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn validate_order_for_pool(order: OrderDatum, pool: PoolDatum) -> bool {
+    if let Some(i) = order.ident {
+        if i != pool.ident {
+            return false;
+        }
+    }
+    match order.action {
+        Order::Swap(a, b) => {
+            let give_coin = AssetClass::from_pair((a.0, a.1));
+            let take_coin = AssetClass::from_pair((b.0, b.1));
+            let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
+            let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
+            matches_a_to_b || matches_b_to_a
+        }
+        Order::Deposit((a, b)) => {
+            let give_coin = AssetClass::from_pair((a.0, a.1));
+            let take_coin = AssetClass::from_pair((b.0, b.1));
+            let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
+            let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
+            matches_a_to_b || matches_b_to_a
+        }
+        _ => todo!(),
+    }
+}
+
 #[derive(AsPlutus, Debug, PartialEq)]
 pub enum Destination {
     Fixed(PlutusAddress, AikenDatum),
@@ -136,6 +219,18 @@ pub enum AikenDatum {
 #[derive(Debug, PartialEq)]
 pub struct AnyPlutusData {
     inner: PlutusData,
+}
+
+impl AnyPlutusData {
+    fn empty_cons() -> Self {
+        Self {
+            inner: PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
+            }),
+        }
+    }
 }
 
 impl AsPlutus for AnyPlutusData {
@@ -373,5 +468,74 @@ mod tests {
         let expected_ident =
             hex::decode("ba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c").unwrap();
         assert_eq!(pool.ident.to_bytes(), expected_ident);
+    }
+
+    fn i64_to_bigint(i: i64) -> BigInt {
+        BigInt::Int(pallas_codec::utils::Int::from(i))
+    }
+
+    struct ValidateSwapTestCase {
+        scoop_fee: i64,
+        ada_offered: i64,
+        rberry_offered: i64,
+        actual_ada: i128,
+        actual_rberry: i128,
+    }
+
+    fn test_validate_ada_rberry_swap_schema(test_case: ValidateSwapTestCase) -> bool {
+        let pkh = hex::decode("00").unwrap();
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let order = OrderDatum {
+            ident: None,
+            owner: Multisig::Signature(pkh),
+            scoop_fee: i64_to_bigint(test_case.scoop_fee),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                (ADA_POLICY, ADA_TOKEN, i64_to_bigint(test_case.ada_offered)),
+                (
+                    rberry_policy.clone(),
+                    rberry_token.clone(),
+                    i64_to_bigint(test_case.rberry_offered),
+                ),
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let value = value![
+            test_case.actual_ada,
+            (&rberry_asset_class, test_case.actual_rberry)
+        ];
+        validate_order_value(order, value)
+    }
+
+    #[test]
+    fn test_validate_ada_rberry_swap_1() {
+        assert!(test_validate_ada_rberry_swap_schema(ValidateSwapTestCase {
+            scoop_fee: 1_000_000,
+            ada_offered: 1_000_000,
+            rberry_offered: 1_000_000,
+            actual_ada: 10_000_000,
+            actual_rberry: 1_000_000,
+        }))
+    }
+
+    // 3 ADA on the utxo is not sufficient because after deducting the 1 ADA
+    // scoop fee and the 1 ADA offered the remaining amount is 1 ADA, less than
+    // the 2 ADA rider value
+    #[test]
+    fn test_validate_ada_rberry_swap_insufficient_ada() {
+        assert!(!test_validate_ada_rberry_swap_schema(
+            ValidateSwapTestCase {
+                scoop_fee: 1_000_000,
+                ada_offered: 1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 3_000_000,
+                actual_rberry: 1_000_000,
+            }
+        ))
     }
 }
