@@ -164,9 +164,8 @@ impl SundaeV3PoolOrders {
         self.orders.insert(order)
     }
 
-    // TODO: Should this be `<=` ?
     fn rollback(&mut self, slot: u64) {
-        self.orders.retain(|o| o.slot < slot);
+        self.orders.retain(|o| o.slot <= slot);
     }
 }
 
@@ -186,7 +185,7 @@ impl SundaeV3PoolStates {
     }
 
     fn rollback(&mut self, slot: u64) {
-        self.states.retain(|state| state.slot < slot);
+        self.states.retain(|state| state.slot <= slot);
     }
 
     #[cfg(test)]
