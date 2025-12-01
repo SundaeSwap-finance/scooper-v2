@@ -147,7 +147,6 @@ where
     }
 }
 
-// Invariant: The items of the vector are sorted with respect to the slot to support rollbacks
 struct SundaeV3PoolOrders {
     orders: SortedVec<SundaeV3Order>,
 }
