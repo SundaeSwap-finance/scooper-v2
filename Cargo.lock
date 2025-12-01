@@ -867,6 +867,8 @@ dependencies = [
  "pallas-primitives",
  "pallas-traverse",
  "plutus-parser",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

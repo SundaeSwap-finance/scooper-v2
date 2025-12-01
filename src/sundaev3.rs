@@ -44,7 +44,7 @@ impl AsPlutus for Ident {
     }
 }
 
-#[derive(AsPlutus, Clone)]
+#[derive(AsPlutus, Clone, PartialEq, Eq)]
 pub struct PoolDatum {
     pub ident: Ident,
     pub assets: (AssetClass, AssetClass),
@@ -278,10 +278,18 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value) -> Option<f64> {
     Some((quantity_a as f64) / (quantity_b as f64))
 }
 
+#[derive(Clone, Eq, PartialEq)]
 pub struct SundaeV3Pool {
     pub address: pallas_addresses::Address,
     pub value: Value,
     pub pool_datum: PoolDatum,
+    pub slot: u64,
+}
+
+impl PartialOrd for SundaeV3Pool {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.slot.cmp(&other.slot))
+    }
 }
 
 #[cfg(test)]
