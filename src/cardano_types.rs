@@ -134,7 +134,7 @@ pub struct TransactionOutput {
     pub script_ref: Option<ScriptRef>,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TransactionInput(pub pallas_primitives::TransactionInput);
 
 impl fmt::Display for TransactionInput {

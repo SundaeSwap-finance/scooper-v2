@@ -96,6 +96,7 @@ struct SundaeV3Order {
     #[allow(unused)]
     output: TransactionOutput,
     slot: u64,
+    spent_slot: Option<u64>,
 }
 
 impl PartialOrd for SundaeV3Order {
@@ -167,6 +168,23 @@ impl SundaeV3PoolOrders {
     fn rollback(&mut self, slot: u64) {
         self.orders.retain(|o| o.slot <= slot);
     }
+
+    #[allow(unused)]
+    fn iter<'a>(&'a mut self) -> std::slice::Iter<'a, SundaeV3Order> {
+        self.orders.contents.iter()
+    }
+
+    fn iter_mut<'a>(&'a mut self) -> std::slice::IterMut<'a, SundaeV3Order> {
+        self.orders.contents.iter_mut()
+    }
+}
+
+impl IntoIterator for SundaeV3PoolOrders {
+    type Item = SundaeV3Order;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.orders.contents.into_iter()
+    }
 }
 
 #[derive(Default)]
@@ -197,6 +215,18 @@ impl SundaeV3PoolStates {
 struct SundaeV3Index {
     pools: BTreeMap<Ident, SundaeV3PoolStates>,
     orders: BTreeMap<Option<Ident>, SundaeV3PoolOrders>,
+    // TODO: When pruning old orders marked as spent from memory db, also remove the entry here
+    order_to_pool: BTreeMap<TransactionInput, Ident>,
+}
+
+impl SundaeV3Index {
+    fn new() -> Self {
+        Self {
+            pools: BTreeMap::new(),
+            orders: BTreeMap::new(),
+            order_to_pool: BTreeMap::new(),
+        }
+    }
 }
 
 struct SundaeV3Indexer {
@@ -261,16 +291,37 @@ impl ManagedIndex for SundaeV3Indexer {
                             let this_pool_orders =
                                 index.orders.entry(od.ident.clone()).or_default();
                             this_pool_orders.insert(SundaeV3Order {
-                                input: this_input,
+                                input: this_input.clone(),
                                 output: tx_out,
                                 slot: info.slot,
+                                spent_slot: None,
                             });
+
+                            if let Some(pool_ident) = od.ident {
+                                index.order_to_pool.insert(this_input, pool_ident);
+                            }
 
                             event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
                             return Ok(());
                         }
                     }
                     Datum::None | Datum::Hash(_) => {}
+                }
+            }
+        }
+
+        for tx_in in tx.inputs() {
+            let this_input = TransactionInput(pallas_primitives::TransactionInput {
+                transaction_id: tx_in.hash().clone(),
+                index: tx_in.index(),
+            });
+            if let Some(pool_ident) = index.order_to_pool.get(&this_input).cloned() {
+                if let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone())) {
+                    for order in pool_orders.iter_mut() {
+                        if order.input == this_input {
+                            order.spent_slot = Some(info.slot);
+                        }
+                    }
                 }
             }
         }
@@ -384,10 +435,7 @@ async fn main() {
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
     let kill_tx2 = kill_tx.clone();
 
-    let index = Arc::new(Mutex::new(SundaeV3Index {
-        pools: BTreeMap::new(),
-        orders: BTreeMap::new(),
-    }));
+    let index = Arc::new(Mutex::new(SundaeV3Index::new()));
     let index2 = index.clone();
 
     // Manage restarting of the main scoop task in case we want to resync
@@ -461,10 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ingest_block() {
-        let state = Arc::new(Mutex::new(SundaeV3Index {
-            pools: BTreeMap::new(),
-            orders: BTreeMap::new(),
-        }));
+        let state = Arc::new(Mutex::new(SundaeV3Index::new()));
         let protocol_file = fs::File::open("testdata/protocol").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer {
@@ -501,10 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rollback() {
-        let state = Arc::new(Mutex::new(SundaeV3Index {
-            pools: BTreeMap::new(),
-            orders: BTreeMap::new(),
-        }));
+        let state = Arc::new(Mutex::new(SundaeV3Index::new()));
         let protocol_file = fs::File::open("testdata/protocol").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer {

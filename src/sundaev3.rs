@@ -474,7 +474,7 @@ mod tests {
         BigInt::Int(pallas_codec::utils::Int::from(i))
     }
 
-    struct ValidateSwapTestCase {
+    struct ValidateAdaRBerrySwapTestCase {
         scoop_fee: i64,
         ada_offered: i64,
         rberry_offered: i64,
@@ -482,7 +482,7 @@ mod tests {
         actual_rberry: i128,
     }
 
-    fn test_validate_ada_rberry_swap_schema(test_case: ValidateSwapTestCase) -> bool {
+    fn test_validate_ada_rberry_swap_schema(test_case: ValidateAdaRBerrySwapTestCase) -> bool {
         let pkh = hex::decode("00").unwrap();
         let rberry_policy = vec![
             145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
@@ -512,15 +512,66 @@ mod tests {
         validate_order_value(order, value)
     }
 
+    struct ValidateRBerrySBerrySwapTestCase {
+        scoop_fee: i64,
+        rberry_offered: i64,
+        sberry_offered: i64,
+        actual_ada: i128,
+        actual_rberry: i128,
+        actual_sberry: i128,
+    }
+
+    fn test_validate_rberry_sberry_swap_schema(
+        test_case: ValidateRBerrySBerrySwapTestCase,
+    ) -> bool {
+        let pkh = hex::decode("00").unwrap();
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let sberry_policy = rberry_policy.clone();
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let sberry_token = vec![77, 121, 85, 83, 69];
+        let order = OrderDatum {
+            ident: None,
+            owner: Multisig::Signature(pkh),
+            scoop_fee: i64_to_bigint(test_case.scoop_fee),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                (
+                    rberry_policy.clone(),
+                    rberry_policy.clone(),
+                    i64_to_bigint(test_case.rberry_offered),
+                ),
+                (
+                    sberry_policy.clone(),
+                    sberry_token.clone(),
+                    i64_to_bigint(test_case.sberry_offered),
+                ),
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let sberry_asset_class = AssetClass::from_pair((sberry_policy, sberry_token));
+        let value = value![
+            test_case.actual_ada,
+            (&rberry_asset_class, test_case.actual_rberry),
+            (&sberry_asset_class, test_case.actual_sberry)
+        ];
+        validate_order_value(order, value)
+    }
+
     #[test]
-    fn test_validate_ada_rberry_swap_1() {
-        assert!(test_validate_ada_rberry_swap_schema(ValidateSwapTestCase {
-            scoop_fee: 1_000_000,
-            ada_offered: 1_000_000,
-            rberry_offered: 1_000_000,
-            actual_ada: 10_000_000,
-            actual_rberry: 1_000_000,
-        }))
+    fn test_validate_ada_rberry_swap() {
+        assert!(test_validate_ada_rberry_swap_schema(
+            ValidateAdaRBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                ada_offered: 1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 10_000_000,
+                actual_rberry: 1_000_000,
+            }
+        ))
     }
 
     // 3 ADA on the utxo is not sufficient because after deducting the 1 ADA
@@ -529,7 +580,7 @@ mod tests {
     #[test]
     fn test_validate_ada_rberry_swap_insufficient_ada() {
         assert!(!test_validate_ada_rberry_swap_schema(
-            ValidateSwapTestCase {
+            ValidateAdaRBerrySwapTestCase {
                 scoop_fee: 1_000_000,
                 ada_offered: 1_000_000,
                 rberry_offered: 1_000_000,
