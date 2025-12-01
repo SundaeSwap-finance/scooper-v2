@@ -513,16 +513,11 @@ mod tests {
         };
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
-        let block_info = BlockInfo {
-            slot: block.slot(),
-            hash: acropolis::BlockHash::new(*block.hash()),
-        };
-
         let pool_id = Ident::new(
             &hex::decode("32c43f096fa05626da1ead9383793ccd7bba6a1b259e77597766aee8").unwrap(),
         );
 
-        handle_block(&mut indexer, block).await.unwrap();
+        handle_block(&mut indexer, block.clone()).await.unwrap();
         {
             // The block contains a pool scoop, which results in a pool state being recorded.
             let index = state.lock().await;
@@ -531,7 +526,12 @@ mod tests {
             assert!(!pool_states_empty);
         }
 
-        indexer.handle_rollback(&block_info).await.unwrap();
+        let rollback_block_info = BlockInfo {
+            slot: block.slot() - 1,
+            hash: acropolis::BlockHash::new([0; 32]),
+        };
+
+        indexer.handle_rollback(&rollback_block_info).await.unwrap();
         {
             // After rollback, the states for this pool have been deleted,
             // though the map entry for the pool still exists.
