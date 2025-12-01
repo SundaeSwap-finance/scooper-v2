@@ -312,15 +312,15 @@ impl ManagedIndex for SundaeV3Indexer {
 
         for tx_in in tx.inputs() {
             let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                transaction_id: tx_in.hash().clone(),
+                transaction_id: *tx_in.hash(),
                 index: tx_in.index(),
             });
-            if let Some(pool_ident) = index.order_to_pool.get(&this_input).cloned() {
-                if let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone())) {
-                    for order in pool_orders.iter_mut() {
-                        if order.input == this_input {
-                            order.spent_slot = Some(info.slot);
-                        }
+            if let Some(pool_ident) = index.order_to_pool.get(&this_input).cloned()
+                && let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone()))
+            {
+                for order in pool_orders.iter_mut() {
+                    if order.input == this_input {
+                        order.spent_slot = Some(info.slot);
                     }
                 }
             }

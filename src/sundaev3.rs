@@ -179,10 +179,10 @@ fn validate_order_value(datum: OrderDatum, value: Value) -> bool {
 }
 
 fn validate_order_for_pool(order: OrderDatum, pool: PoolDatum) -> bool {
-    if let Some(i) = order.ident {
-        if i != pool.ident {
-            return false;
-        }
+    if let Some(i) = order.ident
+        && i != pool.ident
+    {
+        return false;
     }
     match order.action {
         Order::Swap(a, b) => {
