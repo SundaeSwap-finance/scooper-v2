@@ -12,7 +12,7 @@ use plutus_parser::AsPlutus;
 
 pub type Bytes = Vec<u8>;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -25,7 +25,7 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
     token: vec![],
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
@@ -67,7 +67,7 @@ impl fmt::Display for AssetClass {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
 
 impl Value {
@@ -81,7 +81,7 @@ impl Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Datum {
     None,
     Hash(Bytes),
@@ -92,7 +92,7 @@ pub enum Datum {
 // an 'Any' type that always succeeds at decoding and functions
 //   TransactionOutput<T> -> TransactionOutput<Any>
 //   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
-#[derive(Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct TransactionOutput {
     pub address: Address,
     pub value: Value,
@@ -100,6 +100,7 @@ pub struct TransactionOutput {
     pub script_ref: Option<ScriptRef>,
 }
 
+#[derive(PartialEq, Eq, Debug)]
 pub struct TransactionInput(pub pallas_primitives::TransactionInput);
 
 impl fmt::Display for TransactionInput {

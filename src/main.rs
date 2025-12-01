@@ -90,6 +90,7 @@ enum Commands {
     },
 }
 
+#[derive(PartialEq, Eq)]
 struct SundaeV3Order {
     input: TransactionInput,
     #[allow(unused)]
@@ -97,20 +98,22 @@ struct SundaeV3Order {
     slot: u64,
 }
 
-struct SortedVec<T> {
-    contents: Vec<T>,
-    compare: fn(&T, &T) -> std::cmp::Ordering,
+impl PartialOrd for SundaeV3Order {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.slot.cmp(&other.slot))
+    }
 }
 
-impl<T> SortedVec<T> {
-    fn new() -> Self
-    where
-        T: Ord,
-    {
-        SortedVec {
-            contents: vec![],
-            compare: |a, b| a.cmp(b),
-        }
+struct SortedVec<T> {
+    contents: Vec<T>,
+}
+
+impl<T> SortedVec<T>
+where
+    T: PartialOrd,
+{
+    fn new() -> Self {
+        SortedVec { contents: vec![] }
     }
 
     fn insert(&mut self, elem: T) {
@@ -118,7 +121,7 @@ impl<T> SortedVec<T> {
             self.contents.push(elem);
         } else {
             for i in 0..self.contents.len() {
-                if (self.compare)(&self.contents[i], &elem) == std::cmp::Ordering::Greater {
+                if self.contents[i] > elem {
                     self.contents.insert(i, elem);
                     return;
                 }
@@ -137,7 +140,7 @@ impl<T> SortedVec<T> {
 
 impl<T> Default for SortedVec<T>
 where
-    T: Ord,
+    T: PartialOrd,
 {
     fn default() -> Self {
         SortedVec::new()
@@ -152,10 +155,7 @@ struct SundaeV3PoolOrders {
 impl Default for SundaeV3PoolOrders {
     fn default() -> Self {
         SundaeV3PoolOrders {
-            orders: SortedVec {
-                contents: vec![],
-                compare: |a, b| a.slot.cmp(&b.slot),
-            },
+            orders: SortedVec { contents: vec![] },
         }
     }
 }
@@ -171,39 +171,23 @@ impl SundaeV3PoolOrders {
     }
 }
 
+#[derive(Default)]
 struct SundaeV3PoolStates {
-    states: SortedVec<(SundaeV3Pool, u64)>,
-}
-
-impl Default for SundaeV3PoolStates {
-    fn default() -> Self {
-        SundaeV3PoolStates {
-            states: SortedVec {
-                contents: vec![],
-                compare: |a, b| a.1.cmp(&b.1),
-            },
-        }
-    }
+    states: SortedVec<SundaeV3Pool>,
 }
 
 impl SundaeV3PoolStates {
     #[cfg(test)]
     fn latest(&self) -> &SundaeV3Pool {
-        &self.states.contents.last().unwrap().0
+        &self.states.contents.last().unwrap()
     }
 
-    #[cfg(test)]
-    fn latest_with_slot(&self) -> &(SundaeV3Pool, u64) {
-        self.states.contents.last().unwrap()
-    }
-
-    fn insert(&mut self, pool: SundaeV3Pool, slot: u64) {
-        self.states.insert((pool, slot))
+    fn insert(&mut self, pool: SundaeV3Pool) {
+        self.states.insert(pool)
     }
 
     fn rollback(&mut self, slot: u64) {
-        self.states
-            .retain(|(_state, state_slot)| *state_slot < slot);
+        self.states.retain(|state| state.slot < slot);
     }
 
     #[cfg(test)]
@@ -254,9 +238,10 @@ impl ManagedIndex for SundaeV3Indexer {
                                 address: tx_out.address,
                                 value: tx_out.value,
                                 pool_datum: pd,
+                                slot: info.slot,
                             };
                             let this_pool = index.pools.entry(pool_id).or_default();
-                            this_pool.insert(pool_record, info.slot);
+                            this_pool.insert(pool_record);
 
                             event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
                             return Ok(());
@@ -595,24 +580,22 @@ mod tests {
             market_open: pallas_primitives::BigInt::Int(Int::from(0)),
             protocol_fees: pallas_primitives::BigInt::Int(Int::from(0)),
         };
-        let pool = SundaeV3Pool {
-            address: address_1,
-            value: value_1,
-            pool_datum: pool_datum_1,
+        let pool = |s| SundaeV3Pool {
+            address: address_1.clone(),
+            value: value_1.clone(),
+            pool_datum: pool_datum_1.clone(),
+            slot: s,
         };
         let mut pools = SundaeV3PoolStates {
-            states: SortedVec {
-                contents: vec![],
-                compare: |a, b| a.1.cmp(&b.1),
-            },
+            states: SortedVec { contents: vec![] },
         };
-        pools.insert(pool.clone(), 1);
-        pools.insert(pool.clone(), 0);
-        let (_latest_pool, slot) = pools.latest_with_slot();
-        assert_eq!(*slot, 1);
+        pools.insert(pool(1));
+        pools.insert(pool(0));
+        let latest_pool = pools.latest();
+        assert_eq!(latest_pool.slot, 1);
 
-        pools.insert(pool.clone(), 2);
-        let (_latest_pool, slot) = pools.latest_with_slot();
-        assert_eq!(*slot, 2);
+        pools.insert(pool(2));
+        let latest_pool = pools.latest();
+        assert_eq!(latest_pool.slot, 2);
     }
 }
