@@ -163,6 +163,7 @@ impl fmt::Display for ValidationError {
                         hex::encode(bigint_bytes)
                     )
                 }
+                ValueError::CannotDecodeGives => write!(f, "cannot decode gives"),
             },
         }
     }
@@ -182,6 +183,7 @@ pub enum ValueError {
     GivesZeroTokens,
     HasInsufficientAda,
     DeclaredExceedsActual,
+    CannotDecodeGives,
     CannotDecodeScoopFee(BigInt),
 }
 
@@ -196,33 +198,34 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
         Order::Strategy(_) => Ok(()),
         Order::Swap(a, b) => {
             let gives = a.2.clone();
-            let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let actual_amount = value.get_asset_class(&gives_asset);
-            let actual_ada = value.get_asset_class(&ADA_ASSET_CLASS);
-            let gives_ada = 0;
-            let actual_amount = if gives_asset == ADA_ASSET_CLASS {
-                actual_amount - (ADA_RIDER + scoop_fee)
-            } else {
-                actual_amount
-            };
-            if actual_amount == 0 {
-                return Err(ValueError::GivesZeroTokens);
-            }
-            let gives_insufficient_ada = actual_ada >= gives_ada + ADA_RIDER + scoop_fee;
-            let declared_exceeds_actual = if let Ok(gives) = get_bigint(gives) {
-                gives > actual_amount
-            } else {
-                true
-            };
+            if let Ok(gives) = get_bigint(gives) {
+                let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+                let actual_amount = value.get_asset_class(&gives_asset);
+                let actual_ada = value.get_asset_class(&ADA_ASSET_CLASS);
+                let mut gives_ada = 0;
+                let actual_amount = if gives_asset == ADA_ASSET_CLASS {
+                    gives_ada = gives;
+                    actual_amount - (ADA_RIDER + scoop_fee)
+                } else {
+                    actual_amount
+                };
+                if actual_amount == 0 {
+                    return Err(ValueError::GivesZeroTokens);
+                }
+                let gives_insufficient_ada = actual_ada < gives_ada + ADA_RIDER + scoop_fee;
+                let declared_exceeds_actual = gives > actual_amount;
 
-            if gives_insufficient_ada {
-                return Err(ValueError::HasInsufficientAda);
+                if gives_insufficient_ada {
+                    return Err(ValueError::HasInsufficientAda);
+                }
+                if declared_exceeds_actual {
+                    // This is an error in sundaedatum, even though the smart contract appears to allow it
+                    return Err(ValueError::DeclaredExceedsActual);
+                }
+                Ok(())
+            } else {
+                Err(ValueError::CannotDecodeGives)
             }
-            if declared_exceeds_actual {
-                // This is an error in sundaedatum, even though the smart contract appears to allow it
-                return Err(ValueError::DeclaredExceedsActual);
-            }
-            Ok(())
         }
         Order::Deposit((a, b)) => {
             let gives_a = a.2.clone();
@@ -246,7 +249,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                     }
                     Ok(())
                 }
-                _ => Ok(()),
+                _ => Err(ValueError::CannotDecodeGives),
             }
         }
         Order::Withdrawal((policy, token, offered)) => {

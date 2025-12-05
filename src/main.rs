@@ -180,6 +180,7 @@ impl SundaeV3PoolOrders {
         self.orders.contents.iter()
     }
 
+    #[allow(unused)]
     fn iter_mut<'a>(&'a mut self) -> std::slice::IterMut<'a, SundaeV3Order> {
         self.orders.contents.iter_mut()
     }
@@ -269,6 +270,7 @@ impl ManagedIndex for SundaeV3Indexer {
 
     async fn handle_onchain_tx(&mut self, info: &BlockInfo, tx: &MultiEraTx) -> Result<()> {
         let this_tx_hash = tx.hash();
+        event!(Level::TRACE, "Ingesting tx: {}", hex::encode(this_tx_hash));
         let mut index = self.state.lock().await;
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
@@ -457,8 +459,17 @@ impl AdminServer {
             let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
                 let mut response = String::new();
-                for order in &orders.orders.contents {
-                    response += &format!("{}\n", order.input);
+                response += "Valid:\n";
+                if !orders.orders.contents.is_empty() {
+                    for order in &orders.orders.contents {
+                        response += &format!("  {}\n", order.input);
+                    }
+                }
+                if !orders.unrecoverable_orders.contents.is_empty() {
+                    response += "Unrecoverable:\n";
+                    for order in &orders.unrecoverable_orders.contents {
+                        response += &format!("  {}\n", order.input);
+                    }
                 }
                 return response;
             } else {
@@ -489,6 +500,7 @@ impl AdminServer {
 #[allow(unreachable_code)]
 async fn main() {
     tracing_subscriber::fmt::init();
+    event!(Level::INFO, "Started scooper");
     let args = Args::parse();
 
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
@@ -514,7 +526,7 @@ async fn main() {
                     Ok(()) => {}
                     Err(e) => {
                         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        println!("Scooper thread died: {}", e);
+                        event!(Level::INFO, "Scooper thread died: {}", e);
                     }
                 }
             });
