@@ -123,28 +123,80 @@ pub struct OrderDatum {
 }
 
 // TODO: Replace uses of this with code that doesn't fail
-fn get_bigint(b: BigInt) -> Option<i128> {
+fn get_bigint(b: BigInt) -> Result<i128, BigInt> {
     match b {
-        BigInt::Int(i) => Some(i128::from(i)),
-        _ => None,
+        BigInt::Int(i) => Ok(i128::from(i)),
+        _ => Err(b),
     }
 }
 
 const ADA_RIDER: i128 = 2000000;
 
-fn validate_order_value(datum: OrderDatum, value: Value) -> bool {
-    let scoop_fee = match get_bigint(datum.scoop_fee) {
-        Some(i) => i,
-        None => return false,
+pub enum ValidationError {
+    ValueError(ValueError),
+    PoolError(PoolError),
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::PoolError(e) => match e {
+                PoolError::IdentMismatch => write!(f, "order ident does not match pool ident"),
+                PoolError::CoinPairMismatch => {
+                    write!(f, "order coin pair does not match pool coin pair")
+                }
+            },
+            ValidationError::ValueError(e) => match e {
+                ValueError::GivesZeroTokens => write!(f, "gives zero tokens"),
+                ValueError::HasInsufficientAda => {
+                    write!(f, "has insufficient ada")
+                }
+                ValueError::DeclaredExceedsActual => {
+                    write!(f, "offers value in excess of available funds")
+                }
+                ValueError::CannotDecodeScoopFee(b) => {
+                    let mut bigint_bytes = vec![];
+                    minicbor::encode(b, &mut bigint_bytes);
+                    write!(
+                        f,
+                        "cannot decode the scoop fee ({})",
+                        hex::encode(bigint_bytes)
+                    )
+                }
+            },
+        }
+    }
+}
+
+pub fn validate_order(
+    datum: &OrderDatum,
+    value: &Value,
+    pool: &PoolDatum,
+) -> Result<(), ValidationError> {
+    validate_order_value(datum, value).map_err(ValidationError::ValueError)?;
+    validate_order_for_pool(datum, pool).map_err(ValidationError::PoolError)?;
+    Ok(())
+}
+
+pub enum ValueError {
+    GivesZeroTokens,
+    HasInsufficientAda,
+    DeclaredExceedsActual,
+    CannotDecodeScoopFee(BigInt),
+}
+
+pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), ValueError> {
+    let scoop_fee = match get_bigint(datum.scoop_fee.clone()) {
+        Ok(i) => i,
+        Err(scoop_fee) => {
+            return Err(ValueError::CannotDecodeScoopFee(scoop_fee));
+        }
     };
-    match datum.action {
-        Order::Strategy(_) => true,
+    match &datum.action {
+        Order::Strategy(_) => Ok(()),
         Order::Swap(a, b) => {
-            // 1. If offering ada, must offer enough to cover offer plus rider and scoop fee
-            // 2. Declared amount of offered coin must not exceed actual amount
-            // 3. Gives must not be zero
-            let gives = a.2;
-            let gives_asset = AssetClass::from_pair((a.0, a.1));
+            let gives = a.2.clone();
+            let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
             let actual_amount = value.get_asset_class(&gives_asset);
             let actual_ada = value.get_asset_class(&ADA_ASSET_CLASS);
             let gives_ada = 0;
@@ -153,53 +205,102 @@ fn validate_order_value(datum: OrderDatum, value: Value) -> bool {
             } else {
                 actual_amount
             };
-            let gives_sufficient_ada = actual_ada >= gives_ada + ADA_RIDER + scoop_fee;
-            let declared_does_not_exceed_actual = if let Some(gives) = get_bigint(gives) {
-                gives <= actual_amount
+            if actual_amount == 0 {
+                return Err(ValueError::GivesZeroTokens);
+            }
+            let gives_insufficient_ada = actual_ada >= gives_ada + ADA_RIDER + scoop_fee;
+            let declared_exceeds_actual = if let Ok(gives) = get_bigint(gives) {
+                gives > actual_amount
             } else {
-                false
+                true
             };
-            gives_sufficient_ada && declared_does_not_exceed_actual
+
+            if gives_insufficient_ada {
+                return Err(ValueError::HasInsufficientAda);
+            }
+            if declared_exceeds_actual {
+                // This is an error in sundaedatum, even though the smart contract appears to allow it
+                return Err(ValueError::DeclaredExceedsActual);
+            }
+            Ok(())
         }
         Order::Deposit((a, b)) => {
-            // 1. Cannot deposit 0 tokens
-            let gives_a = a.2;
-            let gives_b = b.2;
-            let asset_a = AssetClass::from_pair((a.0, a.1));
-            let asset_b = AssetClass::from_pair((b.0, b.1));
+            let gives_a = a.2.clone();
+            let gives_b = b.2.clone();
+            let asset_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+            let asset_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
             match (get_bigint(gives_a), get_bigint(gives_b)) {
-                (Some(g_a), Some(g_b)) => {
-                    g_a > value.get_asset_class(&asset_a) && g_b > value.get_asset_class(&asset_b)
+                (Ok(g_a), Ok(g_b)) => {
+                    let mut actual_a = value.get_asset_class(&asset_a);
+                    if asset_a == ADA_ASSET_CLASS {
+                        if actual_a < ADA_RIDER + scoop_fee {
+                            return Err(ValueError::HasInsufficientAda);
+                        }
+                        actual_a -= ADA_RIDER + scoop_fee;
+                    }
+                    let actual_b = value.get_asset_class(&asset_b);
+
+                    let deposits_zero_tokens = actual_a == 0 && actual_b == 0;
+                    if !deposits_zero_tokens {
+                        return Err(ValueError::GivesZeroTokens);
+                    }
+                    Ok(())
                 }
-                _ => false,
+                _ => Ok(()),
             }
         }
-        _ => false,
+        Order::Withdrawal((policy, token, offered)) => {
+            let offered = get_bigint(offered.clone()).unwrap();
+            if offered == 0 {
+                return Err(ValueError::GivesZeroTokens);
+            }
+            let actual =
+                value.get_asset_class(&AssetClass::from_pair((policy.clone(), token.clone())));
+            if offered > actual {
+                return Err(ValueError::DeclaredExceedsActual);
+            }
+            if value.get_asset_class(&ADA_ASSET_CLASS) < ADA_RIDER + scoop_fee {
+                return Err(ValueError::HasInsufficientAda);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
-fn validate_order_for_pool(order: OrderDatum, pool: PoolDatum) -> bool {
-    if let Some(i) = order.ident
-        && i != pool.ident
+pub enum PoolError {
+    IdentMismatch,
+    CoinPairMismatch,
+}
+
+pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(), PoolError> {
+    if let Some(i) = &order.ident
+        && i != &pool.ident
     {
-        return false;
+        return Err(PoolError::IdentMismatch);
     }
-    match order.action {
+    match &order.action {
         Order::Swap(a, b) => {
-            let give_coin = AssetClass::from_pair((a.0, a.1));
-            let take_coin = AssetClass::from_pair((b.0, b.1));
+            let give_coin = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+            let take_coin = AssetClass::from_pair((b.0.clone(), b.1.clone()));
             let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
             let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
-            matches_a_to_b || matches_b_to_a
+            if !(matches_a_to_b || matches_b_to_a) {
+                return Err(PoolError::CoinPairMismatch);
+            }
+            Ok(())
         }
         Order::Deposit((a, b)) => {
-            let give_coin = AssetClass::from_pair((a.0, a.1));
-            let take_coin = AssetClass::from_pair((b.0, b.1));
+            let give_coin = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+            let take_coin = AssetClass::from_pair((b.0.clone(), b.1.clone()));
             let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
             let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
-            matches_a_to_b || matches_b_to_a
+            if !(matches_a_to_b || matches_b_to_a) {
+                return Err(PoolError::CoinPairMismatch);
+            }
+            Ok(())
         }
-        _ => todo!(),
+        _ => Ok(()),
     }
 }
 
@@ -509,7 +610,7 @@ mod tests {
             test_case.actual_ada,
             (&rberry_asset_class, test_case.actual_rberry)
         ];
-        validate_order_value(order, value)
+        validate_order_value(&order, &value).is_ok()
     }
 
     struct ValidateRBerrySBerrySwapTestCase {
@@ -558,7 +659,7 @@ mod tests {
             (&rberry_asset_class, test_case.actual_rberry),
             (&sberry_asset_class, test_case.actual_sberry)
         ];
-        validate_order_value(order, value)
+        validate_order_value(&order, &value).is_ok()
     }
 
     #[test]

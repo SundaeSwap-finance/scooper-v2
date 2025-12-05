@@ -24,7 +24,7 @@ use serde::Deserialize;
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
 use plutus_parser::AsPlutus;
-use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool};
+use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool, validate_order};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -150,12 +150,14 @@ where
 
 struct SundaeV3PoolOrders {
     orders: SortedVec<SundaeV3Order>,
+    unrecoverable_orders: SortedVec<SundaeV3Order>,
 }
 
 impl Default for SundaeV3PoolOrders {
     fn default() -> Self {
         SundaeV3PoolOrders {
             orders: SortedVec { contents: vec![] },
+            unrecoverable_orders: SortedVec { contents: vec![] },
         }
     }
 }
@@ -163,6 +165,10 @@ impl Default for SundaeV3PoolOrders {
 impl SundaeV3PoolOrders {
     fn insert(&mut self, order: SundaeV3Order) {
         self.orders.insert(order)
+    }
+
+    fn insert_unrecoverable(&mut self, order: SundaeV3Order) {
+        self.unrecoverable_orders.insert(order)
     }
 
     fn rollback(&mut self, slot: u64) {
@@ -176,6 +182,14 @@ impl SundaeV3PoolOrders {
 
     fn iter_mut<'a>(&'a mut self) -> std::slice::IterMut<'a, SundaeV3Order> {
         self.orders.contents.iter_mut()
+    }
+
+    fn spend(&mut self, slot: u64, this_input: &TransactionInput) {
+        for order in self.iter_mut() {
+            if &order.input == this_input {
+                order.spent_slot = Some(slot);
+            }
+        }
     }
 }
 
@@ -193,7 +207,6 @@ struct SundaeV3PoolStates {
 }
 
 impl SundaeV3PoolStates {
-    #[cfg(test)]
     fn latest(&self) -> &SundaeV3Pool {
         self.states.contents.last().unwrap()
     }
@@ -282,27 +295,69 @@ impl ManagedIndex for SundaeV3Indexer {
                     transaction_id: this_tx_hash,
                     index: ix as u64,
                 });
+                let this_input_ref = format!("{}#{}", hex::encode(this_tx_hash), ix);
                 let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
                 match tx_out.datum {
                     Datum::Data(ref inline) => {
                         let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
                         let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
                         if let Ok(od) = od {
-                            let this_pool_orders =
-                                index.orders.entry(od.ident.clone()).or_default();
-                            this_pool_orders.insert(SundaeV3Order {
-                                input: this_input.clone(),
-                                output: tx_out,
-                                slot: info.slot,
-                                spent_slot: None,
-                            });
+                            if let Some(ref ident) = od.ident {
+                                if let Some(pool) = index.pools.get(ident) {
+                                    let current_pool = pool.latest();
+                                    let order_value_ok = validate_order(
+                                        &od,
+                                        &tx_out.value,
+                                        &current_pool.pool_datum,
+                                    );
 
-                            if let Some(pool_ident) = od.ident {
-                                index.order_to_pool.insert(this_input, pool_ident);
+                                    let this_pool_orders =
+                                        index.orders.entry(od.ident.clone()).or_default();
+
+                                    if let Err(e) = order_value_ok {
+                                        event!(
+                                            Level::DEBUG,
+                                            "Order {} was rejected: {}",
+                                            this_input_ref,
+                                            e
+                                        );
+                                        this_pool_orders.insert_unrecoverable(SundaeV3Order {
+                                            input: this_input.clone(),
+                                            output: tx_out,
+                                            slot: info.slot,
+                                            spent_slot: None,
+                                        });
+
+                                        return Ok(());
+                                    }
+
+                                    this_pool_orders.insert(SundaeV3Order {
+                                        input: this_input.clone(),
+                                        output: tx_out,
+                                        slot: info.slot,
+                                        spent_slot: None,
+                                    });
+
+                                    index.order_to_pool.insert(this_input, ident.clone());
+
+                                    event!(Level::DEBUG, "Added order {} to index", this_input_ref);
+                                    return Ok(());
+                                } else {
+                                    event!(
+                                        Level::WARN,
+                                        "Order {} was listed for an unknown pool {}",
+                                        this_input_ref,
+                                        ident,
+                                    );
+                                }
+                            } else {
+                                // Order is free
+                                event!(
+                                    Level::WARN,
+                                    "Order {} was listed for no pool",
+                                    this_input_ref,
+                                )
                             }
-
-                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            return Ok(());
                         }
                     }
                     Datum::None | Datum::Hash(_) => {}
@@ -318,11 +373,7 @@ impl ManagedIndex for SundaeV3Indexer {
             if let Some(pool_ident) = index.order_to_pool.get(&this_input).cloned()
                 && let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone()))
             {
-                for order in pool_orders.iter_mut() {
-                    if order.input == this_input {
-                        order.spent_slot = Some(info.slot);
-                    }
-                }
+                pool_orders.spend(info.slot, &this_input);
             }
         }
         Ok(())
