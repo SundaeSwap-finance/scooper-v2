@@ -185,7 +185,12 @@ impl SundaeV3PoolOrders {
     }
 
     fn spend(&mut self, slot: u64, this_input: &TransactionInput) {
-        for order in self.iter_mut() {
+        for order in self.orders.contents.iter_mut() {
+            if &order.input == this_input {
+                order.spent_slot = Some(slot);
+            }
+        }
+        for order in self.unrecoverable_orders.contents.iter_mut() {
             if &order.input == this_input {
                 order.spent_slot = Some(slot);
             }
@@ -328,6 +333,8 @@ impl ManagedIndex for SundaeV3Indexer {
                                             spent_slot: None,
                                         });
 
+                                        index.order_to_pool.insert(this_input, ident.clone());
+
                                         return Ok(());
                                     }
 
@@ -374,6 +381,7 @@ impl ManagedIndex for SundaeV3Indexer {
                 && let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone()))
             {
                 pool_orders.spend(info.slot, &this_input);
+                index.order_to_pool.remove(&this_input);
             }
         }
         Ok(())
