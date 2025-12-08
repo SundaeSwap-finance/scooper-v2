@@ -532,11 +532,11 @@ impl AdminServer {
                     let pd = &pool.latest().pool_datum;
                     let pv = &pool.latest().value;
                     let policy = self.protocol.get_pool_script_hash().unwrap();
-                    match estimate_whether_in_range(policy, &od, &pd, &pv) {
+                    match estimate_whether_in_range(policy, od, pd, pv) {
                         Ok(()) => response.valid.push(&order.input),
                         Err(reason) => response.out_of_range.push(OrderOutOfRange {
                             order: &order.input,
-                            reason: reason,
+                            reason,
                         }),
                     }
                 }
