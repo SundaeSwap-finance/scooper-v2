@@ -137,6 +137,15 @@ pub struct TransactionOutput {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TransactionInput(pub pallas_primitives::TransactionInput);
 
+impl serde::ser::Serialize for TransactionInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{}", self))
+    }
+}
+
 impl fmt::Display for TransactionInput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}#{}", hex::encode(self.0.transaction_id), self.0.index)

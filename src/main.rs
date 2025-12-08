@@ -19,7 +19,7 @@ mod multisig;
 mod serde_compat;
 mod sundaev3;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
@@ -451,6 +451,12 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
     }
 }
 
+#[derive(Serialize)]
+struct GetPoolOrders<'a> {
+    valid: Vec<&'a TransactionInput>,
+    unrecoverable: Vec<&'a TransactionInput>,
+}
+
 impl AdminServer {
     async fn do_call(&self, req: Request<IncomingBody>) -> String {
         if let Some(pool_id) = req.uri().path().strip_prefix("/pool/") {
@@ -458,20 +464,21 @@ impl AdminServer {
             let id_bytes = hex::decode(pool_id).unwrap();
             let ident = Ident::new(&id_bytes);
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
-                let mut response = String::new();
-                response += "Valid:\n";
+                let mut response = GetPoolOrders {
+                    valid: vec![],
+                    unrecoverable: vec![],
+                };
                 if !orders.orders.contents.is_empty() {
                     for order in &orders.orders.contents {
-                        response += &format!("  {}\n", order.input);
+                        response.valid.push(&order.input);
                     }
                 }
                 if !orders.unrecoverable_orders.contents.is_empty() {
-                    response += "Unrecoverable:\n";
                     for order in &orders.unrecoverable_orders.contents {
-                        response += &format!("  {}\n", order.input);
+                        response.unrecoverable.push(&order.input);
                     }
                 }
-                return response;
+                return serde_json::to_string(&response).unwrap();
             } else {
                 return "No such pool".into();
             }
