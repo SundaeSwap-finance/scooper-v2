@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
 use plutus_parser::AsPlutus;
-use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool, validate_order};
+use sundaev3::{
+    Ident, OrderDatum, PoolDatum, SundaeV3Pool, SwapDirection, get_bigint, get_pool_price,
+    swap_price, validate_order,
+};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -37,12 +40,21 @@ use tokio::net::TcpListener;
 
 use crate::acropolis::{BlockInfo, Indexer, ManagedIndex};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SundaeV3Protocol {
     #[serde(deserialize_with = "serde_compat::deserialize_address")]
     order_address: Address,
     #[serde(deserialize_with = "serde_compat::deserialize_address")]
     pool_address: Address,
+}
+
+impl SundaeV3Protocol {
+    fn get_pool_script_hash(&self) -> Option<&[u8]> {
+        match &self.pool_address {
+            Address::Shelley(s) => Some(s.payment().as_hash().as_slice()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -95,6 +107,7 @@ struct SundaeV3Order {
     input: TransactionInput,
     #[allow(unused)]
     output: TransactionOutput,
+    datum: OrderDatum,
     slot: u64,
     spent_slot: Option<u64>,
 }
@@ -310,7 +323,8 @@ impl ManagedIndex for SundaeV3Indexer {
                         let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
                         if let Ok(od) = od {
                             if let Some(ref ident) = od.ident {
-                                if let Some(pool) = index.pools.get(ident) {
+                                let ident = ident.clone();
+                                if let Some(pool) = index.pools.get(&ident) {
                                     let current_pool = pool.latest();
                                     let order_value_ok = validate_order(
                                         &od,
@@ -331,11 +345,12 @@ impl ManagedIndex for SundaeV3Indexer {
                                         this_pool_orders.insert_unrecoverable(SundaeV3Order {
                                             input: this_input.clone(),
                                             output: tx_out,
+                                            datum: od,
                                             slot: info.slot,
                                             spent_slot: None,
                                         });
 
-                                        index.order_to_pool.insert(this_input, ident.clone());
+                                        index.order_to_pool.insert(this_input, ident);
 
                                         return Ok(());
                                     }
@@ -343,11 +358,12 @@ impl ManagedIndex for SundaeV3Indexer {
                                     this_pool_orders.insert(SundaeV3Order {
                                         input: this_input.clone(),
                                         output: tx_out,
+                                        datum: od,
                                         slot: info.slot,
                                         spent_slot: None,
                                     });
 
-                                    index.order_to_pool.insert(this_input, ident.clone());
+                                    index.order_to_pool.insert(this_input, ident);
 
                                     event!(Level::DEBUG, "Added order {} to index", this_input_ref);
                                     return Ok(());
@@ -435,6 +451,7 @@ async fn do_scoops(
 struct AdminServer {
     index: Arc<Mutex<SundaeV3Index>>,
     kill_tx: tokio::sync::broadcast::Sender<()>,
+    protocol: SundaeV3Protocol,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -454,7 +471,42 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
 #[derive(Serialize)]
 struct GetPoolOrders<'a> {
     valid: Vec<&'a TransactionInput>,
+    out_of_range: Vec<OrderOutOfRange<'a>>,
     unrecoverable: Vec<&'a TransactionInput>,
+}
+
+#[derive(Serialize)]
+struct OrderOutOfRange<'a> {
+    order: &'a TransactionInput,
+    reason: (f64, f64),
+}
+
+fn estimate_whether_in_range(
+    policy: &[u8],
+    od: &OrderDatum,
+    pd: &PoolDatum,
+    pool_value: &cardano_types::Value,
+) -> Result<(), (f64, f64)> {
+    let rewards = &pd.protocol_fees;
+    let pool_price =
+        get_pool_price(policy, pool_value, get_bigint(rewards.clone()).unwrap()).unwrap();
+    let swap_price = swap_price(od).unwrap();
+    match swap_price {
+        (SwapDirection::AtoB, swap_price) => {
+            if pool_price <= swap_price {
+                Ok(())
+            } else {
+                Err((swap_price, pool_price))
+            }
+        }
+        (SwapDirection::BtoA, swap_price) => {
+            if pool_price >= (1.0 / swap_price) {
+                Ok(())
+            } else {
+                Err((1.0 / swap_price, pool_price))
+            }
+        }
+    }
 }
 
 impl AdminServer {
@@ -463,20 +515,33 @@ impl AdminServer {
             let index_lock = self.index.lock().await;
             let id_bytes = hex::decode(pool_id).unwrap();
             let ident = Ident::new(&id_bytes);
+            let pool = match index_lock.pools.get(&ident) {
+                Some(p) => p,
+                None => {
+                    return "No such pool".into();
+                }
+            };
             if let Some(orders) = index_lock.orders.get(&Some(ident)) {
                 let mut response = GetPoolOrders {
                     valid: vec![],
+                    out_of_range: vec![],
                     unrecoverable: vec![],
                 };
-                if !orders.orders.contents.is_empty() {
-                    for order in &orders.orders.contents {
-                        response.valid.push(&order.input);
+                for order in &orders.orders.contents {
+                    let od = &order.datum;
+                    let pd = &pool.latest().pool_datum;
+                    let pv = &pool.latest().value;
+                    let policy = self.protocol.get_pool_script_hash().unwrap();
+                    match estimate_whether_in_range(policy, &od, &pd, &pv) {
+                        Ok(()) => response.valid.push(&order.input),
+                        Err(reason) => response.out_of_range.push(OrderOutOfRange {
+                            order: &order.input,
+                            reason: reason,
+                        }),
                     }
                 }
-                if !orders.unrecoverable_orders.contents.is_empty() {
-                    for order in &orders.unrecoverable_orders.contents {
-                        response.unrecoverable.push(&order.input);
-                    }
+                for order in &orders.unrecoverable_orders.contents {
+                    response.unrecoverable.push(&order.input);
                 }
                 return serde_json::to_string(&response).unwrap();
             } else {
@@ -509,6 +574,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
+    let protocol_file = fs::File::open(&args.protocol).unwrap();
+    let protocol: SundaeV3Protocol = serde_json::from_reader(protocol_file).unwrap();
 
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
     let kill_tx2 = kill_tx.clone();
@@ -552,8 +619,13 @@ async fn main() {
             let io = TokioIo::new(stream);
             let kill_tx = kill_tx2.clone();
             let index = index2.clone();
+            let protocol = protocol.clone();
             tokio::task::spawn(async {
-                let admin_server = AdminServer { index, kill_tx };
+                let admin_server = AdminServer {
+                    index,
+                    kill_tx,
+                    protocol,
+                };
                 if let Err(err) = http1::Builder::new()
                     .serve_connection(io, admin_server)
                     .await

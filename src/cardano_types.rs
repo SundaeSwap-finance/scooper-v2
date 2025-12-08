@@ -28,7 +28,7 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
     token: ADA_TOKEN,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
@@ -196,5 +196,20 @@ pub fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> Transactio
         datum,
         value,
         script_ref,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_assetclass_ord() {
+        let rberry = AssetClass::from_pair((vec![0x66, 0x67], vec![0x66, 0x66]));
+        let sberry = AssetClass::from_pair((vec![0x66, 0x67], vec![0x66, 0x67]));
+        let foobar = AssetClass::from_pair((vec![0x99, 0x99], vec![0x01, 0x01]));
+        assert!(ADA_ASSET_CLASS < rberry);
+        assert!(rberry < sberry);
+        assert!(sberry < foobar);
     }
 }
