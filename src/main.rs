@@ -1,19 +1,27 @@
-use anyhow::{Result, bail};
+use acropolis_common::messages::Message;
+use acropolis_common::{BlockHash, BlockInfo, Point};
+use acropolis_module_block_unpacker::BlockUnpacker;
+use acropolis_module_custom_indexer::CustomIndexer;
+use acropolis_module_custom_indexer::chain_index::ChainIndex;
+use acropolis_module_custom_indexer::cursor_store::InMemoryCursorStore;
+use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
+use acropolis_module_peer_network_interface::PeerNetworkInterface;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use caryatid_process::Process;
+use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
-use pallas_network::miniprotocols::Point;
+use config::{Config, File};
 use pallas_primitives::PlutusData;
 use pallas_traverse::MultiEraTx;
 use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use tracing::{Level, event, warn};
 
 use std::sync::Arc;
 
-mod acropolis;
 mod cardano_types;
 mod multisig;
 mod serde_compat;
@@ -35,8 +43,6 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::TcpListener;
 
-use crate::acropolis::{BlockInfo, Indexer, ManagedIndex};
-
 #[derive(Deserialize)]
 struct SundaeV3Protocol {
     #[serde(deserialize_with = "serde_compat::deserialize_address")]
@@ -48,34 +54,25 @@ struct SundaeV3Protocol {
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
     #[arg(short, long)]
-    addr: String,
-
-    #[arg(short, long)]
-    magic: u64,
-
-    #[arg(short, long)]
     protocol: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
-}
 
-#[derive(Clone, Debug)]
-struct BlockHash(Vec<u8>);
+    #[arg(long, value_name = "PATH", default_value = "scooper.toml")]
+    config: String,
+}
 
 const BLOCK_HASH_SIZE: usize = 32;
 
 fn parse_block_hash(bh: &str) -> Result<BlockHash> {
     let bytes = hex::decode(bh)?;
-    if bytes.len() == BLOCK_HASH_SIZE {
-        Ok(BlockHash(bytes.to_vec()))
-    } else {
-        bail!(
-            "Expected length {} for block hash, but got {}",
-            BLOCK_HASH_SIZE,
-            bytes.len()
+    BlockHash::try_from(bytes).map_err(|v| {
+        anyhow!(
+            "invalid block hash length: expected {BLOCK_HASH_SIZE} bytes, got {} bytes",
+            v.len()
         )
-    }
+    })
 }
 
 #[derive(clap::Subcommand, Clone, Debug)]
@@ -214,12 +211,13 @@ fn payment_part_equal(a: &Address, b: &Address) -> bool {
 }
 
 #[async_trait]
-impl ManagedIndex for SundaeV3Indexer {
+impl ChainIndex for SundaeV3Indexer {
     fn name(&self) -> String {
         "sundae-v3".to_string()
     }
 
-    async fn handle_onchain_tx(&mut self, info: &BlockInfo, tx: &MultiEraTx) -> Result<()> {
+    async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
+        let tx = MultiEraTx::decode(raw_tx)?;
         let this_tx_hash = tx.hash();
         let mut index = self.state.lock().await;
         for (ix, output) in tx.outputs().iter().enumerate() {
@@ -277,45 +275,20 @@ impl ManagedIndex for SundaeV3Indexer {
         Ok(())
     }
 
-    async fn handle_rollback(&mut self, info: &BlockInfo) -> Result<()> {
-        warn!("rolling back to {}:{}", info.slot, info.hash);
+    async fn handle_rollback(&mut self, point: &Point) -> Result<()> {
+        warn!("rolling back to {}:{:?}", point.slot(), point.hash());
         let mut index = self.state.lock().await;
         for pool in index.pools.values_mut() {
-            pool.rollback(info.slot);
+            pool.rollback(point.slot());
         }
         for pool_orders in index.orders.values_mut() {
-            pool_orders.rollback(info.slot);
+            pool_orders.rollback(point.slot());
         }
         Ok(())
     }
-}
 
-async fn do_scoops(
-    args: Args,
-    mut abort: tokio::sync::broadcast::Receiver<()>,
-    index: Arc<Mutex<SundaeV3Index>>,
-) -> Result<()> {
-    let start = match args.command {
-        Commands::SyncFromOrigin => Point::Origin,
-        Commands::SyncFromPoint { slot, block_hash } => Point::Specific(slot, block_hash.0),
-    };
-
-    let protocol_file = fs::File::open(args.protocol)?;
-    let protocol: SundaeV3Protocol = serde_json::from_reader(protocol_file)?;
-    let index = SundaeV3Indexer {
-        state: index,
-        protocol,
-    };
-
-    let mut indexer = Indexer::new(&args.addr, args.magic);
-    indexer.add_index(index, start, false);
-    tokio::select! {
-        res = indexer.run() => {
-            res
-        }
-        _ = abort.recv() => {
-            Ok(())
-        }
+    async fn reset(&mut self, start: &Point) -> Result<Point> {
+        Ok(start.clone())
     }
 }
 
@@ -357,7 +330,7 @@ impl AdminServer {
         }
 
         match req.uri().path() {
-            "/resync-from-kupo" => {
+            "/resync-from-acropolis" => {
                 let _ = self.kill_tx.send(());
                 "resync".into()
             }
@@ -378,71 +351,125 @@ impl AdminServer {
 #[tokio::main]
 #[allow(unreachable_code)]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
 
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
-    let kill_tx2 = kill_tx.clone();
 
     let index = Arc::new(Mutex::new(SundaeV3Index {
         pools: BTreeMap::new(),
         orders: BTreeMap::new(),
     }));
-    let index2 = index.clone();
 
-    // Manage restarting of the main scoop task in case we want to resync
-    let manager_handle = tokio::spawn(async move {
-        loop {
-            let kill_rx2 = kill_tx.subscribe();
-            let args2 = args.clone();
-            {
-                let mut lock = index.lock().await;
-                lock.pools.clear();
-                lock.orders.clear();
-            }
-            let index2 = index.clone();
-            let do_scoops_handle = tokio::spawn(async move {
-                event!(Level::DEBUG, "Doing scoops");
-                match do_scoops(args2, kill_rx2, index2).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        println!("Scooper thread died: {}", e);
-                    }
-                }
-            });
-            do_scoops_handle.await.unwrap();
-        }
-    });
+    let manager_handle = tokio::spawn(manager_loop(args.clone(), index.clone(), kill_tx.clone()));
+    let admin_handle = tokio::spawn(admin_server(index.clone(), kill_tx.clone()));
 
-    // HTTP server for admin controls:
-    //   - running a health check
-    //   - triggering a resync from kupo
-    let admin_server_handle = tokio::spawn(async move {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 9999));
-        let listener = TcpListener::bind(addr).await.unwrap();
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let kill_tx = kill_tx2.clone();
-            let index = index2.clone();
-            tokio::task::spawn(async {
-                let admin_server = AdminServer { index, kill_tx };
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, admin_server)
-                    .await
+    tokio::try_join!(manager_handle, admin_handle).unwrap();
+}
+
+async fn manager_loop(
+    args: Args,
+    index: Arc<Mutex<SundaeV3Index>>,
+    kill_tx: tokio::sync::broadcast::Sender<()>,
+) {
+    loop {
+        let args = args.clone();
+        let index = index.clone();
+        let mut kill_rx = kill_tx.subscribe();
+
+        // Run the Acropolis instance inside isolated runtime so all modules are killed on restart
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build runtime");
+
+            rt.block_on(async move {
                 {
-                    event!(Level::DEBUG, "Failed to serve connection: {:?}", err);
+                    let mut state = index.lock().await;
+                    state.pools.clear();
+                    state.orders.clear();
                 }
-            });
-        }
-    });
 
-    tokio::try_join!(manager_handle, admin_server_handle).unwrap();
+                let config = Arc::new(
+                    Config::builder()
+                        .add_source(File::with_name("config/acropolis"))
+                        .add_source(File::with_name(&args.config))
+                        .build()
+                        .unwrap(),
+                );
+
+                let mut process = Process::<Message>::create(config).await;
+                GenesisBootstrapper::register(&mut process);
+                BlockUnpacker::register(&mut process);
+                PeerNetworkInterface::register(&mut process);
+
+                let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
+                process.register(indexer.clone());
+
+                let protocol: SundaeV3Protocol = {
+                    let f = std::fs::File::open(&args.protocol).unwrap();
+                    serde_json::from_reader(f).unwrap()
+                };
+
+                let v3_index = SundaeV3Indexer {
+                    state: index,
+                    protocol,
+                };
+
+                let start = match args.command {
+                    Commands::SyncFromOrigin => Point::Origin,
+                    Commands::SyncFromPoint { slot, block_hash } => Point::Specific {
+                        slot,
+                        hash: block_hash,
+                    },
+                };
+
+                indexer.add_index(v3_index, start, false).await.unwrap();
+
+                tokio::select! {
+                    _ = kill_rx.recv() => {}
+                    _ = tokio::spawn(async move { let _ = process.run().await; }) => {}
+                };
+            });
+        });
+
+        handle.join().unwrap();
+        warn!("Restarting Scooper indexer");
+    }
+}
+
+async fn admin_server(
+    index: Arc<Mutex<SundaeV3Index>>,
+    kill_tx: tokio::sync::broadcast::Sender<()>,
+) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 9999));
+    let listener = TcpListener::bind(addr).await.unwrap();
+
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+
+        let kill_tx = kill_tx.clone();
+        let index = index.clone();
+
+        tokio::task::spawn(async {
+            let admin_server = AdminServer { index, kill_tx };
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(io, admin_server)
+                .await
+            {
+                event!(Level::DEBUG, "Failed to serve connection: {:?}", err);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use acropolis_common::{BlockIntent, BlockStatus, Era, Point};
     use pallas_codec::utils::Int;
     use pallas_traverse::MultiEraBlock;
 
@@ -450,11 +477,21 @@ mod tests {
 
     async fn handle_block(indexer: &mut SundaeV3Indexer, block: MultiEraBlock<'_>) -> Result<()> {
         let info = BlockInfo {
+            status: BlockStatus::Volatile,
+            intent: BlockIntent::none(),
             slot: block.slot(),
-            hash: acropolis::BlockHash::new(*block.hash()),
+            number: 0,
+            hash: BlockHash::new(*block.hash()),
+            epoch: 0,
+            epoch_slot: 0,
+            new_epoch: false,
+            tip_slot: None,
+            timestamp: 0,
+            era: Era::Conway,
         };
         for tx in block.txs() {
-            indexer.handle_onchain_tx(&info, &tx).await?
+            let raw_tx = tx.encode();
+            indexer.handle_onchain_tx_bytes(&info, &raw_tx).await?
         }
         Ok(())
     }
@@ -526,12 +563,15 @@ mod tests {
             assert!(!pool_states_empty);
         }
 
-        let rollback_block_info = BlockInfo {
+        let rollback_block_point = Point::Specific {
             slot: block.slot() - 1,
-            hash: acropolis::BlockHash::new([0; 32]),
+            hash: BlockHash::new([0; 32]),
         };
 
-        indexer.handle_rollback(&rollback_block_info).await.unwrap();
+        indexer
+            .handle_rollback(&rollback_block_point)
+            .await
+            .unwrap();
         {
             // After rollback, the states for this pool have been deleted,
             // though the map entry for the pool still exists.

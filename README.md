@@ -1,5 +1,5 @@
 Example sync point:
 
 ```
-cargo run --  --addr IP:PORT --magic 2 --protocol testdata/protocol sync-from-point --block-hash cf3b5ce37a5826d086dda5aac20962cd0ffc9dddc76e68899700bda14d1dbbdd --slot 75755312
+cargo run -- --protocol testdata/protocol sync-from-point --block-hash 5ac5ae6d76fc1f3062a7035bbcff515ff09462d70cb23813cb6d6d53589b6694 --slot 48462123
 ```

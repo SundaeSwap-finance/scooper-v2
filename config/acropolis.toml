@@ -1,0 +1,29 @@
+[global.startup]
+method = "snapshot"
+topic = "cardano.sequence.start"
+
+[module.genesis-bootstrapper]
+
+[module.peer-network-interface]
+block-topic = "cardano.block.proposed"
+sync-point = "dynamic"
+
+[module.block-unpacker]
+
+[module.custom-indexer]
+
+[startup]
+topic = "cardano.sequence.start"
+
+[message-bus.internal]
+class = "in-memory"
+workers = 50
+dispatch-queue-size = 1000
+worker-queue-size = 100
+bulk-block-capacity = 50
+bulk-resume-capacity = 75
+
+# Message routing
+[[message-router.route]]
+pattern = "#"
+bus = "internal"

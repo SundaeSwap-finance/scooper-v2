@@ -1,0 +1,6 @@
+[module.peer-network-interface]
+# Upstream peers to connect to (example: ["backbone.cardano.iog.io:3001", "backbone.mainnet.emurgornd.com:3001"])
+node-addresses = ["mithril-signer-1.testing-preview.api.mithril.network:9091"]
+
+# Network selection (mainnet: 764824073, preprod: 1, preview: 2) 
+magic-number = 2
