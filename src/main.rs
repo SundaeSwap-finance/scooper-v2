@@ -14,6 +14,7 @@ use tracing::{Level, event, warn};
 use std::sync::Arc;
 
 mod acropolis;
+mod bigint;
 mod cardano_types;
 mod multisig;
 mod serde_compat;
@@ -638,8 +639,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use bigint::BigInt;
     use pallas_traverse::MultiEraBlock;
-    use sundaev3::BigInt;
 
     use super::*;
 

@@ -5,148 +5,10 @@ use plutus_parser::AsPlutus;
 use std::fmt;
 use std::rc::Rc;
 
-use num_traits::cast::ToPrimitive;
-
+use crate::bigint::BigInt;
 use crate::cardano_types::{ADA_ASSET_CLASS, ADA_POLICY, ADA_TOKEN, AssetClass, Value};
 use crate::multisig::Multisig;
 use crate::value;
-
-#[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Debug)]
-pub struct BigInt(num_bigint::BigInt);
-
-impl BigInt {
-    fn unwrap(self) -> num_bigint::BigInt {
-        self.0
-    }
-}
-
-impl From<i32> for BigInt {
-    fn from(i: i32) -> Self {
-        Self(num_bigint::BigInt::from(i))
-    }
-}
-
-impl From<i64> for BigInt {
-    fn from(i: i64) -> Self {
-        Self(num_bigint::BigInt::from(i))
-    }
-}
-
-impl From<u64> for BigInt {
-    fn from(u: u64) -> Self {
-        Self(num_bigint::BigInt::from(u))
-    }
-}
-
-impl From<i128> for BigInt {
-    fn from(i: i128) -> Self {
-        Self(num_bigint::BigInt::from(i))
-    }
-}
-
-impl std::ops::Add for BigInt {
-    type Output = BigInt;
-    fn add(self, other: BigInt) -> BigInt {
-        Self(self.0 + other.0)
-    }
-}
-
-impl std::ops::Sub for BigInt {
-    type Output = BigInt;
-    fn sub(self, other: BigInt) -> BigInt {
-        Self(self.0 - other.0)
-    }
-}
-
-impl std::ops::SubAssign for BigInt {
-    fn sub_assign(&mut self, other: BigInt) {
-        self.0 -= other.0
-    }
-}
-
-impl std::ops::Mul for BigInt {
-    type Output = BigInt;
-    fn mul(self, other: BigInt) -> BigInt {
-        BigInt(&self.0 * &other.0)
-    }
-}
-
-impl std::ops::Mul<&BigInt> for &BigInt {
-    type Output = BigInt;
-    fn mul(self, other: &BigInt) -> BigInt {
-        BigInt(&self.0 * &other.0)
-    }
-}
-
-impl std::ops::Mul<&BigInt> for BigInt {
-    type Output = BigInt;
-    fn mul(self, other: &BigInt) -> BigInt {
-        BigInt(&self.0 * &other.0)
-    }
-}
-
-impl std::ops::Mul<BigInt> for &BigInt {
-    type Output = BigInt;
-    fn mul(self, other: BigInt) -> BigInt {
-        BigInt(&self.0 * &other.0)
-    }
-}
-
-impl std::ops::MulAssign for BigInt {
-    fn mul_assign(&mut self, other: BigInt) {
-        self.0 *= other.0
-    }
-}
-
-impl AsPlutus for BigInt {
-    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
-        let b: pallas_primitives::BigInt = AsPlutus::from_plutus(data)?;
-        match b {
-            pallas_primitives::BigInt::Int(i) => {
-                Ok(BigInt(num_bigint::BigInt::from(Into::<i128>::into(i.0))))
-            }
-            pallas_primitives::BigInt::BigUInt(bytes) => {
-                let n = num_bigint::BigUint::from_bytes_be(&bytes);
-                Ok(BigInt(num_bigint::BigInt::from_biguint(
-                    num_bigint::Sign::Plus,
-                    n,
-                )))
-            }
-            pallas_primitives::BigInt::BigNInt(bytes) => {
-                let n = num_bigint::BigUint::from_bytes_be(&bytes);
-                Ok(BigInt(num_bigint::BigInt::from_biguint(
-                    num_bigint::Sign::Minus,
-                    n,
-                )))
-            }
-        }
-    }
-    fn to_plutus(self) -> PlutusData {
-        let self_as_i128: Result<i128, _> = self.0.clone().try_into();
-        if let Ok(u) = self_as_i128 {
-            let self_as_cbor_int: Result<minicbor::data::Int, _> = u.try_into();
-            if let Ok(u) = self_as_cbor_int {
-                return PlutusData::BigInt(pallas_primitives::BigInt::Int(pallas_primitives::Int(
-                    u,
-                )));
-            }
-        }
-        let (sign, big_uint) = self.0.into_parts();
-        match sign {
-            num_bigint::Sign::Plus => {
-                let bytes = big_uint.to_bytes_be();
-                PlutusData::BigInt(pallas_primitives::BigInt::BigUInt(bytes.into()))
-            }
-            num_bigint::Sign::NoSign => {
-                unreachable!()
-            }
-            num_bigint::Sign::Minus => {
-                let bytes = big_uint.to_bytes_be();
-                PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()))
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -326,7 +188,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 return Err(ValueError::GivesZeroTokens);
             }
             let gives_insufficient_ada =
-                actual_ada < gives_ada + ADA_RIDER.into() + scoop_fee.clone();
+                actual_ada < gives_ada + BigInt::from(ADA_RIDER) + scoop_fee.clone();
             let declared_exceeds_actual = gives > actual_amount;
 
             if gives_insufficient_ada {
@@ -433,7 +295,7 @@ pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
             let takes = b.2.clone();
             let coin_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
             let coin_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
-            let mut price = gives.0.to_f64()? / takes.0.to_f64()?;
+            let mut price = gives.to_f64()? / takes.to_f64()?;
             if takes == 0.into() {
                 price = f64::MAX;
             }
@@ -584,7 +446,7 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value, rewards: &BigInt) -> Option
         quantity_a -= rewards.clone();
     }
     let quantity_b = BigInt::from(v.get_asset_class(&coin_b));
-    Some(quantity_a.0.to_f64()? / quantity_b.0.to_f64()?)
+    Some(quantity_a.to_f64()? / quantity_b.to_f64()?)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -906,51 +768,5 @@ mod tests {
         };
         let swap_price = swap_price(&od);
         assert_eq!(swap_price, Some((SwapDirection::BtoA, 0.1)));
-    }
-
-    #[test]
-    fn bigint_roundtrip_small() {
-        let mut x = BigInt::from(123);
-        let mut byte_buf = vec![];
-        let pd = AsPlutus::to_plutus(x.clone());
-        let bytes = minicbor::encode(&pd, &mut byte_buf);
-        let pd_from = minicbor::decode(&byte_buf).unwrap();
-        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
-        assert_eq!(x, big_int_from);
-    }
-
-    #[test]
-    fn bigint_roundtrip_big_pos() {
-        let mut x = BigInt::from(1);
-        let mut n = BigInt::from(256);
-        for _ in 0..10 {
-            x = x * &n;
-        }
-        let u64_max = BigInt::from(u64::MAX);
-        assert!(x > u64_max);
-        let mut byte_buf = vec![];
-        let pd = AsPlutus::to_plutus(x.clone());
-        let bytes = minicbor::encode(&pd, &mut byte_buf);
-        let pd_from = minicbor::decode(&byte_buf).unwrap();
-        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
-        assert_eq!(x, big_int_from);
-    }
-
-    #[test]
-    fn bigint_roundtrip_big_neg() {
-        let mut x = BigInt::from(1);
-        let mut n = BigInt::from(256);
-        for _ in 0..11 {
-            x = x * &n;
-        }
-        x *= BigInt::from(-1);
-        let neg_u64_max = BigInt::from(u64::MAX) * BigInt::from(-1);
-        assert!(x < neg_u64_max);
-        let mut byte_buf = vec![];
-        let pd = AsPlutus::to_plutus(x.clone());
-        let bytes = minicbor::encode(&pd, &mut byte_buf);
-        let pd_from = minicbor::decode(&byte_buf).unwrap();
-        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
-        assert_eq!(x, big_int_from);
     }
 }
