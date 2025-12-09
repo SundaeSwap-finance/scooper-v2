@@ -453,12 +453,6 @@ impl AsPlutus for AnyPlutusData {
     }
 }
 
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct FixedDestination {
-//    pub address: PlutusAddress,
-//    pub datum: AikenDatum,
-//}
-
 #[derive(AsPlutus, Debug, PartialEq, Eq)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
@@ -516,33 +510,6 @@ pub struct StrategyExecution {
     details: Order,
     extensions: AnyPlutusData,
 }
-
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub enum PoolMintRedeemer {
-//    MintLP(Ident),
-//    CreatePool(CreatePool),
-//    BurnPool(Ident),
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct CreatePool {
-//    assets: (AssetClass, AssetClass),
-//    pool_output: BigInt,
-//    metadata_output: BigInt,
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub enum ManageRedeemer {
-//    WithdrawFees(WithdrawFees),
-//    UpdatePoolFees(BigInt),
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct WithdrawFees {
-//    amount: BigInt,
-//    treasury_output: BigInt,
-//    pool_input: BigInt,
-//}
 
 pub fn get_pool_asset_pair(pool_policy: &[u8], v: &Value) -> Option<(AssetClass, AssetClass)> {
     let mut native_token_a = None;
