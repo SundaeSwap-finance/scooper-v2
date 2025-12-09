@@ -288,6 +288,9 @@ impl ChainIndex for SundaeV3Indexer {
     }
 
     async fn reset(&mut self, start: &Point) -> Result<Point> {
+        let mut index = self.state.lock().await;
+        index.orders.clear();
+        index.pools.clear();
         Ok(start.clone())
     }
 }
@@ -353,6 +356,15 @@ impl AdminServer {
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
+    let scooper_config_file = args.config;
+    let protocol_config_file = args.protocol;
+    let default_start = match args.command {
+        Commands::SyncFromOrigin => Point::Origin,
+        Commands::SyncFromPoint { slot, block_hash } => Point::Specific {
+            slot,
+            hash: block_hash,
+        },
+    };
 
     let (kill_tx, _) = tokio::sync::broadcast::channel(1);
 
@@ -361,21 +373,31 @@ async fn main() {
         orders: BTreeMap::new(),
     }));
 
-    let manager_handle = tokio::spawn(manager_loop(args.clone(), index.clone(), kill_tx.clone()));
+    let manager_handle = tokio::spawn(manager_loop(
+        index.clone(),
+        kill_tx.clone(),
+        scooper_config_file,
+        protocol_config_file,
+        default_start,
+    ));
     let admin_handle = tokio::spawn(admin_server(index.clone(), kill_tx.clone()));
 
     tokio::try_join!(manager_handle, admin_handle).unwrap();
 }
 
 async fn manager_loop(
-    args: Args,
     index: Arc<Mutex<SundaeV3Index>>,
     kill_tx: tokio::sync::broadcast::Sender<()>,
+    scooper_config_file: String,
+    protocol_config_file: PathBuf,
+    default_start: Point,
 ) {
     loop {
-        let args = args.clone();
         let index = index.clone();
         let mut kill_rx = kill_tx.subscribe();
+        let scooper_config_file = scooper_config_file.clone();
+        let protocol_config_file = protocol_config_file.clone();
+        let default_start = default_start.clone();
 
         // Run the Acropolis instance inside isolated runtime so all modules are killed on restart
         let handle = std::thread::spawn(move || {
@@ -394,7 +416,7 @@ async fn manager_loop(
                 let config = Arc::new(
                     Config::builder()
                         .add_source(File::with_name("config/acropolis"))
-                        .add_source(File::with_name(&args.config))
+                        .add_source(File::with_name(&scooper_config_file))
                         .build()
                         .unwrap(),
                 );
@@ -408,7 +430,7 @@ async fn manager_loop(
                 process.register(indexer.clone());
 
                 let protocol: SundaeV3Protocol = {
-                    let f = std::fs::File::open(&args.protocol).unwrap();
+                    let f = std::fs::File::open(protocol_config_file).unwrap();
                     serde_json::from_reader(f).unwrap()
                 };
 
@@ -417,15 +439,10 @@ async fn manager_loop(
                     protocol,
                 };
 
-                let start = match args.command {
-                    Commands::SyncFromOrigin => Point::Origin,
-                    Commands::SyncFromPoint { slot, block_hash } => Point::Specific {
-                        slot,
-                        hash: block_hash,
-                    },
-                };
-
-                indexer.add_index(v3_index, start, false).await.unwrap();
+                indexer
+                    .add_index(v3_index, default_start, false)
+                    .await
+                    .unwrap();
 
                 tokio::select! {
                     _ = kill_rx.recv() => {}
