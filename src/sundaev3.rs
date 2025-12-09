@@ -141,11 +141,14 @@ impl fmt::Display for ValidationError {
             },
             ValidationError::ValueError(e) => match e {
                 ValueError::GivesZeroTokens => write!(f, "gives zero tokens"),
-                ValueError::HasInsufficientAda => {
-                    write!(f, "has insufficient ada")
+                ValueError::HasInsufficientAda { expected, actual } => {
+                    write!(f, "has insufficient ada ({actual} < {expected})")
                 }
-                ValueError::DeclaredExceedsActual => {
-                    write!(f, "offers value in excess of available funds")
+                ValueError::DeclaredExceedsActual { declared, actual } => {
+                    write!(
+                        f,
+                        "offers value in excess of available funds ({actual} < {declared})"
+                    )
                 }
             },
         }
@@ -164,8 +167,8 @@ pub fn validate_order(
 
 pub enum ValueError {
     GivesZeroTokens,
-    HasInsufficientAda,
-    DeclaredExceedsActual,
+    HasInsufficientAda { expected: BigInt, actual: BigInt },
+    DeclaredExceedsActual { declared: BigInt, actual: BigInt },
 }
 
 pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), ValueError> {
@@ -187,16 +190,22 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             if actual_amount == BigInt::from(0) {
                 return Err(ValueError::GivesZeroTokens);
             }
-            let gives_insufficient_ada =
-                actual_ada < gives_ada + BigInt::from(ADA_RIDER) + scoop_fee.clone();
+            let expected = gives_ada + BigInt::from(ADA_RIDER) + scoop_fee.clone();
+            let gives_insufficient_ada = actual_ada < expected;
             let declared_exceeds_actual = gives > actual_amount;
 
             if gives_insufficient_ada {
-                return Err(ValueError::HasInsufficientAda);
+                return Err(ValueError::HasInsufficientAda {
+                    expected,
+                    actual: actual_ada,
+                });
             }
             if declared_exceeds_actual {
                 // This is an error in sundaedatum, even though the smart contract appears to allow it
-                return Err(ValueError::DeclaredExceedsActual);
+                return Err(ValueError::DeclaredExceedsActual {
+                    declared: gives,
+                    actual: actual_amount,
+                });
             }
             Ok(())
         }
@@ -207,8 +216,12 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             let asset_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
             let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
             if asset_a == ADA_ASSET_CLASS {
-                if actual_a < BigInt::from(ADA_RIDER) + scoop_fee.clone() {
-                    return Err(ValueError::HasInsufficientAda);
+                let minimum = BigInt::from(ADA_RIDER) + scoop_fee.clone();
+                if actual_a < minimum {
+                    return Err(ValueError::HasInsufficientAda {
+                        expected: minimum,
+                        actual: actual_a,
+                    });
                 }
                 actual_a -= BigInt::from(ADA_RIDER) + scoop_fee;
             }
@@ -229,12 +242,15 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 value.get_asset_class(&AssetClass::from_pair((policy.clone(), token.clone()))),
             );
             if offered > &actual {
-                return Err(ValueError::DeclaredExceedsActual);
+                return Err(ValueError::DeclaredExceedsActual {
+                    declared: offered.clone(),
+                    actual,
+                });
             }
-            if BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS))
-                < BigInt::from(ADA_RIDER) + scoop_fee
-            {
-                return Err(ValueError::HasInsufficientAda);
+            let expected = BigInt::from(ADA_RIDER) + scoop_fee;
+            let actual = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            if actual < expected {
+                return Err(ValueError::HasInsufficientAda { expected, actual });
             }
             Ok(())
         }

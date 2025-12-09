@@ -1,6 +1,7 @@
 use num_traits::cast::ToPrimitive;
 use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
+use std::fmt;
 
 #[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Debug)]
 pub struct BigInt(num_bigint::BigInt);
@@ -12,6 +13,12 @@ impl BigInt {
 
     pub fn to_f64(&self) -> Option<f64> {
         self.0.to_f64()
+    }
+}
+
+impl fmt::Display for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &self.0)
     }
 }
 
