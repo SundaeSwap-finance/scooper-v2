@@ -860,6 +860,7 @@ dependencies = [
  "hyper-util",
  "minicbor",
  "num-bigint",
+ "num-traits",
  "pallas-addresses",
  "pallas-codec",
  "pallas-crypto",

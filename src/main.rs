@@ -25,8 +25,8 @@ use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
 use plutus_parser::AsPlutus;
 use sundaev3::{
-    Ident, OrderDatum, PoolDatum, SundaeV3Pool, SwapDirection, get_bigint, get_pool_price,
-    swap_price, validate_order,
+    Ident, OrderDatum, PoolDatum, SundaeV3Pool, SwapDirection, get_pool_price, swap_price,
+    validate_order,
 };
 
 use http_body_util::Full;
@@ -469,7 +469,7 @@ impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
 }
 
 #[derive(Serialize)]
-struct GetPoolOrders<'a> {
+struct QueryPoolResponse<'a> {
     valid: Vec<&'a TransactionInput>,
     out_of_range: Vec<OrderOutOfRange<'a>>,
     unrecoverable: Vec<&'a TransactionInput>,
@@ -488,8 +488,7 @@ fn estimate_whether_in_range(
     pool_value: &cardano_types::Value,
 ) -> Result<(), (f64, f64)> {
     let rewards = &pd.protocol_fees;
-    let pool_price =
-        get_pool_price(policy, pool_value, get_bigint(rewards.clone()).unwrap()).unwrap();
+    let pool_price = get_pool_price(policy, pool_value, rewards).unwrap();
     let swap_price = swap_price(od).unwrap();
     match swap_price {
         (SwapDirection::AtoB, swap_price) => {
@@ -521,32 +520,30 @@ impl AdminServer {
                     return "No such pool".into();
                 }
             };
-            if let Some(orders) = index_lock.orders.get(&Some(ident)) {
-                let mut response = GetPoolOrders {
-                    valid: vec![],
-                    out_of_range: vec![],
-                    unrecoverable: vec![],
-                };
-                for order in &orders.orders.contents {
-                    let od = &order.datum;
-                    let pd = &pool.latest().pool_datum;
-                    let pv = &pool.latest().value;
-                    let policy = self.protocol.get_pool_script_hash().unwrap();
-                    match estimate_whether_in_range(policy, od, pd, pv) {
-                        Ok(()) => response.valid.push(&order.input),
-                        Err(reason) => response.out_of_range.push(OrderOutOfRange {
-                            order: &order.input,
-                            reason,
-                        }),
-                    }
+            let d = Default::default();
+            let orders = index_lock.orders.get(&Some(ident)).unwrap_or(&d);
+            let mut response = QueryPoolResponse {
+                valid: vec![],
+                out_of_range: vec![],
+                unrecoverable: vec![],
+            };
+            for order in &orders.orders.contents {
+                let od = &order.datum;
+                let pd = &pool.latest().pool_datum;
+                let pv = &pool.latest().value;
+                let policy = self.protocol.get_pool_script_hash().unwrap();
+                match estimate_whether_in_range(policy, od, pd, pv) {
+                    Ok(()) => response.valid.push(&order.input),
+                    Err(reason) => response.out_of_range.push(OrderOutOfRange {
+                        order: &order.input,
+                        reason,
+                    }),
                 }
-                for order in &orders.unrecoverable_orders.contents {
-                    response.unrecoverable.push(&order.input);
-                }
-                return serde_json::to_string(&response).unwrap();
-            } else {
-                return "No such pool".into();
             }
+            for order in &orders.unrecoverable_orders.contents {
+                response.unrecoverable.push(&order.input);
+            }
+            return serde_json::to_string(&response).unwrap();
         }
 
         match req.uri().path() {
@@ -641,8 +638,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use pallas_codec::utils::Int;
     use pallas_traverse::MultiEraBlock;
+    use sundaev3::BigInt;
 
     use super::*;
 
@@ -763,12 +760,12 @@ mod tests {
                     token: vec![],
                 },
             ),
-            circulating_lp: pallas_primitives::BigInt::Int(Int::from(0)),
-            ask_fees_per_10_thousand: pallas_primitives::BigInt::Int(Int::from(0)),
-            bid_fees_per_10_thousand: pallas_primitives::BigInt::Int(Int::from(0)),
+            circulating_lp: BigInt::from(0),
+            ask_fees_per_10_thousand: BigInt::from(0),
+            bid_fees_per_10_thousand: BigInt::from(0),
             fee_manager: None,
-            market_open: pallas_primitives::BigInt::Int(Int::from(0)),
-            protocol_fees: pallas_primitives::BigInt::Int(Int::from(0)),
+            market_open: BigInt::from(0),
+            protocol_fees: BigInt::from(0),
         };
         let pool = |s| SundaeV3Pool {
             address: address_1.clone(),

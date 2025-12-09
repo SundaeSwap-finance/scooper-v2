@@ -1,13 +1,118 @@
 #![allow(unused)]
 
-use pallas_primitives::{BigInt, PlutusData};
+use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use std::fmt;
 use std::rc::Rc;
 
+use num_traits::cast::ToPrimitive;
+
 use crate::cardano_types::{ADA_ASSET_CLASS, ADA_POLICY, ADA_TOKEN, AssetClass, Value};
 use crate::multisig::Multisig;
 use crate::value;
+
+#[derive(Eq, Ord, PartialEq, PartialOrd, Clone, Debug)]
+pub struct BigInt(num_bigint::BigInt);
+
+impl BigInt {
+    fn unwrap(self) -> num_bigint::BigInt {
+        self.0
+    }
+}
+
+impl From<i32> for BigInt {
+    fn from(i: i32) -> Self {
+        Self(num_bigint::BigInt::from(i))
+    }
+}
+
+impl From<i64> for BigInt {
+    fn from(i: i64) -> Self {
+        Self(num_bigint::BigInt::from(i))
+    }
+}
+
+impl From<u64> for BigInt {
+    fn from(u: u64) -> Self {
+        Self(num_bigint::BigInt::from(u))
+    }
+}
+
+impl From<i128> for BigInt {
+    fn from(i: i128) -> Self {
+        Self(num_bigint::BigInt::from(i))
+    }
+}
+
+impl std::ops::Add for BigInt {
+    type Output = BigInt;
+    fn add(self, other: BigInt) -> BigInt {
+        Self(self.0 + other.0)
+    }
+}
+
+impl std::ops::Sub for BigInt {
+    type Output = BigInt;
+    fn sub(self, other: BigInt) -> BigInt {
+        Self(self.0 - other.0)
+    }
+}
+
+impl std::ops::SubAssign for BigInt {
+    fn sub_assign(&mut self, other: BigInt) {
+        self.0 -= other.0
+    }
+}
+
+impl AsPlutus for BigInt {
+    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let b: pallas_primitives::BigInt = AsPlutus::from_plutus(data)?;
+        match b {
+            pallas_primitives::BigInt::Int(i) => {
+                Ok(BigInt(num_bigint::BigInt::from(Into::<i128>::into(i.0))))
+            }
+            pallas_primitives::BigInt::BigUInt(bytes) => {
+                let n = num_bigint::BigUint::from_bytes_be(&bytes);
+                Ok(BigInt(num_bigint::BigInt::from_biguint(
+                    num_bigint::Sign::Plus,
+                    n,
+                )))
+            }
+            pallas_primitives::BigInt::BigNInt(bytes) => {
+                let n = num_bigint::BigUint::from_bytes_be(&bytes);
+                Ok(BigInt(num_bigint::BigInt::from_biguint(
+                    num_bigint::Sign::Minus,
+                    n,
+                )))
+            }
+        }
+    }
+    fn to_plutus(self) -> PlutusData {
+        let self_as_i128: Result<i128, _> = self.0.clone().try_into();
+        if let Ok(u) = self_as_i128 {
+            let self_as_cbor_int: Result<minicbor::data::Int, _> = u.try_into();
+            if let Ok(u) = self_as_cbor_int {
+                return PlutusData::BigInt(pallas_primitives::BigInt::Int(pallas_primitives::Int(
+                    u,
+                )));
+            }
+        }
+        let (sign, big_uint) = self.0.into_parts();
+        match sign {
+            num_bigint::Sign::Plus => {
+                let bytes = big_uint.to_bytes_be();
+                return PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()));
+            }
+            num_bigint::Sign::NoSign => {
+                unreachable!()
+            }
+            num_bigint::Sign::Minus => {
+                let bytes = big_uint.to_bytes_be();
+                return PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()));
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -122,14 +227,6 @@ pub struct OrderDatum {
     pub extra: AnyPlutusData,
 }
 
-// TODO: Replace uses of this with code that doesn't fail
-pub fn get_bigint(b: BigInt) -> Result<i128, BigInt> {
-    match b {
-        BigInt::Int(i) => Ok(i128::from(i)),
-        _ => Err(b),
-    }
-}
-
 const ADA_RIDER: i128 = 2000000;
 
 pub enum ValidationError {
@@ -154,16 +251,6 @@ impl fmt::Display for ValidationError {
                 ValueError::DeclaredExceedsActual => {
                     write!(f, "offers value in excess of available funds")
                 }
-                ValueError::CannotDecodeScoopFee(b) => {
-                    let mut bigint_bytes = vec![];
-                    minicbor::encode(b, &mut bigint_bytes);
-                    write!(
-                        f,
-                        "cannot decode the scoop fee ({})",
-                        hex::encode(bigint_bytes)
-                    )
-                }
-                ValueError::CannotDecodeGives => write!(f, "cannot decode gives"),
             },
         }
     }
@@ -183,86 +270,74 @@ pub enum ValueError {
     GivesZeroTokens,
     HasInsufficientAda,
     DeclaredExceedsActual,
-    CannotDecodeGives,
-    CannotDecodeScoopFee(BigInt),
 }
 
 pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), ValueError> {
-    let scoop_fee = match get_bigint(datum.scoop_fee.clone()) {
-        Ok(i) => i,
-        Err(scoop_fee) => {
-            return Err(ValueError::CannotDecodeScoopFee(scoop_fee));
-        }
-    };
+    let scoop_fee = datum.scoop_fee.clone();
     match &datum.action {
         Order::Strategy(_) => Ok(()),
         Order::Swap(a, b) => {
             let gives = a.2.clone();
-            if let Ok(gives) = get_bigint(gives) {
-                let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-                let actual_amount = value.get_asset_class(&gives_asset);
-                let actual_ada = value.get_asset_class(&ADA_ASSET_CLASS);
-                let mut gives_ada = 0;
-                let actual_amount = if gives_asset == ADA_ASSET_CLASS {
-                    gives_ada = gives;
-                    actual_amount - (ADA_RIDER + scoop_fee)
-                } else {
-                    actual_amount
-                };
-                if actual_amount == 0 {
-                    return Err(ValueError::GivesZeroTokens);
-                }
-                let gives_insufficient_ada = actual_ada < gives_ada + ADA_RIDER + scoop_fee;
-                let declared_exceeds_actual = gives > actual_amount;
-
-                if gives_insufficient_ada {
-                    return Err(ValueError::HasInsufficientAda);
-                }
-                if declared_exceeds_actual {
-                    // This is an error in sundaedatum, even though the smart contract appears to allow it
-                    return Err(ValueError::DeclaredExceedsActual);
-                }
-                Ok(())
+            let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+            let actual_amount = BigInt::from(value.get_asset_class(&gives_asset));
+            let actual_ada = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            let mut gives_ada = BigInt::from(0);
+            let actual_amount = if gives_asset == ADA_ASSET_CLASS {
+                gives_ada = gives.clone();
+                actual_amount - (BigInt::from(ADA_RIDER) + scoop_fee.clone())
             } else {
-                Err(ValueError::CannotDecodeGives)
+                actual_amount
+            };
+            if actual_amount == BigInt::from(0) {
+                return Err(ValueError::GivesZeroTokens);
             }
+            let gives_insufficient_ada =
+                actual_ada < gives_ada + ADA_RIDER.into() + scoop_fee.clone();
+            let declared_exceeds_actual = gives > actual_amount;
+
+            if gives_insufficient_ada {
+                return Err(ValueError::HasInsufficientAda);
+            }
+            if declared_exceeds_actual {
+                // This is an error in sundaedatum, even though the smart contract appears to allow it
+                return Err(ValueError::DeclaredExceedsActual);
+            }
+            Ok(())
         }
         Order::Deposit((a, b)) => {
             let gives_a = a.2.clone();
             let gives_b = b.2.clone();
             let asset_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
             let asset_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
-            match (get_bigint(gives_a), get_bigint(gives_b)) {
-                (Ok(g_a), Ok(g_b)) => {
-                    let mut actual_a = value.get_asset_class(&asset_a);
-                    if asset_a == ADA_ASSET_CLASS {
-                        if actual_a < ADA_RIDER + scoop_fee {
-                            return Err(ValueError::HasInsufficientAda);
-                        }
-                        actual_a -= ADA_RIDER + scoop_fee;
-                    }
-                    let actual_b = value.get_asset_class(&asset_b);
-
-                    let deposits_zero_tokens = actual_a == 0 && actual_b == 0;
-                    if !deposits_zero_tokens {
-                        return Err(ValueError::GivesZeroTokens);
-                    }
-                    Ok(())
+            let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
+            if asset_a == ADA_ASSET_CLASS {
+                if actual_a < BigInt::from(ADA_RIDER) + scoop_fee.clone() {
+                    return Err(ValueError::HasInsufficientAda);
                 }
-                _ => Err(ValueError::CannotDecodeGives),
+                actual_a -= BigInt::from(ADA_RIDER) + scoop_fee;
             }
-        }
-        Order::Withdrawal((policy, token, offered)) => {
-            let offered = get_bigint(offered.clone()).unwrap();
-            if offered == 0 {
+            let actual_b = BigInt::from(value.get_asset_class(&asset_b));
+
+            let deposits_zero_tokens =
+                actual_a == BigInt::from(0u64) && actual_b == BigInt::from(0u64);
+            if !deposits_zero_tokens {
                 return Err(ValueError::GivesZeroTokens);
             }
-            let actual =
-                value.get_asset_class(&AssetClass::from_pair((policy.clone(), token.clone())));
-            if offered > actual {
+            Ok(())
+        }
+        Order::Withdrawal((policy, token, offered)) => {
+            if offered == &BigInt::from(0) {
+                return Err(ValueError::GivesZeroTokens);
+            }
+            let actual = BigInt::from(
+                value.get_asset_class(&AssetClass::from_pair((policy.clone(), token.clone()))),
+            );
+            if offered > &actual {
                 return Err(ValueError::DeclaredExceedsActual);
             }
-            if value.get_asset_class(&ADA_ASSET_CLASS) < ADA_RIDER + scoop_fee {
+            if BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS))
+                < BigInt::from(ADA_RIDER) + scoop_fee
+            {
                 return Err(ValueError::HasInsufficientAda);
             }
             Ok(())
@@ -320,12 +395,12 @@ pub enum SwapDirection {
 pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
     match &order.action {
         Order::Swap(a, b) => {
-            let gives = get_bigint(a.2.clone()).unwrap();
-            let takes = get_bigint(b.2.clone()).unwrap();
+            let gives = a.2.clone();
+            let takes = b.2.clone();
             let coin_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
             let coin_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
-            let mut price = gives as f64 / takes as f64;
-            if takes == 0 {
+            let mut price = gives.0.to_f64()? / takes.0.to_f64()?;
+            if takes == 0.into() {
                 price = f64::MAX;
             }
             if coin_a < coin_b {
@@ -501,14 +576,14 @@ pub fn get_pool_asset_pair(pool_policy: &[u8], v: &Value) -> Option<(AssetClass,
     }
 }
 
-pub fn get_pool_price(pool_policy: &[u8], v: &Value, rewards: i128) -> Option<f64> {
+pub fn get_pool_price(pool_policy: &[u8], v: &Value, rewards: &BigInt) -> Option<f64> {
     let (coin_a, coin_b) = get_pool_asset_pair(pool_policy, v)?;
-    let mut quantity_a = v.get_asset_class(&coin_a);
+    let mut quantity_a = BigInt::from(v.get_asset_class(&coin_a));
     if coin_a == ADA_ASSET_CLASS {
-        quantity_a -= rewards;
+        quantity_a -= rewards.clone();
     }
-    let quantity_b = v.get_asset_class(&coin_b);
-    Some((quantity_a as f64) / (quantity_b as f64))
+    let quantity_b = BigInt::from(v.get_asset_class(&coin_b));
+    Some(quantity_a.0.to_f64()? / quantity_b.0.to_f64()?)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -534,7 +609,7 @@ mod tests {
         let bytes = hex::decode("9f4100410102ff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
         let singleton: SingletonValue = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(singleton.2, BigInt::Int(2.into()));
+        assert_eq!(singleton.2, BigInt::from(2));
     }
 
     #[test]
@@ -558,7 +633,7 @@ mod tests {
             hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
         assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
         assert_eq!(order.owner, Multisig::Signature(expected_signature));
-        assert_eq!(order.scoop_fee, BigInt::Int(10.into()));
+        assert_eq!(order.scoop_fee, BigInt::from(10));
         assert_eq!(
             order.destination,
             Destination::Fixed(
@@ -572,8 +647,8 @@ mod tests {
         assert_eq!(
             order.action,
             Order::Swap(
-                (vec![0], vec![1], BigInt::Int(2.into()),),
-                (vec![3], vec![4], BigInt::Int(5.into()),)
+                (vec![0], vec![1], BigInt::from(2)),
+                (vec![3], vec![4], BigInt::from(5))
             )
         );
         assert_eq!(
@@ -609,7 +684,7 @@ mod tests {
     }
 
     fn i64_to_bigint(i: i64) -> BigInt {
-        BigInt::Int(pallas_codec::utils::Int::from(i))
+        BigInt::from(i)
     }
 
     struct ValidateAdaRBerrySwapTestCase {
@@ -749,7 +824,7 @@ mod tests {
             protocol_fees: i64_to_bigint(protocol_fees),
         };
         let pool_value = value![103_000_000, (&rberry_asset_class, 100_000_000)];
-        let price = get_pool_price(&pool_policy, &pool_value, protocol_fees as i128);
+        let price = get_pool_price(&pool_policy, &pool_value, &BigInt::from(protocol_fees));
         assert_eq!(price, Some(1.0));
     }
 
@@ -774,7 +849,7 @@ mod tests {
             protocol_fees: i64_to_bigint(protocol_fees),
         };
         let pool_value = value![103_000_000, (&rberry_asset_class, 1_000_000_000)];
-        let price = get_pool_price(&pool_policy, &pool_value, protocol_fees as i128);
+        let price = get_pool_price(&pool_policy, &pool_value, &BigInt::from(protocol_fees));
         assert_eq!(price, Some(0.1));
     }
 
