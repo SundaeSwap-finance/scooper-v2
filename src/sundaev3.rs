@@ -64,6 +64,40 @@ impl std::ops::SubAssign for BigInt {
     }
 }
 
+impl std::ops::Mul for BigInt {
+    type Output = BigInt;
+    fn mul(self, other: BigInt) -> BigInt {
+        BigInt(&self.0 * &other.0)
+    }
+}
+
+impl std::ops::Mul<&BigInt> for &BigInt {
+    type Output = BigInt;
+    fn mul(self, other: &BigInt) -> BigInt {
+        BigInt(&self.0 * &other.0)
+    }
+}
+
+impl std::ops::Mul<&BigInt> for BigInt {
+    type Output = BigInt;
+    fn mul(self, other: &BigInt) -> BigInt {
+        BigInt(&self.0 * &other.0)
+    }
+}
+
+impl std::ops::Mul<BigInt> for &BigInt {
+    type Output = BigInt;
+    fn mul(self, other: BigInt) -> BigInt {
+        BigInt(&self.0 * &other.0)
+    }
+}
+
+impl std::ops::MulAssign for BigInt {
+    fn mul_assign(&mut self, other: BigInt) {
+        self.0 *= other.0
+    }
+}
+
 impl AsPlutus for BigInt {
     fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
         let b: pallas_primitives::BigInt = AsPlutus::from_plutus(data)?;
@@ -872,5 +906,51 @@ mod tests {
         };
         let swap_price = swap_price(&od);
         assert_eq!(swap_price, Some((SwapDirection::BtoA, 0.1)));
+    }
+
+    #[test]
+    fn bigint_roundtrip_small() {
+        let mut x = BigInt::from(123);
+        let mut byte_buf = vec![];
+        let pd = AsPlutus::to_plutus(x.clone());
+        let bytes = minicbor::encode(&pd, &mut byte_buf);
+        let pd_from = minicbor::decode(&byte_buf).unwrap();
+        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
+        assert_eq!(x, big_int_from);
+    }
+
+    #[test]
+    fn bigint_roundtrip_big_pos() {
+        let mut x = BigInt::from(1);
+        let mut n = BigInt::from(256);
+        for _ in 0..10 {
+            x = x * &n;
+        }
+        let u64_max = BigInt::from(u64::MAX);
+        assert!(x > u64_max);
+        let mut byte_buf = vec![];
+        let pd = AsPlutus::to_plutus(x.clone());
+        let bytes = minicbor::encode(&pd, &mut byte_buf);
+        let pd_from = minicbor::decode(&byte_buf).unwrap();
+        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
+        assert_eq!(x, big_int_from);
+    }
+
+    #[test]
+    fn bigint_roundtrip_big_neg() {
+        let mut x = BigInt::from(1);
+        let mut n = BigInt::from(256);
+        for _ in 0..11 {
+            x = x * &n;
+        }
+        x *= BigInt::from(-1);
+        let neg_u64_max = BigInt::from(u64::MAX) * BigInt::from(-1);
+        assert!(x < neg_u64_max);
+        let mut byte_buf = vec![];
+        let pd = AsPlutus::to_plutus(x.clone());
+        let bytes = minicbor::encode(&pd, &mut byte_buf);
+        let pd_from = minicbor::decode(&byte_buf).unwrap();
+        let big_int_from = AsPlutus::from_plutus(pd_from).unwrap();
+        assert_eq!(x, big_int_from);
     }
 }
