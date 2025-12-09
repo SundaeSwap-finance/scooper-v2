@@ -101,14 +101,14 @@ impl AsPlutus for BigInt {
         match sign {
             num_bigint::Sign::Plus => {
                 let bytes = big_uint.to_bytes_be();
-                return PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()));
+                PlutusData::BigInt(pallas_primitives::BigInt::BigUInt(bytes.into()))
             }
             num_bigint::Sign::NoSign => {
                 unreachable!()
             }
             num_bigint::Sign::Minus => {
                 let bytes = big_uint.to_bytes_be();
-                return PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()));
+                PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()))
             }
         }
     }
