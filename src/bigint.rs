@@ -87,6 +87,12 @@ impl std::ops::SubAssign for BigInt {
     }
 }
 
+impl std::ops::SubAssign<&BigInt> for BigInt {
+    fn sub_assign(&mut self, other: &BigInt) {
+        self.0 -= &other.0
+    }
+}
+
 impl std::ops::Mul for BigInt {
     type Output = BigInt;
     fn mul(self, other: BigInt) -> BigInt {

@@ -176,35 +176,38 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
     match &datum.action {
         Order::Strategy(_) => Ok(()),
         Order::Swap(a, b) => {
+            let minimum_ada = BigInt::from(ADA_RIDER) + scoop_fee.clone();
             let gives = a.2.clone();
             let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let actual_amount = BigInt::from(value.get_asset_class(&gives_asset));
-            let actual_ada = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
-            let mut gives_ada = BigInt::from(0);
-            let actual_amount = if gives_asset == ADA_ASSET_CLASS {
-                gives_ada = gives.clone();
-                actual_amount - (BigInt::from(ADA_RIDER) + scoop_fee.clone())
+            let gives_ada = if gives_asset == ADA_ASSET_CLASS {
+                gives.clone()
             } else {
-                actual_amount
+                BigInt::from(0)
             };
-            if actual_amount == BigInt::from(0) {
-                return Err(ValueError::GivesZeroTokens);
-            }
-            let expected = gives_ada + BigInt::from(ADA_RIDER) + scoop_fee.clone();
-            let gives_insufficient_ada = actual_ada < expected;
-            let declared_exceeds_actual = gives > actual_amount;
-
-            if gives_insufficient_ada {
+            let actual_ada = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            let expected_ada = gives_ada + minimum_ada.clone();
+            if actual_ada < expected_ada {
                 return Err(ValueError::HasInsufficientAda {
-                    expected,
+                    expected: expected_ada,
                     actual: actual_ada,
                 });
             }
-            if declared_exceeds_actual {
+
+            let actual_amount_of_give_token = BigInt::from(value.get_asset_class(&gives_asset))
+                - if gives_asset == ADA_ASSET_CLASS {
+                    minimum_ada
+                } else {
+                    BigInt::from(0)
+                };
+            if actual_amount_of_give_token < BigInt::from(0) {
+                return Err(ValueError::GivesZeroTokens);
+            }
+
+            if actual_amount_of_give_token < gives {
                 // This is an error in sundaedatum, even though the smart contract appears to allow it
                 return Err(ValueError::DeclaredExceedsActual {
                     declared: gives,
-                    actual: actual_amount,
+                    actual: actual_amount_of_give_token,
                 });
             }
             Ok(())
@@ -223,7 +226,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                         actual: actual_a,
                     });
                 }
-                actual_a -= BigInt::from(ADA_RIDER) + scoop_fee;
+                actual_a -= minimum;
             }
             let actual_b = BigInt::from(value.get_asset_class(&asset_b));
 
@@ -459,7 +462,10 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value, rewards: &BigInt) -> Option
     let (coin_a, coin_b) = get_pool_asset_pair(pool_policy, v)?;
     let mut quantity_a = BigInt::from(v.get_asset_class(&coin_a));
     if coin_a == ADA_ASSET_CLASS {
-        quantity_a -= rewards.clone();
+        if &quantity_a < rewards {
+            return None;
+        }
+        quantity_a -= rewards;
     }
     let quantity_b = BigInt::from(v.get_asset_class(&coin_b));
     Some(quantity_a.to_f64()? / quantity_b.to_f64()?)
