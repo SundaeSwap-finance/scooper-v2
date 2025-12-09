@@ -1,7 +1,7 @@
 use pallas_primitives::BigInt;
 use plutus_parser::AsPlutus;
 
-#[derive(AsPlutus, Clone, Debug, PartialEq, Eq)]
+#[derive(AsPlutus, Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Multisig {
     Signature(Vec<u8>),
     AllOf(Vec<Multisig>),

@@ -18,14 +18,8 @@ use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tracing::{Level, event, warn};
-
 use std::sync::Arc;
-
-mod cardano_types;
-mod multisig;
-mod serde_compat;
-mod sundaev3;
+use tracing::{Level, event, warn};
 
 use serde::Deserialize;
 
@@ -42,6 +36,11 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::TcpListener;
+
+mod cardano_types;
+mod multisig;
+mod serde_compat;
+mod sundaev3;
 
 #[derive(Deserialize)]
 struct SundaeV3Protocol {
@@ -339,12 +338,19 @@ impl AdminServer {
             }
             "/health" => "health".into(),
             "/pools" => {
-                let mut response = String::new();
                 let index_lock = self.index.lock().await;
-                for pool_id in index_lock.pools.keys() {
-                    response += &format!("{pool_id}\n");
+                let mut json_map = serde_json::Map::new();
+
+                for (ident, states) in &index_lock.pools {
+                    if let Some(latest) = states.states.contents.last() {
+                        json_map.insert(
+                            hex::encode(ident.to_bytes()),
+                            serde_json::to_value(latest).unwrap(),
+                        );
+                    }
                 }
-                response
+
+                serde_json::to_string_pretty(&json_map).unwrap()
             }
             _ => "unknown".into(),
         }

@@ -6,6 +6,10 @@ use std::fmt;
 
 use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass, Value};
 use crate::multisig::Multisig;
+use crate::serde_compat::{
+    serialize_address, serialize_assets, serialize_ident, serialize_multisig,
+    serialize_plutus_bigint, serialize_value,
+};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -44,15 +48,23 @@ impl AsPlutus for Ident {
     }
 }
 
-#[derive(AsPlutus, Clone, PartialEq, Eq)]
+#[derive(AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolDatum {
+    #[serde(serialize_with = "serialize_ident")]
     pub ident: Ident,
+    #[serde(serialize_with = "serialize_assets")]
     pub assets: (AssetClass, AssetClass),
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub circulating_lp: BigInt,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub bid_fees_per_10_thousand: BigInt,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub ask_fees_per_10_thousand: BigInt,
+    #[serde(serialize_with = "serialize_multisig")]
     pub fee_manager: Option<Multisig>,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub market_open: BigInt,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub protocol_fees: BigInt,
 }
 
@@ -278,9 +290,11 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value) -> Option<f64> {
     Some((quantity_a as f64) / (quantity_b as f64))
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV3Pool {
+    #[serde(serialize_with = "serialize_address")]
     pub address: pallas_addresses::Address,
+    #[serde(serialize_with = "serialize_value")]
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub slot: u64,
