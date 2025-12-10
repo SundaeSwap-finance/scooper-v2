@@ -18,6 +18,8 @@ clap = { version = "4.5.41", features = ["derive"] }
 config = "0.15.11"
 hex = "0.4.3"
 minicbor = { version = "0.26.0", features = ["alloc", "derive"] }
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
 pallas-addresses = "1.0.0-alpha.2"
 pallas-codec = "1.0.0-alpha.2"
 pallas-primitives = "1.0.0-alpha.2"
