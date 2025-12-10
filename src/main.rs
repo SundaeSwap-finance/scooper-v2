@@ -13,6 +13,7 @@ use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
 use config::{Config, File};
 use pallas_traverse::MultiEraTx;
+use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
@@ -26,7 +27,7 @@ mod multisig;
 mod serde_compat;
 mod sundaev3;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
@@ -144,6 +145,19 @@ where
         F: FnMut(&T) -> bool,
     {
         self.contents.retain(condition);
+    }
+}
+
+impl<T: Serialize> Serialize for SortedVec<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.contents.len()))?;
+        for item in &self.contents {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
     }
 }
 

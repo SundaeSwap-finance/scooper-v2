@@ -4,6 +4,8 @@ use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, NativeScript};
 use pallas_primitives::{PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -34,6 +36,22 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
+}
+
+impl serde::Serialize for AssetClass {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.policy.is_empty() {
+            return serializer.serialize_str("lovelace");
+        }
+
+        let policy_hex = hex::encode(&self.policy);
+        let name_hex = hex::encode(&self.token);
+
+        serializer.serialize_str(&format!("{}.{}", policy_hex, name_hex))
+    }
 }
 
 impl AsPlutus for AssetClass {
@@ -117,11 +135,56 @@ impl Value {
     }
 }
 
+impl serde::Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let outer = &self.0;
+
+        let mut map = serializer.serialize_map(None)?;
+
+        for (policy, inner) in outer {
+            if policy.is_empty() {
+                for qty in inner.values() {
+                    map.serialize_entry("lovelace", qty)?;
+                }
+                continue;
+            }
+
+            let policy_hex = hex::encode(policy);
+
+            for (token, qty) in inner {
+                let token_hex = hex::encode(token);
+                let key = format!("{}.{}", policy_hex, token_hex);
+                map.serialize_entry(&key, qty)?;
+            }
+        }
+
+        map.end()
+    }
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum Datum {
     None,
     ParsedOrder(OrderDatum),
     ParsedPool(PoolDatum),
+}
+
+impl Serialize for Datum {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Datum::None => serializer.serialize_none(),
+
+            Datum::ParsedOrder(od) => od.serialize(serializer),
+
+            Datum::ParsedPool(pd) => pd.serialize(serializer),
+        }
+    }
 }
 
 // Would be convenient to parameterize this by the type of the decoded datum, with
