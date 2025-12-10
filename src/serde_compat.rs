@@ -1,6 +1,6 @@
 use pallas_addresses::Address;
 use pallas_primitives::Fragment;
-use plutus_parser::BigInt;
+use plutus_parser::AsPlutus;
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use serde::{Deserializer, Serializer, de, ser::Error};
@@ -51,39 +51,6 @@ where
     serializer.serialize_str(&bech)
 }
 
-pub fn serialize_plutus_bigint<S>(v: &BigInt, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let val = bigint_to_i128(v).map_err(serde::ser::Error::custom)?;
-    serializer.serialize_i128(val)
-}
-
-pub fn bigint_to_i128(v: &BigInt) -> Result<i128, &'static str> {
-    match v {
-        BigInt::Int(x) => Ok(i128::from(x.0)),
-
-        BigInt::BigUInt(bytes) | BigInt::BigNInt(bytes) => {
-            let neg = matches!(v, BigInt::BigNInt(_));
-
-            if bytes.len() > 16 {
-                return Err("BigInt out of i128 range");
-            }
-
-            let mut buf = [0u8; 16];
-            let offset = 16 - bytes.len();
-            buf[offset..].copy_from_slice(bytes);
-
-            let mut n = i128::from_be_bytes(buf);
-            if neg {
-                n = -n;
-            }
-
-            Ok(n)
-        }
-    }
-}
-
 impl serde::Serialize for Ident {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -99,10 +66,8 @@ impl serde::Serialize for AnyPlutusData {
     where
         S: serde::Serializer,
     {
-        let cbor = self
-            .raw()
-            .encode_fragment()
-            .map_err(serde::ser::Error::custom)?;
+        let cbor = self.clone().to_plutus();
+        let cbor = cbor.encode_fragment().map_err(serde::ser::Error::custom)?;
 
         serializer.serialize_str(&hex::encode(cbor))
     }
@@ -157,7 +122,7 @@ impl serde::Serialize for SingletonValue {
         let key = if self.policy.is_empty() {
             "lovelace".to_string()
         } else {
-            format!("{}.{}", hex::encode(&self.policy), hex::encode(&self.name))
+            format!("{}.{}", hex::encode(&self.policy), hex::encode(&self.token))
         };
 
         let mut map = serializer.serialize_map(Some(1))?;
@@ -248,17 +213,9 @@ impl serde::Serialize for Multisig {
                 map.end()
             }
 
-            Multisig::Before(slot) => {
-                let n =
-                    crate::serde_compat::bigint_to_i128(slot).map_err(serde::ser::Error::custom)?;
-                serializer.serialize_str(&format!("before:{n}"))
-            }
+            Multisig::Before(slot) => serializer.serialize_str(&format!("before:{slot}")),
 
-            Multisig::After(slot) => {
-                let n =
-                    crate::serde_compat::bigint_to_i128(slot).map_err(serde::ser::Error::custom)?;
-                serializer.serialize_str(&format!("after:{n}"))
-            }
+            Multisig::After(slot) => serializer.serialize_str(&format!("after:{slot}")),
         }
     }
 }

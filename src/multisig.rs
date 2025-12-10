@@ -1,5 +1,6 @@
-use pallas_primitives::BigInt;
 use plutus_parser::AsPlutus;
+
+use crate::bigint::BigInt;
 
 #[derive(AsPlutus, Clone, Debug, PartialEq, Eq)]
 pub enum Multisig {

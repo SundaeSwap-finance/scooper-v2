@@ -79,8 +79,8 @@ pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
 macro_rules! value {
     ( $ada:expr, $( $token:expr ),* ) => {
         {
-            let mut value = Value::new();
-            value.insert(&ADA_ASSET_CLASS, $ada);
+            let mut value = $crate::cardano_types::Value::new();
+            value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, $ada);
             $(
                 value.insert($token.0, $token.1);
             )*
