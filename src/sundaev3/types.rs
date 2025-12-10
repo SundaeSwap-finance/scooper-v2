@@ -291,7 +291,7 @@ impl serde::Serialize for AnyPlutusData {
     where
         S: serde::Serializer,
     {
-        let cbor = self.clone().to_plutus();
+        let cbor = self.inner();
         let cbor = cbor.encode_fragment().map_err(serde::ser::Error::custom)?;
 
         serializer.serialize_str(&hex::encode(cbor))
@@ -299,6 +299,10 @@ impl serde::Serialize for AnyPlutusData {
 }
 
 impl AnyPlutusData {
+    pub fn inner(&self) -> &PlutusData {
+        &self.inner
+    }
+
     pub fn empty_cons() -> Self {
         Self {
             inner: PlutusData::Constr(pallas_primitives::Constr {
