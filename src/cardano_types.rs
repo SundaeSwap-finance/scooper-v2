@@ -22,12 +22,15 @@ pub enum ScriptRef {
     PlutusV3(PlutusScript<3>),
 }
 
+pub const ADA_POLICY: Vec<u8> = vec![];
+pub const ADA_TOKEN: Vec<u8> = vec![];
+
 pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
-    policy: vec![],
-    token: vec![],
+    policy: ADA_POLICY,
+    token: ADA_TOKEN,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
@@ -72,7 +75,25 @@ impl fmt::Display for AssetClass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
 
+#[macro_export]
+macro_rules! value {
+    ( $ada:expr, $( $token:expr ),* ) => {
+        {
+            let mut value = Value::new();
+            value.insert(&ADA_ASSET_CLASS, $ada);
+            $(
+                value.insert($token.0, $token.1);
+            )*
+            value
+        }
+    };
+}
+
 impl Value {
+    pub fn new() -> Self {
+        Value(BTreeMap::new())
+    }
+
     pub fn get_asset_class(&self, asset_class: &AssetClass) -> i128 {
         if let Some(assets) = self.0.get(&asset_class.policy)
             && let Some(quantity) = assets.get(&asset_class.token)
@@ -81,9 +102,22 @@ impl Value {
         }
         0
     }
+
+    pub fn insert(&mut self, asset_class: &AssetClass, quantity: i128) {
+        match self.0.get_mut(&asset_class.policy) {
+            Some(tokens) => {
+                tokens.insert(asset_class.token.clone(), quantity);
+            }
+            None => {
+                let mut new_tokens = BTreeMap::new();
+                new_tokens.insert(asset_class.token.clone(), quantity);
+                self.0.insert(asset_class.policy.clone(), new_tokens);
+            }
+        }
+    }
 }
 
-#[derive(PartialEq, Eq, Debug, serde::Serialize)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Datum {
     None,
     ParsedOrder(OrderDatum),
@@ -103,8 +137,17 @@ pub struct TransactionOutput {
     pub script_ref: Option<ScriptRef>,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TransactionInput(pub pallas_primitives::TransactionInput);
+
+impl serde::ser::Serialize for TransactionInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{}", self))
+    }
+}
 
 impl fmt::Display for TransactionInput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -166,5 +209,20 @@ pub fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> Transactio
         datum,
         value,
         script_ref,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_assetclass_ord() {
+        let rberry = AssetClass::from_pair((vec![0x66, 0x67], vec![0x66, 0x66]));
+        let sberry = AssetClass::from_pair((vec![0x66, 0x67], vec![0x66, 0x67]));
+        let foobar = AssetClass::from_pair((vec![0x99, 0x99], vec![0x01, 0x01]));
+        assert!(ADA_ASSET_CLASS < rberry);
+        assert!(rberry < sberry);
+        assert!(sberry < foobar);
     }
 }

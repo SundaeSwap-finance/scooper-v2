@@ -1,13 +1,16 @@
 use pallas_addresses::Address;
 use pallas_primitives::Fragment;
 use plutus_parser::BigInt;
-use serde::ser::{SerializeMap, SerializeSeq};
+use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use serde::{Deserializer, Serializer, de, ser::Error};
 
-use crate::cardano_types::{AssetClass, TransactionInput, Value};
+use crate::SortedVec;
+use crate::cardano_types::{AssetClass, Datum, Value};
 use crate::multisig::Multisig;
 use crate::sundaev3::{
     AikenDatum, AnyPlutusData, Credential, Destination, Ident, Order, Referenced, SingletonValue,
+    StrategyAuthorization,
 };
 
 struct AddressVisitor;
@@ -112,46 +115,34 @@ impl serde::Serialize for Order {
     {
         use serde::ser::SerializeMap;
 
-        let (key, value) = match self {
-            Order::Strategy(auth) => ("Strategy", serde_json::Value::String(format!("{:?}", auth))),
+        let mut map = serializer.serialize_map(Some(1))?;
 
-            Order::Swap(a, b) => (
-                "Swap",
-                serde_json::Value::Array(vec![
-                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
-                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
-                ]),
-            ),
+        match self {
+            Order::Strategy(auth) => {
+                map.serialize_entry("Strategy", auth)?;
+            }
 
-            Order::Deposit((a, b)) => (
-                "Deposit",
-                serde_json::Value::Array(vec![
-                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
-                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
-                ]),
-            ),
+            Order::Swap(a, b) => {
+                map.serialize_entry("Swap", &(a, b))?;
+            }
 
-            Order::Withdrawal(v) => (
-                "Withdrawal",
-                serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
-            ),
+            Order::Deposit((a, b)) => {
+                map.serialize_entry("Deposit", &(a, b))?;
+            }
 
-            Order::Donation((a, b)) => (
-                "Donation",
-                serde_json::Value::Array(vec![
-                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
-                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
-                ]),
-            ),
+            Order::Withdrawal(v) => {
+                map.serialize_entry("Withdrawal", v)?;
+            }
 
-            Order::Record(ac) => (
-                "Record",
-                serde_json::to_value(ac).map_err(serde::ser::Error::custom)?,
-            ),
+            Order::Donation((a, b)) => {
+                map.serialize_entry("Donation", &(a, b))?;
+            }
+
+            Order::Record(asset_class) => {
+                map.serialize_entry("Record", asset_class)?;
+            }
         };
 
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(key, &value)?;
         map.end()
     }
 }
@@ -163,20 +154,14 @@ impl serde::Serialize for SingletonValue {
     {
         use serde::ser::SerializeMap;
 
-        // Convert BigInt → i128
-        let amount_i128 =
-            crate::serde_compat::bigint_to_i128(&self.amount).map_err(serde::ser::Error::custom)?;
-
-        // Format asset key
         let key = if self.policy.is_empty() {
             "lovelace".to_string()
         } else {
             format!("{}.{}", hex::encode(&self.policy), hex::encode(&self.name))
         };
 
-        // Emit as: { "<asset>": amount }
         let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry(&key, &amount_i128)?;
+        map.serialize_entry(&key, &self.amount)?;
         map.end()
     }
 }
@@ -327,13 +312,52 @@ impl serde::Serialize for Destination {
     }
 }
 
-impl serde::Serialize for TransactionInput {
+impl<T: Serialize> Serialize for SortedVec<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let tx_id_hex = hex::encode(self.0.transaction_id.as_ref());
-        let s = format!("{}:{}", tx_id_hex, self.0.index);
-        serializer.serialize_str(&s)
+        let mut seq = serializer.serialize_seq(Some(self.contents.len()))?;
+        for item in &self.contents {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for StrategyAuthorization {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            StrategyAuthorization::Signature(bytes) => {
+                let hex = hex::encode(bytes);
+                let mut st = serializer.serialize_struct("StrategyAuthorization", 1)?;
+                st.serialize_field("Signature", &hex)?;
+                st.end()
+            }
+            StrategyAuthorization::Script(bytes) => {
+                let hex = hex::encode(bytes);
+                let mut st = serializer.serialize_struct("StrategyAuthorization", 1)?;
+                st.serialize_field("Script", &hex)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl Serialize for Datum {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Datum::None => serializer.serialize_none(),
+
+            Datum::ParsedOrder(od) => od.serialize(serializer),
+
+            Datum::ParsedPool(pd) => pd.serialize(serializer),
+        }
     }
 }

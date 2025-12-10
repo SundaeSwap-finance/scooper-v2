@@ -2338,6 +2338,7 @@ checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -3581,6 +3582,8 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "minicbor 0.26.5",
+ "num-bigint",
+ "num-traits",
  "pallas-addresses 1.0.0-alpha.3",
  "pallas-codec 1.0.0-alpha.3",
  "pallas-primitives 1.0.0-alpha.3",

@@ -1,12 +1,15 @@
 #![allow(unused)]
 
-use pallas_primitives::{BigInt, PlutusData};
+use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use std::fmt;
+use std::rc::Rc;
 
-use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass, Value};
+use crate::bigint::BigInt;
+use crate::cardano_types::{ADA_ASSET_CLASS, ADA_POLICY, ADA_TOKEN, AssetClass, Value};
 use crate::multisig::Multisig;
 use crate::serde_compat::{serialize_address, serialize_plutus_bigint};
+use crate::value;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -49,16 +52,11 @@ impl AsPlutus for Ident {
 pub struct PoolDatum {
     pub ident: Ident,
     pub assets: (AssetClass, AssetClass),
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub circulating_lp: BigInt,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub bid_fees_per_10_thousand: BigInt,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub ask_fees_per_10_thousand: BigInt,
     pub fee_manager: Option<Multisig>,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub market_open: BigInt,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub protocol_fees: BigInt,
 }
 
@@ -98,7 +96,7 @@ pub struct SignedStrategyExecution {
     signature: Option<Vec<u8>>,
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Eq, Debug, PartialEq)]
 pub enum StrategyAuthorization {
     Signature(Vec<u8>),
     Script(Vec<u8>),
@@ -111,7 +109,16 @@ pub struct SingletonValue {
     pub amount: BigInt,
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq)]
+impl SingletonValue {
+    pub fn asset_class(&self) -> AssetClass {
+        AssetClass {
+            policy: self.policy.clone(),
+            token: self.name.clone(),
+        }
+    }
+}
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Order {
     Strategy(StrategyAuthorization),
     Swap(SingletonValue, SingletonValue),
@@ -121,7 +128,7 @@ pub enum Order {
     Record(AssetClass),
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub struct OrderDatum {
     pub ident: Option<Ident>,
     pub owner: Multisig,
@@ -131,22 +138,237 @@ pub struct OrderDatum {
     pub extra: AnyPlutusData,
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq)]
+const ADA_RIDER: i128 = 2000000;
+
+pub enum ValidationError {
+    ValueError(ValueError),
+    PoolError(PoolError),
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::PoolError(e) => match e {
+                PoolError::IdentMismatch => write!(f, "order ident does not match pool ident"),
+                PoolError::CoinPairMismatch => {
+                    write!(f, "order coin pair does not match pool coin pair")
+                }
+            },
+            ValidationError::ValueError(e) => match e {
+                ValueError::GivesZeroTokens => write!(f, "gives zero tokens"),
+                ValueError::HasInsufficientAda { expected, actual } => {
+                    write!(f, "has insufficient ada ({actual} < {expected})")
+                }
+                ValueError::DeclaredExceedsActual { declared, actual } => {
+                    write!(
+                        f,
+                        "offers value in excess of available funds ({actual} < {declared})"
+                    )
+                }
+            },
+        }
+    }
+}
+
+pub fn validate_order(
+    datum: &OrderDatum,
+    value: &Value,
+    pool: &PoolDatum,
+) -> Result<(), ValidationError> {
+    validate_order_value(datum, value).map_err(ValidationError::ValueError)?;
+    validate_order_for_pool(datum, pool).map_err(ValidationError::PoolError)?;
+    Ok(())
+}
+
+pub enum ValueError {
+    GivesZeroTokens,
+    HasInsufficientAda { expected: BigInt, actual: BigInt },
+    DeclaredExceedsActual { declared: BigInt, actual: BigInt },
+}
+
+pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), ValueError> {
+    let scoop_fee = datum.scoop_fee.clone();
+    match &datum.action {
+        Order::Strategy(_) => Ok(()),
+        Order::Swap(a, b) => {
+            let minimum_ada = BigInt::from(ADA_RIDER) + scoop_fee.clone();
+            let gives = a.amount.clone();
+            let gives_asset = AssetClass::from_pair((a.policy.clone(), a.name.clone()));
+            let gives_ada = if gives_asset == ADA_ASSET_CLASS {
+                gives.clone()
+            } else {
+                BigInt::from(0)
+            };
+            let actual_ada = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            let expected_ada = gives_ada + minimum_ada.clone();
+            if actual_ada < expected_ada {
+                return Err(ValueError::HasInsufficientAda {
+                    expected: expected_ada,
+                    actual: actual_ada,
+                });
+            }
+
+            let actual_amount_of_give_token = BigInt::from(value.get_asset_class(&gives_asset))
+                - if gives_asset == ADA_ASSET_CLASS {
+                    minimum_ada
+                } else {
+                    BigInt::from(0)
+                };
+            if actual_amount_of_give_token < BigInt::from(0) {
+                return Err(ValueError::GivesZeroTokens);
+            }
+
+            if actual_amount_of_give_token < gives {
+                // This is an error in sundaedatum, even though the smart contract appears to allow it
+                return Err(ValueError::DeclaredExceedsActual {
+                    declared: gives,
+                    actual: actual_amount_of_give_token,
+                });
+            }
+            Ok(())
+        }
+        Order::Deposit((a, b)) => {
+            let gives_a = a.amount.clone();
+            let gives_b = b.amount.clone();
+            let asset_a = AssetClass::from_pair((a.policy.clone(), a.name.clone()));
+            let asset_b = AssetClass::from_pair((b.policy.clone(), b.name.clone()));
+            let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
+            if asset_a == ADA_ASSET_CLASS {
+                let minimum = BigInt::from(ADA_RIDER) + scoop_fee.clone();
+                if actual_a < minimum {
+                    return Err(ValueError::HasInsufficientAda {
+                        expected: minimum,
+                        actual: actual_a,
+                    });
+                }
+                actual_a -= minimum;
+            }
+            let actual_b = BigInt::from(value.get_asset_class(&asset_b));
+
+            let deposits_zero_tokens =
+                actual_a == BigInt::from(0u64) && actual_b == BigInt::from(0u64);
+            if !deposits_zero_tokens {
+                return Err(ValueError::GivesZeroTokens);
+            }
+            Ok(())
+        }
+        Order::Withdrawal(datum_value) => {
+            if datum_value.amount == BigInt::from(0) {
+                return Err(ValueError::GivesZeroTokens);
+            }
+            let actual = BigInt::from(value.get_asset_class(&datum_value.asset_class()));
+            if datum_value.amount > actual {
+                return Err(ValueError::DeclaredExceedsActual {
+                    declared: datum_value.amount.clone(),
+                    actual,
+                });
+            }
+            let expected = BigInt::from(ADA_RIDER) + scoop_fee;
+            let actual = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            if actual < expected {
+                return Err(ValueError::HasInsufficientAda { expected, actual });
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub enum PoolError {
+    IdentMismatch,
+    CoinPairMismatch,
+}
+
+pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(), PoolError> {
+    if let Some(i) = &order.ident
+        && i != &pool.ident
+    {
+        return Err(PoolError::IdentMismatch);
+    }
+    match &order.action {
+        Order::Swap(a, b) => {
+            let give_coin = AssetClass::from_pair((a.policy.clone(), a.name.clone()));
+            let take_coin = AssetClass::from_pair((b.policy.clone(), b.name.clone()));
+            let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
+            let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
+            if !(matches_a_to_b || matches_b_to_a) {
+                return Err(PoolError::CoinPairMismatch);
+            }
+            Ok(())
+        }
+        Order::Deposit((a, b)) => {
+            let give_coin = AssetClass::from_pair((a.policy.clone(), a.name.clone()));
+            let take_coin = AssetClass::from_pair((b.policy.clone(), b.name.clone()));
+            let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
+            let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
+            if !(matches_a_to_b || matches_b_to_a) {
+                return Err(PoolError::CoinPairMismatch);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwapDirection {
+    AtoB,
+    BtoA,
+}
+
+// Get the marginal pool price for this swap. This figure being in agreement
+// with the pool price does not guarantee that the order will succeed; for
+// instance, swap fees and finite CPP liquidity will cause the takes to be lower
+// than expected.
+pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
+    match &order.action {
+        Order::Swap(a, b) => {
+            let gives = a.amount.clone();
+            let takes = b.amount.clone();
+            let coin_a = AssetClass::from_pair((a.policy.clone(), a.name.clone()));
+            let coin_b = AssetClass::from_pair((b.policy.clone(), b.name.clone()));
+            let mut price = gives.to_f64()? / takes.to_f64()?;
+            if takes == 0.into() {
+                price = f64::MAX;
+            }
+            if coin_a < coin_b {
+                Some((SwapDirection::AtoB, price))
+            } else {
+                Some((SwapDirection::BtoA, price))
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Destination {
     Fixed(PlutusAddress, AikenDatum),
     SelfDestination,
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub enum AikenDatum {
     NoDatum,
     DatumHash(Vec<u8>),
     InlineDatum(Vec<u8>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnyPlutusData {
     inner: PlutusData,
+}
+
+impl AnyPlutusData {
+    fn empty_cons() -> Self {
+        Self {
+            inner: PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
+            }),
+        }
+    }
 }
 
 impl AnyPlutusData {
@@ -165,19 +387,13 @@ impl AsPlutus for AnyPlutusData {
     }
 }
 
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct FixedDestination {
-//    pub address: PlutusAddress,
-//    pub datum: AikenDatum,
-//}
-
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
     pub stake_credential: Option<StakeCredential>,
 }
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Credential {
     VerificationKey(VerificationKeyHash),
     Script(ScriptHash),
@@ -186,7 +402,7 @@ pub enum Credential {
 type VerificationKeyHash = Vec<u8>;
 type ScriptHash = Vec<u8>;
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Referenced<T: AsPlutus> {
     Inline(T),
     Pointer(StakePointer),
@@ -195,13 +411,10 @@ pub enum Referenced<T: AsPlutus> {
 type PaymentCredential = Credential;
 type StakeCredential = Referenced<Credential>;
 
-#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StakePointer {
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub slot_number: BigInt,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub transaction_index: BigInt,
-    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub certificate_index: BigInt,
 }
 
@@ -231,33 +444,6 @@ pub struct StrategyExecution {
     details: Order,
     extensions: AnyPlutusData,
 }
-
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub enum PoolMintRedeemer {
-//    MintLP(Ident),
-//    CreatePool(CreatePool),
-//    BurnPool(Ident),
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct CreatePool {
-//    assets: (AssetClass, AssetClass),
-//    pool_output: BigInt,
-//    metadata_output: BigInt,
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub enum ManageRedeemer {
-//    WithdrawFees(WithdrawFees),
-//    UpdatePoolFees(BigInt),
-//}
-//
-//#[derive(AsPlutus, Debug, PartialEq)]
-//pub struct WithdrawFees {
-//    amount: BigInt,
-//    treasury_output: BigInt,
-//    pool_input: BigInt,
-//}
 
 pub fn get_pool_asset_pair(pool_policy: &[u8], v: &Value) -> Option<(AssetClass, AssetClass)> {
     let mut native_token_a = None;
@@ -291,11 +477,17 @@ pub fn get_pool_asset_pair(pool_policy: &[u8], v: &Value) -> Option<(AssetClass,
     }
 }
 
-pub fn get_pool_price(pool_policy: &[u8], v: &Value) -> Option<f64> {
+pub fn get_pool_price(pool_policy: &[u8], v: &Value, rewards: &BigInt) -> Option<f64> {
     let (coin_a, coin_b) = get_pool_asset_pair(pool_policy, v)?;
-    let quantity_a = v.get_asset_class(&coin_a);
-    let quantity_b = v.get_asset_class(&coin_b);
-    Some((quantity_a as f64) / (quantity_b as f64))
+    let mut quantity_a = BigInt::from(v.get_asset_class(&coin_a));
+    if coin_a == ADA_ASSET_CLASS {
+        if &quantity_a < rewards {
+            return None;
+        }
+        quantity_a -= rewards;
+    }
+    let quantity_b = BigInt::from(v.get_asset_class(&coin_b));
+    Some(quantity_a.to_f64()? / quantity_b.to_f64()?)
 }
 
 #[derive(Clone, Eq, PartialEq, serde::Serialize)]
@@ -322,7 +514,7 @@ mod tests {
         let bytes = hex::decode("9f4100410102ff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
         let singleton: SingletonValue = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(singleton.amount, BigInt::Int(2.into()));
+        assert_eq!(singleton.amount, BigInt::from(2));
     }
 
     #[test]
@@ -346,7 +538,7 @@ mod tests {
             hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
         assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
         assert_eq!(order.owner, Multisig::Signature(expected_signature));
-        assert_eq!(order.scoop_fee, BigInt::Int(10.into()));
+        assert_eq!(order.scoop_fee, BigInt::from(10));
         assert_eq!(
             order.destination,
             Destination::Fixed(
@@ -363,12 +555,12 @@ mod tests {
                 SingletonValue {
                     policy: vec![0],
                     name: vec![1],
-                    amount: BigInt::Int(2.into())
+                    amount: BigInt::from(2)
                 },
                 SingletonValue {
                     policy: vec![3],
                     name: vec![4],
-                    amount: BigInt::Int(5.into())
+                    amount: BigInt::from(5)
                 }
             )
         );
@@ -402,5 +594,241 @@ mod tests {
         let expected_ident =
             hex::decode("ba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c").unwrap();
         assert_eq!(pool.ident.to_bytes(), expected_ident);
+    }
+
+    fn i64_to_bigint(i: i64) -> BigInt {
+        BigInt::from(i)
+    }
+
+    struct ValidateAdaRBerrySwapTestCase {
+        scoop_fee: i64,
+        ada_offered: i64,
+        rberry_offered: i64,
+        actual_ada: i128,
+        actual_rberry: i128,
+    }
+
+    fn test_validate_ada_rberry_swap_schema(test_case: ValidateAdaRBerrySwapTestCase) -> bool {
+        let pkh = hex::decode("00").unwrap();
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let order = OrderDatum {
+            ident: None,
+            owner: Multisig::Signature(pkh),
+            scoop_fee: i64_to_bigint(test_case.scoop_fee),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                SingletonValue {
+                    policy: ADA_POLICY,
+                    name: ADA_TOKEN,
+                    amount: i64_to_bigint(test_case.ada_offered),
+                },
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    name: rberry_token.clone(),
+                    amount: i64_to_bigint(test_case.rberry_offered),
+                },
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let value = value![
+            test_case.actual_ada,
+            (&rberry_asset_class, test_case.actual_rberry)
+        ];
+        validate_order_value(&order, &value).is_ok()
+    }
+
+    struct ValidateRBerrySBerrySwapTestCase {
+        scoop_fee: i64,
+        rberry_offered: i64,
+        sberry_offered: i64,
+        actual_ada: i128,
+        actual_rberry: i128,
+        actual_sberry: i128,
+    }
+
+    fn test_validate_rberry_sberry_swap_schema(
+        test_case: ValidateRBerrySBerrySwapTestCase,
+    ) -> bool {
+        let pkh = hex::decode("00").unwrap();
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let sberry_policy = rberry_policy.clone();
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let sberry_token = vec![77, 121, 85, 83, 69];
+        let order = OrderDatum {
+            ident: None,
+            owner: Multisig::Signature(pkh),
+            scoop_fee: i64_to_bigint(test_case.scoop_fee),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    name: rberry_token.clone(),
+                    amount: i64_to_bigint(test_case.rberry_offered),
+                },
+                SingletonValue {
+                    policy: sberry_policy.clone(),
+                    name: sberry_token.clone(),
+                    amount: i64_to_bigint(test_case.sberry_offered),
+                },
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let sberry_asset_class = AssetClass::from_pair((sberry_policy, sberry_token));
+        let value = value![
+            test_case.actual_ada,
+            (&rberry_asset_class, test_case.actual_rberry),
+            (&sberry_asset_class, test_case.actual_sberry)
+        ];
+        validate_order_value(&order, &value).is_ok()
+    }
+
+    #[test]
+    fn test_validate_ada_rberry_swap() {
+        assert!(test_validate_ada_rberry_swap_schema(
+            ValidateAdaRBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                ada_offered: 1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 10_000_000,
+                actual_rberry: 1_000_000,
+            }
+        ))
+    }
+
+    // 3 ADA on the utxo is not sufficient because after deducting the 1 ADA
+    // scoop fee and the 1 ADA offered the remaining amount is 1 ADA, less than
+    // the 2 ADA rider value
+    #[test]
+    fn test_validate_ada_rberry_swap_insufficient_ada() {
+        assert!(!test_validate_ada_rberry_swap_schema(
+            ValidateAdaRBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                ada_offered: 1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 3_000_000,
+                actual_rberry: 1_000_000,
+            }
+        ))
+    }
+
+    #[test]
+    fn test_pool_price_1() {
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let pool_policy = vec![0x09];
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let protocol_fees = 3_000_000;
+        let pd = PoolDatum {
+            ident: Ident(vec![]),
+            assets: (ADA_ASSET_CLASS, rberry_asset_class.clone()),
+            circulating_lp: i64_to_bigint(0),
+            bid_fees_per_10_thousand: i64_to_bigint(0),
+            ask_fees_per_10_thousand: i64_to_bigint(0),
+            fee_manager: None,
+            market_open: i64_to_bigint(0),
+            protocol_fees: i64_to_bigint(protocol_fees),
+        };
+        let pool_value = value![103_000_000, (&rberry_asset_class, 100_000_000)];
+        let price = get_pool_price(&pool_policy, &pool_value, &BigInt::from(protocol_fees));
+        assert_eq!(price, Some(1.0));
+    }
+
+    #[test]
+    fn test_pool_price_1_10() {
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let pool_policy = vec![0x09];
+        let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
+        let protocol_fees = 3_000_000;
+        let pd = PoolDatum {
+            ident: Ident(vec![]),
+            assets: (ADA_ASSET_CLASS, rberry_asset_class.clone()),
+            circulating_lp: i64_to_bigint(0),
+            bid_fees_per_10_thousand: i64_to_bigint(0),
+            ask_fees_per_10_thousand: i64_to_bigint(0),
+            fee_manager: None,
+            market_open: i64_to_bigint(0),
+            protocol_fees: i64_to_bigint(protocol_fees),
+        };
+        let pool_value = value![103_000_000, (&rberry_asset_class, 1_000_000_000)];
+        let price = get_pool_price(&pool_policy, &pool_value, &BigInt::from(protocol_fees));
+        assert_eq!(price, Some(0.1));
+    }
+
+    #[test]
+    fn test_swap_price_a_to_b() {
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let sberry_token = vec![77, 121, 85, 83, 69];
+        let od = OrderDatum {
+            ident: Some(Ident(vec![])),
+            owner: Multisig::Signature(vec![]),
+            scoop_fee: i64_to_bigint(1_280_000),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    name: rberry_token,
+                    amount: i64_to_bigint(1_000_000),
+                },
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    name: sberry_token,
+                    amount: i64_to_bigint(10_000_000),
+                },
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let swap_price = swap_price(&od);
+        assert_eq!(swap_price, Some((SwapDirection::AtoB, 0.1)));
+    }
+
+    #[test]
+    fn test_swap_price_b_to_a() {
+        let rberry_policy = vec![
+            145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
+            129, 142, 76, 122, 197, 209, 0, 74, 22,
+        ];
+        let rberry_token = vec![77, 121, 85, 83, 68];
+        let sberry_token = vec![77, 121, 85, 83, 69];
+        let od = OrderDatum {
+            ident: Some(Ident(vec![])),
+            owner: Multisig::Signature(vec![]),
+            scoop_fee: i64_to_bigint(1_280_000),
+            destination: Destination::SelfDestination,
+            action: Order::Swap(
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    name: sberry_token,
+                    amount: i64_to_bigint(1_000_000),
+                },
+                SingletonValue {
+                    policy: rberry_policy,
+                    name: rberry_token,
+                    amount: i64_to_bigint(10_000_000),
+                },
+            ),
+            extra: AnyPlutusData::empty_cons(),
+        };
+        let swap_price = swap_price(&od);
+        assert_eq!(swap_price, Some((SwapDirection::BtoA, 0.1)));
     }
 }
