@@ -293,122 +293,101 @@ impl ChainIndex for SundaeV3Indexer {
 
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
         let tx = MultiEraTx::decode(raw_tx)?;
-        let tx_hash = tx.hash();
-        event!(Level::TRACE, "Ingesting tx: {}", hex::encode(tx_hash));
-
+        let this_tx_hash = tx.hash();
+        event!(Level::TRACE, "Ingesting tx: {}", hex::encode(this_tx_hash));
         let mut index = self.state.lock().await;
-
         for (ix, output) in tx.outputs().iter().enumerate() {
-            let tx_out = cardano_types::convert_transaction_output(output);
-            let addr = &tx_out.address;
-
-            match &tx_out.datum {
-                Datum::ParsedPool(pool_datum)
-                    if payment_part_equal(addr, &self.protocol.pool_address) =>
-                {
-                    index
-                        .pools
-                        .entry(pool_datum.ident.clone())
-                        .or_default()
-                        .insert(SundaeV3Pool {
-                            address: tx_out.address.clone(),
-                            value: tx_out.value.clone(),
-                            pool_datum: pool_datum.clone(),
+            let address = output.address()?;
+            if payment_part_equal(&address, &self.protocol.pool_address) {
+                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
+                match tx_out.datum {
+                    Datum::ParsedPool(pd) => {
+                        let pool_id = pd.ident.clone();
+                        let pool_record = SundaeV3Pool {
+                            address: tx_out.address,
+                            value: tx_out.value,
+                            pool_datum: pd,
                             slot: info.slot,
-                        });
+                        };
+                        let this_pool = index.pools.entry(pool_id).or_default();
+                        this_pool.insert(pool_record);
 
-                    event!(Level::DEBUG, "{}", hex::encode(tx_hash));
-                    return Ok(());
+                        event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
+                        return Ok(());
+                    }
+                    Datum::None | Datum::ParsedOrder(_) => {}
                 }
+            } else if payment_part_equal(&address, &self.protocol.order_address) {
+                let this_input = TransactionInput(pallas_primitives::TransactionInput {
+                    transaction_id: this_tx_hash,
+                    index: ix as u64,
+                });
+                let this_input_ref = format!("{}#{}", hex::encode(this_tx_hash), ix);
+                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
+                match tx_out.datum {
+                    Datum::ParsedOrder(ref od) => {
+                        if let Some(ref ident) = od.ident {
+                            let ident = ident.clone();
+                            if let Some(pool) = index.pools.get(&ident) {
+                                let datum = od.clone();
+                                let current_pool = pool.latest();
+                                let order_value_ok =
+                                    validate_order(&datum, &tx_out.value, &current_pool.pool_datum);
 
-                Datum::ParsedOrder(order_datum)
-                    if payment_part_equal(addr, &self.protocol.order_address) =>
-                {
-                    let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                        transaction_id: tx_hash,
-                        index: ix as u64,
-                    });
+                                let this_pool_orders =
+                                    index.orders.entry(Some(ident.clone())).or_default();
 
-                    let this_input_ref = format!("{}#{}", hex::encode(tx_hash), ix);
-                    let tx_out: TransactionOutput =
-                        cardano_types::convert_transaction_output(output);
+                                if let Err(e) = order_value_ok {
+                                    event!(
+                                        Level::DEBUG,
+                                        "Order {} was rejected: {}",
+                                        this_input_ref,
+                                        e
+                                    );
+                                    this_pool_orders.insert_unrecoverable(SundaeV3Order {
+                                        input: this_input.clone(),
+                                        output: tx_out,
+                                        datum,
+                                        slot: info.slot,
+                                        spent_slot: None,
+                                    });
 
-                    if let Some(ref ident) = order_datum.ident {
-                        let ident = ident.clone();
-                        if let Some(pool) = index.pools.get(&ident) {
-                            let current_pool = pool.latest();
-                            let order_value_ok = validate_order(
-                                order_datum,
-                                &tx_out.value,
-                                &current_pool.pool_datum,
-                            );
+                                    index.order_to_pool.insert(this_input, ident);
 
-                            let this_pool_orders =
-                                index.orders.entry(order_datum.ident.clone()).or_default();
+                                    return Ok(());
+                                }
 
-                            if let Err(e) = order_value_ok {
-                                event!(
-                                    Level::DEBUG,
-                                    "Order {} was rejected: {}",
-                                    this_input_ref,
-                                    e
-                                );
-                                this_pool_orders.insert_unrecoverable(SundaeV3Order {
+                                this_pool_orders.insert(SundaeV3Order {
                                     input: this_input.clone(),
                                     output: tx_out,
-                                    datum: order_datum.clone(),
+                                    datum,
                                     slot: info.slot,
                                     spent_slot: None,
                                 });
 
                                 index.order_to_pool.insert(this_input, ident);
 
+                                event!(Level::DEBUG, "Added order {} to index", this_input_ref);
                                 return Ok(());
+                            } else {
+                                event!(
+                                    Level::WARN,
+                                    "Order {} was listed for an unknown pool {}",
+                                    this_input_ref,
+                                    ident,
+                                );
                             }
-
-                            this_pool_orders.insert(SundaeV3Order {
-                                input: this_input.clone(),
-                                output: tx_out,
-                                datum: order_datum.clone(),
-                                slot: info.slot,
-                                spent_slot: None,
-                            });
-
-                            index.order_to_pool.insert(this_input, ident);
-
-                            event!(Level::DEBUG, "Added order {} to index", this_input_ref);
-                            return Ok(());
                         } else {
+                            // Order is free
                             event!(
                                 Level::WARN,
-                                "Order {} was listed for an unknown pool {}",
+                                "Order {} was listed for no pool",
                                 this_input_ref,
-                                ident,
-                            );
+                            )
                         }
-                    } else {
-                        // Order is free
-                        event!(
-                            Level::WARN,
-                            "Order {} was listed for no pool",
-                            this_input_ref,
-                        )
                     }
+                    Datum::None | Datum::ParsedPool(_) => {}
                 }
-                _ => {}
-            }
-        }
-
-        for tx_in in tx.inputs() {
-            let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                transaction_id: *tx_in.hash(),
-                index: tx_in.index(),
-            });
-            if let Some(pool_ident) = index.order_to_pool.get(&this_input).cloned()
-                && let Some(pool_orders) = index.orders.get_mut(&Some(pool_ident.clone()))
-            {
-                pool_orders.spend(info.slot, &this_input);
-                index.order_to_pool.remove(&this_input);
             }
         }
 
