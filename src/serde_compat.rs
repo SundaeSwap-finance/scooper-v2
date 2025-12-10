@@ -1,11 +1,14 @@
 use pallas_addresses::Address;
+use pallas_primitives::Fragment;
 use plutus_parser::BigInt;
-use serde::ser::SerializeMap;
-use serde::{Deserializer, Serialize, Serializer, de, ser::Error};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserializer, Serializer, de, ser::Error};
 
-use crate::cardano_types::AssetClass;
+use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::multisig::Multisig;
-use crate::{cardano_types::Value, sundaev3::Ident};
+use crate::sundaev3::{
+    AikenDatum, AnyPlutusData, Credential, Destination, Ident, Order, Referenced, SingletonValue,
+};
 
 struct AddressVisitor;
 
@@ -45,57 +48,213 @@ where
     serializer.serialize_str(&bech)
 }
 
-pub fn serialize_ident<S>(ident: &Ident, serializer: S) -> Result<S::Ok, S::Error>
+pub fn serialize_plutus_bigint<S>(v: &BigInt, serializer: S) -> Result<S::Ok, S::Error>
 where
-    S: Serializer,
+    S: serde::Serializer,
 {
-    let bytes = ident.to_bytes();
-    let hex = hex::encode(bytes);
-    serializer.serialize_str(&hex)
+    let val = bigint_to_i128(v).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_i128(val)
 }
 
-pub fn serialize_value<S>(value: &Value, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let outer = &value.0;
+pub fn bigint_to_i128(v: &BigInt) -> Result<i128, &'static str> {
+    match v {
+        BigInt::Int(x) => Ok(i128::from(x.0)),
 
-    let mut map = serializer.serialize_map(None)?;
+        BigInt::BigUInt(bytes) | BigInt::BigNInt(bytes) => {
+            let neg = matches!(v, BigInt::BigNInt(_));
 
-    for (policy, inner_map) in outer {
-        if policy.is_empty() {
-            for qty in inner_map.values() {
-                map.serialize_entry("lovelace", qty)?;
+            if bytes.len() > 16 {
+                return Err("BigInt out of i128 range");
             }
-            continue;
-        }
 
-        let policy_hex = hex::encode(policy);
+            let mut buf = [0u8; 16];
+            let offset = 16 - bytes.len();
+            buf[offset..].copy_from_slice(bytes);
 
-        for (token, qty) in inner_map {
-            let token_hex = hex::encode(token);
+            let mut n = i128::from_be_bytes(buf);
+            if neg {
+                n = -n;
+            }
 
-            let key = format!("{}.{}", policy_hex, token_hex);
-
-            map.serialize_entry(&key, qty)?;
+            Ok(n)
         }
     }
-
-    map.end()
 }
 
-pub fn serialize_multisig<S>(value: &Option<Multisig>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match value {
-        Some(ms) => match ms {
+impl serde::Serialize for Ident {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let hex_str = hex::encode(&**self);
+        serializer.serialize_str(&hex_str)
+    }
+}
+
+impl serde::Serialize for AnyPlutusData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let cbor = self
+            .raw()
+            .encode_fragment()
+            .map_err(serde::ser::Error::custom)?;
+
+        serializer.serialize_str(&hex::encode(cbor))
+    }
+}
+
+impl serde::Serialize for Order {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let (key, value) = match self {
+            Order::Strategy(auth) => ("Strategy", serde_json::Value::String(format!("{:?}", auth))),
+
+            Order::Swap(a, b) => (
+                "Swap",
+                serde_json::Value::Array(vec![
+                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
+                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
+                ]),
+            ),
+
+            Order::Deposit((a, b)) => (
+                "Deposit",
+                serde_json::Value::Array(vec![
+                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
+                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
+                ]),
+            ),
+
+            Order::Withdrawal(v) => (
+                "Withdrawal",
+                serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
+            ),
+
+            Order::Donation((a, b)) => (
+                "Donation",
+                serde_json::Value::Array(vec![
+                    serde_json::to_value(a).map_err(serde::ser::Error::custom)?,
+                    serde_json::to_value(b).map_err(serde::ser::Error::custom)?,
+                ]),
+            ),
+
+            Order::Record(ac) => (
+                "Record",
+                serde_json::to_value(ac).map_err(serde::ser::Error::custom)?,
+            ),
+        };
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(key, &value)?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for SingletonValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        // Convert BigInt → i128
+        let amount_i128 =
+            crate::serde_compat::bigint_to_i128(&self.amount).map_err(serde::ser::Error::custom)?;
+
+        // Format asset key
+        let key = if self.policy.is_empty() {
+            "lovelace".to_string()
+        } else {
+            format!("{}.{}", hex::encode(&self.policy), hex::encode(&self.name))
+        };
+
+        // Emit as: { "<asset>": amount }
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&key, &amount_i128)?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for AssetClass {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.policy.is_empty() {
+            return serializer.serialize_str("lovelace");
+        }
+
+        let policy_hex = hex::encode(&self.policy);
+        let name_hex = hex::encode(&self.token);
+
+        serializer.serialize_str(&format!("{}.{}", policy_hex, name_hex))
+    }
+}
+
+impl serde::Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let outer = &self.0;
+
+        // We do not know the exact number of map entries, because:
+        // lovelace occupies 1 entry, and each asset is one entry.
+        let mut map = serializer.serialize_map(None)?;
+
+        for (policy, inner) in outer {
+            if policy.is_empty() {
+                // lovelace case
+                for qty in inner.values() {
+                    map.serialize_entry("lovelace", qty)?;
+                }
+                continue;
+            }
+
+            let policy_hex = hex::encode(policy);
+
+            for (token, qty) in inner {
+                let token_hex = hex::encode(token);
+                let key = format!("{}.{}", policy_hex, token_hex);
+                map.serialize_entry(&key, qty)?;
+            }
+        }
+
+        map.end()
+    }
+}
+
+impl serde::Serialize for Multisig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
             Multisig::Signature(bytes) => serializer.serialize_str(&hex::encode(bytes)),
 
             Multisig::Script(bytes) => serializer.serialize_str(&hex::encode(bytes)),
 
-            Multisig::AllOf(list) => serializer.serialize_some(list),
-            Multisig::AnyOf(list) => serializer.serialize_some(list),
+            Multisig::AllOf(list) => {
+                let mut seq = serializer.serialize_seq(Some(list.len()))?;
+                for item in list {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+
+            Multisig::AnyOf(list) => {
+                let mut seq = serializer.serialize_seq(Some(list.len()))?;
+                for item in list {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
 
             Multisig::AtLeast(n, list) => {
                 let mut map = serializer.serialize_map(Some(2))?;
@@ -104,58 +263,77 @@ where
                 map.end()
             }
 
-            Multisig::Before(n) => serializer.serialize_newtype_variant("Multisig", 0, "before", n),
+            Multisig::Before(slot) => {
+                let n =
+                    crate::serde_compat::bigint_to_i128(slot).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&format!("before:{n}"))
+            }
 
-            Multisig::After(n) => serializer.serialize_newtype_variant("Multisig", 1, "after", n),
-        },
-
-        None => serializer.serialize_none(),
+            Multisig::After(slot) => {
+                let n =
+                    crate::serde_compat::bigint_to_i128(slot).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&format!("after:{n}"))
+            }
+        }
     }
 }
 
-pub fn serialize_assets<S>(
-    assets: &(AssetClass, AssetClass),
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    fn encode(ac: &AssetClass) -> String {
-        if ac.policy.is_empty() {
-            return "lovelace".to_string();
-        }
-        let policy = hex::encode(&ac.policy);
-        let name = hex::encode(&ac.token);
-        format!("{}.{}", policy, name)
-    }
+impl serde::Serialize for Destination {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
 
-    let arr = [encode(&assets.0), encode(&assets.1)];
-    arr.serialize(serializer)
+        match self {
+            Destination::SelfDestination => serializer.serialize_str("self"),
+
+            Destination::Fixed(addr, datum) => {
+                let payment_hex = match &addr.payment_credential {
+                    Credential::VerificationKey(vkh) => hex::encode(vkh.as_slice()),
+                    Credential::Script(sh) => hex::encode(sh.as_slice()),
+                };
+
+                let stake_hex: Option<String> = match &addr.stake_credential {
+                    Some(Referenced::Inline(Credential::VerificationKey(vkh))) => {
+                        Some(hex::encode(vkh.as_slice()))
+                    }
+                    Some(Referenced::Inline(Credential::Script(sh))) => {
+                        Some(hex::encode(sh.as_slice()))
+                    }
+                    _ => None,
+                };
+
+                let datum_hex: Option<String> = match datum {
+                    AikenDatum::NoDatum => None,
+                    AikenDatum::DatumHash(v) => Some(hex::encode(v)),
+                    AikenDatum::InlineDatum(v) => Some(hex::encode(v)),
+                };
+
+                let mut map = serializer.serialize_map(Some(2))?;
+
+                map.serialize_entry(
+                    "address",
+                    &serde_json::json!({
+                        "payment": payment_hex,
+                        "stake": stake_hex
+                    }),
+                )?;
+
+                map.serialize_entry("datum", &datum_hex)?;
+                map.end()
+            }
+        }
+    }
 }
 
-pub fn serialize_plutus_bigint<S>(v: &BigInt, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match v {
-        BigInt::Int(x) => serializer.serialize_i128(i128::from(x.0)),
-
-        BigInt::BigUInt(bytes) | BigInt::BigNInt(bytes) => {
-            let neg = matches!(v, BigInt::BigNInt(_));
-
-            if bytes.len() > 16 {
-                return Err(serde::ser::Error::custom("BigInt out of i128 range"));
-            }
-
-            let mut buf = [0u8; 16];
-            let buf_len = buf.len();
-            buf[buf_len - bytes.len()..].copy_from_slice(bytes);
-
-            let mut n = i128::from_be_bytes(buf);
-            if neg {
-                n = -n;
-            }
-            serializer.serialize_i128(n)
-        }
+impl serde::Serialize for TransactionInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let tx_id_hex = hex::encode(self.0.transaction_id.as_ref());
+        let s = format!("{}:{}", tx_id_hex, self.0.index);
+        serializer.serialize_str(&s)
     }
 }

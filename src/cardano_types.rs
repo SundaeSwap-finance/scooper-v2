@@ -10,9 +10,11 @@ use std::fmt;
 
 use plutus_parser::AsPlutus;
 
+use crate::serde_compat::serialize_address;
+use crate::sundaev3::{OrderDatum, PoolDatum};
 pub type Bytes = Vec<u8>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -81,19 +83,20 @@ impl Value {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, serde::Serialize)]
 pub enum Datum {
     None,
-    Hash(Bytes),
-    Data(Bytes),
+    ParsedOrder(OrderDatum),
+    ParsedPool(PoolDatum),
 }
 
 // Would be convenient to parameterize this by the type of the decoded datum, with
 // an 'Any' type that always succeeds at decoding and functions
 //   TransactionOutput<T> -> TransactionOutput<Any>
 //   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, serde::Serialize)]
 pub struct TransactionOutput {
+    #[serde(serialize_with = "serialize_address")]
     pub address: Address,
     pub value: Value,
     pub datum: Datum,
@@ -112,8 +115,18 @@ impl fmt::Display for TransactionInput {
 pub fn convert_datum(datum: Option<DatumOption>) -> Datum {
     match datum {
         None => Datum::None,
-        Some(DatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
-        Some(DatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
+        Some(DatumOption::Hash(h)) => Datum::None,
+        Some(DatumOption::Data(d)) => {
+            let plutus_data: PlutusData = minicbor::decode(d.raw_cbor()).unwrap();
+
+            if let Ok(order) = AsPlutus::from_plutus(plutus_data.clone()) {
+                return Datum::ParsedOrder(order);
+            }
+            if let Ok(pool) = AsPlutus::from_plutus(plutus_data) {
+                return Datum::ParsedPool(pool);
+            }
+            Datum::None
+        }
     }
 }
 

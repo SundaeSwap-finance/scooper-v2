@@ -12,7 +12,6 @@ use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
 use config::{Config, File};
-use pallas_primitives::PlutusData;
 use pallas_traverse::MultiEraTx;
 use tokio::sync::Mutex;
 
@@ -25,8 +24,7 @@ use serde::Deserialize;
 
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
-use plutus_parser::AsPlutus;
-use sundaev3::{Ident, OrderDatum, PoolDatum, SundaeV3Pool};
+use sundaev3::{Ident, SundaeV3Pool};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -86,10 +84,9 @@ enum Commands {
     },
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 struct SundaeV3Order {
     input: TransactionInput,
-    #[allow(unused)]
     output: TransactionOutput,
     slot: u64,
 }
@@ -100,6 +97,7 @@ impl PartialOrd for SundaeV3Order {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
 struct SortedVec<T> {
     contents: Vec<T>,
 }
@@ -143,6 +141,7 @@ where
     }
 }
 
+#[derive(Debug, serde::Serialize)]
 struct SundaeV3PoolOrders {
     orders: SortedVec<SundaeV3Order>,
 }
@@ -217,58 +216,55 @@ impl ChainIndex for SundaeV3Indexer {
 
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
         let tx = MultiEraTx::decode(raw_tx)?;
-        let this_tx_hash = tx.hash();
+        let tx_hash = tx.hash();
         let mut index = self.state.lock().await;
+
         for (ix, output) in tx.outputs().iter().enumerate() {
-            let address = output.address()?;
-            if payment_part_equal(&address, &self.protocol.pool_address) {
-                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
-                match tx_out.datum {
-                    Datum::Data(ref inline) => {
-                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                        let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
-                        if let Ok(pd) = pd {
-                            let pool_id = pd.ident.clone();
-                            let pool_record = SundaeV3Pool {
-                                address: tx_out.address,
-                                value: tx_out.value,
-                                pool_datum: pd,
-                                slot: info.slot,
-                            };
-                            let this_pool = index.pools.entry(pool_id).or_default();
-                            this_pool.insert(pool_record);
+            let tx_out = cardano_types::convert_transaction_output(output);
+            let addr = &tx_out.address;
 
-                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            return Ok(());
-                        }
-                    }
-                    Datum::None | Datum::Hash(_) => {}
-                }
-            } else if payment_part_equal(&address, &self.protocol.order_address) {
-                let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                    transaction_id: this_tx_hash,
-                    index: ix as u64,
-                });
-                let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
-                match tx_out.datum {
-                    Datum::Data(ref inline) => {
-                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                        let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
-                        if let Ok(od) = od {
-                            let this_pool_orders =
-                                index.orders.entry(od.ident.clone()).or_default();
-                            this_pool_orders.insert(SundaeV3Order {
-                                input: this_input,
-                                output: tx_out,
-                                slot: info.slot,
-                            });
+            match &tx_out.datum {
+                Datum::ParsedPool(pool_datum)
+                    if payment_part_equal(addr, &self.protocol.pool_address) =>
+                {
+                    index
+                        .pools
+                        .entry(pool_datum.ident.clone())
+                        .or_default()
+                        .insert(SundaeV3Pool {
+                            address: tx_out.address.clone(),
+                            value: tx_out.value.clone(),
+                            pool_datum: pool_datum.clone(),
+                            slot: info.slot,
+                        });
 
-                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            return Ok(());
-                        }
-                    }
-                    Datum::None | Datum::Hash(_) => {}
+                    event!(Level::DEBUG, "{}", hex::encode(tx_hash));
+                    return Ok(());
                 }
+
+                Datum::ParsedOrder(order_datum)
+                    if payment_part_equal(addr, &self.protocol.order_address) =>
+                {
+                    let input = TransactionInput(pallas_primitives::TransactionInput {
+                        transaction_id: tx_hash,
+                        index: ix as u64,
+                    });
+
+                    index
+                        .orders
+                        .entry(order_datum.ident.clone())
+                        .or_default()
+                        .insert(SundaeV3Order {
+                            input,
+                            output: tx_out,
+                            slot: info.slot,
+                        });
+
+                    event!(Level::DEBUG, "{}", hex::encode(tx_hash));
+                    return Ok(());
+                }
+
+                _ => {}
             }
         }
         Ok(())
@@ -347,6 +343,30 @@ impl AdminServer {
                             hex::encode(ident.to_bytes()),
                             serde_json::to_value(latest).unwrap(),
                         );
+                    }
+                }
+
+                serde_json::to_string_pretty(&json_map).unwrap()
+            }
+            "/orders" => {
+                let index_lock = self.index.lock().await;
+
+                let mut json_map = serde_json::Map::new();
+                for (ident, order) in &index_lock.orders {
+                    tracing::info!("orders: {:?}", order);
+                    let hex = match ident.as_ref() {
+                        Some(id) => hex::encode(id.to_bytes()),
+                        None => "null".to_string(),
+                    };
+
+                    match serde_json::to_value(order) {
+                        Ok(val) => {
+                            json_map.insert(hex, val);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to serialize order {:?}: {}", ident, e);
+                            continue;
+                        }
                     }
                 }
 
@@ -495,6 +515,8 @@ mod tests {
     use acropolis_common::{BlockIntent, BlockStatus, Era, Point};
     use pallas_codec::utils::Int;
     use pallas_traverse::MultiEraBlock;
+
+    use crate::sundaev3::PoolDatum;
 
     use super::*;
 

@@ -6,10 +6,7 @@ use std::fmt;
 
 use crate::cardano_types::{ADA_ASSET_CLASS, AssetClass, Value};
 use crate::multisig::Multisig;
-use crate::serde_compat::{
-    serialize_address, serialize_assets, serialize_ident, serialize_multisig,
-    serialize_plutus_bigint, serialize_value,
-};
+use crate::serde_compat::{serialize_address, serialize_plutus_bigint};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -48,11 +45,9 @@ impl AsPlutus for Ident {
     }
 }
 
-#[derive(AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolDatum {
-    #[serde(serialize_with = "serialize_ident")]
     pub ident: Ident,
-    #[serde(serialize_with = "serialize_assets")]
     pub assets: (AssetClass, AssetClass),
     #[serde(serialize_with = "serialize_plutus_bigint")]
     pub circulating_lp: BigInt,
@@ -60,7 +55,6 @@ pub struct PoolDatum {
     pub bid_fees_per_10_thousand: BigInt,
     #[serde(serialize_with = "serialize_plutus_bigint")]
     pub ask_fees_per_10_thousand: BigInt,
-    #[serde(serialize_with = "serialize_multisig")]
     pub fee_manager: Option<Multisig>,
     #[serde(serialize_with = "serialize_plutus_bigint")]
     pub market_open: BigInt,
@@ -104,15 +98,20 @@ pub struct SignedStrategyExecution {
     signature: Option<Vec<u8>>,
 }
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub enum StrategyAuthorization {
     Signature(Vec<u8>),
     Script(Vec<u8>),
 }
 
-pub type SingletonValue = (Vec<u8>, Vec<u8>, BigInt);
+#[derive(AsPlutus, Debug, Clone, PartialEq, Eq)]
+pub struct SingletonValue {
+    pub policy: Vec<u8>,
+    pub name: Vec<u8>,
+    pub amount: BigInt,
+}
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq)]
 pub enum Order {
     Strategy(StrategyAuthorization),
     Swap(SingletonValue, SingletonValue),
@@ -122,7 +121,7 @@ pub enum Order {
     Record(AssetClass),
 }
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub struct OrderDatum {
     pub ident: Option<Ident>,
     pub owner: Multisig,
@@ -132,22 +131,28 @@ pub struct OrderDatum {
     pub extra: AnyPlutusData,
 }
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq)]
 pub enum Destination {
     Fixed(PlutusAddress, AikenDatum),
     SelfDestination,
 }
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub enum AikenDatum {
     NoDatum,
     DatumHash(Vec<u8>),
     InlineDatum(Vec<u8>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct AnyPlutusData {
     inner: PlutusData,
+}
+
+impl AnyPlutusData {
+    pub fn raw(&self) -> &PlutusData {
+        &self.inner
+    }
 }
 
 impl AsPlutus for AnyPlutusData {
@@ -166,13 +171,13 @@ impl AsPlutus for AnyPlutusData {
 //    pub datum: AikenDatum,
 //}
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
     pub stake_credential: Option<StakeCredential>,
 }
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub enum Credential {
     VerificationKey(VerificationKeyHash),
     Script(ScriptHash),
@@ -181,7 +186,7 @@ pub enum Credential {
 type VerificationKeyHash = Vec<u8>;
 type ScriptHash = Vec<u8>;
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub enum Referenced<T: AsPlutus> {
     Inline(T),
     Pointer(StakePointer),
@@ -190,10 +195,13 @@ pub enum Referenced<T: AsPlutus> {
 type PaymentCredential = Credential;
 type StakeCredential = Referenced<Credential>;
 
-#[derive(AsPlutus, Debug, PartialEq)]
+#[derive(AsPlutus, Eq, Debug, PartialEq, serde::Serialize)]
 pub struct StakePointer {
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub slot_number: BigInt,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub transaction_index: BigInt,
+    #[serde(serialize_with = "serialize_plutus_bigint")]
     pub certificate_index: BigInt,
 }
 
@@ -294,7 +302,6 @@ pub fn get_pool_price(pool_policy: &[u8], v: &Value) -> Option<f64> {
 pub struct SundaeV3Pool {
     #[serde(serialize_with = "serialize_address")]
     pub address: pallas_addresses::Address,
-    #[serde(serialize_with = "serialize_value")]
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub slot: u64,
@@ -315,7 +322,7 @@ mod tests {
         let bytes = hex::decode("9f4100410102ff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
         let singleton: SingletonValue = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(singleton.2, BigInt::Int(2.into()));
+        assert_eq!(singleton.amount, BigInt::Int(2.into()));
     }
 
     #[test]
@@ -353,8 +360,16 @@ mod tests {
         assert_eq!(
             order.action,
             Order::Swap(
-                (vec![0], vec![1], BigInt::Int(2.into()),),
-                (vec![3], vec![4], BigInt::Int(5.into()),)
+                SingletonValue {
+                    policy: vec![0],
+                    name: vec![1],
+                    amount: BigInt::Int(2.into())
+                },
+                SingletonValue {
+                    policy: vec![3],
+                    name: vec![4],
+                    amount: BigInt::Int(5.into())
+                }
             )
         );
         assert_eq!(
