@@ -1,8 +1,10 @@
 [package]
 name = "scooper-v2"
+description = "Server for Sundae Scooper"
 version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/rrruko/scooper-v2"
+publish = false
 
 [dependencies]
 acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "1fa60a8", package = "acropolis_common" }
