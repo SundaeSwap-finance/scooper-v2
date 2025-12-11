@@ -20,6 +20,7 @@ mod bigint;
 mod cardano_types;
 mod historical_state;
 mod multisig;
+mod scooper;
 mod serde_compat;
 mod sundaev3;
 
@@ -27,9 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use cardano_types::TransactionInput;
 use pallas_addresses::Address;
-use sundaev3::{
-    Ident, OrderDatum, PoolDatum, SwapDirection, get_pool_price, swap_price, validate_order,
-};
+use sundaev3::{Ident, validate_order};
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -40,7 +39,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::TcpListener;
 
-use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer};
+use crate::scooper::Scooper;
+use crate::sundaev3::{
+    PoolError, SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update, ValidationError,
+};
 
 #[derive(Clone, Deserialize)]
 struct SundaeV3Protocol {
@@ -135,33 +137,6 @@ struct OrderUnrecoverable<'a> {
     reason: String,
 }
 
-fn estimate_whether_in_range(
-    policy: &[u8],
-    od: &OrderDatum,
-    pd: &PoolDatum,
-    pool_value: &cardano_types::Value,
-) -> Result<(), (f64, f64)> {
-    let rewards = &pd.protocol_fees;
-    let pool_price = get_pool_price(policy, pool_value, rewards).unwrap();
-    let swap_price = swap_price(od).unwrap();
-    match swap_price {
-        (SwapDirection::AtoB, swap_price) => {
-            if pool_price <= swap_price {
-                Ok(())
-            } else {
-                Err((swap_price, pool_price))
-            }
-        }
-        (SwapDirection::BtoA, swap_price) => {
-            if pool_price >= (1.0 / swap_price) {
-                Ok(())
-            } else {
-                Err((1.0 / swap_price, pool_price))
-            }
-        }
-    }
-}
-
 impl AdminServer {
     async fn do_call(&self, req: Request<IncomingBody>) -> String {
         if let Some(pool_id) = req.uri().path().strip_prefix("/pool/") {
@@ -184,20 +159,28 @@ impl AdminServer {
                 if order.datum.ident.as_ref() != Some(&ident) {
                     continue;
                 }
-                if let Err(err) =
-                    validate_order(&order.datum, &order.output.value, &pool.pool_datum)
-                {
-                    response.unrecoverable.push(OrderUnrecoverable {
-                        order: &order.input,
-                        reason: err.to_string(),
-                    });
-                } else if let Err(reason) =
-                    estimate_whether_in_range(policy, &order.datum, &pool.pool_datum, &pool.value)
-                {
-                    response.out_of_range.push(OrderOutOfRange {
-                        order: &order.input,
-                        reason,
-                    });
+                if let Err(err) = validate_order(
+                    &order.datum,
+                    &order.output.value,
+                    &pool.pool_datum,
+                    &pool.value,
+                    policy,
+                ) {
+                    if let ValidationError::PoolError(PoolError::OutOfRange(
+                        swap_price,
+                        pool_price,
+                    )) = err
+                    {
+                        response.out_of_range.push(OrderOutOfRange {
+                            order: &order.input,
+                            reason: (swap_price, pool_price),
+                        });
+                    } else {
+                        response.unrecoverable.push(OrderUnrecoverable {
+                            order: &order.input,
+                            reason: err.to_string(),
+                        });
+                    }
                 } else {
                     response.valid.push(&order.input);
                 }
@@ -281,22 +264,32 @@ async fn main() {
 
     const ROLLBACK_LIMIT: usize = 2160;
     let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new(ROLLBACK_LIMIT)));
+    let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
         index.clone(),
         kill_tx.clone(),
+        broadcaster.clone(),
         scooper_config_file,
         protocol.clone(),
         default_start,
     ));
+    let scooper_handle = tokio::spawn(
+        Scooper::new(
+            broadcaster.subscribe(),
+            protocol.get_pool_script_hash().unwrap(),
+        )
+        .run(),
+    );
     let admin_handle = tokio::spawn(admin_server(index.clone(), kill_tx.clone(), protocol));
 
-    tokio::try_join!(manager_handle, admin_handle).unwrap();
+    tokio::try_join!(manager_handle, scooper_handle, admin_handle).unwrap();
 }
 
 async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     kill_tx: tokio::sync::broadcast::Sender<()>,
+    broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
     scooper_config_file: String,
     protocol: SundaeV3Protocol,
     default_start: Point,
@@ -307,6 +300,7 @@ async fn manager_loop(
         let scooper_config_file = scooper_config_file.clone();
         let protocol = protocol.clone();
         let default_start = default_start.clone();
+        let broadcaster = broadcaster.clone();
 
         // Run the Acropolis instance inside isolated runtime so all modules are killed on restart
         let handle = std::thread::spawn(move || {
@@ -334,7 +328,7 @@ async fn manager_loop(
                 let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
                 process.register(indexer.clone());
 
-                let v3_index = SundaeV3Indexer::new(index, protocol);
+                let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
 
                 indexer
                     .add_index(v3_index, default_start, false)

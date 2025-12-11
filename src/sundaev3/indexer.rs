@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use pallas_addresses::Address;
 use pallas_traverse::MultiEraTx;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{trace, warn};
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
     sundaev3::{Ident, SundaeV3Order, SundaeV3Pool},
 };
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SundaeV3State {
     pub pools: BTreeMap<Ident, Arc<SundaeV3Pool>>,
     pub orders: Vec<Arc<SundaeV3Order>>,
@@ -27,14 +27,36 @@ pub struct SundaeV3State {
 
 pub type SundaeV3HistoricalState = HistoricalState<SundaeV3State>;
 
+#[derive(Clone, Debug, Default)]
+pub struct SundaeV3Update {
+    pub slot: u64,
+    pub tip_slot: Option<u64>,
+    pub state: SundaeV3State,
+}
+impl SundaeV3Update {
+    #[allow(unused)]
+    pub fn is_at_tip(&self) -> bool {
+        self.tip_slot.is_some_and(|s| s <= self.slot)
+    }
+}
+
 pub struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3HistoricalState>>,
+    broadcaster: watch::Sender<SundaeV3Update>,
     protocol: SundaeV3Protocol,
 }
 
 impl SundaeV3Indexer {
-    pub fn new(state: Arc<Mutex<SundaeV3HistoricalState>>, protocol: SundaeV3Protocol) -> Self {
-        Self { state, protocol }
+    pub fn new(
+        state: Arc<Mutex<SundaeV3HistoricalState>>,
+        broadcaster: watch::Sender<SundaeV3Update>,
+        protocol: SundaeV3Protocol,
+    ) -> Self {
+        Self {
+            state,
+            broadcaster,
+            protocol,
+        }
     }
 }
 
@@ -51,6 +73,7 @@ impl ChainIndex for SundaeV3Indexer {
         let mut history = self.state.lock().await;
 
         let state = history.update_slot(info.slot)?;
+        let mut changed = false;
 
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
@@ -70,6 +93,7 @@ impl ChainIndex for SundaeV3Indexer {
                         slot: info.slot,
                     };
                     state.pools.insert(pool_id, Arc::new(pool_record));
+                    changed = true;
                 }
             } else if payment_part_equal(&address, &self.protocol.order_address) {
                 let this_input = TransactionInput(pallas_primitives::TransactionInput {
@@ -86,6 +110,7 @@ impl ChainIndex for SundaeV3Indexer {
                         slot: info.slot,
                     };
                     state.orders.push(Arc::new(order));
+                    changed = true;
                 }
             }
         }
@@ -100,12 +125,28 @@ impl ChainIndex for SundaeV3Indexer {
                 })
             })
             .collect::<BTreeSet<_>>();
+        let old_pool_count = state.pools.len();
         state
             .pools
             .retain(|_, pool| !spent_inputs.contains(&pool.input));
+        if state.pools.len() != old_pool_count {
+            changed = true;
+        }
+        let old_order_count = state.orders.len();
         state
             .orders
             .retain(|order| !spent_inputs.contains(&order.input));
+        if state.orders.len() != old_order_count {
+            changed = true;
+        }
+
+        if changed {
+            self.broadcaster.send_replace(SundaeV3Update {
+                slot: info.slot,
+                tip_slot: info.tip_slot,
+                state: state.clone(),
+            });
+        }
 
         Ok(())
     }
@@ -175,10 +216,7 @@ mod tests {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new(2160)));
         let protocol_file = fs::File::open("testdata/protocol").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
-        let mut indexer = SundaeV3Indexer {
-            state: state.clone(),
-            protocol,
-        };
+        let mut indexer = SundaeV3Indexer::new(state.clone(), watch::Sender::default(), protocol);
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
         let ada_policy: Vec<u8> = vec![];
@@ -212,10 +250,7 @@ mod tests {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new(2160)));
         let protocol_file = fs::File::open("testdata/protocol").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
-        let mut indexer = SundaeV3Indexer {
-            state: state.clone(),
-            protocol,
-        };
+        let mut indexer = SundaeV3Indexer::new(state.clone(), watch::Sender::default(), protocol);
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
         let pool_id = Ident::new(

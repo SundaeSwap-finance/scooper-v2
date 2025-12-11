@@ -397,7 +397,7 @@ pub struct StrategyExecution {
     extensions: AnyPlutusData,
 }
 
-#[derive(Clone, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV3Pool {
     pub input: TransactionInput,
     #[serde(serialize_with = "serialize_address")]
@@ -413,7 +413,7 @@ impl PartialOrd for SundaeV3Pool {
     }
 }
 
-#[derive(PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV3Order {
     pub input: TransactionInput,
     pub output: TransactionOutput,
