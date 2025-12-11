@@ -62,10 +62,10 @@ pub enum SwapDirection {
 pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
     match &order.action {
         Order::Swap(a, b) => {
-            let gives = a.2.clone();
-            let takes = b.2.clone();
-            let coin_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let coin_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
+            let gives = a.amount.clone();
+            let takes = b.amount.clone();
+            let coin_a = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
+            let coin_b = AssetClass::from_pair((b.policy.clone(), b.token.clone()));
             let mut price = gives.to_f64()? / takes.to_f64()?;
             if takes == 0.into() {
                 price = f64::MAX;
@@ -84,7 +84,7 @@ pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
 mod tests {
     use crate::{
         multisig::Multisig,
-        sundaev3::{AnyPlutusData, Destination, Ident},
+        sundaev3::{AnyPlutusData, Destination, Ident, SingletonValue},
         value,
     };
 
@@ -138,12 +138,16 @@ mod tests {
             scoop_fee: i64_to_bigint(1_280_000),
             destination: Destination::SelfDestination,
             action: Order::Swap(
-                (
-                    rberry_policy.clone(),
-                    rberry_token,
-                    i64_to_bigint(1_000_000),
-                ),
-                (rberry_policy, sberry_token, i64_to_bigint(10_000_000)),
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    token: rberry_token,
+                    amount: i64_to_bigint(1_000_000),
+                },
+                SingletonValue {
+                    policy: rberry_policy,
+                    token: sberry_token,
+                    amount: i64_to_bigint(10_000_000),
+                },
             ),
             extra: AnyPlutusData::empty_cons(),
         };
@@ -165,12 +169,16 @@ mod tests {
             scoop_fee: i64_to_bigint(1_280_000),
             destination: Destination::SelfDestination,
             action: Order::Swap(
-                (
-                    rberry_policy.clone(),
-                    sberry_token,
-                    i64_to_bigint(1_000_000),
-                ),
-                (rberry_policy, rberry_token, i64_to_bigint(10_000_000)),
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    token: sberry_token,
+                    amount: i64_to_bigint(1_000_000),
+                },
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    token: rberry_token,
+                    amount: i64_to_bigint(10_000_000),
+                },
             ),
             extra: AnyPlutusData::empty_cons(),
         };

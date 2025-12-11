@@ -1,5 +1,5 @@
 use pallas_addresses::Address;
-use serde::{Deserializer, de};
+use serde::{Deserializer, Serializer, de, ser::Error};
 
 struct AddressVisitor;
 
@@ -23,4 +23,18 @@ where
     D: Deserializer<'de>,
 {
     deserializer.deserialize_str(AddressVisitor)
+}
+
+pub fn serialize_address<S>(
+    addr: &pallas_addresses::Address,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let bech = addr
+        .to_bech32()
+        .map_err(|e| S::Error::custom(e.to_string()))?;
+
+    serializer.serialize_str(&bech)
 }

@@ -127,6 +127,18 @@ impl std::ops::MulAssign for BigInt {
     }
 }
 
+impl serde::Serialize for BigInt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if let Ok(n) = self.0.clone().try_into() as Result<i128, _> {
+            return serializer.serialize_i128(n);
+        }
+        Err(serde::ser::Error::custom("BigInt out of i128 range"))
+    }
+}
+
 impl AsPlutus for BigInt {
     fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
         let b: pallas_primitives::BigInt = AsPlutus::from_plutus(data)?;

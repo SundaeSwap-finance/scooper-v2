@@ -1,12 +1,15 @@
 #![allow(unused)]
 
-use pallas_primitives::PlutusData;
+use pallas_primitives::{Fragment, PlutusData};
 use plutus_parser::AsPlutus;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::bigint::BigInt;
 use crate::cardano_types::{AssetClass, TransactionInput, TransactionOutput, Value};
 use crate::multisig::Multisig;
+use crate::serde_compat::serialize_address;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -18,6 +21,16 @@ impl Ident {
 
     pub fn to_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl serde::Serialize for Ident {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let hex_str = hex::encode(&**self);
+        serializer.serialize_str(&hex_str)
     }
 }
 
@@ -45,7 +58,7 @@ impl AsPlutus for Ident {
     }
 }
 
-#[derive(AsPlutus, Clone, PartialEq, Eq)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolDatum {
     pub ident: Ident,
     pub assets: (AssetClass, AssetClass),
@@ -93,15 +106,76 @@ pub struct SignedStrategyExecution {
     signature: Option<Vec<u8>>,
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum StrategyAuthorization {
     Signature(Vec<u8>),
     Script(Vec<u8>),
 }
 
-pub type SingletonValue = (Vec<u8>, Vec<u8>, BigInt);
+impl Serialize for StrategyAuthorization {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            StrategyAuthorization::Signature(bytes) => {
+                let hex = hex::encode(bytes);
+                let mut st = serializer.serialize_struct("StrategyAuthorization", 1)?;
+                st.serialize_field("Signature", &hex)?;
+                st.end()
+            }
+            StrategyAuthorization::Script(bytes) => {
+                let hex = hex::encode(bytes);
+                let mut st = serializer.serialize_struct("StrategyAuthorization", 1)?;
+                st.serialize_field("Script", &hex)?;
+                st.end()
+            }
+        }
+    }
+}
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SingletonValue {
+    pub policy: Vec<u8>,
+    pub token: Vec<u8>,
+    pub amount: BigInt,
+}
+
+impl AsPlutus for SingletonValue {
+    fn from_plutus(pd: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let (policy, token, amount): (Vec<u8>, Vec<u8>, BigInt) = AsPlutus::from_plutus(pd)?;
+        Ok(Self {
+            policy,
+            token,
+            amount,
+        })
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        (self.policy, self.token, self.amount).to_plutus()
+    }
+}
+
+impl serde::Serialize for SingletonValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let key = if self.policy.is_empty() {
+            "lovelace".to_string()
+        } else {
+            format!("{}.{}", hex::encode(&self.policy), hex::encode(&self.token))
+        };
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&key, &self.amount)?;
+        map.end()
+    }
+}
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Order {
     Strategy(StrategyAuthorization),
     Swap(SingletonValue, SingletonValue),
@@ -111,7 +185,46 @@ pub enum Order {
     Record(AssetClass),
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+impl serde::Serialize for Order {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+
+        match self {
+            Order::Strategy(auth) => {
+                map.serialize_entry("Strategy", auth)?;
+            }
+
+            Order::Swap(a, b) => {
+                map.serialize_entry("Swap", &(a, b))?;
+            }
+
+            Order::Deposit((a, b)) => {
+                map.serialize_entry("Deposit", &(a, b))?;
+            }
+
+            Order::Withdrawal(v) => {
+                map.serialize_entry("Withdrawal", v)?;
+            }
+
+            Order::Donation((a, b)) => {
+                map.serialize_entry("Donation", &(a, b))?;
+            }
+
+            Order::Record(asset_class) => {
+                map.serialize_entry("Record", asset_class)?;
+            }
+        };
+
+        map.end()
+    }
+}
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OrderDatum {
     pub ident: Option<Ident>,
     pub owner: Multisig,
@@ -121,25 +234,90 @@ pub struct OrderDatum {
     pub extra: AnyPlutusData,
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Destination {
     Fixed(PlutusAddress, AikenDatum),
     SelfDestination,
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+impl serde::Serialize for Destination {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        match self {
+            Destination::SelfDestination => serializer.serialize_str("self"),
+
+            Destination::Fixed(addr, datum) => {
+                let payment_hex = match &addr.payment_credential {
+                    Credential::VerificationKey(vkh) => hex::encode(vkh.as_slice()),
+                    Credential::Script(sh) => hex::encode(sh.as_slice()),
+                };
+
+                let stake_hex: Option<String> = match &addr.stake_credential {
+                    Some(Referenced::Inline(Credential::VerificationKey(vkh))) => {
+                        Some(hex::encode(vkh.as_slice()))
+                    }
+                    Some(Referenced::Inline(Credential::Script(sh))) => {
+                        Some(hex::encode(sh.as_slice()))
+                    }
+                    _ => None,
+                };
+
+                let datum_hex: Option<String> = match datum {
+                    AikenDatum::NoDatum => None,
+                    AikenDatum::DatumHash(v) => Some(hex::encode(v)),
+                    AikenDatum::InlineDatum(v) => Some(hex::encode(v)),
+                };
+
+                let mut map = serializer.serialize_map(Some(2))?;
+
+                map.serialize_entry(
+                    "address",
+                    &serde_json::json!({
+                        "payment": payment_hex,
+                        "stake": stake_hex
+                    }),
+                )?;
+
+                map.serialize_entry("datum", &datum_hex)?;
+                map.end()
+            }
+        }
+    }
+}
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum AikenDatum {
     NoDatum,
     DatumHash(Vec<u8>),
     InlineDatum(Vec<u8>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnyPlutusData {
     inner: PlutusData,
 }
 
+impl serde::Serialize for AnyPlutusData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let cbor = self.inner();
+        let cbor = cbor.encode_fragment().map_err(serde::ser::Error::custom)?;
+
+        serializer.serialize_str(&hex::encode(cbor))
+    }
+}
+
 impl AnyPlutusData {
+    pub fn inner(&self) -> &PlutusData {
+        &self.inner
+    }
+
     pub fn empty_cons() -> Self {
         Self {
             inner: PlutusData::Constr(pallas_primitives::Constr {
@@ -161,13 +339,13 @@ impl AsPlutus for AnyPlutusData {
     }
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
     pub stake_credential: Option<StakeCredential>,
 }
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Credential {
     VerificationKey(VerificationKeyHash),
     Script(ScriptHash),
@@ -176,7 +354,7 @@ pub enum Credential {
 type VerificationKeyHash = Vec<u8>;
 type ScriptHash = Vec<u8>;
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Referenced<T: AsPlutus> {
     Inline(T),
     Pointer(StakePointer),
@@ -185,7 +363,7 @@ pub enum Referenced<T: AsPlutus> {
 type PaymentCredential = Credential;
 type StakeCredential = Referenced<Credential>;
 
-#[derive(AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub struct StakePointer {
     pub slot_number: BigInt,
     pub transaction_index: BigInt,
@@ -219,8 +397,9 @@ pub struct StrategyExecution {
     extensions: AnyPlutusData,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV3Pool {
+    #[serde(serialize_with = "serialize_address")]
     pub address: pallas_addresses::Address,
     pub value: Value,
     pub pool_datum: PoolDatum,
@@ -252,7 +431,7 @@ mod tests {
         let bytes = hex::decode("9f4100410102ff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
         let singleton: SingletonValue = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(singleton.2, BigInt::from(2));
+        assert_eq!(singleton.amount, BigInt::from(2));
     }
 
     #[test]
@@ -263,8 +442,16 @@ mod tests {
         assert_eq!(
             order,
             Order::Swap(
-                (vec![0x00], vec![0x01], BigInt::from(2)),
-                (vec![0x03], vec![0x04], BigInt::from(5))
+                SingletonValue {
+                    policy: vec![0x00],
+                    token: vec![0x01],
+                    amount: BigInt::from(2),
+                },
+                SingletonValue {
+                    policy: vec![0x03],
+                    token: vec![0x04],
+                    amount: BigInt::from(5),
+                }
             )
         );
     }
@@ -297,8 +484,16 @@ mod tests {
         assert_eq!(
             order.action,
             Order::Swap(
-                (vec![0], vec![1], BigInt::from(2)),
-                (vec![3], vec![4], BigInt::from(5))
+                SingletonValue {
+                    policy: vec![0],
+                    token: vec![1],
+                    amount: BigInt::from(2),
+                },
+                SingletonValue {
+                    policy: vec![3],
+                    token: vec![4],
+                    amount: BigInt::from(5),
+                }
             )
         );
         assert_eq!(

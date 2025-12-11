@@ -4,15 +4,19 @@ use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, NativeScript};
 use pallas_primitives::{PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use plutus_parser::AsPlutus;
 
+use crate::serde_compat::serialize_address;
+use crate::sundaev3::{OrderDatum, PoolDatum};
 pub type Bytes = Vec<u8>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -32,6 +36,22 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
+}
+
+impl serde::Serialize for AssetClass {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.policy.is_empty() {
+            return serializer.serialize_str("lovelace");
+        }
+
+        let policy_hex = hex::encode(&self.policy);
+        let name_hex = hex::encode(&self.token);
+
+        serializer.serialize_str(&format!("{}.{}", policy_hex, name_hex))
+    }
 }
 
 impl AsPlutus for AssetClass {
@@ -115,19 +135,65 @@ impl Value {
     }
 }
 
+impl serde::Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let outer = &self.0;
+
+        let mut map = serializer.serialize_map(None)?;
+
+        for (policy, inner) in outer {
+            if policy.is_empty() {
+                for qty in inner.values() {
+                    map.serialize_entry("lovelace", qty)?;
+                }
+                continue;
+            }
+
+            let policy_hex = hex::encode(policy);
+
+            for (token, qty) in inner {
+                let token_hex = hex::encode(token);
+                let key = format!("{}.{}", policy_hex, token_hex);
+                map.serialize_entry(&key, qty)?;
+            }
+        }
+
+        map.end()
+    }
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum Datum {
     None,
-    Hash(Bytes),
-    Data(Bytes),
+    ParsedOrder(OrderDatum),
+    ParsedPool(PoolDatum),
+}
+
+impl Serialize for Datum {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Datum::None => serializer.serialize_none(),
+
+            Datum::ParsedOrder(od) => od.serialize(serializer),
+
+            Datum::ParsedPool(pd) => pd.serialize(serializer),
+        }
+    }
 }
 
 // Would be convenient to parameterize this by the type of the decoded datum, with
 // an 'Any' type that always succeeds at decoding and functions
 //   TransactionOutput<T> -> TransactionOutput<Any>
 //   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, serde::Serialize)]
 pub struct TransactionOutput {
+    #[serde(serialize_with = "serialize_address")]
     pub address: Address,
     pub value: Value,
     pub datum: Datum,
@@ -155,8 +221,18 @@ impl fmt::Display for TransactionInput {
 pub fn convert_datum(datum: Option<DatumOption>) -> Datum {
     match datum {
         None => Datum::None,
-        Some(DatumOption::Hash(h)) => Datum::Hash(h.to_vec()),
-        Some(DatumOption::Data(d)) => Datum::Data(d.unwrap().raw_cbor().to_vec()),
+        Some(DatumOption::Hash(h)) => Datum::None,
+        Some(DatumOption::Data(d)) => {
+            let plutus_data: PlutusData = minicbor::decode(d.raw_cbor()).unwrap();
+
+            if let Ok(order) = AsPlutus::from_plutus(plutus_data.clone()) {
+                return Datum::ParsedOrder(order);
+            }
+            if let Ok(pool) = AsPlutus::from_plutus(plutus_data) {
+                return Datum::ParsedPool(pool);
+            }
+            Datum::None
+        }
     }
 }
 

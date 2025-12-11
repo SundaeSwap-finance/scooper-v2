@@ -12,15 +12,14 @@ use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
 use config::{Config, File};
-use pallas_primitives::PlutusData;
 use pallas_traverse::MultiEraTx;
+use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tracing::{Level, event, warn};
-
 use std::sync::Arc;
+use tracing::{Level, event, warn};
 
 mod bigint;
 mod cardano_types;
@@ -28,11 +27,10 @@ mod multisig;
 mod serde_compat;
 mod sundaev3;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use cardano_types::{Datum, TransactionInput, TransactionOutput};
 use pallas_addresses::Address;
-use plutus_parser::AsPlutus;
 use sundaev3::{
     Ident, OrderDatum, PoolDatum, SundaeV3Pool, SwapDirection, get_pool_price, swap_price,
     validate_order,
@@ -100,10 +98,9 @@ enum Commands {
     },
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 struct SundaeV3Order {
     input: TransactionInput,
-    #[allow(unused)]
     output: TransactionOutput,
     datum: OrderDatum,
     slot: u64,
@@ -116,6 +113,7 @@ impl PartialOrd for SundaeV3Order {
     }
 }
 
+#[derive(Debug)]
 struct SortedVec<T> {
     contents: Vec<T>,
 }
@@ -150,6 +148,19 @@ where
     }
 }
 
+impl<T: Serialize> Serialize for SortedVec<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.contents.len()))?;
+        for item in &self.contents {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
+    }
+}
+
 impl<T> Default for SortedVec<T>
 where
     T: PartialOrd,
@@ -159,6 +170,7 @@ where
     }
 }
 
+#[derive(Debug, serde::Serialize)]
 struct SundaeV3PoolOrders {
     orders: SortedVec<SundaeV3Order>,
     unrecoverable_orders: SortedVec<SundaeV3Order>,
@@ -289,25 +301,21 @@ impl ChainIndex for SundaeV3Indexer {
             if payment_part_equal(&address, &self.protocol.pool_address) {
                 let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
                 match tx_out.datum {
-                    Datum::Data(ref inline) => {
-                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                        let pd: Result<PoolDatum, _> = AsPlutus::from_plutus(plutus_data);
-                        if let Ok(pd) = pd {
-                            let pool_id = pd.ident.clone();
-                            let pool_record = SundaeV3Pool {
-                                address: tx_out.address,
-                                value: tx_out.value,
-                                pool_datum: pd,
-                                slot: info.slot,
-                            };
-                            let this_pool = index.pools.entry(pool_id).or_default();
-                            this_pool.insert(pool_record);
+                    Datum::ParsedPool(pd) => {
+                        let pool_id = pd.ident.clone();
+                        let pool_record = SundaeV3Pool {
+                            address: tx_out.address,
+                            value: tx_out.value,
+                            pool_datum: pd,
+                            slot: info.slot,
+                        };
+                        let this_pool = index.pools.entry(pool_id).or_default();
+                        this_pool.insert(pool_record);
 
-                            event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
-                            return Ok(());
-                        }
+                        event!(Level::DEBUG, "{}", hex::encode(this_tx_hash));
+                        return Ok(());
                     }
-                    Datum::None | Datum::Hash(_) => {}
+                    Datum::None | Datum::ParsedOrder(_) => {}
                 }
             } else if payment_part_equal(&address, &self.protocol.order_address) {
                 let this_input = TransactionInput(pallas_primitives::TransactionInput {
@@ -317,74 +325,68 @@ impl ChainIndex for SundaeV3Indexer {
                 let this_input_ref = format!("{}#{}", hex::encode(this_tx_hash), ix);
                 let tx_out: TransactionOutput = cardano_types::convert_transaction_output(output);
                 match tx_out.datum {
-                    Datum::Data(ref inline) => {
-                        let plutus_data: PlutusData = minicbor::decode(inline).unwrap();
-                        let od: Result<OrderDatum, _> = AsPlutus::from_plutus(plutus_data);
-                        if let Ok(od) = od {
-                            if let Some(ref ident) = od.ident {
-                                let ident = ident.clone();
-                                if let Some(pool) = index.pools.get(&ident) {
-                                    let current_pool = pool.latest();
-                                    let order_value_ok = validate_order(
-                                        &od,
-                                        &tx_out.value,
-                                        &current_pool.pool_datum,
+                    Datum::ParsedOrder(ref od) => {
+                        if let Some(ref ident) = od.ident {
+                            let ident = ident.clone();
+                            if let Some(pool) = index.pools.get(&ident) {
+                                let datum = od.clone();
+                                let current_pool = pool.latest();
+                                let order_value_ok =
+                                    validate_order(&datum, &tx_out.value, &current_pool.pool_datum);
+
+                                let this_pool_orders =
+                                    index.orders.entry(Some(ident.clone())).or_default();
+
+                                if let Err(e) = order_value_ok {
+                                    event!(
+                                        Level::DEBUG,
+                                        "Order {} was rejected: {}",
+                                        this_input_ref,
+                                        e
                                     );
-
-                                    let this_pool_orders =
-                                        index.orders.entry(od.ident.clone()).or_default();
-
-                                    if let Err(e) = order_value_ok {
-                                        event!(
-                                            Level::DEBUG,
-                                            "Order {} was rejected: {}",
-                                            this_input_ref,
-                                            e
-                                        );
-                                        this_pool_orders.insert_unrecoverable(SundaeV3Order {
-                                            input: this_input.clone(),
-                                            output: tx_out,
-                                            datum: od,
-                                            slot: info.slot,
-                                            spent_slot: None,
-                                        });
-
-                                        index.order_to_pool.insert(this_input, ident);
-
-                                        return Ok(());
-                                    }
-
-                                    this_pool_orders.insert(SundaeV3Order {
+                                    this_pool_orders.insert_unrecoverable(SundaeV3Order {
                                         input: this_input.clone(),
                                         output: tx_out,
-                                        datum: od,
+                                        datum,
                                         slot: info.slot,
                                         spent_slot: None,
                                     });
 
                                     index.order_to_pool.insert(this_input, ident);
 
-                                    event!(Level::DEBUG, "Added order {} to index", this_input_ref);
                                     return Ok(());
-                                } else {
-                                    event!(
-                                        Level::WARN,
-                                        "Order {} was listed for an unknown pool {}",
-                                        this_input_ref,
-                                        ident,
-                                    );
                                 }
+
+                                this_pool_orders.insert(SundaeV3Order {
+                                    input: this_input.clone(),
+                                    output: tx_out,
+                                    datum,
+                                    slot: info.slot,
+                                    spent_slot: None,
+                                });
+
+                                index.order_to_pool.insert(this_input, ident);
+
+                                event!(Level::DEBUG, "Added order {} to index", this_input_ref);
+                                return Ok(());
                             } else {
-                                // Order is free
                                 event!(
                                     Level::WARN,
-                                    "Order {} was listed for no pool",
+                                    "Order {} was listed for an unknown pool {}",
                                     this_input_ref,
-                                )
+                                    ident,
+                                );
                             }
+                        } else {
+                            // Order is free
+                            event!(
+                                Level::WARN,
+                                "Order {} was listed for no pool",
+                                this_input_ref,
+                            )
                         }
                     }
-                    Datum::None | Datum::Hash(_) => {}
+                    Datum::None | Datum::ParsedPool(_) => {}
                 }
             }
         }
@@ -531,12 +533,42 @@ impl AdminServer {
             }
             "/health" => "health".into(),
             "/pools" => {
-                let mut response = String::new();
                 let index_lock = self.index.lock().await;
-                for pool_id in index_lock.pools.keys() {
-                    response += &format!("{pool_id}\n");
+                let mut json_map = serde_json::Map::new();
+
+                for (ident, states) in &index_lock.pools {
+                    if let Some(latest) = states.states.contents.last() {
+                        json_map.insert(
+                            hex::encode(ident.to_bytes()),
+                            serde_json::to_value(latest).unwrap(),
+                        );
+                    }
                 }
-                response
+
+                serde_json::to_string_pretty(&json_map).unwrap()
+            }
+            "/orders" => {
+                let index_lock = self.index.lock().await;
+
+                let mut json_map = serde_json::Map::new();
+                for (ident, order) in &index_lock.orders {
+                    let hex = match ident.as_ref() {
+                        Some(id) => hex::encode(id.to_bytes()),
+                        None => "null".to_string(),
+                    };
+
+                    match serde_json::to_value(order) {
+                        Ok(val) => {
+                            json_map.insert(hex, val);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to serialize order {:?}: {}", ident, e);
+                            continue;
+                        }
+                    }
+                }
+
+                serde_json::to_string_pretty(&json_map).unwrap()
             }
             _ => "unknown".into(),
         }
@@ -685,6 +717,8 @@ mod tests {
     use acropolis_common::{BlockIntent, BlockStatus, Era};
     use bigint::BigInt;
     use pallas_traverse::MultiEraBlock;
+
+    use crate::sundaev3::PoolDatum;
 
     use super::*;
 

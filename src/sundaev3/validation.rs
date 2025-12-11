@@ -62,8 +62,8 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
         Order::Strategy(_) => Ok(()),
         Order::Swap(a, b) => {
             let minimum_ada = BigInt::from(ADA_RIDER) + scoop_fee.clone();
-            let gives = a.2.clone();
-            let gives_asset = AssetClass::from_pair((a.0.clone(), a.1.clone()));
+            let gives = a.amount.clone();
+            let gives_asset = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
             let gives_ada = if gives_asset == ADA_ASSET_CLASS {
                 gives.clone()
             } else {
@@ -98,10 +98,10 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             Ok(())
         }
         Order::Deposit((a, b)) => {
-            let gives_a = a.2.clone();
-            let gives_b = b.2.clone();
-            let asset_a = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let asset_b = AssetClass::from_pair((b.0.clone(), b.1.clone()));
+            let gives_a = a.amount.clone();
+            let gives_b = b.amount.clone();
+            let asset_a = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
+            let asset_b = AssetClass::from_pair((b.policy.clone(), b.token.clone()));
             let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
             if asset_a == ADA_ASSET_CLASS {
                 let minimum = BigInt::from(ADA_RIDER) + scoop_fee.clone();
@@ -122,16 +122,17 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             }
             Ok(())
         }
-        Order::Withdrawal((policy, token, offered)) => {
-            if offered == &BigInt::from(0) {
+        Order::Withdrawal(singleton) => {
+            if singleton.amount == BigInt::from(0) {
                 return Err(ValueError::GivesZeroTokens);
             }
-            let actual = BigInt::from(
-                value.get_asset_class(&AssetClass::from_pair((policy.clone(), token.clone()))),
-            );
-            if offered > &actual {
+            let actual = BigInt::from(value.get_asset_class(&AssetClass::from_pair((
+                singleton.policy.clone(),
+                singleton.token.clone(),
+            ))));
+            if singleton.amount > actual {
                 return Err(ValueError::DeclaredExceedsActual {
-                    declared: offered.clone(),
+                    declared: singleton.amount.clone(),
                     actual,
                 });
             }
@@ -159,8 +160,8 @@ pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(
     }
     match &order.action {
         Order::Swap(a, b) => {
-            let give_coin = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let take_coin = AssetClass::from_pair((b.0.clone(), b.1.clone()));
+            let give_coin = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
+            let take_coin = AssetClass::from_pair((b.policy.clone(), b.token.clone()));
             let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
             let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
             if !(matches_a_to_b || matches_b_to_a) {
@@ -169,8 +170,8 @@ pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(
             Ok(())
         }
         Order::Deposit((a, b)) => {
-            let give_coin = AssetClass::from_pair((a.0.clone(), a.1.clone()));
-            let take_coin = AssetClass::from_pair((b.0.clone(), b.1.clone()));
+            let give_coin = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
+            let take_coin = AssetClass::from_pair((b.policy.clone(), b.token.clone()));
             let matches_a_to_b = pool.assets.0 == give_coin && pool.assets.1 == take_coin;
             let matches_b_to_a = pool.assets.0 == take_coin && pool.assets.1 == give_coin;
             if !(matches_a_to_b || matches_b_to_a) {
@@ -187,7 +188,7 @@ mod tests {
     use crate::{
         cardano_types::{ADA_POLICY, ADA_TOKEN},
         multisig::Multisig,
-        sundaev3::{AnyPlutusData, Destination},
+        sundaev3::{AnyPlutusData, Destination, SingletonValue},
         value,
     };
 
@@ -218,12 +219,16 @@ mod tests {
             scoop_fee: i64_to_bigint(test_case.scoop_fee),
             destination: Destination::SelfDestination,
             action: Order::Swap(
-                (ADA_POLICY, ADA_TOKEN, i64_to_bigint(test_case.ada_offered)),
-                (
-                    rberry_policy.clone(),
-                    rberry_token.clone(),
-                    i64_to_bigint(test_case.rberry_offered),
-                ),
+                SingletonValue {
+                    policy: ADA_POLICY,
+                    token: ADA_TOKEN,
+                    amount: i64_to_bigint(test_case.ada_offered),
+                },
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    token: rberry_token.clone(),
+                    amount: i64_to_bigint(test_case.rberry_offered),
+                },
             ),
             extra: AnyPlutusData::empty_cons(),
         };
@@ -261,16 +266,16 @@ mod tests {
             scoop_fee: i64_to_bigint(test_case.scoop_fee),
             destination: Destination::SelfDestination,
             action: Order::Swap(
-                (
-                    rberry_policy.clone(),
-                    rberry_policy.clone(),
-                    i64_to_bigint(test_case.rberry_offered),
-                ),
-                (
-                    sberry_policy.clone(),
-                    sberry_token.clone(),
-                    i64_to_bigint(test_case.sberry_offered),
-                ),
+                SingletonValue {
+                    policy: rberry_policy.clone(),
+                    token: rberry_token.clone(),
+                    amount: i64_to_bigint(test_case.rberry_offered),
+                },
+                SingletonValue {
+                    policy: sberry_policy.clone(),
+                    token: sberry_token.clone(),
+                    amount: i64_to_bigint(test_case.sberry_offered),
+                },
             ),
             extra: AnyPlutusData::empty_cons(),
         };
