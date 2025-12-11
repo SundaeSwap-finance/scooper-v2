@@ -134,11 +134,26 @@ impl Serialize for StrategyAuthorization {
     }
 }
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingletonValue {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
     pub amount: BigInt,
+}
+
+impl AsPlutus for SingletonValue {
+    fn from_plutus(pd: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let (policy, token, amount): (Vec<u8>, Vec<u8>, BigInt) = AsPlutus::from_plutus(pd)?;
+        Ok(Self {
+            policy,
+            token,
+            amount,
+        })
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        (self.policy, self.token, self.amount).to_plutus()
+    }
 }
 
 impl serde::Serialize for SingletonValue {
