@@ -7,7 +7,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.30.2"
 # CI backends to support
 ci = "github"
-# Do not create a release, assume one already exists
+# Whether dist should create a Github Release or use an existing draft
 create-release = false
 # The installers to generate for each app
 installers = []
