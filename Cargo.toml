@@ -1,7 +1,7 @@
 [package]
 name = "scooper-v2"
 description = "Server for Sundae Scooper"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/rrruko/scooper-v2"
 license-file = "LICENSE"
