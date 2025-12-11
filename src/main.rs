@@ -5,6 +5,7 @@ use acropolis_module_custom_indexer::CustomIndexer;
 use acropolis_module_custom_indexer::chain_index::ChainIndex;
 use acropolis_module_custom_indexer::cursor_store::InMemoryCursorStore;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
+use acropolis_module_mithril_snapshot_fetcher::MithrilSnapshotFetcher;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -651,6 +652,7 @@ async fn manager_loop(
                 let mut process = Process::<Message>::create(config).await;
                 GenesisBootstrapper::register(&mut process);
                 BlockUnpacker::register(&mut process);
+                MithrilSnapshotFetcher::register(&mut process);
                 PeerNetworkInterface::register(&mut process);
 
                 let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
