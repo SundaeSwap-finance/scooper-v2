@@ -5,7 +5,7 @@ use std::fmt;
 use crate::{
     bigint::BigInt,
     cardano_types::{ADA_ASSET_CLASS, AssetClass, Value},
-    sundaev3::{Order, OrderDatum, PoolDatum},
+    sundaev3::{Order, OrderDatum, PoolDatum, SwapDirection, get_pool_price, swap_price},
 };
 
 const ADA_RIDER: i128 = 2000000;
@@ -22,6 +22,12 @@ impl fmt::Display for ValidationError {
                 PoolError::IdentMismatch => write!(f, "order ident does not match pool ident"),
                 PoolError::CoinPairMismatch => {
                     write!(f, "order coin pair does not match pool coin pair")
+                }
+                PoolError::OutOfRange(swap_price, pool_price) => {
+                    write!(
+                        f,
+                        "order out of range (swap price {swap_price}, pool price {pool_price})"
+                    )
                 }
             },
             ValidationError::ValueError(e) => match e {
@@ -41,12 +47,16 @@ impl fmt::Display for ValidationError {
 }
 
 pub fn validate_order(
-    datum: &OrderDatum,
+    order: &OrderDatum,
     value: &Value,
     pool: &PoolDatum,
+    pool_value: &Value,
+    policy: &[u8],
 ) -> Result<(), ValidationError> {
-    validate_order_value(datum, value).map_err(ValidationError::ValueError)?;
-    validate_order_for_pool(datum, pool).map_err(ValidationError::PoolError)?;
+    validate_order_value(order, value).map_err(ValidationError::ValueError)?;
+    validate_order_for_pool(order, pool).map_err(ValidationError::PoolError)?;
+    estimate_whether_in_range(policy, order, pool, pool_value)
+        .map_err(ValidationError::PoolError)?;
     Ok(())
 }
 
@@ -150,6 +160,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
 pub enum PoolError {
     IdentMismatch,
     CoinPairMismatch,
+    OutOfRange(f64, f64),
 }
 
 pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(), PoolError> {
@@ -180,6 +191,35 @@ pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+pub fn estimate_whether_in_range(
+    policy: &[u8],
+    od: &OrderDatum,
+    pd: &PoolDatum,
+    pool_value: &Value,
+) -> Result<(), PoolError> {
+    let rewards = &pd.protocol_fees;
+    let pool_price = get_pool_price(policy, pool_value, rewards).unwrap();
+    let Some(swap_price) = swap_price(od) else {
+        return Ok(());
+    };
+    match swap_price {
+        (SwapDirection::AtoB, swap_price) => {
+            if pool_price <= swap_price {
+                Ok(())
+            } else {
+                Err(PoolError::OutOfRange(swap_price, pool_price))
+            }
+        }
+        (SwapDirection::BtoA, swap_price) => {
+            if pool_price >= (1.0 / swap_price) {
+                Ok(())
+            } else {
+                Err(PoolError::OutOfRange(1.0 / swap_price, pool_price))
+            }
+        }
     }
 }
 
