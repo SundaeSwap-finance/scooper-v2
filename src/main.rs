@@ -10,7 +10,6 @@ use anyhow::{Result, anyhow};
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
-use config::{Config, File};
 use tokio::sync::Mutex;
 
 use std::path::PathBuf;
@@ -19,6 +18,7 @@ use tracing::{Level, event, warn};
 
 mod bigint;
 mod cardano_types;
+mod configuration;
 mod historical_state;
 mod multisig;
 mod scooper;
@@ -313,18 +313,15 @@ async fn manager_loop(
             rt.block_on(async move {
                 index.lock().await.rollback_to_origin();
 
-                let config = Arc::new(
-                    Config::builder()
-                        .add_source(File::with_name("config/acropolis"))
-                        .add_source(File::with_name(&scooper_config_file))
-                        .build()
-                        .unwrap(),
-                );
+                let (config, enable_mithril) =
+                    configuration::make_config(&scooper_config_file).unwrap();
 
                 let mut process = Process::<Message>::create(config).await;
                 GenesisBootstrapper::register(&mut process);
                 BlockUnpacker::register(&mut process);
-                MithrilSnapshotFetcher::register(&mut process);
+                if enable_mithril {
+                    MithrilSnapshotFetcher::register(&mut process);
+                }
                 PeerNetworkInterface::register(&mut process);
 
                 let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));

@@ -1,12 +1,17 @@
 [global.startup]
-method = "mithril"
+method = "snapshot"
 topic = "cardano.sequence.start"
 
 [module.genesis-bootstrapper]
+network-name = "preview"
 
 [module.peer-network-interface]
 block-topic = "cardano.block.proposed"
-sync-point = "snapshot"
+sync-point = "dynamic"
+magic-number = 2
+
+[module.mithril-snapshot-fetcher]
+block-publish-topic = "cardano.block.proposed"
 
 [module.block-unpacker]
 
