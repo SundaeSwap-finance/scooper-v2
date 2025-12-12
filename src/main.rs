@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{Level, event, warn};
+use std::time::Duration;
+use tracing::{Level, event, info, warn};
 
 mod bigint;
 mod cardano_types;
@@ -302,47 +303,47 @@ async fn manager_loop(
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
 
-        // Run the Acropolis instance inside isolated runtime so all modules are killed on restart
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
+        let config = Arc::new(
+            Config::builder()
+                .add_source(File::with_name("config/acropolis"))
+                .add_source(File::with_name(&scooper_config_file))
                 .build()
-                .expect("failed to build runtime");
+                .unwrap(),
+        );
 
-            rt.block_on(async move {
-                index.lock().await.rollback_to_origin();
+        let mut process = Process::<Message>::create(config).await;
+        GenesisBootstrapper::register(&mut process);
+        BlockUnpacker::register(&mut process);
+        PeerNetworkInterface::register(&mut process);
 
-                let config = Arc::new(
-                    Config::builder()
-                        .add_source(File::with_name("config/acropolis"))
-                        .add_source(File::with_name(&scooper_config_file))
-                        .build()
-                        .unwrap(),
-                );
+        let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
+        process.register(indexer.clone());
 
-                let mut process = Process::<Message>::create(config).await;
-                GenesisBootstrapper::register(&mut process);
-                BlockUnpacker::register(&mut process);
-                PeerNetworkInterface::register(&mut process);
+        let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
 
-                let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
-                process.register(indexer.clone());
+        indexer
+            .add_index(v3_index, default_start, false)
+            .await
+            .unwrap();
 
-                let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
+        match process.start().await {
+            Ok(running_process) => {
+                let shutdown_requested = kill_rx.recv().await.is_err();
 
-                indexer
-                    .add_index(v3_index, default_start, false)
-                    .await
-                    .unwrap();
+                info!("terminating acropolis process");
+                if let Err(err) = running_process.stop().await {
+                    warn!("could not stop acropolis process: {err:#}");
+                }
+                if shutdown_requested {
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!("could not start acropolis process: {err:#}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        };
 
-                tokio::select! {
-                    _ = kill_rx.recv() => {}
-                    _ = tokio::spawn(async move { let _ = process.run().await; }) => {}
-                };
-            });
-        });
-
-        handle.join().unwrap();
         warn!("Restarting Scooper indexer");
     }
 }
