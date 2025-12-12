@@ -10,9 +10,13 @@ use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
 use config::{Config, File};
+use tokio::select;
+use tokio::signal::ctrl_c;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{Level, event, info, warn};
@@ -38,7 +42,7 @@ use hyper::{Request, Response, body::Incoming as IncomingBody};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::scooper::Scooper;
 use crate::sundaev3::{
@@ -101,7 +105,7 @@ enum Commands {
 #[derive(Clone)]
 struct AdminServer {
     index: Arc<Mutex<SundaeV3HistoricalState>>,
-    kill_tx: tokio::sync::broadcast::Sender<()>,
+    resync_tx: tokio::sync::broadcast::Sender<()>,
     protocol: SundaeV3Protocol,
 }
 
@@ -191,7 +195,7 @@ impl AdminServer {
 
         match req.uri().path() {
             "/resync-from-acropolis" => {
-                let _ = self.kill_tx.send(());
+                let _ = self.resync_tx.send(());
                 "resync".into()
             }
             "/health" => "health".into(),
@@ -256,7 +260,8 @@ async fn main() {
         },
     };
 
-    let (kill_tx, _) = tokio::sync::broadcast::channel(1);
+    let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+    let shutdown = CancellationToken::new();
 
     let protocol: SundaeV3Protocol = {
         let f = std::fs::File::open(protocol_config_file).unwrap();
@@ -269,36 +274,52 @@ async fn main() {
 
     let manager_handle = tokio::spawn(manager_loop(
         index.clone(),
-        kill_tx.clone(),
+        resync_tx.clone(),
         broadcaster.clone(),
         scooper_config_file,
         protocol.clone(),
         default_start,
+        shutdown.child_token(),
     ));
     let scooper_handle = tokio::spawn(
         Scooper::new(
             broadcaster.subscribe(),
             protocol.get_pool_script_hash().unwrap(),
         )
-        .run(),
+        .run(shutdown.child_token()),
     );
-    let admin_handle = tokio::spawn(admin_server(index.clone(), kill_tx.clone(), protocol));
+    let admin_handle = tokio::spawn(admin_server(
+        index.clone(),
+        resync_tx,
+        protocol,
+        shutdown.child_token(),
+    ));
+
+    tokio::spawn(async move {
+        let _ = ctrl_c().await;
+        info!("shutdown requested");
+        shutdown.cancel();
+        let _ = ctrl_c().await;
+        warn!("force shutdown requested");
+        process::exit(0);
+    });
 
     tokio::try_join!(manager_handle, scooper_handle, admin_handle).unwrap();
 }
 
 async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
-    kill_tx: tokio::sync::broadcast::Sender<()>,
+    resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
     scooper_config_file: String,
     protocol: SundaeV3Protocol,
     default_start: Point,
+    shutdown: CancellationToken,
 ) {
     let mut force_restart = false;
     loop {
         let index = index.clone();
-        let mut kill_rx = kill_tx.subscribe();
+        let mut resync_tx = resync_tx.subscribe();
         let scooper_config_file = scooper_config_file.clone();
         let protocol = protocol.clone();
         let default_start = default_start.clone();
@@ -329,15 +350,19 @@ async fn manager_loop(
 
         match process.start().await {
             Ok(running_process) => {
-                let shutdown_requested = kill_rx.recv().await.is_err();
+                let shutting_down = select! {
+                    res = resync_tx.recv() => res.is_err(),
+                    _ = shutdown.cancelled() => true,
+                };
                 force_restart = true;
 
                 info!("terminating acropolis process");
-                if let Err(err) = running_process.stop().await {
-                    warn!("could not stop acropolis process: {err:#}");
+                match running_process.stop().await {
+                    Ok(()) => info!("terminated acropolis process"),
+                    Err(err) => warn!("could not terminate acropolis process: {err:#}"),
                 }
-                if shutdown_requested {
-                    return;
+                if shutting_down {
+                    break;
                 }
             }
             Err(err) => {
@@ -352,32 +377,50 @@ async fn manager_loop(
 
 async fn admin_server(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
-    kill_tx: tokio::sync::broadcast::Sender<()>,
+    resync_tx: tokio::sync::broadcast::Sender<()>,
     protocol: SundaeV3Protocol,
+    shutdown: CancellationToken,
 ) {
     let addr = SocketAddr::from(([127, 0, 0, 1], 9999));
     let listener = TcpListener::bind(addr).await.unwrap();
 
     loop {
-        let (stream, _) = listener.accept().await.unwrap();
-        let io = TokioIo::new(stream);
+        let stream = select! {
+            res = listener.accept() => res.unwrap().0,
+            _ = shutdown.cancelled() => { break; }
+        };
 
-        let kill_tx = kill_tx.clone();
+        let resync_tx = resync_tx.clone();
         let index = index.clone();
         let protocol = protocol.clone();
 
-        tokio::task::spawn(async {
-            let admin_server = AdminServer {
-                index,
-                kill_tx,
-                protocol,
-            };
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, admin_server)
-                .await
-            {
-                event!(Level::DEBUG, "Failed to serve connection: {:?}", err);
+        let child = shutdown.child_token();
+        tokio::task::spawn(async move {
+            select! {
+                _ = child.cancelled() => {},
+                _ = handle_request(stream, index, resync_tx, protocol) => {}
             }
         });
+    }
+}
+
+async fn handle_request(
+    stream: TcpStream,
+    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    resync_tx: tokio::sync::broadcast::Sender<()>,
+    protocol: SundaeV3Protocol,
+) {
+    let io = TokioIo::new(stream);
+
+    let admin_server = AdminServer {
+        index,
+        resync_tx,
+        protocol,
+    };
+    if let Err(err) = http1::Builder::new()
+        .serve_connection(io, admin_server)
+        .await
+    {
+        event!(Level::DEBUG, "Failed to serve connection: {:?}", err);
     }
 }
