@@ -295,6 +295,7 @@ async fn manager_loop(
     protocol: SundaeV3Protocol,
     default_start: Point,
 ) {
+    let mut force_restart = false;
     loop {
         let index = index.clone();
         let mut kill_rx = kill_tx.subscribe();
@@ -322,13 +323,14 @@ async fn manager_loop(
         let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
 
         indexer
-            .add_index(v3_index, default_start, false)
+            .add_index(v3_index, default_start, force_restart)
             .await
             .unwrap();
 
         match process.start().await {
             Ok(running_process) => {
                 let shutdown_requested = kill_rx.recv().await.is_err();
+                force_restart = true;
 
                 info!("terminating acropolis process");
                 if let Err(err) = running_process.stop().await {
