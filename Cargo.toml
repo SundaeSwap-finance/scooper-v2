@@ -19,7 +19,7 @@ caryatid_sdk = "0.14.0"
 caryatid_process = "0.14"
 clap = { version = "4.5.41", features = ["derive"] }
 config = "0.15.11"
-hex = "0.4.3"
+hex = { version = "0.4", features = ["serde"] }
 minicbor = { version = "0.26.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"

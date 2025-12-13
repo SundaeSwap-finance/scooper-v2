@@ -32,7 +32,6 @@ mod sundaev3;
 use serde::{Deserialize, Serialize};
 
 use cardano_types::TransactionInput;
-use pallas_addresses::Address;
 use sundaev3::{Ident, validate_order};
 
 use http_body_util::Full;
@@ -51,19 +50,10 @@ use crate::sundaev3::{
 
 #[derive(Clone, Deserialize)]
 struct SundaeV3Protocol {
-    #[serde(deserialize_with = "serde_compat::deserialize_address")]
-    order_address: Address,
-    #[serde(deserialize_with = "serde_compat::deserialize_address")]
-    pool_address: Address,
-}
-
-impl SundaeV3Protocol {
-    fn get_pool_script_hash(&self) -> Option<&[u8]> {
-        match &self.pool_address {
-            Address::Shelley(s) => Some(s.payment().as_hash().as_slice()),
-            _ => None,
-        }
-    }
+    #[serde(with = "hex")]
+    order_script_hash: Vec<u8>,
+    #[serde(with = "hex")]
+    pool_script_hash: Vec<u8>,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -154,7 +144,6 @@ impl AdminServer {
                     return "No such pool".into();
                 }
             };
-            let policy = self.protocol.get_pool_script_hash().unwrap();
             let mut response = QueryPoolResponse {
                 valid: vec![],
                 out_of_range: vec![],
@@ -169,7 +158,7 @@ impl AdminServer {
                     &order.output.value,
                     &pool.pool_datum,
                     &pool.value,
-                    policy,
+                    &self.protocol.pool_script_hash,
                 ) {
                     if let ValidationError::PoolError(PoolError::OutOfRange(
                         swap_price,
@@ -282,11 +271,8 @@ async fn main() {
         shutdown.child_token(),
     ));
     let scooper_handle = tokio::spawn(
-        Scooper::new(
-            broadcaster.subscribe(),
-            protocol.get_pool_script_hash().unwrap(),
-        )
-        .run(shutdown.child_token()),
+        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)
+            .run(shutdown.child_token()),
     );
     let admin_handle = tokio::spawn(admin_server(
         index.clone(),
