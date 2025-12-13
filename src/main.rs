@@ -11,6 +11,7 @@ use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
 use tokio::sync::Mutex;
+use tracing_subscriber::EnvFilter;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -243,7 +244,11 @@ impl AdminServer {
 #[tokio::main]
 #[allow(unreachable_code)]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(
+            "info,acropolis_module_peer_network_interface=warn",
+        ))
+        .init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
