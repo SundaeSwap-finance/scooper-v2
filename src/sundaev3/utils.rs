@@ -84,7 +84,7 @@ pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
 mod tests {
     use crate::{
         multisig::Multisig,
-        sundaev3::{AnyPlutusData, Destination, Ident, SingletonValue},
+        sundaev3::{Destination, Ident, SingletonValue, empty_cons},
         value,
     };
 
@@ -149,7 +149,7 @@ mod tests {
                     amount: i64_to_bigint(10_000_000),
                 },
             ),
-            extra: AnyPlutusData::empty_cons(),
+            extra: empty_cons(),
         };
         let swap_price = swap_price(&od);
         assert_eq!(swap_price, Some((SwapDirection::AtoB, 0.1)));
@@ -180,7 +180,7 @@ mod tests {
                     amount: i64_to_bigint(10_000_000),
                 },
             ),
-            extra: AnyPlutusData::empty_cons(),
+            extra: empty_cons(),
         };
         let swap_price = swap_price(&od);
         assert_eq!(swap_price, Some((SwapDirection::BtoA, 0.1)));

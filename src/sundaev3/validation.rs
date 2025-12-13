@@ -228,7 +228,7 @@ mod tests {
     use crate::{
         cardano_types::{ADA_POLICY, ADA_TOKEN},
         multisig::Multisig,
-        sundaev3::{AnyPlutusData, Destination, SingletonValue},
+        sundaev3::{Destination, SingletonValue, empty_cons},
         value,
     };
 
@@ -270,7 +270,7 @@ mod tests {
                     amount: i64_to_bigint(test_case.rberry_offered),
                 },
             ),
-            extra: AnyPlutusData::empty_cons(),
+            extra: empty_cons(),
         };
         let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
         let value = value![
@@ -317,7 +317,7 @@ mod tests {
                     amount: i64_to_bigint(test_case.sberry_offered),
                 },
             ),
-            extra: AnyPlutusData::empty_cons(),
+            extra: empty_cons(),
         };
         let rberry_asset_class = AssetClass::from_pair((rberry_policy, rberry_token));
         let sberry_asset_class = AssetClass::from_pair((sberry_policy, sberry_token));

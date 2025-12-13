@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use tokio::sync::watch;
+use tokio::{select, sync::watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     cardano_types::TransactionInput,
@@ -23,8 +24,17 @@ impl Scooper {
         }
     }
 
-    pub async fn run(mut self) {
-        while self.sundaev3.changed().await.is_ok() {
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        loop {
+            select! {
+                _ = shutdown.cancelled() => { break; }
+                res = self.sundaev3.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+
             // Sleep a bit to deduplicate updates to the state.
             tokio::time::sleep(Duration::from_millis(250)).await;
 
