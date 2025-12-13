@@ -4,13 +4,14 @@ use acropolis_module_block_unpacker::BlockUnpacker;
 use acropolis_module_custom_indexer::CustomIndexer;
 use acropolis_module_custom_indexer::cursor_store::InMemoryCursorStore;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
+use acropolis_module_mithril_snapshot_fetcher::MithrilSnapshotFetcher;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
 use anyhow::{Result, anyhow};
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
-use config::{Config, File};
 use tokio::sync::Mutex;
+use tracing_subscriber::EnvFilter;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use tracing::{Level, event, warn};
 
 mod bigint;
 mod cardano_types;
+mod configuration;
 mod historical_state;
 mod multisig;
 mod scooper;
@@ -242,7 +244,11 @@ impl AdminServer {
 #[tokio::main]
 #[allow(unreachable_code)]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(
+            "info,acropolis_module_peer_network_interface=warn",
+        ))
+        .init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
@@ -312,17 +318,15 @@ async fn manager_loop(
             rt.block_on(async move {
                 index.lock().await.rollback_to_origin();
 
-                let config = Arc::new(
-                    Config::builder()
-                        .add_source(File::with_name("config/acropolis"))
-                        .add_source(File::with_name(&scooper_config_file))
-                        .build()
-                        .unwrap(),
-                );
+                let (config, enable_mithril) =
+                    configuration::make_config(&scooper_config_file).unwrap();
 
                 let mut process = Process::<Message>::create(config).await;
                 GenesisBootstrapper::register(&mut process);
                 BlockUnpacker::register(&mut process);
+                if enable_mithril {
+                    MithrilSnapshotFetcher::register(&mut process);
+                }
                 PeerNetworkInterface::register(&mut process);
 
                 let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
