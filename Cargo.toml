@@ -17,6 +17,7 @@ anyhow = "1"
 async-trait = "0.1"
 caryatid_sdk = "0.14.0"
 caryatid_process = "0.14"
+chrono = "0.4"
 clap = { version = "4.5.41", features = ["derive"] }
 config = "0.15.11"
 hex = { version = "0.4", features = ["serde"] }
