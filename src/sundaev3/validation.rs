@@ -25,6 +25,7 @@ impl fmt::Display for ValidationError {
                 PoolError::CoinPairMismatch => {
                     write!(f, "order coin pair does not match pool coin pair")
                 }
+                PoolError::Empty => write!(f, "pool is empty"),
                 PoolError::OutOfRange {
                     swap_price,
                     pool_price,
@@ -167,6 +168,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
 pub enum PoolError {
     IdentMismatch,
     CoinPairMismatch,
+    Empty,
     OutOfRange { swap_price: f64, pool_price: f64 },
 }
 
@@ -208,7 +210,9 @@ pub fn estimate_whether_in_range(
     pool_value: &Value,
 ) -> Result<(), PoolError> {
     let rewards = &pd.protocol_fees;
-    let pool_price = get_pool_price(policy, pool_value, rewards).unwrap();
+    let Some(pool_price) = get_pool_price(policy, pool_value, rewards) else {
+        return Err(PoolError::Empty);
+    };
     let Some(swap_price) = swap_price(od) else {
         return Ok(());
     };
