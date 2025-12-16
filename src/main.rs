@@ -9,7 +9,6 @@ use anyhow::{Result, anyhow};
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
-use config::{Config, File};
 use tokio::select;
 use tokio::signal::ctrl_c;
 use tokio::sync::Mutex;
@@ -23,8 +22,10 @@ use tracing::{Level, event, info, warn};
 
 mod bigint;
 mod cardano_types;
+mod config;
 mod historical_state;
 mod multisig;
+mod persistence;
 mod scooper;
 mod serde_compat;
 mod sundaev3;
@@ -43,6 +44,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::AppConfig;
+use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{
     PoolError, SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update, ValidationError,
@@ -65,7 +68,7 @@ struct Args {
     command: Commands,
 
     #[arg(long, value_name = "PATH", default_value = "scooper.toml")]
-    config: String,
+    config: PathBuf,
 }
 
 const BLOCK_HASH_SIZE: usize = 32;
@@ -240,6 +243,10 @@ async fn main() -> Result<()> {
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
+
+    let config = config::load_config(&scooper_config_file)?;
+    let app_config = config.clone().try_deserialize::<AppConfig>()?;
+
     let protocol_config_file = args.protocol;
     let default_start = match args.command {
         Commands::SyncFromOrigin => Point::Origin,
@@ -257,16 +264,18 @@ async fn main() -> Result<()> {
         serde_json::from_reader(f)?
     };
 
-    const ROLLBACK_LIMIT: usize = 2160;
-    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new(ROLLBACK_LIMIT)));
+    let persistence = persistence::connect(&app_config.persistence).await?;
+
+    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
         index.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
-        scooper_config_file,
+        Arc::new(config),
         protocol.clone(),
+        persistence.clone(),
         default_start,
         shutdown.child_token(),
     ));
@@ -294,12 +303,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
-    scooper_config_file: String,
+    config: Arc<::config::Config>,
     protocol: SundaeV3Protocol,
+    persistence: Arc<dyn Persistence>,
     default_start: Point,
     shutdown: CancellationToken,
 ) {
@@ -307,18 +318,10 @@ async fn manager_loop(
     loop {
         let index = index.clone();
         let mut resync_tx = resync_tx.subscribe();
-        let scooper_config_file = scooper_config_file.clone();
+        let config = config.clone();
         let protocol = protocol.clone();
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
-
-        let config = Arc::new(
-            Config::builder()
-                .add_source(File::with_name("config/acropolis"))
-                .add_source(File::with_name(&scooper_config_file))
-                .build()
-                .unwrap(),
-        );
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
@@ -328,7 +331,14 @@ async fn manager_loop(
         let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
         process.register(indexer.clone());
 
-        let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
+        let mut v3_index = SundaeV3Indexer::new(
+            index,
+            broadcaster,
+            protocol,
+            config::ROLLBACK_LIMIT,
+            persistence.sundae_v3_dao(),
+        );
+        v3_index.load().await.unwrap();
 
         indexer
             .add_index(v3_index, default_start, force_restart)
