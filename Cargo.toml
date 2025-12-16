@@ -1,7 +1,7 @@
 [package]
 name = "scooper-v2"
 description = "Server for Sundae Scooper"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 repository = "https://github.com/rrruko/scooper-v2"
 license-file = "LICENSE"
@@ -25,12 +25,12 @@ minicbor = { version = "0.26.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 pallas-addresses = "1.0.0-alpha.2"
-pallas-codec = "1.0.0-alpha.2"
 pallas-primitives = "1.0.0-alpha.2"
 pallas-traverse = "1.0.0-alpha.2"
+plutus-parser = { version = "0.3.0", default-features = false, features = ["pallas-v1", "derive"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = "0.7"
-plutus-parser = { version = "0.3.0", default-features = false, features = ["pallas-v1", "derive"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = [
   "env-filter",

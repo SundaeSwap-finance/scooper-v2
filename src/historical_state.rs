@@ -4,14 +4,12 @@ use anyhow::{Result, bail};
 
 pub struct HistoricalState<T> {
     slots: BTreeMap<u64, T>,
-    rollback_limit: usize,
 }
 
 impl<T: Default + Clone> HistoricalState<T> {
-    pub fn new(rollback_limit: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             slots: BTreeMap::new(),
-            rollback_limit,
         }
     }
 
@@ -36,10 +34,16 @@ impl<T: Default + Clone> HistoricalState<T> {
             Some((_, e)) => e.clone(),
             None => T::default(),
         };
-        while self.slots.len() > self.rollback_limit {
-            self.slots.pop_first();
-        }
         Ok(self.slots.entry(slot).or_insert(last_entry))
+    }
+
+    pub fn prune_history(&mut self, rollback_limit: u64) -> bool {
+        let mut pruned = false;
+        while self.slots.len() > rollback_limit as usize {
+            self.slots.pop_first();
+            pruned = true;
+        }
+        pruned
     }
 
     pub fn rollback_to_slot(&mut self, slot: u64) -> Vec<(u64, T)> {
@@ -61,7 +65,7 @@ mod tests {
 
     #[test]
     fn should_copy_old_state_into_new_slot() -> Result<()> {
-        let mut history = HistoricalState::<Vec<u8>>::new(3);
+        let mut history = HistoricalState::<Vec<u8>>::new();
         assert!(history.latest().is_empty());
 
         history.update_slot(0)?.push(1);
@@ -75,7 +79,7 @@ mod tests {
 
     #[test]
     fn should_preserve_old_state_on_rollback() -> Result<()> {
-        let mut history = HistoricalState::<Vec<u8>>::new(3);
+        let mut history = HistoricalState::<Vec<u8>>::new();
         assert!(history.latest().is_empty());
 
         history.update_slot(0)?.push(1);
@@ -92,7 +96,7 @@ mod tests {
 
     #[test]
     fn should_not_allow_out_of_order_updates() -> Result<()> {
-        let mut history = HistoricalState::<Vec<u8>>::new(3);
+        let mut history = HistoricalState::<Vec<u8>>::new();
         assert!(history.latest().is_empty());
 
         history.update_slot(0)?.push(1);
