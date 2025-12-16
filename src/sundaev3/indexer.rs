@@ -251,6 +251,7 @@ impl ChainIndex for SundaeV3Indexer {
 
     async fn reset(&mut self, point: &Point) -> Result<Point> {
         warn!("clearing all state and resetting to {point}");
+        self.dao.rollback(0).await?;
         self.state.lock().await.rollback_to_origin();
         Ok(point.clone())
     }
