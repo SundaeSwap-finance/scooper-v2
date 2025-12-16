@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acropolis_common"
 version = "0.3.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",
@@ -24,6 +24,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "imbl",
  "log",
  "memmap2",
  "minicbor 0.25.1",
@@ -43,7 +44,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_block_unpacker"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -56,7 +57,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_custom_indexer"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -75,7 +76,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_genesis_bootstrapper"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -92,7 +93,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_mithril_snapshot_fetcher"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -111,7 +112,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_peer_network_interface"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=1fa60a8#1fa60a817fe55ec1419d349b91279befc6c8ec0f"
+source = "git+https://github.com/input-output-hk/acropolis?rev=d1be34c#d1be34c3650bc143611a325fcb7fa2f495e520ca"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -280,6 +281,12 @@ name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
+name = "archery"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e0a5f99dfebb87bb342d0f53bb92c81842e100bbb915223e38349580e5441d"
 
 [[package]]
 name = "arraydeque"
@@ -707,6 +714,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitmaps"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
+
+[[package]]
 name = "bitmask-enum"
 version = "2.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -891,9 +904,9 @@ dependencies = [
 
 [[package]]
 name = "caryatid_process"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5964024f9c302253bdf84b3f35dc068853ed0c643961072b59f6e69b8f83552"
+checksum = "2297ab4f0eb5ccd04c30cd397cbde5e129097c8e3b0e3f7628d5c16dafdbd532"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2082,6 +2095,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hex-conservative"
@@ -2404,6 +2420,29 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "imbl"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4308a675e4cfc1920f36a8f4d8fb62d5533b7da106844bd1ec51c6f1fa94a0c"
+dependencies = [
+ "archery",
+ "bitmaps",
+ "imbl-sized-chunks",
+ "rand_core 0.9.3",
+ "rand_xoshiro",
+ "version_check",
+]
+
+[[package]]
+name = "imbl-sized-chunks"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f4241005618a62f8d57b2febd02510fb96e0137304728543dfc5fd6f052c22d"
+dependencies = [
+ "bitmaps",
 ]
 
 [[package]]
@@ -3857,11 +3896,12 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plutus-parser"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f8ab185bb73459ac8d64d8781ab5811776a6288e762a66422c14fa554a61c86"
+checksum = "6427406bf0c003799cb7aa7bf622ed61db6542f28489de42059db7b9e877d3a0"
 dependencies = [
  "indexmap 2.12.1",
+ "minicbor 0.26.5",
  "pallas-primitives 1.0.0-alpha.3",
  "plutus-parser-derive",
  "thiserror 2.0.17",
@@ -3869,9 +3909,9 @@ dependencies = [
 
 [[package]]
 name = "plutus-parser-derive"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c514bd62b0a3506635935f1d7484d193c1d92fa0197e676c5cf1371d502d9b60"
+checksum = "8318cdbecfeee3b08288377e331e9f07a58a0314fd3bc874fbc67b64609a3615"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4130,6 +4170,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core 0.9.3",
 ]
 
 [[package]]
@@ -4567,6 +4616,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

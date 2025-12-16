@@ -231,7 +231,7 @@ pub struct OrderDatum {
     pub scoop_fee: BigInt,
     pub destination: Destination,
     pub action: Order,
-    pub extra: AnyPlutusData,
+    pub extra: PlutusData,
 }
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
@@ -296,47 +296,12 @@ pub enum AikenDatum {
     InlineDatum(Vec<u8>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AnyPlutusData {
-    inner: PlutusData,
-}
-
-impl serde::Serialize for AnyPlutusData {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let cbor = self.inner();
-        let cbor = cbor.encode_fragment().map_err(serde::ser::Error::custom)?;
-
-        serializer.serialize_str(&hex::encode(cbor))
-    }
-}
-
-impl AnyPlutusData {
-    pub fn inner(&self) -> &PlutusData {
-        &self.inner
-    }
-
-    pub fn empty_cons() -> Self {
-        Self {
-            inner: PlutusData::Constr(pallas_primitives::Constr {
-                tag: 121,
-                any_constructor: None,
-                fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
-            }),
-        }
-    }
-}
-
-impl AsPlutus for AnyPlutusData {
-    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
-        Ok(AnyPlutusData { inner: data })
-    }
-
-    fn to_plutus(self) -> PlutusData {
-        self.inner
-    }
+pub fn empty_cons() -> PlutusData {
+    PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121,
+        any_constructor: None,
+        fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
+    })
 }
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
@@ -394,7 +359,7 @@ pub struct StrategyExecution {
     tx_ref: OutputReference,
     validity_range: ValidityRange,
     details: Order,
-    extensions: AnyPlutusData,
+    extensions: PlutusData,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
@@ -495,16 +460,7 @@ mod tests {
                 }
             )
         );
-        assert_eq!(
-            order.extra,
-            AnyPlutusData {
-                inner: PlutusData::Constr(pallas_primitives::Constr {
-                    tag: 121,
-                    any_constructor: None,
-                    fields: pallas_primitives::MaybeIndefArray::Def(vec![]),
-                })
-            }
-        );
+        assert_eq!(order.extra, empty_cons());
     }
 
     #[test]

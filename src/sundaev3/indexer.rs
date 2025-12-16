@@ -77,7 +77,7 @@ impl ChainIndex for SundaeV3Indexer {
 
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
-            if payment_part_equal(&address, &self.protocol.pool_address) {
+            if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
                 let this_input = TransactionInput(pallas_primitives::TransactionInput {
                     transaction_id: this_tx_hash,
                     index: ix as u64,
@@ -95,7 +95,7 @@ impl ChainIndex for SundaeV3Indexer {
                     state.pools.insert(pool_id, Arc::new(pool_record));
                     changed = true;
                 }
-            } else if payment_part_equal(&address, &self.protocol.order_address) {
+            } else if payment_hash_equals(&address, &self.protocol.order_script_hash) {
                 let this_input = TransactionInput(pallas_primitives::TransactionInput {
                     transaction_id: this_tx_hash,
                     index: ix as u64,
@@ -172,13 +172,12 @@ impl ChainIndex for SundaeV3Indexer {
     }
 }
 
-fn payment_part_equal(a: &Address, b: &Address) -> bool {
-    if let Address::Shelley(s_a) = a
-        && let Address::Shelley(s_b) = b
-    {
-        return s_a.payment() == s_b.payment();
+fn payment_hash_equals(addr: &Address, hash: &[u8]) -> bool {
+    if let Address::Shelley(s_addr) = addr {
+        s_addr.payment().as_hash() == hash
+    } else {
+        false
     }
-    false
 }
 
 #[cfg(test)]
