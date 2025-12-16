@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
+use acropolis_module_custom_indexer::cursor_store::{CursorEntry, CursorSaveError};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -11,7 +12,7 @@ use tracing::warn;
 
 use crate::{
     cardano_types::TransactionInput,
-    persistence::{PersistedTxo, Persistence, SundaeV3Dao, SundaeV3TxChanges},
+    persistence::{CursorDaoImpl, PersistedTxo, Persistence, SundaeV3Dao, SundaeV3TxChanges},
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -57,6 +58,12 @@ impl Persistence for SqlitePersistence {
         Box::new(SqliteSundaeV3Dao {
             pool: self.pool.clone(),
         })
+    }
+
+    fn cursor_store(&self) -> super::CursorDao {
+        super::CursorDao(Box::new(SqliteCursorDaoImpl {
+            pool: self.pool.clone(),
+        }))
     }
 }
 
@@ -171,8 +178,88 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
     }
 }
 
+struct SqliteCursorDaoImpl {
+    pool: Pool<Sqlite>,
+}
+
+#[async_trait]
+impl CursorDaoImpl for SqliteCursorDaoImpl {
+    async fn load(&self) -> Result<HashMap<String, CursorEntry>> {
+        let query = "
+            SELECT id, bytes
+            FROM acropolis_cursors;
+        ";
+        let entries = sqlx::query(query)
+            .try_map(parse_cursor_entry)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut result = HashMap::new();
+        for (id, bytes) in entries {
+            let cursor = serde_json::from_slice(&bytes)?;
+            result.insert(id, cursor);
+        }
+        Ok(result)
+    }
+
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError> {
+        let mut tx = self.pool.begin().await.map_err(|err| {
+            warn!("could not open transaction: {err:#}");
+            let failed = entries.keys().cloned().collect();
+            CursorSaveError { failed }
+        })?;
+        sqlx::query("DELETE FROM acropolis_cursors;")
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| {
+                warn!("could not clear cursors: {err:#}");
+                let failed = entries.keys().cloned().collect();
+                CursorSaveError { failed }
+            })?;
+        let mut failed = vec![];
+        for (id, cursor) in entries {
+            if let Err(err) = save_entry(&mut tx, id, cursor).await {
+                warn!("could not save cursor for {id}: {err:#}");
+                failed.push(id.clone());
+            }
+        }
+        tx.commit().await.map_err(|err| {
+            warn!("could not commit transaction: {err:#}");
+            let failed = entries.keys().cloned().collect();
+            CursorSaveError { failed }
+        })?;
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(CursorSaveError { failed })
+        }
+    }
+}
+
+fn parse_cursor_entry(row: SqliteRow) -> Result<(String, Vec<u8>), sqlx::error::Error> {
+    let id: String = row.try_get("id")?;
+    let bytes: Vec<u8> = row.try_get("bytes")?;
+    Ok((id, bytes))
+}
+
+async fn save_entry(
+    tx: &mut sqlx::SqliteTransaction<'_>,
+    id: &str,
+    cursor: &CursorEntry,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(cursor)?;
+    sqlx::query("INSERT INTO acropolis_cursors(id, bytes) VALUES(?,?);")
+        .bind(id)
+        .bind(bytes)
+        .execute(tx.as_mut())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use acropolis_common::{Point, hash::Hash};
+    use acropolis_module_custom_indexer::cursor_store::CursorStore;
+
     use super::*;
 
     async fn new_db() -> Result<SqlitePersistence> {
@@ -479,6 +566,91 @@ mod tests {
         let txos = dao.load_txos().await?;
         assert_eq!(txos, vec![pool]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_store_should_load_no_cursors() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.cursor_store();
+
+        assert!(dao.load().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_store_should_load_cursor() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.cursor_store();
+
+        let tip = Point::Specific {
+            hash: Hash::default(),
+            slot: 1337,
+        };
+        let cursor = CursorEntry { tip, halted: false };
+        let mut entries = HashMap::new();
+        entries.insert("abc".to_string(), cursor.clone());
+
+        dao.save(&entries).await?;
+
+        let new_entries = dao.load().await?;
+        assert_eq!(new_entries.len(), entries.len());
+        let new_cursor = new_entries.get("abc").unwrap();
+        assert_eq!(new_cursor.tip, cursor.tip);
+        assert_eq!(new_cursor.halted, cursor.halted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_store_should_overwrite_cursor() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.cursor_store();
+
+        let tip = Point::Specific {
+            hash: Hash::default(),
+            slot: 1337,
+        };
+        let mut cursor = CursorEntry { tip, halted: false };
+        let mut entries = HashMap::new();
+        entries.insert("abc".to_string(), cursor.clone());
+        dao.save(&entries).await?;
+
+        cursor.tip = Point::Specific {
+            hash: Hash::default(),
+            slot: 1338,
+        };
+        cursor.halted = true;
+        entries.insert("abc".to_string(), cursor.clone());
+        dao.save(&entries).await?;
+
+        let new_entries = dao.load().await?;
+        assert_eq!(new_entries.len(), entries.len());
+        let new_cursor = new_entries.get("abc").unwrap();
+        assert_eq!(new_cursor.tip, cursor.tip);
+        assert_eq!(new_cursor.halted, cursor.halted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cursor_store_should_remove_cursor() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.cursor_store();
+
+        let tip = Point::Specific {
+            hash: Hash::default(),
+            slot: 1337,
+        };
+        let cursor = CursorEntry { tip, halted: false };
+        let mut entries = HashMap::new();
+        entries.insert("abc".to_string(), cursor.clone());
+        dao.save(&entries).await?;
+
+        entries.clear();
+        dao.save(&entries).await?;
+
+        assert!(dao.load().await?.is_empty());
         Ok(())
     }
 }

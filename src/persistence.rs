@@ -1,7 +1,8 @@
 mod sqlite;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use acropolis_module_custom_indexer::cursor_store::{CursorEntry, CursorSaveError, CursorStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -25,6 +26,7 @@ impl Default for PersistenceConfig {
 
 pub trait Persistence: Send + Sync {
     fn sundae_v3_dao(&self) -> Box<dyn SundaeV3Dao>;
+    fn cursor_store(&self) -> CursorDao;
 }
 
 pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>> {
@@ -68,4 +70,22 @@ pub struct PersistedTxo {
     pub created_slot: u64,
     pub era: u16,
     pub txo: Vec<u8>,
+}
+
+pub struct CursorDao(Box<dyn CursorDaoImpl>);
+
+#[async_trait]
+trait CursorDaoImpl: Send + Sync + 'static {
+    async fn load(&self) -> Result<HashMap<String, CursorEntry>>;
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError>;
+}
+
+impl CursorStore for CursorDao {
+    async fn load(&self) -> Result<HashMap<String, CursorEntry>> {
+        self.0.load().await
+    }
+
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError> {
+        self.0.save(entries).await
+    }
 }

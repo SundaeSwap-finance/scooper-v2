@@ -12,3 +12,8 @@ CREATE TABLE sundae_v3_txos (
 CREATE INDEX sundae_v3_txos_created_slot_idx ON sundae_v3_txos (created_slot);
 CREATE INDEX sundae_v3_txos_spent_slot_idx ON sundae_v3_txos (spent_slot);
 CREATE INDEX sundae_v3_txos_spent_height_idx ON sundae_v3_txos (spent_height);
+
+CREATE TABLE acropolis_cursors (
+    id TEXT PRIMARY KEY NOT NULL,
+    bytes BLOB NOT NULL
+);

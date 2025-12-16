@@ -2,7 +2,6 @@ use acropolis_common::messages::Message;
 use acropolis_common::{BlockHash, Point};
 use acropolis_module_block_unpacker::BlockUnpacker;
 use acropolis_module_custom_indexer::CustomIndexer;
-use acropolis_module_custom_indexer::cursor_store::InMemoryCursorStore;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
 use anyhow::{Result, anyhow};
@@ -328,7 +327,7 @@ async fn manager_loop(
         BlockUnpacker::register(&mut process);
         PeerNetworkInterface::register(&mut process);
 
-        let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
+        let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
         let mut v3_index = SundaeV3Indexer::new(
