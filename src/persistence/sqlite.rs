@@ -263,7 +263,7 @@ mod tests {
     use super::*;
 
     async fn new_db() -> Result<SqlitePersistence> {
-        Ok(SqlitePersistence::new(&SqliteConfig { filename: None }).await?)
+        SqlitePersistence::new(&SqliteConfig { filename: None }).await
     }
 
     fn preview_pool() -> PersistedTxo {
