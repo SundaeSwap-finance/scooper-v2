@@ -143,7 +143,8 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
         let query = "
             SELECT tx_id, txo_index, txo_type, created_slot, era, txo
             FROM sundae_v3_txos
-            WHERE spent_slot IS NULL;
+            WHERE spent_slot IS NULL
+            ORDER BY created_slot, tx_id, txo_index;
         ";
         Ok(sqlx::query_as(query).fetch_all(&self.pool).await?)
     }
