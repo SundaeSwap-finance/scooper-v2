@@ -160,10 +160,10 @@ impl AdminServer {
                     &pool.value,
                     &self.protocol.pool_script_hash,
                 ) {
-                    if let ValidationError::PoolError(PoolError::OutOfRange(
+                    if let ValidationError::PoolError(PoolError::OutOfRange {
                         swap_price,
                         pool_price,
-                    )) = err
+                    }) = err
                     {
                         response.out_of_range.push(OrderOutOfRange {
                             order: &order.input,
@@ -235,7 +235,7 @@ impl AdminServer {
 
 #[tokio::main]
 #[allow(unreachable_code)]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
@@ -253,8 +253,8 @@ async fn main() {
     let shutdown = CancellationToken::new();
 
     let protocol: SundaeV3Protocol = {
-        let f = std::fs::File::open(protocol_config_file).unwrap();
-        serde_json::from_reader(f).unwrap()
+        let f = std::fs::File::open(protocol_config_file)?;
+        serde_json::from_reader(f)?
     };
 
     const ROLLBACK_LIMIT: usize = 2160;
@@ -271,7 +271,7 @@ async fn main() {
         shutdown.child_token(),
     ));
     let scooper_handle = tokio::spawn(
-        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)
+        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)?
             .run(shutdown.child_token()),
     );
     let admin_handle = tokio::spawn(admin_server(
@@ -290,7 +290,8 @@ async fn main() {
         process::exit(0);
     });
 
-    tokio::try_join!(manager_handle, scooper_handle, admin_handle).unwrap();
+    tokio::try_join!(manager_handle, scooper_handle, admin_handle)?;
+    Ok(())
 }
 
 async fn manager_loop(

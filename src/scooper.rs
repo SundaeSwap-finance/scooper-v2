@@ -1,7 +1,19 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufWriter, Write as _},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
+use anyhow::Result;
+use serde::Serialize;
 use tokio::{select, sync::watch};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
+
+const LOG_DIR: &str = "logs";
 
 use crate::{
     cardano_types::TransactionInput,
@@ -14,14 +26,17 @@ use crate::{
 pub struct Scooper {
     sundaev3: watch::Receiver<SundaeV3Update>,
     policy: Vec<u8>,
+    orders: BTreeMap<TransactionInput, OrderValidity>,
 }
 
 impl Scooper {
-    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>, policy: &[u8]) -> Self {
-        Self {
+    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>, policy: &[u8]) -> Result<Self> {
+        fs::create_dir_all(LOG_DIR)?;
+        Ok(Self {
             sundaev3,
             policy: policy.to_vec(),
-        }
+            orders: BTreeMap::new(),
+        })
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) {
@@ -40,20 +55,53 @@ impl Scooper {
 
             let update = self.sundaev3.borrow_and_update().clone();
             // TODO: only "scoop" when we're at the head of the chain
-            self.log_orders(&update.state);
+            self.log_orders(update.slot, &update.state);
         }
     }
 
-    fn log_orders(&self, state: &SundaeV3State) {
-        let mut orders = vec![];
+    fn log_orders(&mut self, slot: u64, state: &SundaeV3State) {
+        let mut new_orders = BTreeMap::new();
         for order in &state.orders {
-            orders.push(OrderState {
-                order: order.input.clone(),
-                validity: self.validate_order(order, &state.pools),
-            });
+            let validity = self.validate_order(order, &state.pools);
+            new_orders.insert(order.input.clone(), validity);
         }
 
-        // TODO: log the orders
+        let mut updates = vec![];
+        for (txo, validity) in &new_orders {
+            match self.orders.get(txo) {
+                None => updates.push(OrderState {
+                    order: txo,
+                    slot,
+                    action: OrderAction::Added { valid: validity },
+                }),
+                Some(old_validity) => {
+                    if old_validity != validity {
+                        updates.push(OrderState {
+                            order: txo,
+                            slot,
+                            action: OrderAction::Changed { valid: validity },
+                        });
+                    }
+                }
+            }
+        }
+        for txo in self.orders.keys() {
+            if !new_orders.contains_key(txo) {
+                updates.push(OrderState {
+                    order: txo,
+                    slot,
+                    action: OrderAction::Removed,
+                });
+            }
+        }
+
+        if !updates.is_empty()
+            && let Err(err) = self.write_updates(&updates)
+        {
+            warn!("could not log updates: {err:#}");
+        }
+
+        self.orders = new_orders;
     }
 
     fn validate_order(
@@ -62,7 +110,9 @@ impl Scooper {
         pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
     ) -> OrderValidity {
         if let Err(err) = validate_order_value(&order.datum, &order.output.value) {
-            return OrderValidity::ValueError(err);
+            return OrderValidity::Invalid {
+                reason: OrderInvalidReason::ValueError(err),
+            };
         }
         let mut valid_pools = vec![];
         let mut errors = BTreeMap::new();
@@ -81,23 +131,66 @@ impl Scooper {
             }
         }
         if !valid_pools.is_empty() {
-            OrderValidity::Valid(valid_pools)
+            OrderValidity::Valid { pools: valid_pools }
         } else if !errors.is_empty() {
-            OrderValidity::PoolErrors(errors)
+            OrderValidity::Invalid {
+                reason: OrderInvalidReason::PoolErrors(errors),
+            }
         } else {
-            OrderValidity::NoPools
+            OrderValidity::Invalid {
+                reason: OrderInvalidReason::NoPools,
+            }
         }
+    }
+
+    fn write_updates(&self, updates: &[OrderState]) -> Result<()> {
+        let date = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let filename = format!("{date}.jsonl");
+        let path: PathBuf = [LOG_DIR, &filename].iter().collect();
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut file = BufWriter::new(file);
+        for update in updates {
+            serde_json::to_writer(&mut file, update)?;
+            writeln!(&mut file)?;
+        }
+        Ok(())
     }
 }
 
-#[expect(unused)]
-struct OrderState {
-    order: TransactionInput,
-    validity: OrderValidity,
+#[derive(Serialize)]
+struct OrderState<'a> {
+    slot: u64,
+    order: &'a TransactionInput,
+    action: OrderAction<'a>,
 }
-#[expect(unused)]
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum OrderAction<'a> {
+    Added {
+        #[serde(flatten)]
+        valid: &'a OrderValidity,
+    },
+    Changed {
+        #[serde(flatten)]
+        valid: &'a OrderValidity,
+    },
+    Removed,
+}
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "validity")]
 enum OrderValidity {
-    Valid(Vec<Ident>),
+    Valid { pools: Vec<Ident> },
+    Invalid { reason: OrderInvalidReason },
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+enum OrderInvalidReason {
     NoPools,
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
