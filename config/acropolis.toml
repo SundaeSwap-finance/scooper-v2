@@ -1,14 +1,11 @@
 [global.startup]
-method = "snapshot"
 topic = "cardano.sequence.start"
 
 [module.genesis-bootstrapper]
-network-name = "preview"
 
 [module.peer-network-interface]
 block-topic = "cardano.block.proposed"
-sync-point = "dynamic"
-magic-number = 2
+sync-point = "snapshot"
 
 [module.mithril-snapshot-fetcher]
 block-publish-topic = "cardano.block.proposed"
@@ -16,9 +13,6 @@ block-publish-topic = "cardano.block.proposed"
 [module.block-unpacker]
 
 [module.custom-indexer]
-
-[startup]
-topic = "cardano.sequence.start"
 
 [message-bus.internal]
 class = "in-memory"

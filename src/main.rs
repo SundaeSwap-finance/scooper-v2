@@ -239,9 +239,7 @@ impl AdminServer {
 #[allow(unreachable_code)]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(
-            "info,acropolis_module_peer_network_interface=warn",
-        ))
+        .with_env_filter(EnvFilter::new("info"))
         .init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
