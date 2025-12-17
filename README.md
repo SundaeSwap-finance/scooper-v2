@@ -1,5 +1,5 @@
 Example sync point:
 
 ```
-cargo run -- --protocol testdata/protocol sync-from-point --block-hash 5ac5ae6d76fc1f3062a7035bbcff515ff09462d70cb23813cb6d6d53589b6694 --slot 48462123
+cargo run -- --protocol testdata/protocol sync-from-point --block-hash 46611089f2b003bd829a820585170e423c8496a6225c2e3a625f2ad34fa94ab6 --slot 48462098
 ```
