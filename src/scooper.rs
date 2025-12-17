@@ -75,7 +75,7 @@ impl Scooper {
                     action: OrderAction::Added { valid: validity },
                 }),
                 Some(old_validity) => {
-                    if old_validity != validity {
+                    if self.validity_changed(old_validity, validity) {
                         updates.push(OrderState {
                             order: txo,
                             slot,
@@ -102,6 +102,47 @@ impl Scooper {
         }
 
         self.orders = new_orders;
+    }
+
+    // Log if the order's valid state has changed, unless the change is just becuase the pool price changed
+    fn validity_changed(&self, old: &OrderValidity, new: &OrderValidity) -> bool {
+        match (old, new) {
+            (
+                OrderValidity::Invalid {
+                    reason: OrderInvalidReason::PoolErrors(old_errors),
+                },
+                OrderValidity::Invalid {
+                    reason: OrderInvalidReason::PoolErrors(new_errors),
+                },
+            ) => {
+                if old_errors.len() != new_errors.len() {
+                    return true;
+                }
+                for (ident, old_error) in old_errors {
+                    let Some(new_error) = new_errors.get(ident) else {
+                        return true;
+                    };
+                    let matching = match (old_error, new_error) {
+                        (
+                            PoolError::OutOfRange {
+                                swap_price: old_price,
+                                ..
+                            },
+                            PoolError::OutOfRange {
+                                swap_price: new_price,
+                                ..
+                            },
+                        ) => old_price != new_price,
+                        (o, n) => o != n,
+                    };
+                    if !matching {
+                        return true;
+                    }
+                }
+                false
+            }
+            (o, n) => o != n,
+        }
     }
 
     fn validate_order(
