@@ -8,31 +8,31 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_common" }
-acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_block_unpacker" }
-acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_custom_indexer" }
-acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_genesis_bootstrapper" }
-acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_peer_network_interface" }
+acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "e2976c7", package = "acropolis_common" }
+acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "e2976c7", package = "acropolis_module_block_unpacker" }
+acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "e2976c7", package = "acropolis_module_custom_indexer" }
+acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "e2976c7", package = "acropolis_module_genesis_bootstrapper" }
+acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "e2976c7", package = "acropolis_module_peer_network_interface" }
 anyhow = "1"
 async-trait = "0.1"
-caryatid_sdk = "0.14.0"
+caryatid_sdk = "0.14"
 caryatid_process = "0.14"
 chrono = "0.4"
 clap = { version = "4.5.41", features = ["derive"] }
 config = "0.15.11"
 hex = { version = "0.4", features = ["serde"] }
-minicbor = { version = "0.26.0", features = ["alloc", "derive"] }
+minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = "1.0.0-alpha.2"
-pallas-primitives = "1.0.0-alpha.2"
-pallas-traverse = "1.0.0-alpha.2"
-plutus-parser = { version = "0.3.0", default-features = false, features = ["pallas-v1", "derive"] }
+pallas-addresses = "0.34"
+pallas-primitives = "0.34"
+pallas-traverse = "0.34"
+plutus-parser = { version = "0.4", features = ["derive"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = [
+tracing-subscriber = { version = "0.3", features = [
   "env-filter",
   "std",
   "json",

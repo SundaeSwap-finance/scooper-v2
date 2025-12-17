@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use pallas_addresses::Address;
-use pallas_primitives::conway::{DatumOption, NativeScript};
+use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
 use pallas_primitives::{Hash, PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
 use serde::ser::SerializeMap;
@@ -226,12 +226,12 @@ impl fmt::Display for TransactionInput {
     }
 }
 
-pub fn convert_datum(datum: Option<DatumOption>) -> Datum {
+pub fn convert_datum(datum: Option<MintedDatumOption>) -> Datum {
     match datum {
         None => Datum::None,
-        Some(DatumOption::Hash(h)) => Datum::None,
-        Some(DatumOption::Data(d)) => {
-            let plutus_data: PlutusData = minicbor::decode(d.raw_cbor()).unwrap();
+        Some(MintedDatumOption::Hash(h)) => Datum::None,
+        Some(MintedDatumOption::Data(d)) => {
+            let plutus_data: PlutusData = d.0.unwrap();
 
             if let Ok(order) = AsPlutus::from_plutus(plutus_data.clone()) {
                 return Datum::ParsedOrder(order);
@@ -261,12 +261,14 @@ pub fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     Value(result)
 }
 
-pub fn convert_script_ref(script_ref: pallas_primitives::conway::ScriptRef) -> ScriptRef {
+pub fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef) -> ScriptRef {
     match script_ref {
-        pallas_primitives::conway::ScriptRef::NativeScript(n) => ScriptRef::Native(n.unwrap()),
-        pallas_primitives::conway::ScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1(s),
-        pallas_primitives::conway::ScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2(s),
-        pallas_primitives::conway::ScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3(s),
+        pallas_primitives::conway::MintedScriptRef::NativeScript(n) => {
+            ScriptRef::Native(n.unwrap())
+        }
+        pallas_primitives::conway::MintedScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1(s),
+        pallas_primitives::conway::MintedScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2(s),
+        pallas_primitives::conway::MintedScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3(s),
     }
 }
 
