@@ -14,10 +14,10 @@ use tracing::{trace, warn};
 
 use crate::{
     SundaeV3Protocol,
-    cardano_types::{self, Datum, TransactionInput},
+    cardano_types::{self, AssetClass, Datum, TransactionInput, TransactionOutput},
     historical_state::HistoricalState,
     persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
-    sundaev3::{Ident, SundaeV3Order, SundaeV3Pool},
+    sundaev3::{Ident, PoolDatum, SundaeV3Order, SundaeV3Pool},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -77,7 +77,7 @@ impl SundaeV3Indexer {
             slot = slot.max(txo.created_slot);
             match txo.txo_type.as_str() {
                 "pool" => {
-                    let Datum::ParsedPool(pool_datum) = output.datum else {
+                    let Some(pool_datum) = self.parse_pool(&output) else {
                         bail!("invalid pool datum");
                     };
                     state.pools.insert(
@@ -112,6 +112,23 @@ impl SundaeV3Indexer {
             state,
         });
         Ok(())
+    }
+
+    fn parse_pool(&self, tx_out: &TransactionOutput) -> Option<PoolDatum> {
+        let Datum::ParsedPool(pool_datum) = &tx_out.datum else {
+            return None;
+        };
+        let mut asset_name = vec![0x00, 0x0d, 0xe1, 0x40];
+        asset_name.extend_from_slice(&pool_datum.ident);
+        let nft_asset_id = AssetClass {
+            policy: self.protocol.pool_script_hash.clone(),
+            token: asset_name,
+        };
+        if tx_out.value.get_asset_class(&nft_asset_id) > 0 {
+            Some(pool_datum.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -165,7 +182,7 @@ impl ChainIndex for SundaeV3Indexer {
                     index: ix as u64,
                 });
                 let tx_out = cardano_types::convert_transaction_output(output);
-                if let Datum::ParsedPool(pd) = tx_out.datum {
+                if let Some(pd) = self.parse_pool(&tx_out) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
                         txo_type: "pool".to_string(),
