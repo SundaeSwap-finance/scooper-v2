@@ -40,6 +40,8 @@ impl SundaeV3Update {
     }
 }
 
+const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+
 pub struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3HistoricalState>>,
     broadcaster: watch::Sender<SundaeV3Update>,
@@ -117,7 +119,7 @@ impl SundaeV3Indexer {
         let Datum::ParsedPool(pool_datum) = &tx_out.datum else {
             return None;
         };
-        let mut asset_name = vec![0x00, 0x0d, 0xe1, 0x40];
+        let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
         asset_name.extend_from_slice(&pool_datum.ident);
         let nft_asset_id = AssetClass {
             policy: self.protocol.pool_script_hash.clone(),
