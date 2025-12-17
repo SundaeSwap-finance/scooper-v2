@@ -2,7 +2,7 @@
 
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, NativeScript};
-use pallas_primitives::{PlutusData, PlutusScript};
+use pallas_primitives::{Hash, PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -202,6 +202,14 @@ pub struct TransactionOutput {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TransactionInput(pub pallas_primitives::TransactionInput);
+impl TransactionInput {
+    pub fn new(transaction_id: Hash<32>, index: u64) -> Self {
+        Self(pallas_primitives::TransactionInput {
+            transaction_id,
+            index,
+        })
+    }
+}
 
 impl serde::ser::Serialize for TransactionInput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

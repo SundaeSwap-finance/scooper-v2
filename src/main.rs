@@ -2,7 +2,6 @@ use acropolis_common::messages::Message;
 use acropolis_common::{BlockHash, Point};
 use acropolis_module_block_unpacker::BlockUnpacker;
 use acropolis_module_custom_indexer::CustomIndexer;
-use acropolis_module_custom_indexer::cursor_store::InMemoryCursorStore;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
 use acropolis_module_mithril_snapshot_fetcher::MithrilSnapshotFetcher;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
@@ -14,7 +13,6 @@ use tokio::select;
 use tokio::signal::ctrl_c;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 use std::path::PathBuf;
 use std::process;
@@ -24,9 +22,10 @@ use tracing::{Level, event, info, warn};
 
 mod bigint;
 mod cardano_types;
-mod configuration;
+mod config;
 mod historical_state;
 mod multisig;
+mod persistence;
 mod scooper;
 mod serde_compat;
 mod sundaev3;
@@ -45,6 +44,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::AppConfig;
+use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{
     PoolError, SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update, ValidationError,
@@ -67,7 +68,7 @@ struct Args {
     command: Commands,
 
     #[arg(long, value_name = "PATH", default_value = "scooper.toml")]
-    config: String,
+    config: PathBuf,
 }
 
 const BLOCK_HASH_SIZE: usize = 32;
@@ -162,10 +163,10 @@ impl AdminServer {
                     &pool.value,
                     &self.protocol.pool_script_hash,
                 ) {
-                    if let ValidationError::PoolError(PoolError::OutOfRange(
+                    if let ValidationError::PoolError(PoolError::OutOfRange {
                         swap_price,
                         pool_price,
-                    )) = err
+                    }) = err
                     {
                         response.out_of_range.push(OrderOutOfRange {
                             order: &order.input,
@@ -237,13 +238,15 @@ impl AdminServer {
 
 #[tokio::main]
 #[allow(unreachable_code)]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("info"))
-        .init();
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
+
+    let config = config::load_config(&scooper_config_file)?;
+    let app_config = config.clone().try_deserialize::<AppConfig>()?;
+
     let protocol_config_file = args.protocol;
     let default_start = match args.command {
         Commands::SyncFromOrigin => Point::Origin,
@@ -257,25 +260,27 @@ async fn main() {
     let shutdown = CancellationToken::new();
 
     let protocol: SundaeV3Protocol = {
-        let f = std::fs::File::open(protocol_config_file).unwrap();
-        serde_json::from_reader(f).unwrap()
+        let f = std::fs::File::open(protocol_config_file)?;
+        serde_json::from_reader(f)?
     };
 
-    const ROLLBACK_LIMIT: usize = 2160;
-    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new(ROLLBACK_LIMIT)));
+    let persistence = persistence::connect(&app_config.persistence).await?;
+
+    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
         index.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
-        scooper_config_file,
+        Arc::new(config),
         protocol.clone(),
+        persistence.clone(),
         default_start,
         shutdown.child_token(),
     ));
     let scooper_handle = tokio::spawn(
-        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)
+        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)?
             .run(shutdown.child_token()),
     );
     let admin_handle = tokio::spawn(admin_server(
@@ -294,15 +299,18 @@ async fn main() {
         process::exit(0);
     });
 
-    tokio::try_join!(manager_handle, scooper_handle, admin_handle).unwrap();
+    tokio::try_join!(manager_handle, scooper_handle, admin_handle)?;
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
-    scooper_config_file: String,
+    config: Arc<::config::Config>,
     protocol: SundaeV3Protocol,
+    persistence: Arc<dyn Persistence>,
     default_start: Point,
     shutdown: CancellationToken,
 ) {
@@ -310,12 +318,11 @@ async fn manager_loop(
     loop {
         let index = index.clone();
         let mut resync_tx = resync_tx.subscribe();
-        let scooper_config_file = scooper_config_file.clone();
+        let config = config.clone();
         let protocol = protocol.clone();
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
-
-        let (config, enable_mithril) = configuration::make_config(&scooper_config_file).unwrap();
+        let enable_mithril = config::use_mithril(&config);
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
@@ -325,10 +332,17 @@ async fn manager_loop(
         BlockUnpacker::register(&mut process);
         PeerNetworkInterface::register(&mut process);
 
-        let indexer = Arc::new(CustomIndexer::new(InMemoryCursorStore::new()));
+        let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
-        let v3_index = SundaeV3Indexer::new(index, broadcaster, protocol);
+        let mut v3_index = SundaeV3Indexer::new(
+            index,
+            broadcaster,
+            protocol,
+            config::ROLLBACK_LIMIT,
+            persistence.sundae_v3_dao(),
+        );
+        v3_index.load().await.unwrap();
 
         indexer
             .add_index(v3_index, default_start, force_restart)

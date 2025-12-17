@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 use crate::{
     bigint::BigInt,
     cardano_types::{ADA_ASSET_CLASS, AssetClass, Value},
@@ -23,7 +25,11 @@ impl fmt::Display for ValidationError {
                 PoolError::CoinPairMismatch => {
                     write!(f, "order coin pair does not match pool coin pair")
                 }
-                PoolError::OutOfRange(swap_price, pool_price) => {
+                PoolError::Empty => write!(f, "pool is empty"),
+                PoolError::OutOfRange {
+                    swap_price,
+                    pool_price,
+                } => {
                     write!(
                         f,
                         "order out of range (swap price {swap_price}, pool price {pool_price})"
@@ -60,6 +66,7 @@ pub fn validate_order(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub enum ValueError {
     GivesZeroTokens,
     HasInsufficientAda { expected: BigInt, actual: BigInt },
@@ -157,10 +164,12 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
     }
 }
 
+#[derive(Debug, PartialEq, Serialize)]
 pub enum PoolError {
     IdentMismatch,
     CoinPairMismatch,
-    OutOfRange(f64, f64),
+    Empty,
+    OutOfRange { swap_price: f64, pool_price: f64 },
 }
 
 pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(), PoolError> {
@@ -201,7 +210,9 @@ pub fn estimate_whether_in_range(
     pool_value: &Value,
 ) -> Result<(), PoolError> {
     let rewards = &pd.protocol_fees;
-    let pool_price = get_pool_price(policy, pool_value, rewards).unwrap();
+    let Some(pool_price) = get_pool_price(policy, pool_value, rewards) else {
+        return Err(PoolError::Empty);
+    };
     let Some(swap_price) = swap_price(od) else {
         return Ok(());
     };
@@ -210,14 +221,20 @@ pub fn estimate_whether_in_range(
             if pool_price <= swap_price {
                 Ok(())
             } else {
-                Err(PoolError::OutOfRange(swap_price, pool_price))
+                Err(PoolError::OutOfRange {
+                    swap_price,
+                    pool_price,
+                })
             }
         }
         (SwapDirection::BtoA, swap_price) => {
             if pool_price >= (1.0 / swap_price) {
                 Ok(())
             } else {
-                Err(PoolError::OutOfRange(1.0 / swap_price, pool_price))
+                Err(PoolError::OutOfRange {
+                    swap_price: 1.0 / swap_price,
+                    pool_price,
+                })
             }
         }
     }

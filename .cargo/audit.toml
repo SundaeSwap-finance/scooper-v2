@@ -1,2 +1,7 @@
 [advisories]
 informational_warnings = []
+ignore = [
+    # sqlx transitively depends on the RSA crate.
+    # Doesn't matter the library never hits the vulnerable path.
+    "RUSTSEC-2023-0071"
+]
