@@ -1,14 +1,13 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use acropolis_common::{BlockInfo, Point};
 use acropolis_module_custom_indexer::chain_index::ChainIndex;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use pallas_addresses::Address;
+use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
+use plutus_parser::AsPlutus;
 use tokio::sync::{Mutex, watch};
 use tracing::{trace, warn};
 
@@ -17,7 +16,7 @@ use crate::{
     cardano_types::{self, AssetClass, Datum, TransactionInput, TransactionOutput},
     historical_state::HistoricalState,
     persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
-    sundaev3::{Ident, PoolDatum, SundaeV3Order, SundaeV3Pool},
+    sundaev3::{Ident, OrderRedeemer, PoolDatum, SundaeV3Order, SundaeV3Pool, validate_order},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +129,52 @@ impl SundaeV3Indexer {
             None
         }
     }
+
+    fn parse_order_redeemer(&self, tx: &MultiEraTx, spend_index: usize) -> Option<OrderRedeemer> {
+        let redeemers = tx.redeemers();
+        let redeemer = redeemers
+            .iter()
+            .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)?;
+        OrderRedeemer::from_plutus(redeemer.data().clone()).ok()
+    }
+
+    fn validate_scoop(
+        &self,
+        slot: u64,
+        order: &SundaeV3Order,
+        pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
+    ) {
+        if let Some(ident) = &order.datum.ident {
+            let Some(pool) = pools.get(ident) else {
+                warn!(slot, order = %order.input, ident = %ident, "order was scooped by unrecognized pool");
+                return;
+            };
+            if let Err(error) = validate_order(
+                &order.datum,
+                &order.output.value,
+                &pool.pool_datum,
+                &pool.value,
+                &self.protocol.pool_script_hash,
+            ) {
+                warn!(slot, order = %order.input, ident = %ident, "invalid order was scooped: {error:#}");
+            }
+        } else {
+            let mut errors = vec![];
+            for (ident, pool) in pools {
+                match validate_order(
+                    &order.datum,
+                    &order.output.value,
+                    &pool.pool_datum,
+                    &pool.value,
+                    &self.protocol.pool_script_hash,
+                ) {
+                    Ok(()) => return,
+                    Err(error) => errors.push(format!("{ident}: {error:#}")),
+                }
+            }
+            warn!(slot, order = %order.input, "invalid order was scooped: [{}]", errors.join(", "));
+        }
+    }
 }
 
 #[async_trait]
@@ -147,27 +192,30 @@ impl ChainIndex for SundaeV3Indexer {
         let state = history.update_slot(info.slot)?;
         let mut changes = SundaeV3TxChanges::new(info.slot, info.number);
 
-        let spent_inputs = tx
+        let mut spent_inputs = tx
             .inputs()
             .into_iter()
-            .map(|i| {
-                TransactionInput(pallas_primitives::TransactionInput {
-                    transaction_id: *i.hash(),
-                    index: i.index(),
-                })
-            })
-            .collect::<BTreeSet<_>>();
-        state.pools.retain(|_, pool| {
-            if spent_inputs.contains(&pool.input) {
-                changes.spent_txos.push(pool.input.clone());
-                false
-            } else {
-                true
-            }
-        });
+            .map(|i| TransactionInput::new(*i.hash(), i.index()))
+            .collect::<Vec<_>>();
+        spent_inputs.sort();
+
         state.orders.retain(|order| {
-            if spent_inputs.contains(&order.input) {
-                changes.spent_txos.push(order.input.clone());
+            let Ok(spend_index) = spent_inputs.binary_search(&order.input) else {
+                // not spent
+                return true;
+            };
+            match self.parse_order_redeemer(&tx, spend_index) {
+                Some(OrderRedeemer::Scoop) => self.validate_scoop(info.slot, order, &state.pools),
+                Some(OrderRedeemer::Cancel) => {}
+                None => warn!(order = %order.input, "order spent without a valid redeemer!"),
+            }
+            changes.spent_txos.push(order.input.clone());
+            false
+        });
+
+        state.pools.retain(|_, pool| {
+            if spent_inputs.binary_search(&pool.input).is_ok() {
+                changes.spent_txos.push(pool.input.clone());
                 false
             } else {
                 true

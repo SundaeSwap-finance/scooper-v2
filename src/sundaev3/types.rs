@@ -88,6 +88,15 @@ pub enum PoolRedeemer {
     Manage,
 }
 
+/// An order can be spent either to Scoop (execute) it, or to cancel it
+#[derive(AsPlutus, Debug, PartialEq, Eq)]
+pub enum OrderRedeemer {
+    /// Execute the order
+    Scoop,
+    /// Or cancel/update it
+    Cancel,
+}
+
 #[derive(AsPlutus, Debug, PartialEq)]
 pub struct SSEBytes(Vec<u8>);
 
