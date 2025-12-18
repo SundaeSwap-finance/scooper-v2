@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use std::fmt;
 
 use serde::Serialize;
@@ -77,7 +75,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
     let scoop_fee = datum.scoop_fee.clone();
     match &datum.action {
         Order::Strategy(_) => Ok(()),
-        Order::Swap(a, b) => {
+        Order::Swap(a, _b) => {
             let minimum_ada = BigInt::from(ADA_RIDER) + scoop_fee.clone();
             let gives = a.amount.clone();
             let gives_asset = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
@@ -115,8 +113,8 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             Ok(())
         }
         Order::Deposit((a, b)) => {
-            let gives_a = a.amount.clone();
-            let gives_b = b.amount.clone();
+            //let gives_a = a.amount.clone();
+            //let gives_b = b.amount.clone();
             let asset_a = AssetClass::from_pair((a.policy.clone(), a.token.clone()));
             let asset_b = AssetClass::from_pair((b.policy.clone(), b.token.clone()));
             let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
@@ -263,7 +261,9 @@ mod tests {
         actual_rberry: i128,
     }
 
-    fn test_validate_ada_rberry_swap_schema(test_case: ValidateAdaRBerrySwapTestCase) -> bool {
+    fn test_validate_ada_rberry_swap_schema(
+        test_case: ValidateAdaRBerrySwapTestCase,
+    ) -> Result<(), ValueError> {
         let pkh = hex::decode("00").unwrap();
         let rberry_policy = vec![
             145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
@@ -294,7 +294,7 @@ mod tests {
             test_case.actual_ada,
             (&rberry_asset_class, test_case.actual_rberry)
         ];
-        validate_order_value(&order, &value).is_ok()
+        validate_order_value(&order, &value)
     }
 
     struct ValidateRBerrySBerrySwapTestCase {
@@ -308,7 +308,7 @@ mod tests {
 
     fn test_validate_rberry_sberry_swap_schema(
         test_case: ValidateRBerrySBerrySwapTestCase,
-    ) -> bool {
+    ) -> Result<(), ValueError> {
         let pkh = hex::decode("00").unwrap();
         let rberry_policy = vec![
             145, 212, 243, 130, 39, 63, 68, 47, 21, 233, 218, 72, 203, 35, 52, 155, 162, 117, 248,
@@ -343,20 +343,21 @@ mod tests {
             (&rberry_asset_class, test_case.actual_rberry),
             (&sberry_asset_class, test_case.actual_sberry)
         ];
-        validate_order_value(&order, &value).is_ok()
+        validate_order_value(&order, &value)
     }
 
     #[test]
     fn test_validate_ada_rberry_swap() {
-        assert!(test_validate_ada_rberry_swap_schema(
-            ValidateAdaRBerrySwapTestCase {
+        assert_eq!(
+            test_validate_ada_rberry_swap_schema(ValidateAdaRBerrySwapTestCase {
                 scoop_fee: 1_000_000,
                 ada_offered: 1_000_000,
                 rberry_offered: 1_000_000,
                 actual_ada: 10_000_000,
                 actual_rberry: 1_000_000,
-            }
-        ))
+            }),
+            Ok(())
+        )
     }
 
     // 3 ADA on the utxo is not sufficient because after deducting the 1 ADA
@@ -364,14 +365,49 @@ mod tests {
     // the 2 ADA rider value
     #[test]
     fn test_validate_ada_rberry_swap_insufficient_ada() {
-        assert!(!test_validate_ada_rberry_swap_schema(
-            ValidateAdaRBerrySwapTestCase {
+        assert_eq!(
+            test_validate_ada_rberry_swap_schema(ValidateAdaRBerrySwapTestCase {
                 scoop_fee: 1_000_000,
                 ada_offered: 1_000_000,
                 rberry_offered: 1_000_000,
                 actual_ada: 3_000_000,
                 actual_rberry: 1_000_000,
-            }
-        ))
+            }),
+            Err(ValueError::HasInsufficientAda {
+                expected: BigInt::from(4_000_000),
+                actual: BigInt::from(3_000_000)
+            })
+        )
+    }
+
+    #[test]
+    fn test_validate_rberry_sberry_swap() {
+        assert_eq!(
+            test_validate_rberry_sberry_swap_schema(ValidateRBerrySBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                sberry_offered: 1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 3_000_000,
+                actual_sberry: 10_000_000,
+                actual_rberry: 1_000_000,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_rberry_sberry_gives_zero_tokens() {
+        // TODO: make it pass
+        assert_eq!(
+            test_validate_rberry_sberry_swap_schema(ValidateRBerrySBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                sberry_offered: -1_000_000,
+                rberry_offered: 1_000_000,
+                actual_ada: 3_000_000,
+                actual_sberry: 10_000_000,
+                actual_rberry: 1_000_000,
+            }),
+            Err(ValueError::GivesZeroTokens)
+        );
     }
 }
