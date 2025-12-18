@@ -8,11 +8,12 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_common" }
-acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_block_unpacker" }
-acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_custom_indexer" }
-acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_genesis_bootstrapper" }
-acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "d1be34c", package = "acropolis_module_peer_network_interface" }
+acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_common" }
+acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_module_block_unpacker" }
+acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_module_custom_indexer" }
+acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_module_genesis_bootstrapper" }
+acropolis_module_mithril_snapshot_fetcher = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_module_mithril_snapshot_fetcher" }
+acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "4772787", package = "acropolis_module_peer_network_interface" }
 anyhow = "1"
 async-trait = "0.1"
 caryatid_sdk = "0.14.0"
