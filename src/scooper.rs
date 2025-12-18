@@ -17,10 +17,9 @@ const LOG_DIR: &str = "logs";
 
 use crate::{
     bigint::BigInt,
-    cardano_types::{AssetClass, TransactionInput},
+    cardano_types::TransactionInput,
     sundaev3::{
-        Ident, PoolError, SundaeV3Order, SundaeV3Pool, SundaeV3State, SundaeV3Update, ValueError,
-        estimate_whether_in_range, get_pool_price, validate_order_for_pool, validate_order_value,
+        Ident, PoolError, SingletonValue, SundaeV3Order, SundaeV3Pool, SundaeV3State, SundaeV3Update, ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value
     },
 };
 
@@ -61,17 +60,19 @@ impl Scooper {
     }
 
     fn log_changes(&mut self, slot: u64, state: &SundaeV3State) {
-        self.log_pools(slot, state);
         self.log_orders(slot, state);
+        self.log_pools(slot, state);
     }
 
     fn log_pools(&mut self, slot: u64, state: &SundaeV3State) {
         let mut new_pools = BTreeMap::new();
         for (ident, pool) in &state.pools {
-            let price = get_pool_price(&pool.pool_datum, &pool.value);
+            let (asset_a, asset_b) = pool.pool_datum.assets.clone();
+            let amount_a = pool.value.get(&asset_a);
+            let amount_b = pool.value.get(&asset_b);
             let summary = PoolSummary {
-                assets: pool.pool_datum.assets.clone(),
-                price,
+                assets: (SingletonValue::new(asset_a, amount_a), SingletonValue::new(asset_b, amount_b)),
+                liquidity: pool.pool_datum.circulating_lp.clone(),
                 protocol_fees: pool.pool_datum.protocol_fees.clone(),
             };
             new_pools.insert(ident.clone(), summary);
@@ -283,8 +284,8 @@ enum PoolAction<'a> {
 
 #[derive(Serialize, PartialEq)]
 struct PoolSummary {
-    assets: (AssetClass, AssetClass),
-    price: Option<f64>,
+    assets: (SingletonValue, SingletonValue),
+    liquidity: BigInt,
     protocol_fees: BigInt,
 }
 

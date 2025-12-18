@@ -157,6 +157,13 @@ impl SingletonValue {
             token: self.token.clone(),
         }
     }
+    pub fn new(class: AssetClass, amount: BigInt) -> Self {
+        Self {
+            policy: class.policy,
+            token: class.token,
+            amount,
+        }
+    }
 }
 
 impl AsPlutus for SingletonValue {
