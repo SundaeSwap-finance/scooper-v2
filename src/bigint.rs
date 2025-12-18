@@ -1,4 +1,4 @@
-use num_traits::cast::ToPrimitive;
+use num_traits::{ConstZero, Num, One, Signed, Zero, cast::ToPrimitive};
 use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use std::fmt;
@@ -124,6 +124,138 @@ impl std::ops::Mul<BigInt> for &BigInt {
 impl std::ops::MulAssign for BigInt {
     fn mul_assign(&mut self, other: BigInt) {
         self.0 *= other.0
+    }
+}
+
+impl std::ops::Div for BigInt {
+    type Output = BigInt;
+    fn div(self, rhs: Self) -> Self::Output {
+        Self(self.0 / rhs.0)
+    }
+}
+
+impl std::ops::Div<&BigInt> for &BigInt {
+    type Output = BigInt;
+    fn div(self, rhs: &BigInt) -> Self::Output {
+        BigInt(&self.0 / &rhs.0)
+    }
+}
+
+impl std::ops::Div<&BigInt> for BigInt {
+    type Output = BigInt;
+    fn div(self, rhs: &BigInt) -> Self::Output {
+        BigInt(self.0 / &rhs.0)
+    }
+}
+
+impl std::ops::Div<BigInt> for &BigInt {
+    type Output = BigInt;
+    fn div(self, rhs: BigInt) -> Self::Output {
+        BigInt(&self.0 / rhs.0)
+    }
+}
+
+impl std::ops::DivAssign for BigInt {
+    fn div_assign(&mut self, rhs: Self) {
+        self.0 /= rhs.0;
+    }
+}
+
+impl std::ops::Rem for BigInt {
+    type Output = BigInt;
+    fn rem(self, rhs: Self) -> Self::Output {
+        Self(self.0 % rhs.0)
+    }
+}
+
+impl std::ops::Rem<&BigInt> for &BigInt {
+    type Output = BigInt;
+    fn rem(self, rhs: &BigInt) -> Self::Output {
+        BigInt(&self.0 % &rhs.0)
+    }
+}
+
+impl std::ops::Rem<&BigInt> for BigInt {
+    type Output = BigInt;
+    fn rem(self, rhs: &BigInt) -> Self::Output {
+        BigInt(self.0 % &rhs.0)
+    }
+}
+
+impl std::ops::Rem<BigInt> for &BigInt {
+    type Output = BigInt;
+    fn rem(self, rhs: BigInt) -> Self::Output {
+        BigInt(&self.0 % rhs.0)
+    }
+}
+
+impl std::ops::RemAssign for BigInt {
+    fn rem_assign(&mut self, rhs: Self) {
+        self.0 %= rhs.0;
+    }
+}
+
+impl std::ops::Neg for BigInt {
+    type Output = BigInt;
+    fn neg(self) -> Self::Output {
+        Self(self.0.neg())
+    }
+}
+
+impl std::ops::Neg for &BigInt {
+    type Output = BigInt;
+    fn neg(self) -> Self::Output {
+        -self.clone()
+    }
+}
+
+impl Zero for BigInt {
+    fn zero() -> Self {
+        Self(num_bigint::BigInt::zero())
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+impl ConstZero for BigInt {
+    const ZERO: Self = Self(num_bigint::BigInt::ZERO);
+}
+
+impl One for BigInt {
+    fn one() -> Self {
+        Self(num_bigint::BigInt::one())
+    }
+}
+
+impl Num for BigInt {
+    type FromStrRadixErr = num_bigint::ParseBigIntError;
+
+    fn from_str_radix(str: &str, radix: u32) -> Result<Self, Self::FromStrRadixErr> {
+        Ok(Self(num_bigint::BigInt::from_str_radix(str, radix)?))
+    }
+}
+
+impl Signed for BigInt {
+    fn abs(&self) -> Self {
+        Self(self.0.abs())
+    }
+
+    fn abs_sub(&self, other: &Self) -> Self {
+        Self(self.0.abs_sub(&other.0))
+    }
+
+    fn signum(&self) -> Self {
+        Self(self.0.signum())
+    }
+
+    fn is_positive(&self) -> bool {
+        self.0.is_positive()
+    }
+
+    fn is_negative(&self) -> bool {
+        self.0.is_negative()
     }
 }
 

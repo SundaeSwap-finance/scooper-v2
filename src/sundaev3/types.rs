@@ -150,6 +150,15 @@ pub struct SingletonValue {
     pub amount: BigInt,
 }
 
+impl SingletonValue {
+    pub fn asset_class(&self) -> AssetClass {
+        AssetClass {
+            policy: self.policy.clone(),
+            token: self.token.clone(),
+        }
+    }
+}
+
 impl AsPlutus for SingletonValue {
     fn from_plutus(pd: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
         let (policy, token, amount): (Vec<u8>, Vec<u8>, BigInt) = AsPlutus::from_plutus(pd)?;
