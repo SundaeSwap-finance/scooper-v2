@@ -74,10 +74,42 @@ impl std::ops::Add<BigInt> for &BigInt {
     }
 }
 
+impl std::ops::AddAssign for BigInt {
+    fn add_assign(&mut self, other: BigInt) {
+        self.0 += other.0
+    }
+}
+
+impl std::ops::AddAssign<&BigInt> for BigInt {
+    fn add_assign(&mut self, other: &BigInt) {
+        self.0 += &other.0
+    }
+}
 impl std::ops::Sub for BigInt {
     type Output = BigInt;
     fn sub(self, other: BigInt) -> BigInt {
         Self(self.0 - other.0)
+    }
+}
+
+impl std::ops::Sub<&BigInt> for &BigInt {
+    type Output = BigInt;
+    fn sub(self, other: &BigInt) -> BigInt {
+        BigInt(&self.0 - &other.0)
+    }
+}
+
+impl std::ops::Sub<&BigInt> for BigInt {
+    type Output = BigInt;
+    fn sub(self, other: &BigInt) -> BigInt {
+        Self(self.0 - &other.0)
+    }
+}
+
+impl std::ops::Sub<BigInt> for &BigInt {
+    type Output = BigInt;
+    fn sub(self, other: BigInt) -> BigInt {
+        BigInt(&self.0 - other.0)
     }
 }
 

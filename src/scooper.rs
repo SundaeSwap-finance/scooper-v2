@@ -206,7 +206,7 @@ impl Scooper {
         order: &SundaeV3Order,
         pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
     ) -> OrderValidity {
-        if let Err(err) = validate_order_value(&order.datum, &order.output.value) {
+        if let Err(err) = validate_order_value(&order.datum, &order.value) {
             return OrderValidity::Invalid {
                 reason: OrderInvalidReason::ValueError(err),
             };

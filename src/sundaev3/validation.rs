@@ -88,7 +88,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 return Err(ValueError::GivesZeroTokens);
             }
 
-            let actual_ada = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            let actual_ada = BigInt::from(value.get(&ADA_ASSET_CLASS));
             let expected_ada = gives_ada + minimum_ada.clone();
             if actual_ada < expected_ada {
                 return Err(ValueError::HasInsufficientTokens {
@@ -98,7 +98,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 });
             }
 
-            let actual_amount_of_give_token = BigInt::from(value.get_asset_class(&gives_asset))
+            let actual_amount_of_give_token = BigInt::from(value.get(&gives_asset))
                 - if gives_asset == ADA_ASSET_CLASS {
                     minimum_ada
                 } else {
@@ -121,7 +121,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
         Order::Deposit((a, b)) => {
             let asset_a = a.asset_class();
             let asset_b = b.asset_class();
-            let mut actual_a = BigInt::from(value.get_asset_class(&asset_a));
+            let mut actual_a = BigInt::from(value.get(&asset_a));
             if asset_a == ADA_ASSET_CLASS {
                 let minimum = BigInt::from(ADA_RIDER) + scoop_fee.clone();
                 if actual_a < minimum {
@@ -133,7 +133,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 }
                 actual_a -= minimum;
             }
-            let actual_b = BigInt::from(value.get_asset_class(&asset_b));
+            let actual_b = BigInt::from(value.get(&asset_b));
 
             if !actual_a.is_positive() || !actual_b.is_positive() {
                 return Err(ValueError::GivesZeroTokens);
@@ -161,7 +161,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             if !singleton.amount.is_positive() {
                 return Err(ValueError::GivesZeroTokens);
             }
-            let actual = BigInt::from(value.get_asset_class(&singleton.asset_class()));
+            let actual = BigInt::from(value.get(&singleton.asset_class()));
             if actual < singleton.amount {
                 return Err(ValueError::HasInsufficientTokens {
                     asset: singleton.asset_class(),
@@ -170,7 +170,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 });
             }
             let expected = BigInt::from(ADA_RIDER) + scoop_fee;
-            let actual = BigInt::from(value.get_asset_class(&ADA_ASSET_CLASS));
+            let actual = BigInt::from(value.get(&ADA_ASSET_CLASS));
             if actual < expected {
                 return Err(ValueError::HasInsufficientTokens {
                     asset: ADA_ASSET_CLASS,

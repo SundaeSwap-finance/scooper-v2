@@ -155,12 +155,9 @@ impl AdminServer {
                 if order.datum.ident.as_ref() != Some(&ident) {
                     continue;
                 }
-                if let Err(err) = validate_order(
-                    &order.datum,
-                    &order.output.value,
-                    &pool.pool_datum,
-                    &pool.value,
-                ) {
+                if let Err(err) =
+                    validate_order(&order.datum, &order.value, &pool.pool_datum, &pool.value)
+                {
                     if let ValidationError::PoolError(PoolError::OutOfRange {
                         swap_price,
                         pool_price,

@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use num_traits::ConstZero;
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
 use pallas_primitives::{Hash, PlutusData, PlutusScript};
@@ -12,6 +13,7 @@ use std::fmt;
 
 use plutus_parser::AsPlutus;
 
+use crate::bigint::BigInt;
 use crate::serde_compat::serialize_address;
 use crate::sundaev3::{OrderDatum, PoolDatum};
 pub type Bytes = Vec<u8>;
@@ -91,16 +93,16 @@ impl fmt::Display for AssetClass {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, i128>>);
+pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, BigInt>>);
 
 #[macro_export]
 macro_rules! value {
     ( $ada:expr, $( $token:expr ),* ) => {
         {
             let mut value = $crate::cardano_types::Value::new();
-            value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, $ada);
+            value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, BigInt::from($ada));
             $(
-                value.insert($token.0, $token.1);
+                value.insert($token.0, BigInt::from($token.1));
             )*
             value
         }
@@ -112,16 +114,16 @@ impl Value {
         Value(BTreeMap::new())
     }
 
-    pub fn get_asset_class(&self, asset_class: &AssetClass) -> i128 {
+    pub fn get(&self, asset_class: &AssetClass) -> BigInt {
         if let Some(assets) = self.0.get(&asset_class.policy)
             && let Some(quantity) = assets.get(&asset_class.token)
         {
-            return *quantity;
+            return quantity.clone();
         }
-        0
+        BigInt::ZERO
     }
 
-    pub fn insert(&mut self, asset_class: &AssetClass, quantity: i128) {
+    pub fn insert(&mut self, asset_class: &AssetClass, quantity: BigInt) {
         match self.0.get_mut(&asset_class.policy) {
             Some(tokens) => {
                 tokens.insert(asset_class.token.clone(), quantity);
@@ -132,6 +134,16 @@ impl Value {
                 self.0.insert(asset_class.policy.clone(), new_tokens);
             }
         }
+    }
+
+    pub fn add(&mut self, asset_class: &AssetClass, quantity: &BigInt) {
+        let new_amount = self.get(asset_class) + quantity;
+        self.insert(asset_class, new_amount);
+    }
+
+    pub fn subtract(&mut self, asset_class: &AssetClass, quantity: &BigInt) {
+        let new_amount = self.get(asset_class) - quantity;
+        self.insert(asset_class, new_amount);
     }
 }
 
@@ -162,6 +174,12 @@ impl serde::Serialize for Value {
         }
 
         map.end()
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", serde_json::to_string(self).unwrap())
     }
 }
 
@@ -254,7 +272,7 @@ pub fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
         let pol = policy.policy();
         for asset in policy.assets() {
             let tok = asset.name();
-            p_map.insert(tok.to_vec(), asset.any_coin());
+            p_map.insert(tok.to_vec(), BigInt::from(asset.any_coin()));
         }
         result.insert(pol.to_vec(), p_map);
     }

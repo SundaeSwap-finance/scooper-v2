@@ -4,6 +4,7 @@ use acropolis_common::{BlockInfo, Point};
 use acropolis_module_custom_indexer::chain_index::ChainIndex;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use num_traits::Signed;
 use pallas_addresses::Address;
 use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
@@ -16,7 +17,10 @@ use crate::{
     cardano_types::{self, AssetClass, Datum, TransactionInput, TransactionOutput},
     historical_state::HistoricalState,
     persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
-    sundaev3::{Ident, OrderRedeemer, PoolDatum, SundaeV3Order, SundaeV3Pool, validate_order},
+    sundaev3::{
+        Ident, OrderRedeemer, PoolDatum, SundaeV3Order, SundaeV3Pool, pool::ScoopedPool,
+        validate_order,
+    },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -85,7 +89,6 @@ impl SundaeV3Indexer {
                         pool_datum.ident.clone(),
                         Arc::new(SundaeV3Pool {
                             input: txo.txo_id,
-                            address: output.address,
                             value: output.value,
                             pool_datum,
                             slot: txo.created_slot,
@@ -93,13 +96,13 @@ impl SundaeV3Indexer {
                     );
                 }
                 "order" => {
-                    let Datum::ParsedOrder(datum) = &output.datum else {
+                    let Datum::ParsedOrder(datum) = output.datum else {
                         bail!("invalid order datum");
                     };
                     state.orders.push(Arc::new(SundaeV3Order {
                         input: txo.txo_id,
-                        datum: datum.clone(),
-                        output,
+                        datum,
+                        value: output.value,
                         slot: txo.created_slot,
                     }));
                 }
@@ -125,7 +128,7 @@ impl SundaeV3Indexer {
             policy: self.protocol.pool_script_hash.clone(),
             token: asset_name,
         };
-        if tx_out.value.get_asset_class(&nft_asset_id) > 0 {
+        if tx_out.value.get(&nft_asset_id).is_positive() {
             Some(pool_datum.clone())
         } else {
             None
@@ -140,39 +143,16 @@ impl SundaeV3Indexer {
         OrderRedeemer::from_plutus(redeemer.data().clone()).ok()
     }
 
-    fn validate_scoop(
-        &self,
-        slot: u64,
-        order: &SundaeV3Order,
-        pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
-    ) {
-        if let Some(ident) = &order.datum.ident {
-            let Some(pool) = pools.get(ident) else {
-                warn!(slot, order = %order.input, ident = %ident, "order was scooped by unrecognized pool");
-                return;
-            };
-            if let Err(error) = validate_order(
-                &order.datum,
-                &order.output.value,
-                &pool.pool_datum,
-                &pool.value,
-            ) {
-                warn!(slot, order = %order.input, ident = %ident, "invalid order was scooped: {error:#}");
+    fn apply_order(&self, slot: u64, order: &SundaeV3Order, pool: Option<&mut ScoopedPool>) {
+        let Some(pool) = pool else {
+            warn!(slot, order = %order.input, "order was scooped in a TX without exactly one pool update");
+            return;
+        };
+        match validate_order(&order.datum, &order.value, &pool.datum, &pool.value) {
+            Ok(()) => pool.apply_order(order),
+            Err(error) => {
+                warn!(slot, order = %order.input, ident = %pool.datum.ident, "invalid order was scooped: {error:#}");
             }
-        } else {
-            let mut errors = vec![];
-            for (ident, pool) in pools {
-                match validate_order(
-                    &order.datum,
-                    &order.output.value,
-                    &pool.pool_datum,
-                    &pool.value,
-                ) {
-                    Ok(()) => return,
-                    Err(error) => errors.push(format!("{ident}: {error:#}")),
-                }
-            }
-            warn!(slot, order = %order.input, "invalid order was scooped: [{}]", errors.join(", "));
         }
     }
 }
@@ -189,39 +169,12 @@ impl ChainIndex for SundaeV3Indexer {
         trace!("Ingesting tx: {}", hex::encode(this_tx_hash));
         let mut history = self.state.lock().await;
 
-        let state = history.update_slot(info.slot)?;
+        let mut updated_pools = BTreeMap::new();
+        let mut new_orders = vec![];
         let mut changes = SundaeV3TxChanges::new(info.slot, info.number);
 
-        let mut spent_inputs = tx
-            .inputs()
-            .into_iter()
-            .map(|i| TransactionInput::new(*i.hash(), i.index()))
-            .collect::<Vec<_>>();
-        spent_inputs.sort();
-
-        state.orders.retain(|order| {
-            let Ok(spend_index) = spent_inputs.binary_search(&order.input) else {
-                // not spent
-                return true;
-            };
-            match self.parse_order_redeemer(&tx, spend_index) {
-                Some(OrderRedeemer::Scoop) => self.validate_scoop(info.slot, order, &state.pools),
-                Some(OrderRedeemer::Cancel) => {}
-                None => warn!(order = %order.input, "order spent without a valid redeemer!"),
-            }
-            changes.spent_txos.push(order.input.clone());
-            false
-        });
-
-        state.pools.retain(|_, pool| {
-            if spent_inputs.binary_search(&pool.input).is_ok() {
-                changes.spent_txos.push(pool.input.clone());
-                false
-            } else {
-                true
-            }
-        });
-
+        // Find which pools and orders have been updated in this transaction.
+        // Do not apply those updates to our new state yet.
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
             if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
@@ -242,12 +195,11 @@ impl ChainIndex for SundaeV3Indexer {
                     let pool_id = pd.ident.clone();
                     let pool_record = SundaeV3Pool {
                         input: this_input,
-                        address: tx_out.address,
                         value: tx_out.value,
                         pool_datum: pd,
                         slot: info.slot,
                     };
-                    state.pools.insert(pool_id, Arc::new(pool_record));
+                    updated_pools.insert(pool_id, Arc::new(pool_record));
                 }
             } else if payment_hash_equals(&address, &self.protocol.order_script_hash) {
                 let this_input = TransactionInput(pallas_primitives::TransactionInput {
@@ -255,7 +207,7 @@ impl ChainIndex for SundaeV3Indexer {
                     index: ix as u64,
                 });
                 let tx_out = cardano_types::convert_transaction_output(output);
-                if let Datum::ParsedOrder(od) = &tx_out.datum {
+                if let Datum::ParsedOrder(od) = tx_out.datum {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
                         txo_type: "order".to_string(),
@@ -264,17 +216,79 @@ impl ChainIndex for SundaeV3Indexer {
                         txo: output.encode(),
                     });
 
-                    let datum = od.clone();
                     let order = SundaeV3Order {
                         input: this_input,
-                        output: tx_out,
-                        datum,
+                        value: tx_out.value,
+                        datum: od,
                         slot: info.slot,
                     };
-                    state.orders.push(Arc::new(order));
+                    new_orders.push(Arc::new(order));
                 }
             }
         }
+
+        let state = history.update_slot(info.slot)?;
+
+        // Capture the state of the pool before any orders got scooped
+        let mut scooped_pool = if updated_pools.len() == 1 {
+            let ident = updated_pools.keys().next().unwrap();
+            state.pools.get(ident).map(|pool| ScoopedPool::new(pool))
+        } else {
+            None
+        };
+
+        let mut spent_inputs = tx
+            .inputs()
+            .into_iter()
+            .map(|i| TransactionInput::new(*i.hash(), i.index()))
+            .collect::<Vec<_>>();
+        spent_inputs.sort();
+
+        // If any orders were scooped, apply them to the pool
+        state.orders.retain(|order| {
+            let Ok(spend_index) = spent_inputs.binary_search(&order.input) else {
+                // not spent
+                return true;
+            };
+            match self.parse_order_redeemer(&tx, spend_index) {
+                Some(OrderRedeemer::Scoop) => {
+                    self.apply_order(info.slot, order, scooped_pool.as_mut())
+                }
+                Some(OrderRedeemer::Cancel) => {}
+                None => warn!(order = %order.input, "order spent without a valid redeemer!"),
+            }
+            changes.spent_txos.push(order.input.clone());
+            false
+        });
+
+        // Remove spent pools
+        state.pools.retain(|_, pool| {
+            if spent_inputs.binary_search(&pool.input).is_ok() {
+                changes.spent_txos.push(pool.input.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        // And apply new pools
+        for (ident, pool) in updated_pools {
+            if let Some(scooped_pool) = &scooped_pool {
+                let expected_lp = &scooped_pool.datum.circulating_lp;
+                let observed_lp = &pool.pool_datum.circulating_lp;
+                if expected_lp != observed_lp {
+                    warn!(ident = %pool.pool_datum.ident, %expected_lp, %observed_lp, "pool has incorrect liquidity");
+                }
+
+                let expected_value = &scooped_pool.value;
+                let observed_value = &pool.value;
+                if expected_value != observed_value {
+                    warn!(ident = %pool.pool_datum.ident, %expected_value, %observed_value, "pool has incorrect value");
+                }
+            }
+            state.pools.insert(ident, pool);
+        }
+        state.orders.append(&mut new_orders);
 
         if !changes.is_empty() {
             self.dao.apply_tx_changes(changes).await?;
@@ -332,6 +346,8 @@ fn payment_hash_equals(addr: &Address, hash: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::bigint::BigInt;
+
     use super::*;
 
     use std::fs;
@@ -415,9 +431,15 @@ mod tests {
         assert_eq!(index.pools.len(), 1);
         let first_pool = index.pools.first_entry().unwrap();
         let pool_value = &first_pool.get().value.0;
-        assert_eq!(pool_value[&ada_policy][&ada_token], 6181255175);
-        assert_eq!(pool_value[&pool_policy][&pool_token], 1);
-        assert_eq!(pool_value[&coin_b_policy][&coin_b_token], 6397550387);
+        assert_eq!(
+            pool_value[&ada_policy][&ada_token],
+            BigInt::from(6181255175i128)
+        );
+        assert_eq!(pool_value[&pool_policy][&pool_token], BigInt::from(1));
+        assert_eq!(
+            pool_value[&coin_b_policy][&coin_b_token],
+            BigInt::from(6397550387i128)
+        );
         assert_eq!(index.orders.len(), 0);
     }
 

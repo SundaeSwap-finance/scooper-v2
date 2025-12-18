@@ -383,8 +383,6 @@ pub struct StrategyExecution {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV3Pool {
     pub input: TransactionInput,
-    #[serde(serialize_with = "serialize_address")]
-    pub address: pallas_addresses::Address,
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub slot: u64,
@@ -399,7 +397,7 @@ impl PartialOrd for SundaeV3Pool {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV3Order {
     pub input: TransactionInput,
-    pub output: TransactionOutput,
+    pub value: Value,
     pub datum: OrderDatum,
     pub slot: u64,
 }
