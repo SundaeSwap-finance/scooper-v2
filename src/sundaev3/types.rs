@@ -1,15 +1,12 @@
-#![allow(unused)]
-
-use pallas_primitives::{Fragment, PlutusData};
+use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::bigint::BigInt;
-use crate::cardano_types::{AssetClass, TransactionInput, TransactionOutput, Value};
+use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::multisig::Multisig;
-use crate::serde_compat::serialize_address;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -70,23 +67,21 @@ pub struct PoolDatum {
     pub protocol_fees: BigInt,
 }
 
-enum PlutusOption<T> {
-    PlutusNone,
-    PlutusSome(T),
-}
-
-fn plutus_option_to_option<T>(p: PlutusOption<T>) -> Option<T> {
-    match p {
-        PlutusOption::PlutusNone => None,
-        PlutusOption::PlutusSome(x) => Some(x),
-    }
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum PoolRedeemer {
+    // When constructing a pool scoop redeemer we don't construct SSEs because they will be
+    // retrieved from a database. So it's better to represent them here as raw bytes.
+    PoolScoop {
+        signatory_index: u64,
+        scooper_index: u64,
+        input_order: Vec<(u64, Option<SSEBytes>, BigInt)>,
+    },
+    Manage,
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
-pub enum PoolRedeemer {
-    PoolScoop(PoolScoop),
-    Manage,
-}
+#[variant = 1]
+pub struct WrappedRedeemer<T: AsPlutus>(pub T);
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
 #[derive(AsPlutus, Debug, PartialEq, Eq)]
@@ -100,16 +95,8 @@ pub enum OrderRedeemer {
 #[derive(AsPlutus, Debug, PartialEq)]
 pub struct SSEBytes(Vec<u8>);
 
-// When constructing a pool scoop redeemer we don't construct SSEs because they will be
-// retrieved from a database. So it's better to represent them here as raw bytes.
 #[derive(AsPlutus, Debug, PartialEq)]
-pub struct PoolScoop {
-    signatory_index: BigInt,
-    scooper_index: BigInt,
-    input_order: Vec<(BigInt, Option<SSEBytes>, BigInt)>,
-}
-
-#[derive(AsPlutus, Debug, PartialEq)]
+#[expect(unused)]
 pub struct SignedStrategyExecution {
     execution: StrategyExecution,
     signature: Option<Vec<u8>>,
@@ -321,6 +308,7 @@ pub enum AikenDatum {
     InlineDatum(Vec<u8>),
 }
 
+#[cfg(test)]
 pub fn empty_cons() -> PlutusData {
     PlutusData::Constr(pallas_primitives::Constr {
         tag: 121,
