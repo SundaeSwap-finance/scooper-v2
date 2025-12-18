@@ -156,7 +156,6 @@ impl SundaeV3Indexer {
                 &order.output.value,
                 &pool.pool_datum,
                 &pool.value,
-                &self.protocol.pool_script_hash,
             ) {
                 warn!(slot, order = %order.input, ident = %ident, "invalid order was scooped: {error:#}");
             }
@@ -168,7 +167,6 @@ impl SundaeV3Indexer {
                     &order.output.value,
                     &pool.pool_datum,
                     &pool.value,
-                    &self.protocol.pool_script_hash,
                 ) {
                     Ok(()) => return,
                     Err(error) => errors.push(format!("{ident}: {error:#}")),

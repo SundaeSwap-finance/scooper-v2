@@ -54,12 +54,10 @@ pub fn validate_order(
     value: &Value,
     pool: &PoolDatum,
     pool_value: &Value,
-    policy: &[u8],
 ) -> Result<(), ValidationError> {
     validate_order_value(order, value).map_err(ValidationError::ValueError)?;
     validate_order_for_pool(order, pool).map_err(ValidationError::PoolError)?;
-    estimate_whether_in_range(policy, order, pool, pool_value)
-        .map_err(ValidationError::PoolError)?;
+    estimate_whether_in_range(order, pool, pool_value).map_err(ValidationError::PoolError)?;
     Ok(())
 }
 
@@ -226,13 +224,11 @@ pub fn validate_order_for_pool(order: &OrderDatum, pool: &PoolDatum) -> Result<(
 }
 
 pub fn estimate_whether_in_range(
-    policy: &[u8],
     od: &OrderDatum,
     pd: &PoolDatum,
     pool_value: &Value,
 ) -> Result<(), PoolError> {
-    let rewards = &pd.protocol_fees;
-    let Some(pool_price) = get_pool_price(policy, pool_value, rewards) else {
+    let Some(pool_price) = get_pool_price(pd, pool_value) else {
         return Err(PoolError::Empty);
     };
     let Some(swap_price) = swap_price(od) else {

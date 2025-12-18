@@ -99,7 +99,6 @@ enum Commands {
 struct AdminServer {
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -161,7 +160,6 @@ impl AdminServer {
                     &order.output.value,
                     &pool.pool_datum,
                     &pool.value,
-                    &self.protocol.pool_script_hash,
                 ) {
                     if let ValidationError::PoolError(PoolError::OutOfRange {
                         swap_price,
@@ -279,14 +277,11 @@ async fn main() -> Result<()> {
         default_start,
         shutdown.child_token(),
     ));
-    let scooper_handle = tokio::spawn(
-        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)?
-            .run(shutdown.child_token()),
-    );
+    let scooper_handle =
+        tokio::spawn(Scooper::new(broadcaster.subscribe())?.run(shutdown.child_token()));
     let admin_handle = tokio::spawn(admin_server(
         index.clone(),
         resync_tx,
-        protocol,
         shutdown.child_token(),
     ));
 
@@ -379,7 +374,6 @@ async fn manager_loop(
 async fn admin_server(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
     shutdown: CancellationToken,
 ) {
     let addr = SocketAddr::from(([127, 0, 0, 1], 9999));
@@ -393,13 +387,12 @@ async fn admin_server(
 
         let resync_tx = resync_tx.clone();
         let index = index.clone();
-        let protocol = protocol.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             select! {
                 _ = child.cancelled() => {},
-                _ = handle_request(stream, index, resync_tx, protocol) => {}
+                _ = handle_request(stream, index, resync_tx) => {}
             }
         });
     }
@@ -409,15 +402,10 @@ async fn handle_request(
     stream: TcpStream,
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
 ) {
     let io = TokioIo::new(stream);
 
-    let admin_server = AdminServer {
-        index,
-        resync_tx,
-        protocol,
-    };
+    let admin_server = AdminServer { index, resync_tx };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
         .await

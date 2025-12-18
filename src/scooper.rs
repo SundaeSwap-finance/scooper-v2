@@ -26,17 +26,15 @@ use crate::{
 
 pub struct Scooper {
     sundaev3: watch::Receiver<SundaeV3Update>,
-    policy: Vec<u8>,
     pools: BTreeMap<Ident, PoolSummary>,
     orders: BTreeMap<TransactionInput, OrderValidity>,
 }
 
 impl Scooper {
-    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>, policy: &[u8]) -> Result<Self> {
+    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>) -> Result<Self> {
         fs::create_dir_all(LOG_DIR)?;
         Ok(Self {
             sundaev3,
-            policy: policy.to_vec(),
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
         })
@@ -70,7 +68,7 @@ impl Scooper {
     fn log_pools(&mut self, slot: u64, state: &SundaeV3State) {
         let mut new_pools = BTreeMap::new();
         for (ident, pool) in &state.pools {
-            let price = get_pool_price(&self.policy, &pool.value, &pool.pool_datum.protocol_fees);
+            let price = get_pool_price(&pool.pool_datum, &pool.value);
             let summary = PoolSummary {
                 assets: pool.pool_datum.assets.clone(),
                 price,
@@ -222,7 +220,7 @@ impl Scooper {
                 }
                 errors.insert(ident.clone(), error);
             } else if let Err(error) =
-                estimate_whether_in_range(&self.policy, &order.datum, &pool.pool_datum, &pool.value)
+                estimate_whether_in_range(&order.datum, &pool.pool_datum, &pool.value)
             {
                 errors.insert(ident.clone(), error);
             } else {
