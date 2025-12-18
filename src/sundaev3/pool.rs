@@ -46,8 +46,8 @@ impl ScoopedPool {
                 let old_b = self.value.get(asset_b);
                 let withdrawn_a = old_a * &lp.amount / &self.datum.circulating_lp;
                 let withdrawn_b = old_b * &lp.amount / &self.datum.circulating_lp;
-                self.value.subtract(&asset_a, &withdrawn_a);
-                self.value.subtract(&asset_b, &withdrawn_b);
+                self.value.subtract(asset_a, &withdrawn_a);
+                self.value.subtract(asset_b, &withdrawn_b);
                 self.datum.circulating_lp -= &lp.amount;
             }
             Order::Donation((a, b)) => {

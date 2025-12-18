@@ -19,7 +19,9 @@ use crate::{
     bigint::BigInt,
     cardano_types::TransactionInput,
     sundaev3::{
-        Ident, PoolError, SingletonValue, SundaeV3Order, SundaeV3Pool, SundaeV3State, SundaeV3Update, ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value
+        Ident, PoolError, SingletonValue, SundaeV3Order, SundaeV3Pool, SundaeV3State,
+        SundaeV3Update, ValueError, estimate_whether_in_range, validate_order_for_pool,
+        validate_order_value,
     },
 };
 
@@ -71,7 +73,10 @@ impl Scooper {
             let amount_a = pool.value.get(&asset_a);
             let amount_b = pool.value.get(&asset_b);
             let summary = PoolSummary {
-                assets: (SingletonValue::new(asset_a, amount_a), SingletonValue::new(asset_b, amount_b)),
+                assets: (
+                    SingletonValue::new(asset_a, amount_a),
+                    SingletonValue::new(asset_b, amount_b),
+                ),
                 liquidity: pool.pool_datum.circulating_lp.clone(),
                 protocol_fees: pool.pool_datum.protocol_fees.clone(),
             };

@@ -1,18 +1,17 @@
 use num_traits::Signed;
 
 use crate::{
-    bigint::BigInt,
     cardano_types::{ADA_ASSET_CLASS, AssetClass, Value},
     sundaev3::{Order, OrderDatum, PoolDatum},
 };
 
 pub fn get_pool_price(datum: &PoolDatum, value: &Value) -> Option<f64> {
     let (coin_a, coin_b) = &datum.assets;
-    let mut quantity_a = BigInt::from(value.get(coin_a));
+    let mut quantity_a = value.get(coin_a);
     if coin_a == &ADA_ASSET_CLASS {
         quantity_a -= &datum.protocol_fees;
     }
-    let quantity_b = BigInt::from(value.get(coin_b));
+    let quantity_b = value.get(coin_b);
     if quantity_a.is_negative() || !quantity_b.is_positive() {
         return None;
     }
@@ -52,6 +51,7 @@ pub fn swap_price(order: &OrderDatum) -> Option<(SwapDirection, f64)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::bigint::BigInt;
     use num_traits::ConstZero;
 
     use crate::{
