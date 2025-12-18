@@ -5,7 +5,7 @@ topic = "cardano.sequence.start"
 
 [module.peer-network-interface]
 block-topic = "cardano.block.proposed"
-sync-point = "snapshot"
+sync-point = "dynamic"
 
 [module.mithril-snapshot-fetcher]
 block-publish-topic = "cardano.block.proposed"
