@@ -16,16 +16,18 @@ use tracing::warn;
 const LOG_DIR: &str = "logs";
 
 use crate::{
-    cardano_types::TransactionInput,
+    bigint::BigInt,
+    cardano_types::{AssetClass, TransactionInput},
     sundaev3::{
         Ident, PoolError, SundaeV3Order, SundaeV3Pool, SundaeV3State, SundaeV3Update, ValueError,
-        estimate_whether_in_range, validate_order_for_pool, validate_order_value,
+        estimate_whether_in_range, get_pool_price, validate_order_for_pool, validate_order_value,
     },
 };
 
 pub struct Scooper {
     sundaev3: watch::Receiver<SundaeV3Update>,
     policy: Vec<u8>,
+    pools: BTreeMap<Ident, PoolSummary>,
     orders: BTreeMap<TransactionInput, OrderValidity>,
 }
 
@@ -35,6 +37,7 @@ impl Scooper {
         Ok(Self {
             sundaev3,
             policy: policy.to_vec(),
+            pools: BTreeMap::new(),
             orders: BTreeMap::new(),
         })
     }
@@ -55,8 +58,63 @@ impl Scooper {
 
             let update = self.sundaev3.borrow_and_update().clone();
             // TODO: only "scoop" when we're at the head of the chain
-            self.log_orders(update.slot, &update.state);
+            self.log_changes(update.slot, &update.state);
         }
+    }
+
+    fn log_changes(&mut self, slot: u64, state: &SundaeV3State) {
+        self.log_pools(slot, state);
+        self.log_orders(slot, state);
+    }
+
+    fn log_pools(&mut self, slot: u64, state: &SundaeV3State) {
+        let mut new_pools = BTreeMap::new();
+        for (ident, pool) in &state.pools {
+            let price = get_pool_price(&self.policy, &pool.value, &pool.pool_datum.protocol_fees);
+            let summary = PoolSummary {
+                assets: pool.pool_datum.assets.clone(),
+                price,
+                protocol_fees: pool.pool_datum.protocol_fees.clone(),
+            };
+            new_pools.insert(ident.clone(), summary);
+        }
+
+        let mut updates = vec![];
+        for (ident, summary) in &new_pools {
+            match self.pools.get(ident) {
+                None => updates.push(PoolState {
+                    slot,
+                    pool: ident,
+                    action: PoolAction::Added { summary },
+                }),
+                Some(old_summary) => {
+                    if old_summary != summary {
+                        updates.push(PoolState {
+                            slot,
+                            pool: ident,
+                            action: PoolAction::Changed { summary },
+                        });
+                    }
+                }
+            }
+        }
+        for ident in self.pools.keys() {
+            if !new_pools.contains_key(ident) {
+                updates.push(PoolState {
+                    slot,
+                    pool: ident,
+                    action: PoolAction::Removed,
+                });
+            }
+        }
+
+        if !updates.is_empty()
+            && let Err(err) = self.write_updates(&updates)
+        {
+            warn!("could not log updates: {err:#}");
+        }
+
+        self.pools = new_pools;
     }
 
     fn log_orders(&mut self, slot: u64, state: &SundaeV3State) {
@@ -75,7 +133,7 @@ impl Scooper {
                     action: OrderAction::Added { valid: validity },
                 }),
                 Some(old_validity) => {
-                    if old_validity != validity {
+                    if self.validity_changed(old_validity, validity) {
                         updates.push(OrderState {
                             order: txo,
                             slot,
@@ -102,6 +160,47 @@ impl Scooper {
         }
 
         self.orders = new_orders;
+    }
+
+    // Log if the order's valid state has changed, unless the change is just becuase the pool price changed
+    fn validity_changed(&self, old: &OrderValidity, new: &OrderValidity) -> bool {
+        match (old, new) {
+            (
+                OrderValidity::Invalid {
+                    reason: OrderInvalidReason::PoolErrors(old_errors),
+                },
+                OrderValidity::Invalid {
+                    reason: OrderInvalidReason::PoolErrors(new_errors),
+                },
+            ) => {
+                if old_errors.len() != new_errors.len() {
+                    return true;
+                }
+                for (ident, old_error) in old_errors {
+                    let Some(new_error) = new_errors.get(ident) else {
+                        return true;
+                    };
+                    let matching = match (old_error, new_error) {
+                        (
+                            PoolError::OutOfRange {
+                                swap_price: old_price,
+                                ..
+                            },
+                            PoolError::OutOfRange {
+                                swap_price: new_price,
+                                ..
+                            },
+                        ) => old_price != new_price,
+                        (o, n) => o != n,
+                    };
+                    if !matching {
+                        return true;
+                    }
+                }
+                false
+            }
+            (o, n) => o != n,
+        }
     }
 
     fn validate_order(
@@ -143,7 +242,7 @@ impl Scooper {
         }
     }
 
-    fn write_updates(&self, updates: &[OrderState]) -> Result<()> {
+    fn write_updates<T: Serialize>(&self, updates: &[T]) -> Result<()> {
         let date = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
@@ -161,6 +260,34 @@ impl Scooper {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct PoolState<'a> {
+    slot: u64,
+    pool: &'a Ident,
+    action: PoolAction<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum PoolAction<'a> {
+    Added {
+        #[serde(flatten)]
+        summary: &'a PoolSummary,
+    },
+    Changed {
+        #[serde(flatten)]
+        summary: &'a PoolSummary,
+    },
+    Removed,
+}
+
+#[derive(Serialize, PartialEq)]
+struct PoolSummary {
+    assets: (AssetClass, AssetClass),
+    price: Option<f64>,
+    protocol_fees: BigInt,
 }
 
 #[derive(Serialize)]

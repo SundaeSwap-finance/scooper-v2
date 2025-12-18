@@ -3,6 +3,7 @@ use acropolis_common::{BlockHash, Point};
 use acropolis_module_block_unpacker::BlockUnpacker;
 use acropolis_module_custom_indexer::CustomIndexer;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
+use acropolis_module_mithril_snapshot_fetcher::MithrilSnapshotFetcher;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
 use anyhow::{Result, anyhow};
 use caryatid_process::Process;
@@ -321,9 +322,13 @@ async fn manager_loop(
         let protocol = protocol.clone();
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
+        let enable_mithril = config::use_mithril(&config);
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
+        if enable_mithril {
+            MithrilSnapshotFetcher::register(&mut process);
+        }
         BlockUnpacker::register(&mut process);
         PeerNetworkInterface::register(&mut process);
 
