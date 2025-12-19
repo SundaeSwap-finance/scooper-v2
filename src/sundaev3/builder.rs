@@ -12,19 +12,24 @@ use crate::{
 pub struct ScoopBuilder {
     pub pool: PoolDatum,
     pub value: Value,
-    settings: Arc<SundaeV3Settings>,
+    expected_size: usize,
+    actual_size: usize,
+    pub settings: Arc<SundaeV3Settings>,
 }
 
 impl ScoopBuilder {
-    pub fn new(pool: &SundaeV3Pool, settings: Arc<SundaeV3Settings>) -> Self {
+    pub fn new(pool: &SundaeV3Pool, settings: Arc<SundaeV3Settings>, size: usize) -> Self {
         Self {
             pool: pool.pool_datum.clone(),
             value: pool.value.clone(),
+            expected_size: size,
+            actual_size: 0,
             settings,
         }
     }
 
     pub fn apply_order(&mut self, order: &SundaeV3Order) -> Result<(), ApplyOrderError> {
+        self.actual_size += 1;
         match &order.datum.action {
             Order::Strategy(_) => Ok(()),
             Order::Swap(given, taken) => {
@@ -45,6 +50,7 @@ impl ScoopBuilder {
                 let takes_num = &pool_takes * &given.amount * &diff;
                 let takes_den = (&pool_gives * BigInt::from(10_000)) + (&given.amount * &diff);
                 let takes = takes_num / takes_den;
+                // our balance is too high, because takes is too low
 
                 let order_give_num = &takes * &pool_gives * BigInt::from(10_000);
 
@@ -72,9 +78,9 @@ impl ScoopBuilder {
                 self.value.add(&given.asset_class(), &order_give);
                 self.value.subtract(&taken.asset_class(), &takes);
 
-                // TODO: base fee is only applied once per scoop
-                let fees = &self.settings.datum.base_fee + &self.settings.datum.simple_fee;
-                self.value.add(&ADA_ASSET_CLASS, &fees);
+                let fee = self.simple_fee();
+                self.pool.protocol_fees += &fee;
+                self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
             }
             Order::Deposit((a, b)) => {
@@ -103,16 +109,31 @@ impl ScoopBuilder {
                 Ok(())
             }
             Order::Donation((a, b)) => {
-                // TODO: even donations are subject to fees
                 self.value.add(&a.asset_class(), &a.amount);
                 self.value.add(&b.asset_class(), &b.amount);
+
+                let fee = self.simple_fee();
+                self.pool.protocol_fees += &fee;
+                self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
             }
             Order::Record(_) => {
-                // TODO: these also cost fees
+                let fee = self.simple_fee();
+                self.pool.protocol_fees += &fee;
+                self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
             }
         }
+    }
+
+    pub fn validate(&self) -> Result<(), ScoopError> {
+        if self.expected_size != self.actual_size {
+            return Err(ScoopError::WrongOrderCount {
+                expected: self.expected_size,
+                actual: self.actual_size,
+            });
+        }
+        Ok(())
     }
 
     fn pool_values(&self) -> (BigInt, BigInt) {
@@ -126,6 +147,13 @@ impl ScoopBuilder {
         let (asset_a, asset_b) = &self.pool.assets;
         (asset_value(asset_a), asset_value(asset_b))
     }
+
+    fn simple_fee(&self) -> BigInt {
+        // The base fee is divided across every order in the scoop
+        let size = BigInt::from(self.expected_size as i128);
+        let amortized_base_fee = (&self.settings.datum.base_fee + &size - BigInt::from(1)) / &size;
+        amortized_base_fee + &self.settings.datum.simple_fee
+    }
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -134,6 +162,12 @@ pub enum ApplyOrderError {
     NoEfficientOrderGive,
     #[error("order coin pair does not match pool coin pair")]
     CoinPairMismatch,
+}
+
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum ScoopError {
+    #[error("scoop has wrong order count (expected {expected}, saw {actual})")]
+    WrongOrderCount { expected: usize, actual: usize },
 }
 
 fn is_efficient(
@@ -218,6 +252,8 @@ mod tests {
 
     #[test]
     fn should_perform_simple_swap() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
         let sberry_asset_class = AssetClass::from_str(
             "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15.534245525259",
         )
@@ -245,14 +281,61 @@ mod tests {
             value!(13_000_000),
         );
 
-        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
-
-        let mut scooped_pool = ScoopBuilder::new(&pool, settings);
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
         assert_eq!(scooped_pool.apply_order(&order), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
 
         assert_eq!(
             scooped_pool.value,
             value!(44_168_000, (&sberry_asset_class, 50_087_617))
+        );
+    }
+
+    #[test]
+    fn should_scoop_two_orders() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
+        let sberry_asset_class = AssetClass::from_str(
+            "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15.534245525259",
+        )
+        .unwrap();
+        let pool = SundaeV3Pool {
+            input: TransactionInput::new(Hash::new([0; 32]), 0),
+            value: value!(23_000_000, (&sberry_asset_class, 1_000)),
+            pool_datum: PoolDatum {
+                ident: Ident::new(&[]),
+                assets: (ADA_ASSET_CLASS, sberry_asset_class.clone()),
+                circulating_lp: BigInt::from(141_421),
+                bid_fees_per_10_thousand: BigInt::from(30),
+                ask_fees_per_10_thousand: BigInt::from(50),
+                fee_manager: None,
+                market_open: BigInt::ZERO,
+                protocol_fees: BigInt::from(3_000_000),
+            },
+            slot: 0,
+        };
+        let donation = build_order(
+            Order::Donation((
+                SingletonValue::new(ADA_ASSET_CLASS, BigInt::ZERO),
+                SingletonValue::new(sberry_asset_class.clone(), BigInt::from(99_999_000)),
+            )),
+            value!(3_100_000, (&sberry_asset_class, 99_999_000)),
+        );
+        let swap = build_order(
+            Order::Swap(
+                SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(10_000_000)),
+                SingletonValue::new(sberry_asset_class.clone(), BigInt::from(323)),
+            ),
+            value!(13_000_000),
+        );
+
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 2);
+        assert_eq!(scooped_pool.apply_order(&donation), Ok(()));
+        assert_eq!(scooped_pool.apply_order(&swap), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
+        assert_eq!(
+            scooped_pool.value,
+            value!(33_668_000, (&sberry_asset_class, 66_733_401)),
         );
     }
 }

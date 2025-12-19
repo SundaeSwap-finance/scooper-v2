@@ -13,7 +13,7 @@ use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
 use plutus_parser::AsPlutus;
 use tokio::sync::{Mutex, watch};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     SundaeV3Protocol,
@@ -291,7 +291,7 @@ impl ChainIndex for SundaeV3Indexer {
                     }
                     if let Some(settings) = state.settings.clone() {
                         scoops.push(Scoop {
-                            builder: ScoopBuilder::new(pool, settings),
+                            builder: ScoopBuilder::new(pool, settings, orders.len()),
                             orders,
                         });
                     } else {
@@ -310,9 +310,18 @@ impl ChainIndex for SundaeV3Indexer {
         let mut scooped_orders = BTreeSet::new();
         if scoops.len() > 1 {
             warn!(slot, tx = %tx.hash(), "one transaction contained multiple scoops");
-        } else if scoops.len() == 1 {
+        } else if let Some(mut scoop) = scoops.pop() {
+            debug!(
+                slot,
+                "scooping pool: {}",
+                serde_json::to_string(&scoop.builder.pool).unwrap()
+            );
+            debug!(
+                slot,
+                "scooping value: {}",
+                serde_json::to_string(&scoop.builder.value).unwrap()
+            );
             // Validate the scoop
-            let mut scoop = scoops.pop().unwrap();
             let ident = scoop.builder.pool.ident.clone();
             for order_index in scoop.orders {
                 scooped_orders.insert(order_index);
@@ -324,13 +333,17 @@ impl ChainIndex for SundaeV3Indexer {
                     warn!(slot, %ident, %input, "unrecognized order in scoop");
                     continue;
                 };
+                debug!(slot, %ident, "applying order: {} {}", serde_json::to_string(&order.datum.action).unwrap(), serde_json::to_string(&order.value).unwrap());
                 self.apply_order(slot, order, &mut scoop.builder);
             }
+            if let Err(error) = scoop.builder.validate() {
+                warn!(slot, %ident, "invalid scoop: {error:#}");
+            }
             if let Some(final_pool) = updated_pools.get(&ident) {
-                let expected_lp = &scoop.builder.pool.circulating_lp;
-                let observed_lp = &final_pool.pool_datum.circulating_lp;
-                if expected_lp != observed_lp {
-                    warn!(slot, %ident, %expected_lp, %observed_lp, "pool has incorrect liquidity");
+                let expected_datum = &scoop.builder.pool.circulating_lp;
+                let observed_datum = &final_pool.pool_datum.circulating_lp;
+                if expected_datum != observed_datum {
+                    warn!(slot, %ident, %expected_datum, %observed_datum, "pool has incorrect datum");
                 }
 
                 let expected_value = &scoop.builder.value;
