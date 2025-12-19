@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use anyhow::bail;
-use num_traits::ConstZero;
+use num_traits::{ConstZero, Zero};
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
 use pallas_primitives::{Hash, PlutusData, PlutusScript};
@@ -163,6 +163,10 @@ impl Value {
     }
 
     pub fn insert(&mut self, asset_class: &AssetClass, quantity: BigInt) {
+        if quantity.is_zero() {
+            self.delete(asset_class);
+            return;
+        }
         match self.0.get_mut(&asset_class.policy) {
             Some(tokens) => {
                 tokens.insert(asset_class.token.clone(), quantity);
@@ -172,6 +176,16 @@ impl Value {
                 new_tokens.insert(asset_class.token.clone(), quantity);
                 self.0.insert(asset_class.policy.clone(), new_tokens);
             }
+        }
+    }
+
+    pub fn delete(&mut self, asset_class: &AssetClass) {
+        let Some(tokens) = self.0.get_mut(&asset_class.policy) else {
+            return;
+        };
+        tokens.remove(&asset_class.token);
+        if tokens.is_empty() {
+            self.0.remove(&asset_class.policy);
         }
     }
 

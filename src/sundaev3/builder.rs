@@ -99,13 +99,16 @@ impl ScoopBuilder {
             Order::Withdrawal(lp) => {
                 // TODO: feeeeeeeeeees
                 let (asset_a, asset_b) = &self.pool.assets;
-                let old_a = self.value.get(asset_a);
-                let old_b = self.value.get(asset_b);
+                let (old_a, old_b) = self.pool_values();
                 let withdrawn_a = old_a * &lp.amount / &self.pool.circulating_lp;
                 let withdrawn_b = old_b * &lp.amount / &self.pool.circulating_lp;
                 self.value.subtract(asset_a, &withdrawn_a);
                 self.value.subtract(asset_b, &withdrawn_b);
                 self.pool.circulating_lp -= &lp.amount;
+
+                let fee = self.simple_fee();
+                self.pool.protocol_fees += &fee;
+                self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
             }
             Order::Donation((a, b)) => {
@@ -337,5 +340,56 @@ mod tests {
             scooped_pool.value,
             value!(33_668_000, (&sberry_asset_class, 66_733_401)),
         );
+    }
+
+    #[test]
+    fn should_scoop_withdrawal() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
+        let test_asset_class = AssetClass::from_str(
+            "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15.54657374417373657433",
+        )
+        .unwrap();
+
+        let lp_asset_class = AssetClass::from_str(
+            "44a1eb2d9f58add4eb1932bd0048e6a1947e85e3fe4f32956a110414.0014df1070a5be631ece9fbb484c806a201aec847a362fa1e5d2783cd0df32b9",
+        ).unwrap();
+
+        let pool = SundaeV3Pool {
+            input: TransactionInput::new(Hash::new([0; 32]), 0),
+            value: value!(71_996_522, (&test_asset_class, 14_517)),
+            pool_datum: PoolDatum {
+                ident: Ident::new(&[]),
+                assets: (ADA_ASSET_CLASS, test_asset_class.clone()),
+                circulating_lp: BigInt::from(1_000_000),
+                bid_fees_per_10_thousand: BigInt::from(100),
+                ask_fees_per_10_thousand: BigInt::from(100),
+                fee_manager: None,
+                market_open: BigInt::from(49_762_568),
+                protocol_fees: BigInt::from(2_004_001),
+            },
+            slot: 0,
+        };
+        let swap = build_order(
+            Order::Swap(
+                SingletonValue::new(test_asset_class.clone(), BigInt::from(10)),
+                SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(157)),
+            ),
+            value!(3_000_000, (&test_asset_class, 10)),
+        );
+        let withdrawal = build_order(
+            Order::Withdrawal(SingletonValue::new(lp_asset_class.clone(), BigInt::from(1_000_000))),
+            value!(3_000_000, (&lp_asset_class, 1_000_000)),
+        );
+
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 2);
+        assert_eq!(scooped_pool.apply_order(&swap), Ok(()));
+        assert_eq!(scooped_pool.apply_order(&withdrawal), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
+        assert_eq!(
+            scooped_pool.value,
+            value!(2_672_001),
+        );
+
     }
 }
