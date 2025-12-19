@@ -15,7 +15,7 @@ use plutus_parser::AsPlutus;
 
 use crate::bigint::BigInt;
 use crate::serde_compat::serialize_address;
-use crate::sundaev3::{OrderDatum, PoolDatum};
+use crate::sundaev3::{OrderDatum, PoolDatum, SettingsDatum};
 pub type Bytes = Vec<u8>;
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -38,6 +38,24 @@ pub const ADA_ASSET_CLASS: AssetClass = AssetClass {
 pub struct AssetClass {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
+}
+
+impl<'de> serde::Deserialize<'de> for AssetClass {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let str = String::deserialize(deserializer)?;
+        if str == "lovelace" {
+            return Ok(ADA_ASSET_CLASS);
+        }
+        let Some((policy_hex, token_hex)) = str.split_once(".") else {
+            return Err(serde::de::Error::custom("no dot found"));
+        };
+        let policy = hex::decode(policy_hex).map_err(serde::de::Error::custom)?;
+        let token = hex::decode(token_hex).map_err(serde::de::Error::custom)?;
+        Ok(AssetClass { policy, token })
+    }
 }
 
 impl serde::Serialize for AssetClass {
@@ -91,6 +109,10 @@ impl fmt::Display for AssetClass {
         }
     }
 }
+
+pub type Rational = (BigInt, BigInt);
+
+pub type VerificationKey = Bytes;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, BigInt>>);
@@ -188,6 +210,7 @@ pub enum Datum {
     None,
     ParsedOrder(OrderDatum),
     ParsedPool(PoolDatum),
+    ParsedSettings(SettingsDatum),
 }
 
 impl Serialize for Datum {
@@ -201,6 +224,8 @@ impl Serialize for Datum {
             Datum::ParsedOrder(od) => od.serialize(serializer),
 
             Datum::ParsedPool(pd) => pd.serialize(serializer),
+
+            Datum::ParsedSettings(sd) => sd.serialize(serializer),
         }
     }
 }
@@ -254,8 +279,11 @@ pub fn convert_datum(datum: Option<MintedDatumOption>) -> Datum {
             if let Ok(order) = AsPlutus::from_plutus(plutus_data.clone()) {
                 return Datum::ParsedOrder(order);
             }
-            if let Ok(pool) = AsPlutus::from_plutus(plutus_data) {
+            if let Ok(pool) = AsPlutus::from_plutus(plutus_data.clone()) {
                 return Datum::ParsedPool(pool);
+            }
+            if let Ok(settings) = AsPlutus::from_plutus(plutus_data) {
+                return Datum::ParsedSettings(settings);
             }
             Datum::None
         }

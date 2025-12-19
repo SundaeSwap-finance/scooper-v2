@@ -5,8 +5,24 @@ use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::bigint::BigInt;
-use crate::cardano_types::{AssetClass, TransactionInput, Value};
+use crate::cardano_types::{AssetClass, Rational, TransactionInput, Value, VerificationKey};
 use crate::multisig::Multisig;
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SettingsDatum {
+    pub settings_admin: Multisig,
+    pub metadata_admin: PlutusAddress,
+    pub treasury_admin: Multisig,
+    pub treasury_address: PlutusAddress,
+    pub treasury_allowance: Rational,
+    pub authorized_scoopers: Option<Vec<VerificationKey>>,
+    pub authorized_staking_keys: Vec<Credential>,
+    pub base_fee: BigInt,
+    pub simple_fee: BigInt,
+    pub strategy_fee: BigInt,
+    pub pool_creation_fee: BigInt,
+    pub extensions: PlutusData,
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -317,13 +333,13 @@ pub fn empty_cons() -> PlutusData {
     })
 }
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
     pub stake_credential: Option<StakeCredential>,
 }
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Credential {
     VerificationKey(VerificationKeyHash),
     Script(ScriptHash),
@@ -332,7 +348,7 @@ pub enum Credential {
 type VerificationKeyHash = Vec<u8>;
 type ScriptHash = Vec<u8>;
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Referenced<T: AsPlutus> {
     Inline(T),
     Pointer(StakePointer),
@@ -341,7 +357,7 @@ pub enum Referenced<T: AsPlutus> {
 type PaymentCredential = Credential;
 type StakeCredential = Referenced<Credential>;
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StakePointer {
     pub slot_number: BigInt,
     pub transaction_index: BigInt,
@@ -394,6 +410,13 @@ pub struct SundaeV3Order {
     pub input: TransactionInput,
     pub value: Value,
     pub datum: OrderDatum,
+    pub slot: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SundaeV3Settings {
+    pub input: TransactionInput,
+    pub datum: SettingsDatum,
     pub slot: u64,
 }
 

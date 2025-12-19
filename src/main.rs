@@ -44,6 +44,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::cardano_types::AssetClass;
 use crate::config::AppConfig;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
@@ -57,6 +58,9 @@ struct SundaeV3Protocol {
     order_script_hash: Vec<u8>,
     #[serde(with = "hex")]
     pool_script_hash: Vec<u8>,
+    #[serde(with = "hex")]
+    settings_script_hash: Vec<u8>,
+    settings_nft: AssetClass,
 }
 
 #[derive(clap::Parser, Clone, Debug)]

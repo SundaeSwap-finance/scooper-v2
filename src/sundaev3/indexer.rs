@@ -21,8 +21,8 @@ use crate::{
     historical_state::HistoricalState,
     persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
     sundaev3::{
-        Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SundaeV3Order, SundaeV3Pool,
-        WrappedRedeemer, pool::ScoopedPool, validate_order,
+        Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV3Order, SundaeV3Pool,
+        SundaeV3Settings, WrappedRedeemer, pool::ScoopedPool, validate_order,
     },
 };
 
@@ -30,6 +30,7 @@ use crate::{
 pub struct SundaeV3State {
     pub pools: BTreeMap<Ident, Arc<SundaeV3Pool>>,
     pub orders: Vec<Arc<SundaeV3Order>>,
+    pub settings: Option<Arc<SundaeV3Settings>>,
 }
 
 pub type SundaeV3HistoricalState = HistoricalState<SundaeV3State>;
@@ -109,6 +110,16 @@ impl SundaeV3Indexer {
                         slot: txo.created_slot,
                     }));
                 }
+                "settings" => {
+                    let Datum::ParsedSettings(datum) = output.datum else {
+                        bail!("invalid settings datum");
+                    };
+                    state.settings = Some(Arc::new(SundaeV3Settings {
+                        input: txo.txo_id,
+                        datum,
+                        slot: txo.created_slot,
+                    }));
+                }
                 other => bail!("unrecognized txo type \"{other}\""),
             }
         }
@@ -133,6 +144,17 @@ impl SundaeV3Indexer {
         };
         if tx_out.value.get(&nft_asset_id).is_positive() {
             Some(pool_datum.clone())
+        } else {
+            None
+        }
+    }
+
+    fn parse_settings(&self, tx_out: &TransactionOutput) -> Option<SettingsDatum> {
+        let Datum::ParsedSettings(settings_datum) = &tx_out.datum else {
+            return None;
+        };
+        if tx_out.value.get(&self.protocol.settings_nft).is_positive() {
+            Some(settings_datum.clone())
         } else {
             None
         }
@@ -171,6 +193,7 @@ impl ChainIndex for SundaeV3Indexer {
 
         let mut updated_pools = BTreeMap::new();
         let mut new_orders = vec![];
+        let mut new_settings = None;
         let mut changes = SundaeV3TxChanges::new(info.slot, info.number);
 
         // Find which pools and orders have been updated in this transaction.
@@ -178,10 +201,7 @@ impl ChainIndex for SundaeV3Indexer {
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
             if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
-                let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                    transaction_id: this_tx_hash,
-                    index: ix as u64,
-                });
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_transaction_output(output);
                 if let Some(pd) = self.parse_pool(&tx_out) {
                     changes.created_txos.push(PersistedTxo {
@@ -202,10 +222,7 @@ impl ChainIndex for SundaeV3Indexer {
                     updated_pools.insert(pool_id, Arc::new(pool_record));
                 }
             } else if payment_hash_equals(&address, &self.protocol.order_script_hash) {
-                let this_input = TransactionInput(pallas_primitives::TransactionInput {
-                    transaction_id: this_tx_hash,
-                    index: ix as u64,
-                });
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_transaction_output(output);
                 if let Datum::ParsedOrder(od) = tx_out.datum {
                     changes.created_txos.push(PersistedTxo {
@@ -223,6 +240,23 @@ impl ChainIndex for SundaeV3Indexer {
                         slot,
                     };
                     new_orders.push(Arc::new(order));
+                }
+            } else if payment_hash_equals(&address, &self.protocol.settings_script_hash) {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_transaction_output(output);
+                if let Some(sd) = self.parse_settings(&tx_out) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "settings".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                    });
+                    new_settings = Some(Arc::new(SundaeV3Settings {
+                        input: this_input,
+                        datum: sd,
+                        slot,
+                    }));
                 }
             }
         }
@@ -251,10 +285,14 @@ impl ChainIndex for SundaeV3Indexer {
                     for (index, _, _) in input_order {
                         orders.push(index as usize);
                     }
-                    scoops.push(Scoop {
-                        pool: ScoopedPool::new(pool),
-                        orders,
-                    });
+                    if let Some(settings) = state.settings.clone() {
+                        scoops.push(Scoop {
+                            pool: ScoopedPool::new(pool, settings),
+                            orders,
+                        });
+                    } else {
+                        warn!(slot, %ident, "scoop attempted while we have no settings");
+                    }
                 }
                 Some(WrappedRedeemer(PoolRedeemer::Manage)) => {
                     // pool's settings were updated, but no scoop was made
@@ -324,9 +362,20 @@ impl ChainIndex for SundaeV3Indexer {
             false
         });
 
-        // And apply new pools and orders
+        // remove old settings too
+        if let Some(settings) = &state.settings
+            && spent_inputs.contains(&settings.input)
+        {
+            changes.spent_txos.push(settings.input.clone());
+            state.settings = None;
+        }
+
+        // And apply the new state
         state.pools.append(&mut updated_pools);
         state.orders.append(&mut new_orders);
+        if let Some(settings) = new_settings {
+            state.settings = Some(settings);
+        }
 
         if !changes.is_empty() {
             self.dao.apply_tx_changes(changes).await?;

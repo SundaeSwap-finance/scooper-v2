@@ -1,21 +1,26 @@
+use std::sync::Arc;
+
 use num_traits::{ConstZero, Signed};
 
 use crate::{
     bigint::BigInt,
     cardano_types::Value,
-    sundaev3::{Order, PoolDatum, SundaeV3Order, SundaeV3Pool},
+    sundaev3::{Order, PoolDatum, SundaeV3Order, SundaeV3Pool, SundaeV3Settings},
 };
 
 pub struct ScoopedPool {
     pub datum: PoolDatum,
     pub value: Value,
+    #[expect(unused)]
+    settings: Arc<SundaeV3Settings>,
 }
 
 impl ScoopedPool {
-    pub fn new(pool: &SundaeV3Pool) -> Self {
+    pub fn new(pool: &SundaeV3Pool, settings: Arc<SundaeV3Settings>) -> Self {
         Self {
             datum: pool.pool_datum.clone(),
             value: pool.value.clone(),
+            settings,
         }
     }
 
