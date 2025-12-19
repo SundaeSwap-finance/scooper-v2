@@ -30,6 +30,7 @@ pallas-primitives = "0.34"
 pallas-traverse = "0.34"
 plutus-parser = { version = "0.4", features = ["derive"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
+thiserror = "2"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1.41"

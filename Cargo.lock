@@ -4800,6 +4800,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-util",
  "tracing",

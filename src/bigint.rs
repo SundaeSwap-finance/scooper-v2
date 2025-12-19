@@ -159,6 +159,12 @@ impl std::ops::MulAssign for BigInt {
     }
 }
 
+impl std::ops::MulAssign<&BigInt> for BigInt {
+    fn mul_assign(&mut self, other: &BigInt) {
+        self.0 *= &other.0
+    }
+}
+
 impl std::ops::Div for BigInt {
     type Output = BigInt;
     fn div(self, rhs: Self) -> Self::Output {

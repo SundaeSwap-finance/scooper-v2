@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use anyhow::bail;
 use num_traits::ConstZero;
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
@@ -10,6 +11,7 @@ use serde::{Serialize, Serializer};
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::str::FromStr;
 
 use plutus_parser::AsPlutus;
 
@@ -40,21 +42,29 @@ pub struct AssetClass {
     pub token: Vec<u8>,
 }
 
+impl FromStr for AssetClass {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "lovelace" {
+            return Ok(ADA_ASSET_CLASS);
+        }
+        let Some((policy_hex, token_hex)) = s.split_once(".") else {
+            bail!("no dot found");
+        };
+        let policy = hex::decode(policy_hex)?;
+        let token = hex::decode(token_hex)?;
+        Ok(AssetClass { policy, token })
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for AssetClass {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let str = String::deserialize(deserializer)?;
-        if str == "lovelace" {
-            return Ok(ADA_ASSET_CLASS);
-        }
-        let Some((policy_hex, token_hex)) = str.split_once(".") else {
-            return Err(serde::de::Error::custom("no dot found"));
-        };
-        let policy = hex::decode(policy_hex).map_err(serde::de::Error::custom)?;
-        let token = hex::decode(token_hex).map_err(serde::de::Error::custom)?;
-        Ok(AssetClass { policy, token })
+        str.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -119,6 +129,13 @@ pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, BigInt>>);
 
 #[macro_export]
 macro_rules! value {
+    ( $ada:expr ) => {
+        {
+            let mut value = $crate::cardano_types::Value::new();
+            value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, BigInt::from($ada));
+            value
+        }
+    };
     ( $ada:expr, $( $token:expr ),* ) => {
         {
             let mut value = $crate::cardano_types::Value::new();

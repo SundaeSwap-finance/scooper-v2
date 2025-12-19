@@ -22,7 +22,7 @@ use crate::{
     persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
     sundaev3::{
         Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV3Order, SundaeV3Pool,
-        SundaeV3Settings, WrappedRedeemer, pool::ScoopedPool, validate_order,
+        SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder, validate_order,
     },
 };
 
@@ -168,11 +168,15 @@ impl SundaeV3Indexer {
         T::from_plutus(redeemer.data().clone()).ok()
     }
 
-    fn apply_order(&self, slot: u64, order: &SundaeV3Order, pool: &mut ScoopedPool) {
-        match validate_order(&order.datum, &order.value, &pool.datum, &pool.value) {
-            Ok(()) => pool.apply_order(order),
+    fn apply_order(&self, slot: u64, order: &SundaeV3Order, scoop: &mut ScoopBuilder) {
+        match validate_order(&order.datum, &order.value, &scoop.pool, &scoop.value) {
+            Ok(()) => {
+                if let Err(error) = scoop.apply_order(order) {
+                    warn!(slot, order = %order.input, ident = %scoop.pool.ident, "could not apply order: {error:#}");
+                }
+            }
             Err(error) => {
-                warn!(slot, order = %order.input, ident = %pool.datum.ident, "invalid order was scooped: {error:#}");
+                warn!(slot, order = %order.input, ident = %scoop.pool.ident, "invalid order was scooped: {error:#}");
             }
         }
     }
@@ -287,7 +291,7 @@ impl ChainIndex for SundaeV3Indexer {
                     }
                     if let Some(settings) = state.settings.clone() {
                         scoops.push(Scoop {
-                            pool: ScoopedPool::new(pool, settings),
+                            builder: ScoopBuilder::new(pool, settings),
                             orders,
                         });
                     } else {
@@ -309,7 +313,7 @@ impl ChainIndex for SundaeV3Indexer {
         } else if scoops.len() == 1 {
             // Validate the scoop
             let mut scoop = scoops.pop().unwrap();
-            let ident = scoop.pool.datum.ident.clone();
+            let ident = scoop.builder.pool.ident.clone();
             for order_index in scoop.orders {
                 scooped_orders.insert(order_index);
                 let Some(input) = spent_inputs.get(order_index) else {
@@ -320,16 +324,16 @@ impl ChainIndex for SundaeV3Indexer {
                     warn!(slot, %ident, %input, "unrecognized order in scoop");
                     continue;
                 };
-                self.apply_order(slot, order, &mut scoop.pool);
+                self.apply_order(slot, order, &mut scoop.builder);
             }
             if let Some(final_pool) = updated_pools.get(&ident) {
-                let expected_lp = &scoop.pool.datum.circulating_lp;
+                let expected_lp = &scoop.builder.pool.circulating_lp;
                 let observed_lp = &final_pool.pool_datum.circulating_lp;
                 if expected_lp != observed_lp {
                     warn!(slot, %ident, %expected_lp, %observed_lp, "pool has incorrect liquidity");
                 }
 
-                let expected_value = &scoop.pool.value;
+                let expected_value = &scoop.builder.value;
                 let observed_value = &final_pool.value;
                 if expected_value != observed_value {
                     warn!(slot, %ident, %expected_value, %observed_value, "pool has incorrect value");
@@ -424,7 +428,7 @@ impl ChainIndex for SundaeV3Indexer {
 }
 
 struct Scoop {
-    pool: ScoopedPool,
+    builder: ScoopBuilder,
     orders: Vec<usize>,
 }
 
