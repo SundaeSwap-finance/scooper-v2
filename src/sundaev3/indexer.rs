@@ -340,10 +340,10 @@ impl ChainIndex for SundaeV3Indexer {
                 warn!(slot, %ident, "invalid scoop: {error:#}");
             }
             if let Some(final_pool) = updated_pools.get(&ident) {
-                let expected_datum = &scoop.builder.pool.circulating_lp;
-                let observed_datum = &final_pool.pool_datum.circulating_lp;
+                let expected_datum = &scoop.builder.pool;
+                let observed_datum = &final_pool.pool_datum;
                 if expected_datum != observed_datum {
-                    warn!(slot, %ident, %expected_datum, %observed_datum, "pool has incorrect datum");
+                    warn!(slot, %ident, expected_datum = serde_json::to_string(&expected_datum).unwrap(), observed_datum = serde_json::to_string(&observed_datum).unwrap(), "pool has incorrect datum");
                 }
 
                 let expected_value = &scoop.builder.value;

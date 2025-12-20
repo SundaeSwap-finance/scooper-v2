@@ -199,6 +199,12 @@ impl std::ops::DivAssign for BigInt {
     }
 }
 
+impl std::ops::DivAssign<&BigInt> for BigInt {
+    fn div_assign(&mut self, rhs: &BigInt) {
+        self.0 /= &rhs.0;
+    }
+}
+
 impl std::ops::Rem for BigInt {
     type Output = BigInt;
     fn rem(self, rhs: Self) -> Self::Output {

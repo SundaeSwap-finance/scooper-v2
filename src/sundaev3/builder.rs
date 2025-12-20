@@ -84,20 +84,57 @@ impl ScoopBuilder {
                 Ok(())
             }
             Order::Deposit((a, b)) => {
-                // TODO: feeeeees
-                let existing_a = self.value.get(&a.asset_class());
-                let new_liquidity = if existing_a.is_positive() {
-                    &a.amount * &self.pool.circulating_lp / existing_a
+                let (quantity_a, quantity_b) = self.pool_values();
+
+                let mut actual_a = order.value.get(&a.asset_class());
+                let actual_b = order.value.get(&b.asset_class());
+                if a.asset_class() == ADA_ASSET_CLASS {
+                    actual_a -= BigInt::from(2_000_000) + &self.pool.protocol_fees;
+                }
+
+                let user_gives_a = (&a.amount).min(&actual_a);
+                if !user_gives_a.is_positive() {
+                    return Err(ApplyOrderError::NegativeDeposit(user_gives_a.clone()));
+                }
+                let user_gives_b = (&b.amount).min(&actual_b);
+
+                let b_in_units_of_a = (user_gives_b * &quantity_a) / &b.amount;
+                let mut a_change = BigInt::ZERO;
+                let mut b_change = BigInt::ZERO;
+
+                if &b_in_units_of_a > user_gives_a {
+                    let mut b_gives_minus_change = &quantity_b * user_gives_a;
+                    b_gives_minus_change -= BigInt::from(1);
+                    b_gives_minus_change /= &quantity_a;
+                    b_gives_minus_change += BigInt::from(1);
+                    b_change = user_gives_b - b_gives_minus_change;
+                } else {
+                    a_change = user_gives_a - b_in_units_of_a;
+                }
+
+                let actual_dep_a = user_gives_a - a_change;
+                let actual_dep_b = user_gives_b - b_change;
+
+                let new_liquidity = if quantity_a.is_positive() {
+                    &actual_dep_a * &self.pool.circulating_lp / &quantity_a
                 } else {
                     BigInt::ZERO
                 };
+
+                if !new_liquidity.is_positive() {
+                    return Err(ApplyOrderError::NoLiquidity);
+                }
+
                 self.pool.circulating_lp += new_liquidity;
-                self.value.add(&a.asset_class(), &a.amount);
-                self.value.add(&b.asset_class(), &b.amount);
+                self.value.add(&a.asset_class(), &actual_dep_a);
+                self.value.add(&b.asset_class(), &actual_dep_b);
+
+                let fee = self.simple_fee();
+                self.pool.protocol_fees += &fee;
+                self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
             }
             Order::Withdrawal(lp) => {
-                // TODO: feeeeeeeeeees
                 let (asset_a, asset_b) = &self.pool.assets;
                 let (old_a, old_b) = self.pool_values();
                 let withdrawn_a = old_a * &lp.amount / &self.pool.circulating_lp;
@@ -165,6 +202,10 @@ pub enum ApplyOrderError {
     NoEfficientOrderGive,
     #[error("order coin pair does not match pool coin pair")]
     CoinPairMismatch,
+    #[error("deposit would give {0} coin A")]
+    NegativeDeposit(BigInt),
+    #[error("would return 0 liquidity")]
+    NoLiquidity,
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -378,7 +419,10 @@ mod tests {
             value!(3_000_000, (&test_asset_class, 10)),
         );
         let withdrawal = build_order(
-            Order::Withdrawal(SingletonValue::new(lp_asset_class.clone(), BigInt::from(1_000_000))),
+            Order::Withdrawal(SingletonValue::new(
+                lp_asset_class.clone(),
+                BigInt::from(1_000_000),
+            )),
             value!(3_000_000, (&lp_asset_class, 1_000_000)),
         );
 
@@ -386,10 +430,63 @@ mod tests {
         assert_eq!(scooped_pool.apply_order(&swap), Ok(()));
         assert_eq!(scooped_pool.apply_order(&withdrawal), Ok(()));
         assert_eq!(scooped_pool.validate(), Ok(()));
-        assert_eq!(
-            scooped_pool.value,
-            value!(2_672_001),
+        assert_eq!(scooped_pool.value, value!(2_672_001),);
+    }
+
+    #[test]
+    fn should_scoop_deposit() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
+        let rberry_asset_class = AssetClass::from_str(
+            "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15.524245525259",
+        )
+        .unwrap();
+        let sberry_asset_class = AssetClass::from_str(
+            "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15.534245525259",
+        )
+        .unwrap();
+
+        let pool = SundaeV3Pool {
+            input: TransactionInput::new(Hash::new([0; 32]), 0),
+            value: value!(
+                96344040,
+                (&rberry_asset_class, 152_640_608),
+                (&sberry_asset_class, 66_301_789)
+            ),
+            pool_datum: PoolDatum {
+                ident: Ident::new(&[]),
+                assets: (rberry_asset_class.clone(), sberry_asset_class.clone()),
+                circulating_lp: BigInt::from(97_000_000),
+                bid_fees_per_10_thousand: BigInt::from(50),
+                ask_fees_per_10_thousand: BigInt::from(30),
+                fee_manager: None,
+                market_open: BigInt::from(0),
+                protocol_fees: BigInt::from(96_344_040),
+            },
+            slot: 0,
+        };
+        let deposit = build_order(
+            Order::Deposit((
+                SingletonValue::new(rberry_asset_class.clone(), BigInt::from(1_000_000)),
+                SingletonValue::new(sberry_asset_class.clone(), BigInt::from(1_000_000)),
+            )),
+            value!(
+                3_100_000,
+                (&rberry_asset_class, 1_000_000),
+                (&sberry_asset_class, 1_000_000)
+            ),
         );
 
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
+        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
+        assert_eq!(
+            scooped_pool.value,
+            value!(
+                96_844_040,
+                (&rberry_asset_class, 153_640_608),
+                (&sberry_asset_class, 66_736_155)
+            ),
+        );
     }
 }
