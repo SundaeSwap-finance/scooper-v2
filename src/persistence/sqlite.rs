@@ -82,10 +82,9 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
 
         if !changes.created_txos.is_empty() {
             let insert_created_txo_query = {
-                let column_names =
-                    "tx_id, txo_index, txo_type, created_slot, spent_slot, spent_height, era, txo";
+                let column_names = "tx_id, txo_index, txo_type, created_slot, spent_slot, spent_height, era, txo, datum";
                 let values_clauses =
-                    vec!["(?,?,?,?,NULL,NULL,?,?)".to_string(); changes.created_txos.len()]
+                    vec!["(?,?,?,?,NULL,NULL,?,?,?)".to_string(); changes.created_txos.len()]
                         .join(",");
                 format!("INSERT INTO sundae_v3_txos ({column_names}) VALUES {values_clauses};")
             };
@@ -98,7 +97,8 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
                     .bind(created_txo.txo_type)
                     .bind(created_txo.created_slot as i64)
                     .bind(created_txo.era)
-                    .bind(created_txo.txo);
+                    .bind(created_txo.txo)
+                    .bind(created_txo.datum);
             }
 
             query.execute(&mut *tx).await?;
@@ -141,7 +141,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
 
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
         let query = "
-            SELECT tx_id, txo_index, txo_type, created_slot, era, txo
+            SELECT tx_id, txo_index, txo_type, created_slot, era, txo, datum
             FROM sundae_v3_txos
             WHERE spent_slot IS NULL
             ORDER BY created_slot, tx_id, txo_index;
@@ -168,6 +168,7 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
         let created_slot: i64 = row.try_get("created_slot")?;
         let era: u16 = row.try_get("era")?;
         let txo: Vec<u8> = row.try_get("txo")?;
+        let datum: Option<Vec<u8>> = row.try_get("datum")?;
 
         Ok(Self {
             txo_id: TransactionInput::new(tx_id.as_slice().into(), txo_index as u64),
@@ -175,6 +176,7 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
             created_slot: created_slot as u64,
             era,
             txo,
+            datum,
         })
     }
 }
@@ -297,6 +299,7 @@ mod tests {
             created_slot: 48463593,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            datum: None,
         }
     }
 
@@ -331,6 +334,7 @@ mod tests {
             created_slot: 48465289,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            datum: None,
         }
     }
 
@@ -371,6 +375,7 @@ mod tests {
             created_slot: 48467939,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            datum: None,
         }
     }
 

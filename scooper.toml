@@ -6,7 +6,7 @@ method = "snapshot"  # Options: "mithril" | "snapshot"
 
 # Upstream peers configuration (example: ["backbone.cardano.iog.io:3001", "backbone.mainnet.emurgornd.com:3001"])
 [module.peer-network-interface]
-node-addresses = ["mithril-signer-1.testing-preview.api.mithril.network:9091"]
+node-addresses = ["localhost:3001", "mithril-signer-1.testing-preview.api.mithril.network:9091"]
 
 # Mithril configuration
 [module.mithril-snapshot-fetcher]

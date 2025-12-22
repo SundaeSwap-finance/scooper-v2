@@ -4,12 +4,12 @@ use anyhow::bail;
 use num_traits::{ConstZero, Zero};
 use pallas_addresses::Address;
 use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
-use pallas_primitives::{Hash, PlutusData, PlutusScript};
+use pallas_primitives::{DatumHash, Hash, KeepRaw, PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
@@ -237,41 +237,40 @@ impl fmt::Display for Value {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub enum Datum {
+pub enum RawDatum<'a> {
     None,
-    ParsedOrder(OrderDatum),
-    ParsedPool(PoolDatum),
-    ParsedSettings(SettingsDatum),
+    Inline(PlutusData),
+    Hash(&'a KeepRaw<'a, PlutusData>),
 }
 
-impl Serialize for Datum {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Datum::None => serializer.serialize_none(),
+impl RawDatum<'_> {
+    pub fn parse<T: AsPlutus>(&self) -> Option<T> {
+        let raw_datum = match self {
+            Self::None => return None,
+            Self::Inline(d) => d,
+            Self::Hash(d) => *d,
+        };
 
-            Datum::ParsedOrder(od) => od.serialize(serializer),
-
-            Datum::ParsedPool(pd) => pd.serialize(serializer),
-
-            Datum::ParsedSettings(sd) => sd.serialize(serializer),
-        }
+        T::from_plutus(raw_datum.clone()).ok()
     }
 }
 
-// Would be convenient to parameterize this by the type of the decoded datum, with
-// an 'Any' type that always succeeds at decoding and functions
-//   TransactionOutput<T> -> TransactionOutput<Any>
-//   TransactionOutput<Any> -> Result<TransactionOutput<T>, Error> where T: minicbor::Decode
-#[derive(PartialEq, Eq, Debug, serde::Serialize)]
-pub struct TransactionOutput {
-    #[serde(serialize_with = "serialize_address")]
+#[derive(PartialEq, Eq, Debug)]
+pub struct TransactionOutput<'a> {
     pub address: Address,
     pub value: Value,
-    pub datum: Datum,
+    pub datum: RawDatum<'a>,
     pub script_ref: Option<ScriptRef>,
+}
+
+impl TransactionOutput<'_> {
+    pub fn hashed_datum(&self) -> Option<Vec<u8>> {
+        if let RawDatum::Hash(data) = &self.datum {
+            Some(data.raw_cbor().to_vec())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -300,28 +299,21 @@ impl fmt::Display for TransactionInput {
     }
 }
 
-pub fn convert_datum(datum: Option<MintedDatumOption>) -> Datum {
+fn convert_datum<'a>(
+    datum: Option<MintedDatumOption<'a>>,
+    data: &'a BTreeMap<DatumHash, KeepRaw<'a, PlutusData>>,
+) -> RawDatum<'a> {
     match datum {
-        None => Datum::None,
-        Some(MintedDatumOption::Hash(h)) => Datum::None,
-        Some(MintedDatumOption::Data(d)) => {
-            let plutus_data: PlutusData = d.0.unwrap();
-
-            if let Ok(order) = AsPlutus::from_plutus(plutus_data.clone()) {
-                return Datum::ParsedOrder(order);
-            }
-            if let Ok(pool) = AsPlutus::from_plutus(plutus_data.clone()) {
-                return Datum::ParsedPool(pool);
-            }
-            if let Ok(settings) = AsPlutus::from_plutus(plutus_data) {
-                return Datum::ParsedSettings(settings);
-            }
-            Datum::None
-        }
+        None => RawDatum::None,
+        Some(MintedDatumOption::Data(d)) => RawDatum::Inline(d.0.unwrap()),
+        Some(MintedDatumOption::Hash(h)) => match data.get(&h) {
+            Some(d) => RawDatum::Hash(d),
+            None => RawDatum::None,
+        },
     }
 }
 
-pub fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
+fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     let mut result = BTreeMap::new();
     let mut ada_policy = BTreeMap::new();
     ada_policy.insert(vec![], value.coin().into());
@@ -338,7 +330,7 @@ pub fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     Value(result)
 }
 
-pub fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef) -> ScriptRef {
+fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef) -> ScriptRef {
     match script_ref {
         pallas_primitives::conway::MintedScriptRef::NativeScript(n) => {
             ScriptRef::Native(n.unwrap())
@@ -349,9 +341,12 @@ pub fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef
     }
 }
 
-pub fn convert_transaction_output<'b>(output: &MultiEraOutput<'b>) -> TransactionOutput {
+pub fn convert_txo<'b>(
+    output: &'b MultiEraOutput<'b>,
+    data: &'b BTreeMap<DatumHash, KeepRaw<'b, PlutusData>>,
+) -> TransactionOutput<'b> {
     let address = output.address().unwrap();
-    let datum = convert_datum(output.datum());
+    let datum = convert_datum(output.datum(), data);
     let value = convert_value(output.value());
     let script_ref = output.script_ref().map(convert_script_ref);
     TransactionOutput {

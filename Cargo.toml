@@ -26,6 +26,7 @@ minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 pallas-addresses = "0.34"
+pallas-crypto = "0.34"
 pallas-primitives = "0.34"
 pallas-traverse = "0.34"
 plutus-parser = { version = "0.4", features = ["derive"] }

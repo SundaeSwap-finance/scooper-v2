@@ -4794,6 +4794,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pallas-addresses 0.34.0",
+ "pallas-crypto 0.34.0",
  "pallas-primitives 0.34.0",
  "pallas-traverse 0.34.0",
  "plutus-parser",

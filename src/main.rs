@@ -236,7 +236,6 @@ impl AdminServer {
 }
 
 #[tokio::main]
-#[allow(unreachable_code)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");

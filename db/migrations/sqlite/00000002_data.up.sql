@@ -1,0 +1,2 @@
+ALTER TABLE sundae_v3_txos
+ADD COLUMN datum BLOB NULL;

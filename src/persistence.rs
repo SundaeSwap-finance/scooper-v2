@@ -70,6 +70,7 @@ pub struct PersistedTxo {
     pub created_slot: u64,
     pub era: u16,
     pub txo: Vec<u8>,
+    pub datum: Option<Vec<u8>>,
 }
 
 pub struct CursorDao(Box<dyn CursorDaoImpl>);
