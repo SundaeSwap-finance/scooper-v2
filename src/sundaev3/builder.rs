@@ -84,28 +84,32 @@ impl ScoopBuilder {
                 Ok(())
             }
             Order::Deposit((a, b)) => {
-                let (quantity_a, quantity_b) = self.pool_values();
+                let fee = self.simple_fee();
+
+                let quantity_a = &a.amount;
+                let quantity_b = &b.amount;
+                let (token_a, token_b) = self.pool_values();
 
                 let mut actual_a = order.value.get(&a.asset_class());
                 let actual_b = order.value.get(&b.asset_class());
                 if a.asset_class() == ADA_ASSET_CLASS {
-                    actual_a -= BigInt::from(2_000_000) + &self.pool.protocol_fees;
+                    actual_a -= BigInt::from(2_000_000) + &fee;
                 }
 
-                let user_gives_a = (&a.amount).min(&actual_a);
+                let user_gives_a = quantity_a.min(&actual_a);
                 if !user_gives_a.is_positive() {
                     return Err(ApplyOrderError::NegativeDeposit(user_gives_a.clone()));
                 }
-                let user_gives_b = (&b.amount).min(&actual_b);
+                let user_gives_b = quantity_b.min(&actual_b);
 
-                let b_in_units_of_a = (user_gives_b * &quantity_a) / &b.amount;
+                let b_in_units_of_a = (user_gives_b * &token_a) / &token_b;
                 let mut a_change = BigInt::ZERO;
                 let mut b_change = BigInt::ZERO;
 
                 if &b_in_units_of_a > user_gives_a {
-                    let mut b_gives_minus_change = &quantity_b * user_gives_a;
+                    let mut b_gives_minus_change = &token_b * user_gives_a;
                     b_gives_minus_change -= BigInt::from(1);
-                    b_gives_minus_change /= &quantity_a;
+                    b_gives_minus_change /= &token_a;
                     b_gives_minus_change += BigInt::from(1);
                     b_change = user_gives_b - b_gives_minus_change;
                 } else {
@@ -116,7 +120,7 @@ impl ScoopBuilder {
                 let actual_dep_b = user_gives_b - b_change;
 
                 let new_liquidity = if quantity_a.is_positive() {
-                    &actual_dep_a * &self.pool.circulating_lp / &quantity_a
+                    &actual_dep_a * &self.pool.circulating_lp / token_a
                 } else {
                     BigInt::ZERO
                 };
@@ -129,7 +133,6 @@ impl ScoopBuilder {
                 self.value.add(&a.asset_class(), &actual_dep_a);
                 self.value.add(&b.asset_class(), &actual_dep_b);
 
-                let fee = self.simple_fee();
                 self.pool.protocol_fees += &fee;
                 self.value.add(&ADA_ASSET_CLASS, &fee);
                 Ok(())
@@ -487,6 +490,47 @@ mod tests {
                 (&rberry_asset_class, 153_640_608),
                 (&sberry_asset_class, 66_736_155)
             ),
+        );
+    }
+
+    #[test]
+    fn should_scoop_other_deposit() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
+        let tindy_asset_class = AssetClass::from_str(
+            "fa3eff2047fdf9293c5feef4dc85ce58097ea1c6da4845a351535183.74494e4459",
+        )
+        .unwrap();
+
+        let pool = SundaeV3Pool {
+            input: TransactionInput::new(Hash::new([0; 32]), 0),
+            value: value!(20_000_000, (&tindy_asset_class, 20_000_000)),
+            pool_datum: PoolDatum {
+                ident: Ident::new(&[]),
+                assets: (ADA_ASSET_CLASS, tindy_asset_class.clone()),
+                circulating_lp: BigInt::from(20_000_000),
+                bid_fees_per_10_thousand: BigInt::from(5),
+                ask_fees_per_10_thousand: BigInt::from(5),
+                fee_manager: None,
+                market_open: BigInt::from(0),
+                protocol_fees: BigInt::from(0),
+            },
+            slot: 0,
+        };
+        let deposit = build_order(
+            Order::Deposit((
+                SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(99_999_998)),
+                SingletonValue::new(tindy_asset_class.clone(), BigInt::from(20_510_929)),
+            )),
+            value!(102_499_998, (&tindy_asset_class, 20_510_929)),
+        );
+
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
+        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
+        assert_eq!(
+            scooped_pool.value,
+            value!(41_010_929, (&tindy_asset_class, 40_510_929)),
         );
     }
 }

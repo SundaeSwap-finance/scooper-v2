@@ -297,7 +297,7 @@ impl serde::Serialize for Destination {
                 let datum_hex: Option<String> = match datum {
                     AikenDatum::NoDatum => None,
                     AikenDatum::DatumHash(v) => Some(hex::encode(v)),
-                    AikenDatum::InlineDatum(v) => Some(hex::encode(v)),
+                    AikenDatum::InlineDatum(v) => Some(hex::encode(v.clone().to_plutus_bytes())),
                 };
 
                 let mut map = serializer.serialize_map(Some(2))?;
@@ -321,7 +321,7 @@ impl serde::Serialize for Destination {
 pub enum AikenDatum {
     NoDatum,
     DatumHash(Vec<u8>),
-    InlineDatum(Vec<u8>),
+    InlineDatum(PlutusData),
 }
 
 #[cfg(test)]
@@ -504,6 +504,16 @@ mod tests {
         let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
         let expected_ident =
             hex::decode("12d88c7f234493742d583c219101050b39e925d715a93060752d60d3").unwrap();
+        assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
+    }
+
+    #[test]
+    fn test_deocde_orderdatum_3() {
+        let od_bytes = hex::decode("d8799fd8799f581c035002e600d25a96003ecd1746007f59bac2788355687d18c7927119ffd8799f581c121fd22e0b57ac206fefc763f8bfa0771919f5218b40691eea4514d0ff1a0007a120d8799fd8799fd87a9f581c73275b9e267fd927bfc14cf653d904d1538ad8869260ab638bf73f5cffd8799fd8799fd8799f581c045d47cac5067ce697478c11051deb935a152e0773a5d7430a11baa8ffffffffd87b9fd8799fd8799f581c121fd22e0b57ac206fefc763f8bfa0771919f5218b40691eea4514d0ff80ffffffd87b9f9f9f40401a0f1b6d96ff9f581c2fe3c3364b443194b10954771c95819b8d6ed464033c21f03f8facb544694254431903ddffffff43d87980ff").unwrap();
+        let order_pd: PlutusData = minicbor::decode(&od_bytes).unwrap();
+        let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
+        let expected_ident =
+            hex::decode("035002e600d25a96003ecd1746007f59bac2788355687d18c7927119").unwrap();
         assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
     }
 

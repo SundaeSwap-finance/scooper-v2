@@ -245,13 +245,15 @@ pub enum RawDatum<'a> {
 
 impl RawDatum<'_> {
     pub fn parse<T: AsPlutus>(&self) -> Option<T> {
-        let raw_datum = match self {
-            Self::None => return None,
-            Self::Inline(d) => d,
-            Self::Hash(d) => *d,
-        };
+        T::from_plutus(self.plutus_data()?.clone()).ok()
+    }
 
-        T::from_plutus(raw_datum.clone()).ok()
+    pub fn plutus_data(&self) -> Option<&PlutusData> {
+        match self {
+            Self::None => None,
+            Self::Inline(d) => Some(d),
+            Self::Hash(d) => Some(*d),
+        }
     }
 }
 
