@@ -533,4 +533,45 @@ mod tests {
             value!(41_010_929, (&tindy_asset_class, 40_510_929)),
         );
     }
+
+    #[test]
+    fn should_scoop_deposit_with_insufficient_assets() {
+        let settings = build_settings(BigInt::from(332_000), BigInt::from(168_000));
+
+        let iusd_asset_class = AssetClass::from_str(
+            "2fe3c3364b443194b10954771c95819b8d6ed464033c21f03f8facb5.69555344",
+        )
+        .unwrap();
+
+        let pool = SundaeV3Pool {
+            input: TransactionInput::new(Hash::new([0; 32]), 0),
+            value: value!(1_333_822_044, (&iusd_asset_class, 660_909_109)),
+            pool_datum: PoolDatum {
+                ident: Ident::new(&[]),
+                assets: (ADA_ASSET_CLASS, iusd_asset_class.clone()),
+                circulating_lp: BigInt::from(938_191_540),
+                bid_fees_per_10_thousand: BigInt::from(30),
+                ask_fees_per_10_thousand: BigInt::from(30),
+                fee_manager: None,
+                market_open: BigInt::from(0),
+                protocol_fees: BigInt::from(2_000_000),
+            },
+            slot: 0,
+        };
+        let deposit = build_order(
+            Order::Deposit((
+                SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(16_839_781)),
+                SingletonValue::new(iusd_asset_class.clone(), BigInt::from(2_874_422)),
+            )),
+            value!(19_772_819, (&iusd_asset_class, 2_802_394)),
+        );
+
+        let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
+        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(scooped_pool.validate(), Ok(()));
+        assert_eq!(
+            scooped_pool.value,
+            value!(1_339_969_250, (&iusd_asset_class, 663_711_503)),
+        );
+    }
 }

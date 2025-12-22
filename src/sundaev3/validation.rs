@@ -119,6 +119,10 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
             Ok(())
         }
         Order::Deposit((a, b)) => {
+            if !a.amount.is_positive() || !b.amount.is_positive() {
+                return Err(ValueError::GivesZeroTokens);
+            }
+
             let asset_a = a.asset_class();
             let asset_b = b.asset_class();
             let mut actual_a = value.get(&asset_a);
@@ -137,22 +141,6 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
 
             if !actual_a.is_positive() || !actual_b.is_positive() {
                 return Err(ValueError::GivesZeroTokens);
-            }
-
-            if actual_a < a.amount {
-                return Err(ValueError::HasInsufficientTokens {
-                    asset: asset_a,
-                    expected: a.amount.clone(),
-                    actual: actual_a,
-                });
-            }
-
-            if actual_b < b.amount {
-                return Err(ValueError::HasInsufficientTokens {
-                    asset: asset_b,
-                    expected: b.amount.clone(),
-                    actual: actual_b,
-                });
             }
 
             Ok(())
