@@ -386,7 +386,7 @@ mod tests {
         let mut x = BigInt::from(1);
         let n = BigInt::from(256);
         for _ in 0..10 {
-            x = x * &n;
+            x *= &n;
         }
         let u64_max = BigInt::from(u64::MAX);
         assert!(x > u64_max);
@@ -403,7 +403,7 @@ mod tests {
         let mut x = BigInt::from(1);
         let n = BigInt::from(256);
         for _ in 0..11 {
-            x = x * &n;
+            x *= &n;
         }
         x *= BigInt::from(-1);
         let neg_u64_max = BigInt::from(u64::MAX) * BigInt::from(-1);
