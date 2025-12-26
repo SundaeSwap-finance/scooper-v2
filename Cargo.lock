@@ -4051,10 +4051,11 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plutus-parser"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f79553b8d0b18b55fe225102f9597a688246cd3c76b20efbfe85f23e7b7df15"
+checksum = "f073006c14fc3f3d553f5606dd44ee69b0e85bb147071251178b04d1ef842f4d"
 dependencies = [
+ "hex",
  "indexmap 2.12.1",
  "minicbor 0.25.1",
  "pallas-primitives 0.34.0",
@@ -4064,9 +4065,9 @@ dependencies = [
 
 [[package]]
 name = "plutus-parser-derive"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23c0a75610d553933ea6dcf8de370f61c54ea92a3840d8cb6481e2fb04414f7c"
+checksum = "4d5d05ff89de47dc985eacfb7d445e758316bb32ca6f16ef0ed140ae23fed35a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6302,7 +6303,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ use tracing::{Level, event, info, warn};
 mod bigint;
 mod cardano_types;
 mod config;
+mod datum_lookup;
 mod historical_state;
 mod multisig;
 mod persistence;

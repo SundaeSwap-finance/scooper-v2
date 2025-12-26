@@ -12,15 +12,16 @@ use pallas_addresses::Address;
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
-use plutus_parser::AsPlutus;
+use plutus_parser::{AsPlutus, PlutusData};
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, trace, warn};
 
 use crate::{
     SundaeV3Protocol,
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
+    datum_lookup::{DatumLookup, ScopedDatumLookup},
     historical_state::HistoricalState,
-    persistence::{PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
+    persistence::{PersistedDatum, PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
     sundaev3::{
         Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV3Order, SundaeV3Pool,
         SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder, validate_order,
@@ -32,6 +33,7 @@ pub struct SundaeV3State {
     pub pools: BTreeMap<Ident, Arc<SundaeV3Pool>>,
     pub orders: Vec<Arc<SundaeV3Order>>,
     pub settings: Option<Arc<SundaeV3Settings>>,
+    datums: DatumLookup,
 }
 
 pub type SundaeV3HistoricalState = HistoricalState<SundaeV3State>;
@@ -50,6 +52,7 @@ impl SundaeV3Update {
 }
 
 const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+const METADATA_DATUM_KEY: u64 = 103251;
 
 pub struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3HistoricalState>>,
@@ -78,26 +81,33 @@ impl SundaeV3Indexer {
 
     pub async fn load(&mut self) -> Result<()> {
         let txos = self.dao.load_txos().await?;
+        let datums = self.dao.load_datums().await?;
         let mut slot = 0;
         let mut state = SundaeV3State::default();
+        for datum in datums {
+            let data = PlutusData::from_plutus_bytes(&datum.datum)
+                .context("could not parse persisted datum")?;
+            state
+                .datums
+                .add_metadata_datum((datum.datum.to_vec(), data));
+        }
+
         for txo in txos {
             let era = Era::try_from(txo.era)?;
             let parsed = MultiEraOutput::decode(era, &txo.txo)?;
-            let data = match &txo.datum {
+            let datum = match &txo.datum {
                 Some(bytes) => {
-                    let hash = Hasher::<256>::hash(bytes);
                     let pd = minicbor::decode(bytes).context("could not parse persisted CBOR")?;
-                    let mut res = BTreeMap::new();
-                    res.insert(hash, pd);
-                    res
+                    Some(pd)
                 }
-                None => BTreeMap::new(),
+                None => None,
             };
-            let output = cardano_types::convert_txo(&parsed, &data);
+            let datums = state.datums.for_persisted_txo(datum);
+            let output = cardano_types::convert_txo(&parsed);
             slot = slot.max(txo.created_slot);
             match txo.txo_type.as_str() {
                 "pool" => {
-                    let Some(pool_datum) = self.parse_pool(&output) else {
+                    let Some(pool_datum) = self.parse_pool(&output, &datums) else {
                         bail!("invalid pool datum");
                     };
                     state.pools.insert(
@@ -111,7 +121,7 @@ impl SundaeV3Indexer {
                     );
                 }
                 "order" => {
-                    let Some(datum) = output.datum.parse() else {
+                    let Some(datum) = output.datum.parse(&datums) else {
                         bail!("invalid order datum");
                     };
                     state.orders.push(Arc::new(SundaeV3Order {
@@ -122,7 +132,7 @@ impl SundaeV3Indexer {
                     }));
                 }
                 "settings" => {
-                    let Some(datum) = output.datum.parse() else {
+                    let Some(datum) = output.datum.parse(&datums) else {
                         bail!("invalid settings datum");
                     };
                     state.settings = Some(Arc::new(SundaeV3Settings {
@@ -143,8 +153,38 @@ impl SundaeV3Indexer {
         Ok(())
     }
 
-    fn parse_pool(&self, tx_out: &TransactionOutput) -> Option<PoolDatum> {
-        let pool_datum: PoolDatum = tx_out.datum.parse()?;
+    fn extract_metadata_datums(&self, tx: &MultiEraTx) -> Vec<(Vec<u8>, PlutusData)> {
+        use pallas_primitives::Metadatum;
+        let metadata = tx.metadata();
+        let Some(Metadatum::Map(kvps)) = metadata.find(METADATA_DATUM_KEY) else {
+            return vec![];
+        };
+        let pairs: &Vec<_> = kvps;
+        let mut result = vec![];
+        'datum: for (_, val) in pairs {
+            let Metadatum::Array(parts) = val else {
+                continue 'datum;
+            };
+            let mut bytes = vec![];
+            for part in parts {
+                let Metadatum::Bytes(b) = part else {
+                    continue 'datum;
+                };
+                bytes.extend_from_slice(b);
+            }
+            if let Ok(datum) = minicbor::decode(&bytes) {
+                result.push((bytes, datum));
+            }
+        }
+        result
+    }
+
+    fn parse_pool(
+        &self,
+        tx_out: &TransactionOutput,
+        datums: &ScopedDatumLookup,
+    ) -> Option<PoolDatum> {
+        let pool_datum: PoolDatum = tx_out.datum.parse(datums)?;
         let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
         asset_name.extend_from_slice(&pool_datum.ident);
         let nft_asset_id = AssetClass {
@@ -158,8 +198,12 @@ impl SundaeV3Indexer {
         }
     }
 
-    fn parse_settings(&self, tx_out: &TransactionOutput) -> Option<SettingsDatum> {
-        let settings_datum: SettingsDatum = tx_out.datum.parse()?;
+    fn parse_settings(
+        &self,
+        tx_out: &TransactionOutput,
+        datums: &ScopedDatumLookup,
+    ) -> Option<SettingsDatum> {
+        let settings_datum: SettingsDatum = tx_out.datum.parse(datums)?;
         if tx_out.value.get(&self.protocol.settings_nft).is_positive() {
             Some(settings_datum)
         } else {
@@ -207,14 +251,20 @@ impl ChainIndex for SundaeV3Indexer {
         let mut new_settings = None;
         let mut changes = SundaeV3TxChanges::new(info.slot, info.number);
 
-        let data = tx
-            .plutus_data()
-            .iter()
-            .map(|datum| {
-                let hash = Hasher::<256>::hash(datum.raw_cbor());
-                (hash, datum.clone())
-            })
-            .collect::<BTreeMap<_, _>>();
+        let state = history.update_slot(slot)?;
+
+        for new_datum in self.extract_metadata_datums(&tx) {
+            let persisted = PersistedDatum {
+                hash: Hasher::<256>::hash(&new_datum.0).to_vec(),
+                datum: new_datum.0.clone(),
+                created_slot: slot,
+            };
+            debug!(slot, hash = %hex::encode(&persisted.hash), "metadata datum spotted");
+            changes.metadata_datums.push(persisted);
+            state.datums.add_metadata_datum(new_datum);
+        }
+
+        let datums = state.datums.for_tx(&tx);
 
         // Find which pools and orders have been updated in this transaction.
         // Do not apply those updates to our new state yet.
@@ -222,15 +272,15 @@ impl ChainIndex for SundaeV3Indexer {
             let address = output.address()?;
             if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output, &data);
-                if let Some(pd) = self.parse_pool(&tx_out) {
+                let tx_out = cardano_types::convert_txo(output);
+                if let Some(pd) = self.parse_pool(&tx_out, &datums) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
                         txo_type: "pool".to_string(),
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
-                        datum: tx_out.hashed_datum(),
+                        datum: tx_out.hashed_datum(&datums),
                     });
 
                     let pool_id = pd.ident.clone();
@@ -244,15 +294,15 @@ impl ChainIndex for SundaeV3Indexer {
                 }
             } else if payment_hash_equals(&address, &self.protocol.order_script_hash) {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output, &data);
-                if let Some(od) = tx_out.datum.parse() {
+                let tx_out = cardano_types::convert_txo(output);
+                if let Some(od) = tx_out.datum.parse(&datums) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
                         txo_type: "order".to_string(),
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
-                        datum: tx_out.hashed_datum(),
+                        datum: tx_out.hashed_datum(&datums),
                     });
 
                     let order = SundaeV3Order {
@@ -265,15 +315,15 @@ impl ChainIndex for SundaeV3Indexer {
                 }
             } else if payment_hash_equals(&address, &self.protocol.settings_script_hash) {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output, &data);
-                if let Some(sd) = self.parse_settings(&tx_out) {
+                let tx_out = cardano_types::convert_txo(output);
+                if let Some(sd) = self.parse_settings(&tx_out, &datums) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
                         txo_type: "settings".to_string(),
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
-                        datum: tx_out.hashed_datum(),
+                        datum: tx_out.hashed_datum(&datums),
                     });
                     new_settings = Some(Arc::new(SundaeV3Settings {
                         input: this_input,
@@ -283,8 +333,6 @@ impl ChainIndex for SundaeV3Indexer {
                 }
             }
         }
-
-        let state = history.update_slot(slot)?;
 
         let mut spent_inputs = tx
             .inputs()
@@ -481,6 +529,7 @@ mod tests {
     use std::fs;
 
     use acropolis_common::{BlockHash, BlockIntent, BlockStatus, Era};
+    use pallas_primitives::DatumHash;
     use pallas_traverse::MultiEraBlock;
 
     struct NoOpSundaeV3Dao;
@@ -496,6 +545,9 @@ mod tests {
             Ok(())
         }
         async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
+            Ok(vec![])
+        }
+        async fn load_datums(&self) -> Result<Vec<PersistedDatum>> {
             Ok(vec![])
         }
         async fn prune_txos(&self, min_height: u64) -> Result<()> {
@@ -609,6 +661,31 @@ mod tests {
             // After rollback, all record of this pool is gone
             let index = state.lock().await.latest().into_owned();
             assert!(!index.pools.contains_key(&pool_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_datums() {
+        let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
+        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let mut indexer = SundaeV3Indexer::new(
+            state.clone(),
+            watch::Sender::default(),
+            protocol,
+            2160,
+            Box::new(NoOpSundaeV3Dao),
+        );
+        let block_bytes = std::fs::read("testdata/metadata.block").unwrap();
+        let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
+        let datum_hash: DatumHash =
+            "8ecfafddfa732227ba5b494183fd3150a4c8614656e6182f92c25ee2d1480019"
+                .parse()
+                .unwrap();
+        handle_block(&mut indexer, block.clone()).await.unwrap();
+        {
+            let index = state.lock().await.latest().into_owned();
+            assert!(index.datums.contains_metadata_datum(datum_hash));
         }
     }
 }

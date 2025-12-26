@@ -16,6 +16,7 @@ use std::str::FromStr;
 use plutus_parser::AsPlutus;
 
 use crate::bigint::BigInt;
+use crate::datum_lookup::ScopedDatumLookup;
 use crate::serde_compat::serialize_address;
 use crate::sundaev3::{OrderDatum, PoolDatum, SettingsDatum};
 pub type Bytes = Vec<u8>;
@@ -237,38 +238,38 @@ impl fmt::Display for Value {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub enum RawDatum<'a> {
+pub enum RawDatum {
     None,
     Inline(PlutusData),
-    Hash(&'a KeepRaw<'a, PlutusData>),
+    Hash(DatumHash),
 }
 
-impl RawDatum<'_> {
-    pub fn parse<T: AsPlutus>(&self) -> Option<T> {
-        T::from_plutus(self.plutus_data()?.clone()).ok()
+impl RawDatum {
+    pub fn parse<T: AsPlutus>(&self, datums: &ScopedDatumLookup) -> Option<T> {
+        T::from_plutus(self.plutus_data(datums)?.clone()).ok()
     }
 
-    pub fn plutus_data(&self) -> Option<&PlutusData> {
+    pub fn plutus_data<'a>(&'a self, datums: &'a ScopedDatumLookup<'a>) -> Option<&'a PlutusData> {
         match self {
             Self::None => None,
             Self::Inline(d) => Some(d),
-            Self::Hash(d) => Some(*d),
+            Self::Hash(h) => datums.lookup_datum(*h),
         }
     }
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct TransactionOutput<'a> {
+pub struct TransactionOutput {
     pub address: Address,
     pub value: Value,
-    pub datum: RawDatum<'a>,
+    pub datum: RawDatum,
     pub script_ref: Option<ScriptRef>,
 }
 
-impl TransactionOutput<'_> {
-    pub fn hashed_datum(&self) -> Option<Vec<u8>> {
-        if let RawDatum::Hash(data) = &self.datum {
-            Some(data.raw_cbor().to_vec())
+impl TransactionOutput {
+    pub fn hashed_datum(&self, lookup: &ScopedDatumLookup) -> Option<Vec<u8>> {
+        if let RawDatum::Hash(hash) = &self.datum {
+            lookup.lookup_bytes(*hash)
         } else {
             None
         }
@@ -301,17 +302,11 @@ impl fmt::Display for TransactionInput {
     }
 }
 
-fn convert_datum<'a>(
-    datum: Option<MintedDatumOption<'a>>,
-    data: &'a BTreeMap<DatumHash, KeepRaw<'a, PlutusData>>,
-) -> RawDatum<'a> {
+fn convert_datum(datum: Option<MintedDatumOption>) -> RawDatum {
     match datum {
         None => RawDatum::None,
         Some(MintedDatumOption::Data(d)) => RawDatum::Inline(d.0.unwrap()),
-        Some(MintedDatumOption::Hash(h)) => match data.get(&h) {
-            Some(d) => RawDatum::Hash(d),
-            None => RawDatum::None,
-        },
+        Some(MintedDatumOption::Hash(h)) => RawDatum::Hash(h),
     }
 }
 
@@ -343,12 +338,9 @@ fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef) ->
     }
 }
 
-pub fn convert_txo<'b>(
-    output: &'b MultiEraOutput<'b>,
-    data: &'b BTreeMap<DatumHash, KeepRaw<'b, PlutusData>>,
-) -> TransactionOutput<'b> {
+pub fn convert_txo(output: &MultiEraOutput) -> TransactionOutput {
     let address = output.address().unwrap();
-    let datum = convert_datum(output.datum(), data);
+    let datum = convert_datum(output.datum());
     let value = convert_value(output.value());
     let script_ref = output.script_ref().map(convert_script_ref);
     TransactionOutput {
