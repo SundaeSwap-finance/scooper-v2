@@ -40,6 +40,7 @@ pub struct SundaeV3TxChanges {
     pub height: u64,
     pub created_txos: Vec<PersistedTxo>,
     pub spent_txos: Vec<TransactionInput>,
+    pub metadata_datums: Vec<PersistedDatum>,
 }
 impl SundaeV3TxChanges {
     pub fn new(slot: u64, height: u64) -> Self {
@@ -48,10 +49,13 @@ impl SundaeV3TxChanges {
             height,
             created_txos: vec![],
             spent_txos: vec![],
+            metadata_datums: vec![],
         }
     }
     pub fn is_empty(&self) -> bool {
-        self.created_txos.is_empty() && self.spent_txos.is_empty()
+        self.created_txos.is_empty()
+            && self.spent_txos.is_empty()
+            && self.metadata_datums.is_empty()
     }
 }
 
@@ -60,6 +64,7 @@ pub trait SundaeV3Dao: Send + Sync + 'static {
     async fn apply_tx_changes(&self, changes: SundaeV3TxChanges) -> Result<()>;
     async fn rollback(&self, slot: u64) -> Result<()>;
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>>;
+    async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
 }
 
@@ -70,6 +75,14 @@ pub struct PersistedTxo {
     pub created_slot: u64,
     pub era: u16,
     pub txo: Vec<u8>,
+    pub datum: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedDatum {
+    pub hash: Vec<u8>,
+    pub datum: Vec<u8>,
+    pub created_slot: u64,
 }
 
 pub struct CursorDao(Box<dyn CursorDaoImpl>);

@@ -26,10 +26,12 @@ minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
 pallas-addresses = "0.34"
+pallas-crypto = "0.34"
 pallas-primitives = "0.34"
 pallas-traverse = "0.34"
-plutus-parser = { version = "0.4", features = ["derive"] }
+plutus-parser = { version = "0.5", features = ["derive"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
+thiserror = "2"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1.41"

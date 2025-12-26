@@ -23,6 +23,7 @@ use tracing::{Level, event, info, warn};
 mod bigint;
 mod cardano_types;
 mod config;
+mod datum_lookup;
 mod historical_state;
 mod multisig;
 mod persistence;
@@ -44,6 +45,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::cardano_types::AssetClass;
 use crate::config::AppConfig;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
@@ -57,6 +59,9 @@ struct SundaeV3Protocol {
     order_script_hash: Vec<u8>,
     #[serde(with = "hex")]
     pool_script_hash: Vec<u8>,
+    #[serde(with = "hex")]
+    settings_script_hash: Vec<u8>,
+    settings_nft: AssetClass,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -99,7 +104,6 @@ enum Commands {
 struct AdminServer {
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -156,13 +160,9 @@ impl AdminServer {
                 if order.datum.ident.as_ref() != Some(&ident) {
                     continue;
                 }
-                if let Err(err) = validate_order(
-                    &order.datum,
-                    &order.output.value,
-                    &pool.pool_datum,
-                    &pool.value,
-                    &self.protocol.pool_script_hash,
-                ) {
+                if let Err(err) =
+                    validate_order(&order.datum, &order.value, &pool.pool_datum, &pool.value)
+                {
                     if let ValidationError::PoolError(PoolError::OutOfRange {
                         swap_price,
                         pool_price,
@@ -237,7 +237,6 @@ impl AdminServer {
 }
 
 #[tokio::main]
-#[allow(unreachable_code)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");
@@ -279,14 +278,11 @@ async fn main() -> Result<()> {
         default_start,
         shutdown.child_token(),
     ));
-    let scooper_handle = tokio::spawn(
-        Scooper::new(broadcaster.subscribe(), &protocol.pool_script_hash)?
-            .run(shutdown.child_token()),
-    );
+    let scooper_handle =
+        tokio::spawn(Scooper::new(broadcaster.subscribe())?.run(shutdown.child_token()));
     let admin_handle = tokio::spawn(admin_server(
         index.clone(),
         resync_tx,
-        protocol,
         shutdown.child_token(),
     ));
 
@@ -379,7 +375,6 @@ async fn manager_loop(
 async fn admin_server(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
     shutdown: CancellationToken,
 ) {
     let addr = SocketAddr::from(([127, 0, 0, 1], 9999));
@@ -393,13 +388,12 @@ async fn admin_server(
 
         let resync_tx = resync_tx.clone();
         let index = index.clone();
-        let protocol = protocol.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             select! {
                 _ = child.cancelled() => {},
-                _ = handle_request(stream, index, resync_tx, protocol) => {}
+                _ = handle_request(stream, index, resync_tx) => {}
             }
         });
     }
@@ -409,15 +403,10 @@ async fn handle_request(
     stream: TcpStream,
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
-    protocol: SundaeV3Protocol,
 ) {
     let io = TokioIo::new(stream);
 
-    let admin_server = AdminServer {
-        index,
-        resync_tx,
-        protocol,
-    };
+    let admin_server = AdminServer { index, resync_tx };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
         .await

@@ -17,26 +17,25 @@ const LOG_DIR: &str = "logs";
 
 use crate::{
     bigint::BigInt,
-    cardano_types::{AssetClass, TransactionInput},
+    cardano_types::TransactionInput,
     sundaev3::{
-        Ident, PoolError, SundaeV3Order, SundaeV3Pool, SundaeV3State, SundaeV3Update, ValueError,
-        estimate_whether_in_range, get_pool_price, validate_order_for_pool, validate_order_value,
+        Ident, PoolError, SingletonValue, SundaeV3Order, SundaeV3Pool, SundaeV3State,
+        SundaeV3Update, ValueError, estimate_whether_in_range, validate_order_for_pool,
+        validate_order_value,
     },
 };
 
 pub struct Scooper {
     sundaev3: watch::Receiver<SundaeV3Update>,
-    policy: Vec<u8>,
     pools: BTreeMap<Ident, PoolSummary>,
     orders: BTreeMap<TransactionInput, OrderValidity>,
 }
 
 impl Scooper {
-    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>, policy: &[u8]) -> Result<Self> {
+    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>) -> Result<Self> {
         fs::create_dir_all(LOG_DIR)?;
         Ok(Self {
             sundaev3,
-            policy: policy.to_vec(),
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
         })
@@ -63,17 +62,22 @@ impl Scooper {
     }
 
     fn log_changes(&mut self, slot: u64, state: &SundaeV3State) {
-        self.log_pools(slot, state);
         self.log_orders(slot, state);
+        self.log_pools(slot, state);
     }
 
     fn log_pools(&mut self, slot: u64, state: &SundaeV3State) {
         let mut new_pools = BTreeMap::new();
         for (ident, pool) in &state.pools {
-            let price = get_pool_price(&self.policy, &pool.value, &pool.pool_datum.protocol_fees);
+            let (asset_a, asset_b) = pool.pool_datum.assets.clone();
+            let amount_a = pool.value.get(&asset_a);
+            let amount_b = pool.value.get(&asset_b);
             let summary = PoolSummary {
-                assets: pool.pool_datum.assets.clone(),
-                price,
+                assets: (
+                    SingletonValue::new(asset_a, amount_a),
+                    SingletonValue::new(asset_b, amount_b),
+                ),
+                liquidity: pool.pool_datum.circulating_lp.clone(),
                 protocol_fees: pool.pool_datum.protocol_fees.clone(),
             };
             new_pools.insert(ident.clone(), summary);
@@ -208,7 +212,7 @@ impl Scooper {
         order: &SundaeV3Order,
         pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
     ) -> OrderValidity {
-        if let Err(err) = validate_order_value(&order.datum, &order.output.value) {
+        if let Err(err) = validate_order_value(&order.datum, &order.value) {
             return OrderValidity::Invalid {
                 reason: OrderInvalidReason::ValueError(err),
             };
@@ -222,7 +226,7 @@ impl Scooper {
                 }
                 errors.insert(ident.clone(), error);
             } else if let Err(error) =
-                estimate_whether_in_range(&self.policy, &order.datum, &pool.pool_datum, &pool.value)
+                estimate_whether_in_range(&order.datum, &pool.pool_datum, &pool.value)
             {
                 errors.insert(ident.clone(), error);
             } else {
@@ -285,8 +289,8 @@ enum PoolAction<'a> {
 
 #[derive(Serialize, PartialEq)]
 struct PoolSummary {
-    assets: (AssetClass, AssetClass),
-    price: Option<f64>,
+    assets: (SingletonValue, SingletonValue),
+    liquidity: BigInt,
     protocol_fees: BigInt,
 }
 

@@ -1,4 +1,6 @@
 {
   "order_script_hash": "cfad1914b599d18bffd14d2bbd696019c2899cbdd6a03325cdf680bc",
-  "pool_script_hash": "44a1eb2d9f58add4eb1932bd0048e6a1947e85e3fe4f32956a110414"
+  "pool_script_hash": "44a1eb2d9f58add4eb1932bd0048e6a1947e85e3fe4f32956a110414",
+  "settings_script_hash": "85ed0c7060ccd4700927d8b60f0160abe2b3c30446fc0a9ac83b6b76",
+  "settings_nft": "85ed0c7060ccd4700927d8b60f0160abe2b3c30446fc0a9ac83b6b76.73657474696e6773"
 }

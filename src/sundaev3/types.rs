@@ -1,15 +1,28 @@
-#![allow(unused)]
-
-use pallas_primitives::{Fragment, PlutusData};
+use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::bigint::BigInt;
-use crate::cardano_types::{AssetClass, TransactionInput, TransactionOutput, Value};
+use crate::cardano_types::{AssetClass, Rational, TransactionInput, Value, VerificationKey};
 use crate::multisig::Multisig;
-use crate::serde_compat::serialize_address;
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SettingsDatum {
+    pub settings_admin: Multisig,
+    pub metadata_admin: PlutusAddress,
+    pub treasury_admin: Multisig,
+    pub treasury_address: PlutusAddress,
+    pub treasury_allowance: Rational,
+    pub authorized_scoopers: Option<Vec<VerificationKey>>,
+    pub authorized_staking_keys: Vec<Credential>,
+    pub base_fee: BigInt,
+    pub simple_fee: BigInt,
+    pub strategy_fee: BigInt,
+    pub pool_creation_fee: BigInt,
+    pub extensions: PlutusData,
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Ident(Vec<u8>);
@@ -70,23 +83,21 @@ pub struct PoolDatum {
     pub protocol_fees: BigInt,
 }
 
-enum PlutusOption<T> {
-    PlutusNone,
-    PlutusSome(T),
-}
-
-fn plutus_option_to_option<T>(p: PlutusOption<T>) -> Option<T> {
-    match p {
-        PlutusOption::PlutusNone => None,
-        PlutusOption::PlutusSome(x) => Some(x),
-    }
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum PoolRedeemer {
+    // When constructing a pool scoop redeemer we don't construct SSEs because they will be
+    // retrieved from a database. So it's better to represent them here as raw bytes.
+    PoolScoop {
+        signatory_index: u64,
+        scooper_index: u64,
+        input_order: Vec<(u64, Option<SSEBytes>, BigInt)>,
+    },
+    Manage,
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
-pub enum PoolRedeemer {
-    PoolScoop(PoolScoop),
-    Manage,
-}
+#[variant = 1]
+pub struct WrappedRedeemer<T: AsPlutus>(pub T);
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
 #[derive(AsPlutus, Debug, PartialEq, Eq)]
@@ -100,16 +111,8 @@ pub enum OrderRedeemer {
 #[derive(AsPlutus, Debug, PartialEq)]
 pub struct SSEBytes(Vec<u8>);
 
-// When constructing a pool scoop redeemer we don't construct SSEs because they will be
-// retrieved from a database. So it's better to represent them here as raw bytes.
 #[derive(AsPlutus, Debug, PartialEq)]
-pub struct PoolScoop {
-    signatory_index: BigInt,
-    scooper_index: BigInt,
-    input_order: Vec<(BigInt, Option<SSEBytes>, BigInt)>,
-}
-
-#[derive(AsPlutus, Debug, PartialEq)]
+#[expect(unused)]
 pub struct SignedStrategyExecution {
     execution: StrategyExecution,
     signature: Option<Vec<u8>>,
@@ -148,6 +151,22 @@ pub struct SingletonValue {
     pub policy: Vec<u8>,
     pub token: Vec<u8>,
     pub amount: BigInt,
+}
+
+impl SingletonValue {
+    pub fn asset_class(&self) -> AssetClass {
+        AssetClass {
+            policy: self.policy.clone(),
+            token: self.token.clone(),
+        }
+    }
+    pub fn new(class: AssetClass, amount: BigInt) -> Self {
+        Self {
+            policy: class.policy,
+            token: class.token,
+            amount,
+        }
+    }
 }
 
 impl AsPlutus for SingletonValue {
@@ -278,7 +297,7 @@ impl serde::Serialize for Destination {
                 let datum_hex: Option<String> = match datum {
                     AikenDatum::NoDatum => None,
                     AikenDatum::DatumHash(v) => Some(hex::encode(v)),
-                    AikenDatum::InlineDatum(v) => Some(hex::encode(v)),
+                    AikenDatum::InlineDatum(v) => Some(hex::encode(v.clone().to_plutus_bytes())),
                 };
 
                 let mut map = serializer.serialize_map(Some(2))?;
@@ -302,9 +321,10 @@ impl serde::Serialize for Destination {
 pub enum AikenDatum {
     NoDatum,
     DatumHash(Vec<u8>),
-    InlineDatum(Vec<u8>),
+    InlineDatum(PlutusData),
 }
 
+#[cfg(test)]
 pub fn empty_cons() -> PlutusData {
     PlutusData::Constr(pallas_primitives::Constr {
         tag: 121,
@@ -313,13 +333,13 @@ pub fn empty_cons() -> PlutusData {
     })
 }
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PlutusAddress {
     pub payment_credential: PaymentCredential,
     pub stake_credential: Option<StakeCredential>,
 }
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Credential {
     VerificationKey(VerificationKeyHash),
     Script(ScriptHash),
@@ -328,7 +348,7 @@ pub enum Credential {
 type VerificationKeyHash = Vec<u8>;
 type ScriptHash = Vec<u8>;
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Referenced<T: AsPlutus> {
     Inline(T),
     Pointer(StakePointer),
@@ -337,7 +357,7 @@ pub enum Referenced<T: AsPlutus> {
 type PaymentCredential = Credential;
 type StakeCredential = Referenced<Credential>;
 
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StakePointer {
     pub slot_number: BigInt,
     pub transaction_index: BigInt,
@@ -374,8 +394,6 @@ pub struct StrategyExecution {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV3Pool {
     pub input: TransactionInput,
-    #[serde(serialize_with = "serialize_address")]
-    pub address: pallas_addresses::Address,
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub slot: u64,
@@ -390,8 +408,15 @@ impl PartialOrd for SundaeV3Pool {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV3Order {
     pub input: TransactionInput,
-    pub output: TransactionOutput,
+    pub value: Value,
     pub datum: OrderDatum,
+    pub slot: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SundaeV3Settings {
+    pub input: TransactionInput,
+    pub datum: SettingsDatum,
     pub slot: u64,
 }
 
@@ -479,6 +504,16 @@ mod tests {
         let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
         let expected_ident =
             hex::decode("12d88c7f234493742d583c219101050b39e925d715a93060752d60d3").unwrap();
+        assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
+    }
+
+    #[test]
+    fn test_deocde_orderdatum_3() {
+        let od_bytes = hex::decode("d8799fd8799f581c035002e600d25a96003ecd1746007f59bac2788355687d18c7927119ffd8799f581c121fd22e0b57ac206fefc763f8bfa0771919f5218b40691eea4514d0ff1a0007a120d8799fd8799fd87a9f581c73275b9e267fd927bfc14cf653d904d1538ad8869260ab638bf73f5cffd8799fd8799fd8799f581c045d47cac5067ce697478c11051deb935a152e0773a5d7430a11baa8ffffffffd87b9fd8799fd8799f581c121fd22e0b57ac206fefc763f8bfa0771919f5218b40691eea4514d0ff80ffffffd87b9f9f9f40401a0f1b6d96ff9f581c2fe3c3364b443194b10954771c95819b8d6ed464033c21f03f8facb544694254431903ddffffff43d87980ff").unwrap();
+        let order_pd: PlutusData = minicbor::decode(&od_bytes).unwrap();
+        let order: OrderDatum = AsPlutus::from_plutus(order_pd).unwrap();
+        let expected_ident =
+            hex::decode("035002e600d25a96003ecd1746007f59bac2788355687d18c7927119").unwrap();
         assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
     }
 
