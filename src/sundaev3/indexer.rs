@@ -23,8 +23,9 @@ use crate::{
     historical_state::HistoricalState,
     persistence::{PersistedDatum, PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
     sundaev3::{
-        Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV3Order, SundaeV3Pool,
-        SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder, validate_order,
+        Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SignedStrategyExecution,
+        SundaeV3Order, SundaeV3Pool, SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder,
+        validate_order,
     },
 };
 
@@ -219,10 +220,20 @@ impl SundaeV3Indexer {
         T::from_plutus(redeemer.data().clone()).ok()
     }
 
-    fn apply_order(&self, slot: u64, order: &SundaeV3Order, scoop: &mut ScoopBuilder) {
+    fn apply_order(
+        &self,
+        slot: u64,
+        order: &SundaeV3Order,
+        sse: Option<SignedStrategyExecution>,
+        scoop: &mut ScoopBuilder,
+    ) {
+        let action = match sse.as_ref() {
+            Some(sse) => &sse.execution.details,
+            None => &order.datum.action,
+        };
         match validate_order(&order.datum, &order.value, &scoop.pool, &scoop.value) {
             Ok(()) => {
-                if let Err(error) = scoop.apply_order(order) {
+                if let Err(error) = scoop.apply_order(action, &order.value) {
                     warn!(slot, order = %order.input, ident = %scoop.pool.ident, "could not apply order: {error:#}");
                 }
             }
@@ -358,8 +369,8 @@ impl ChainIndex for SundaeV3Indexer {
                 Some(WrappedRedeemer(PoolRedeemer::PoolScoop { input_order, .. })) => {
                     // TODO: validate scooper/SSEs
                     let mut orders = vec![];
-                    for (index, _, _) in input_order {
-                        orders.push(index as usize);
+                    for (index, sse, _) in input_order {
+                        orders.push((index as usize, sse));
                     }
                     if let Some(settings) = state.settings.clone() {
                         scoops.push(Scoop {
@@ -395,7 +406,7 @@ impl ChainIndex for SundaeV3Indexer {
             );
             // Validate the scoop
             let ident = scoop.builder.pool.ident.clone();
-            for order_index in scoop.orders {
+            for (order_index, sse) in scoop.orders {
                 scooped_orders.insert(order_index);
                 let Some(input) = spent_inputs.get(order_index) else {
                     warn!(slot, %ident, order_index, "invalid order index in scoop");
@@ -406,7 +417,7 @@ impl ChainIndex for SundaeV3Indexer {
                     continue;
                 };
                 debug!(slot, %ident, "applying order: {} {}", serde_json::to_string(&order.datum.action).unwrap(), serde_json::to_string(&order.value).unwrap());
-                self.apply_order(slot, order, &mut scoop.builder);
+                self.apply_order(slot, order, sse, &mut scoop.builder);
             }
             if let Err(error) = scoop.builder.validate() {
                 warn!(slot, %ident, "invalid scoop: {error:#}");
@@ -514,7 +525,7 @@ impl ChainIndex for SundaeV3Indexer {
 
 struct Scoop {
     builder: ScoopBuilder,
-    orders: Vec<usize>,
+    orders: Vec<(usize, Option<SignedStrategyExecution>)>,
 }
 
 fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {

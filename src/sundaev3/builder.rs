@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{
     bigint::BigInt,
     cardano_types::{ADA_ASSET_CLASS, Value},
-    sundaev3::{Order, PoolDatum, SundaeV3Order, SundaeV3Pool, SundaeV3Settings},
+    sundaev3::{Order, PoolDatum, SundaeV3Pool, SundaeV3Settings},
 };
 
 pub struct ScoopBuilder {
@@ -28,9 +28,9 @@ impl ScoopBuilder {
         }
     }
 
-    pub fn apply_order(&mut self, order: &SundaeV3Order) -> Result<(), ApplyOrderError> {
+    pub fn apply_order(&mut self, order: &Order, value: &Value) -> Result<(), ApplyOrderError> {
         self.actual_size += 1;
-        match &order.datum.action {
+        match order {
             Order::Strategy(_) => Ok(()),
             Order::Swap(given, taken) => {
                 let (pool_gives, pool_takes, charge_per_10k) =
@@ -90,8 +90,8 @@ impl ScoopBuilder {
                 let quantity_b = &b.amount;
                 let (token_a, token_b) = self.pool_values();
 
-                let mut actual_a = order.value.get(&a.asset_class());
-                let actual_b = order.value.get(&b.asset_class());
+                let mut actual_a = value.get(&a.asset_class());
+                let actual_b = value.get(&b.asset_class());
                 if a.asset_class() == ADA_ASSET_CLASS {
                     actual_a -= BigInt::from(2_000_000) + &fee;
                 }
@@ -245,30 +245,11 @@ mod tests {
     use crate::{
         cardano_types::{ADA_ASSET_CLASS, AssetClass, TransactionInput},
         multisig::Multisig,
-        sundaev3::{
-            Credential, Destination, Ident, OrderDatum, PlutusAddress, SettingsDatum,
-            SingletonValue, empty_cons,
-        },
+        sundaev3::{Credential, Ident, PlutusAddress, SettingsDatum, SingletonValue, empty_cons},
         value,
     };
 
     use super::*;
-
-    fn build_order(action: Order, value: Value) -> SundaeV3Order {
-        SundaeV3Order {
-            input: TransactionInput::new(Hash::new([0; 32]), 0),
-            value,
-            datum: OrderDatum {
-                ident: None,
-                owner: Multisig::After(BigInt::ZERO),
-                scoop_fee: BigInt::ZERO,
-                destination: Destination::SelfDestination,
-                action,
-                extra: empty_cons(),
-            },
-            slot: 0,
-        }
-    }
 
     fn build_settings(base_fee: BigInt, simple_fee: BigInt) -> Arc<SundaeV3Settings> {
         Arc::new(SundaeV3Settings {
@@ -320,7 +301,7 @@ mod tests {
             },
             slot: 0,
         };
-        let order = build_order(
+        let (order, value) = (
             Order::Swap(
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(10_000_000)),
                 SingletonValue::new(sberry_asset_class.clone(), BigInt::from(16_146_411)),
@@ -329,7 +310,7 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
-        assert_eq!(scooped_pool.apply_order(&order), Ok(()));
+        assert_eq!(scooped_pool.apply_order(&order, &value), Ok(()));
         assert_eq!(scooped_pool.validate(), Ok(()));
 
         assert_eq!(
@@ -361,14 +342,14 @@ mod tests {
             },
             slot: 0,
         };
-        let donation = build_order(
+        let (donation_order, donation_value) = (
             Order::Donation((
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::ZERO),
                 SingletonValue::new(sberry_asset_class.clone(), BigInt::from(99_999_000)),
             )),
             value!(3_100_000, (&sberry_asset_class, 99_999_000)),
         );
-        let swap = build_order(
+        let (swap_order, swap_value) = (
             Order::Swap(
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(10_000_000)),
                 SingletonValue::new(sberry_asset_class.clone(), BigInt::from(323)),
@@ -377,8 +358,11 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 2);
-        assert_eq!(scooped_pool.apply_order(&donation), Ok(()));
-        assert_eq!(scooped_pool.apply_order(&swap), Ok(()));
+        assert_eq!(
+            scooped_pool.apply_order(&donation_order, &donation_value),
+            Ok(())
+        );
+        assert_eq!(scooped_pool.apply_order(&swap_order, &swap_value), Ok(()));
         assert_eq!(scooped_pool.validate(), Ok(()));
         assert_eq!(
             scooped_pool.value,
@@ -414,14 +398,14 @@ mod tests {
             },
             slot: 0,
         };
-        let swap = build_order(
+        let (swap_order, swap_value) = (
             Order::Swap(
                 SingletonValue::new(test_asset_class.clone(), BigInt::from(10)),
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(157)),
             ),
             value!(3_000_000, (&test_asset_class, 10)),
         );
-        let withdrawal = build_order(
+        let (withdrawal_order, withdrawal_value) = (
             Order::Withdrawal(SingletonValue::new(
                 lp_asset_class.clone(),
                 BigInt::from(1_000_000),
@@ -430,8 +414,11 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 2);
-        assert_eq!(scooped_pool.apply_order(&swap), Ok(()));
-        assert_eq!(scooped_pool.apply_order(&withdrawal), Ok(()));
+        assert_eq!(scooped_pool.apply_order(&swap_order, &swap_value), Ok(()));
+        assert_eq!(
+            scooped_pool.apply_order(&withdrawal_order, &withdrawal_value),
+            Ok(())
+        );
         assert_eq!(scooped_pool.validate(), Ok(()));
         assert_eq!(scooped_pool.value, value!(2_672_001),);
     }
@@ -468,7 +455,7 @@ mod tests {
             },
             slot: 0,
         };
-        let deposit = build_order(
+        let (deposit_order, deposit_value) = (
             Order::Deposit((
                 SingletonValue::new(rberry_asset_class.clone(), BigInt::from(1_000_000)),
                 SingletonValue::new(sberry_asset_class.clone(), BigInt::from(1_000_000)),
@@ -481,7 +468,10 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
-        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(
+            scooped_pool.apply_order(&deposit_order, &deposit_value),
+            Ok(())
+        );
         assert_eq!(scooped_pool.validate(), Ok(()));
         assert_eq!(
             scooped_pool.value,
@@ -517,7 +507,7 @@ mod tests {
             },
             slot: 0,
         };
-        let deposit = build_order(
+        let (deposit_order, deposit_value) = (
             Order::Deposit((
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(99_999_998)),
                 SingletonValue::new(tindy_asset_class.clone(), BigInt::from(20_510_929)),
@@ -526,7 +516,10 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
-        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(
+            scooped_pool.apply_order(&deposit_order, &deposit_value),
+            Ok(())
+        );
         assert_eq!(scooped_pool.validate(), Ok(()));
         assert_eq!(
             scooped_pool.value,
@@ -558,7 +551,7 @@ mod tests {
             },
             slot: 0,
         };
-        let deposit = build_order(
+        let (deposit_order, deposit_value) = (
             Order::Deposit((
                 SingletonValue::new(ADA_ASSET_CLASS, BigInt::from(16_839_781)),
                 SingletonValue::new(iusd_asset_class.clone(), BigInt::from(2_874_422)),
@@ -567,7 +560,10 @@ mod tests {
         );
 
         let mut scooped_pool = ScoopBuilder::new(&pool, settings, 1);
-        assert_eq!(scooped_pool.apply_order(&deposit), Ok(()));
+        assert_eq!(
+            scooped_pool.apply_order(&deposit_order, &deposit_value),
+            Ok(())
+        );
         assert_eq!(scooped_pool.validate(), Ok(()));
         assert_eq!(
             scooped_pool.value,

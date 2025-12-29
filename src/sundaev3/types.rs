@@ -90,7 +90,7 @@ pub enum PoolRedeemer {
     PoolScoop {
         signatory_index: u64,
         scooper_index: u64,
-        input_order: Vec<(u64, Option<SSEBytes>, BigInt)>,
+        input_order: Vec<(u64, Option<SignedStrategyExecution>, BigInt)>,
     },
     Manage,
 }
@@ -109,13 +109,9 @@ pub enum OrderRedeemer {
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
-pub struct SSEBytes(Vec<u8>);
-
-#[derive(AsPlutus, Debug, PartialEq)]
-#[expect(unused)]
 pub struct SignedStrategyExecution {
-    execution: StrategyExecution,
-    signature: Option<Vec<u8>>,
+    pub execution: StrategyExecution,
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
@@ -366,15 +362,26 @@ pub struct StakePointer {
 
 #[derive(AsPlutus, Debug, PartialEq)]
 pub struct OutputReference {
-    transaction_id: Vec<u8>,
+    transaction_id: TransactionId,
     transaction_ix: u64,
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
-pub enum ValidityBound {
+pub struct TransactionId {
+    hash: Vec<u8>,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub enum ValidityBoundType {
     NegativeInfinity,
     Finite(BigInt),
     PositiveInfinity,
+}
+
+#[derive(AsPlutus, Debug, PartialEq)]
+pub struct ValidityBound {
+    bound_type: ValidityBoundType,
+    is_inclusive: bool,
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
@@ -385,10 +392,10 @@ pub struct ValidityRange {
 
 #[derive(AsPlutus, Debug, PartialEq)]
 pub struct StrategyExecution {
-    tx_ref: OutputReference,
-    validity_range: ValidityRange,
-    details: Order,
-    extensions: PlutusData,
+    pub tx_ref: OutputReference,
+    pub validity_range: ValidityRange,
+    pub details: Order,
+    pub extensions: PlutusData,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
