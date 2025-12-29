@@ -1,3 +1,4 @@
+mod builder;
 mod indexer;
 mod types;
 mod utils;
