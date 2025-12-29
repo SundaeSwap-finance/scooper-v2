@@ -84,9 +84,9 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
 
         if !changes.created_txos.is_empty() {
             let insert_created_txo_query = {
-                let column_names = "tx_id, txo_index, txo_type, created_slot, spent_slot, spent_height, era, txo, datum";
+                let column_names = "tx_id, txo_index, txo_type, created_slot, spent_slot, spent_height, era, txo, address, datum";
                 let values_clauses =
-                    vec!["(?,?,?,?,NULL,NULL,?,?,?)".to_string(); changes.created_txos.len()]
+                    vec!["(?,?,?,?,NULL,NULL,?,?,?,?)".to_string(); changes.created_txos.len()]
                         .join(",");
                 format!("INSERT INTO sundae_v3_txos ({column_names}) VALUES {values_clauses};")
             };
@@ -100,6 +100,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
                     .bind(created_txo.created_slot as i64)
                     .bind(created_txo.era)
                     .bind(created_txo.txo)
+                    .bind(created_txo.address)
                     .bind(created_txo.datum);
             }
 
@@ -124,7 +125,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
                 let values_clauses =
                     vec!["(?,?,?)".to_string(); changes.metadata_datums.len()].join(",");
                 format!(
-                    "INSERT INTO sundae_datums ({column_names}) VALUES {values_clauses} ON CONFLICT DO UPDATE SET created_slot = excluded.created_slot;"
+                    "INSERT INTO sundae_v3_datums ({column_names}) VALUES {values_clauses} ON CONFLICT DO UPDATE SET created_slot = excluded.created_slot;"
                 )
             };
             let mut query = sqlx::query(&insert_datum_query);
@@ -158,7 +159,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM sundae_datums WHERE created_slot > ?;")
+        sqlx::query("DELETE FROM sundae_v3_datums WHERE created_slot > ?;")
             .bind(slot as i64)
             .execute(&mut *tx)
             .await?;
@@ -170,7 +171,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>> {
         let query = "
             SELECT hash, datum, created_slot
-            FROM sundae_datums
+            FROM sundae_v3_datums
             ORDER BY created_slot, hash
         ";
         Ok(sqlx::query_as(query).fetch_all(&self.pool).await?)
@@ -178,7 +179,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
 
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
         let query = "
-            SELECT tx_id, txo_index, txo_type, created_slot, era, txo, datum
+            SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum
             FROM sundae_v3_txos
             WHERE spent_slot IS NULL
             ORDER BY created_slot, tx_id, txo_index;
@@ -205,6 +206,7 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
         let created_slot: i64 = row.try_get("created_slot")?;
         let era: u16 = row.try_get("era")?;
         let txo: Vec<u8> = row.try_get("txo")?;
+        let address: Vec<u8> = row.try_get("address")?;
         let datum: Option<Vec<u8>> = row.try_get("datum")?;
 
         Ok(Self {
@@ -213,6 +215,7 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
             created_slot: created_slot as u64,
             era,
             txo,
+            address,
             datum,
         })
     }
@@ -349,6 +352,7 @@ mod tests {
             created_slot: 48463593,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            address: vec![0x12, 0x34],
             datum: None,
         }
     }
@@ -384,6 +388,7 @@ mod tests {
             created_slot: 48465289,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            address: vec![0x12, 0x34],
             datum: None,
         }
     }
@@ -425,6 +430,7 @@ mod tests {
             created_slot: 48467939,
             era: 7,
             txo: hex::decode(txo).unwrap(),
+            address: vec![0x12, 0x34],
             datum: None,
         }
     }

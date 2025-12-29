@@ -291,6 +291,7 @@ impl ChainIndex for SundaeV3Indexer {
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
+                        address: tx_out.address.to_vec(),
                         datum: tx_out.hashed_datum(&datums),
                     });
 
@@ -318,6 +319,7 @@ impl ChainIndex for SundaeV3Indexer {
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
+                        address: tx_out.address.to_vec(),
                         datum: tx_out.hashed_datum(&datums),
                     });
 
@@ -339,6 +341,7 @@ impl ChainIndex for SundaeV3Indexer {
                         created_slot: slot,
                         era: output.era().into(),
                         txo: output.encode(),
+                        address: tx_out.address.to_vec(),
                         datum: tx_out.hashed_datum(&datums),
                     });
                     new_settings = Some(Arc::new(SundaeV3Settings {
