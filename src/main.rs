@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
+use pallas_addresses::ScriptHash;
 use tokio::select;
 use tokio::signal::ctrl_c;
 use tokio::sync::Mutex;
@@ -55,12 +56,9 @@ use crate::sundaev3::{
 
 #[derive(Clone, Deserialize)]
 struct SundaeV3Protocol {
-    #[serde(with = "hex")]
-    order_script_hash: Vec<u8>,
-    #[serde(with = "hex")]
-    pool_script_hash: Vec<u8>,
-    #[serde(with = "hex")]
-    settings_script_hash: Vec<u8>,
+    order_script_hashes: Vec<ScriptHash>,
+    pool_script_hash: ScriptHash,
+    settings_script_hash: ScriptHash,
     settings_nft: AssetClass,
 }
 

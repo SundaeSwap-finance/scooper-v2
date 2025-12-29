@@ -8,7 +8,7 @@ use acropolis_module_custom_indexer::chain_index::ChainIndex;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use num_traits::Signed;
-use pallas_addresses::Address;
+use pallas_addresses::{Address, ScriptHash};
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
@@ -188,7 +188,7 @@ impl SundaeV3Indexer {
         let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
         asset_name.extend_from_slice(&pool_datum.ident);
         let nft_asset_id = AssetClass {
-            policy: self.protocol.pool_script_hash.clone(),
+            policy: self.protocol.pool_script_hash.to_vec(),
             token: asset_name,
         };
         if tx_out.value.get(&nft_asset_id).is_positive() {
@@ -292,7 +292,12 @@ impl ChainIndex for SundaeV3Indexer {
                     };
                     updated_pools.insert(pool_id, Arc::new(pool_record));
                 }
-            } else if payment_hash_equals(&address, &self.protocol.order_script_hash) {
+            } else if self
+                .protocol
+                .order_script_hashes
+                .iter()
+                .any(|hash| payment_hash_equals(&address, hash))
+            {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_txo(output);
                 if let Some(od) = tx_out.datum.parse(&datums) {
@@ -512,7 +517,7 @@ struct Scoop {
     orders: Vec<usize>,
 }
 
-fn payment_hash_equals(addr: &Address, hash: &[u8]) -> bool {
+fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {
     if let Address::Shelley(s_addr) = addr {
         s_addr.payment().as_hash() == hash
     } else {
