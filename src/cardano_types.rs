@@ -1,15 +1,13 @@
-#![allow(unused)]
-
 use anyhow::bail;
 use num_traits::{ConstZero, Zero};
 use pallas_addresses::Address;
-use pallas_primitives::conway::{DatumOption, MintedDatumOption, NativeScript};
-use pallas_primitives::{DatumHash, Hash, KeepRaw, PlutusData, PlutusScript};
+use pallas_primitives::conway::{MintedDatumOption, NativeScript};
+use pallas_primitives::{DatumHash, Hash, PlutusData, PlutusScript};
 use pallas_traverse::MultiEraOutput;
+use serde::Serializer;
 use serde::ser::SerializeMap;
-use serde::{Serialize, Serializer};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -17,8 +15,6 @@ use plutus_parser::AsPlutus;
 
 use crate::bigint::BigInt;
 use crate::datum_lookup::ScopedDatumLookup;
-use crate::serde_compat::serialize_address;
-use crate::sundaev3::{OrderDatum, PoolDatum, SettingsDatum};
 pub type Bytes = Vec<u8>;
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -125,21 +121,21 @@ pub type Rational = (BigInt, BigInt);
 
 pub type VerificationKey = Bytes;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Value(pub BTreeMap<Bytes, BTreeMap<Bytes, BigInt>>);
 
 #[macro_export]
 macro_rules! value {
     ( $ada:expr ) => {
         {
-            let mut value = $crate::cardano_types::Value::new();
+            let mut value = $crate::cardano_types::Value::default();
             value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, BigInt::from($ada));
             value
         }
     };
     ( $ada:expr, $( $token:expr ),* ) => {
         {
-            let mut value = $crate::cardano_types::Value::new();
+            let mut value = $crate::cardano_types::Value::default();
             value.insert(&$crate::cardano_types::ADA_ASSET_CLASS, BigInt::from($ada));
             $(
                 value.insert($token.0, BigInt::from($token.1));
@@ -150,10 +146,6 @@ macro_rules! value {
 }
 
 impl Value {
-    pub fn new() -> Self {
-        Value(BTreeMap::new())
-    }
-
     pub fn get(&self, asset_class: &AssetClass) -> BigInt {
         if let Some(assets) = self.0.get(&asset_class.policy)
             && let Some(quantity) = assets.get(&asset_class.token)

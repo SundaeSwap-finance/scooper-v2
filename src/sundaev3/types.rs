@@ -85,8 +85,6 @@ pub struct PoolDatum {
 
 #[derive(AsPlutus, Debug, PartialEq)]
 pub enum PoolRedeemer {
-    // When constructing a pool scoop redeemer we don't construct SSEs because they will be
-    // retrieved from a database. So it's better to represent them here as raw bytes.
     PoolScoop {
         signatory_index: u64,
         scooper_index: u64,

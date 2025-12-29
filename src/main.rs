@@ -29,7 +29,6 @@ mod historical_state;
 mod multisig;
 mod persistence;
 mod scooper;
-mod serde_compat;
 mod sundaev3;
 
 use serde::{Deserialize, Serialize};
