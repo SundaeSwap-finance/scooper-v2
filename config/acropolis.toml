@@ -1,5 +1,6 @@
 [global.startup]
 topic = "cardano.sequence.start"
+startup-mode = "snapshot"
 
 [module.genesis-bootstrapper]
 

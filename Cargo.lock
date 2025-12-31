@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acropolis_codec"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -19,7 +19,7 @@ dependencies = [
 [[package]]
 name = "acropolis_common"
 version = "0.3.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",
@@ -58,7 +58,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_block_unpacker"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_custom_indexer"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_genesis_bootstrapper"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_mithril_snapshot_fetcher"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_codec",
  "acropolis_common",
@@ -129,7 +129,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_peer_network_interface"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=98cfa4d#98cfa4d69bbb0337d847847985f286f0a36d7658"
+source = "git+https://github.com/input-output-hk/acropolis?rev=e4bce63#e4bce63f292c092c6d0dc6344e12b7fef8b3f284"
 dependencies = [
  "acropolis_common",
  "anyhow",

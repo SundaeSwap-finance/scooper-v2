@@ -235,7 +235,9 @@ impl AdminServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info,mithril_snapshot_fetcher=debug")
+        .init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
@@ -315,13 +317,10 @@ async fn manager_loop(
         let protocol = protocol.clone();
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
-        let enable_mithril = config::use_mithril(&config);
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
-        if enable_mithril {
-            MithrilSnapshotFetcher::register(&mut process);
-        }
+        MithrilSnapshotFetcher::register(&mut process);
         BlockUnpacker::register(&mut process);
         PeerNetworkInterface::register(&mut process);
 
