@@ -235,9 +235,7 @@ impl AdminServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info,mithril_snapshot_fetcher=debug")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let scooper_config_file = args.config;
