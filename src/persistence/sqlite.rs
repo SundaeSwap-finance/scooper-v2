@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use acropolis_module_custom_indexer::cursor_store::{CursorEntry, CursorSaveError};
-use anyhow::Result;
+use acropolis_module_custom_indexer::cursor_store::CursorEntry;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use sqlx::{
@@ -257,37 +257,17 @@ impl CursorDaoImpl for SqliteCursorDaoImpl {
         Ok(result)
     }
 
-    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError> {
-        let mut tx = self.pool.begin().await.map_err(|err| {
-            warn!("could not open transaction: {err:#}");
-            let failed = entries.keys().cloned().collect();
-            CursorSaveError { failed }
-        })?;
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<()> {
+        let mut tx = self.pool.begin().await.context("could not open transaction")?;
         sqlx::query("DELETE FROM acropolis_cursors;")
             .execute(&mut *tx)
             .await
-            .map_err(|err| {
-                warn!("could not clear cursors: {err:#}");
-                let failed = entries.keys().cloned().collect();
-                CursorSaveError { failed }
-            })?;
-        let mut failed = vec![];
+            .context("could not clear cursors")?;
         for (id, cursor) in entries {
-            if let Err(err) = save_entry(&mut tx, id, cursor).await {
-                warn!("could not save cursor for {id}: {err:#}");
-                failed.push(id.clone());
-            }
+            save_entry(&mut tx, id, cursor).await?;
         }
-        tx.commit().await.map_err(|err| {
-            warn!("could not commit transaction: {err:#}");
-            let failed = entries.keys().cloned().collect();
-            CursorSaveError { failed }
-        })?;
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(CursorSaveError { failed })
-        }
+        tx.commit().await.context("could not commit transaction")?;
+        Ok(())
     }
 }
 
@@ -313,6 +293,8 @@ async fn save_entry(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use acropolis_common::{Point, hash::Hash};
     use acropolis_module_custom_indexer::cursor_store::CursorStore;
 
@@ -704,6 +686,12 @@ mod tests {
         Ok(())
     }
 
+    fn new_cursor(point: Point) -> CursorEntry {
+        let mut points = VecDeque::new();
+        points.push_back(point);
+        CursorEntry { points, next_tx: None }
+    }
+
     #[tokio::test]
     async fn cursor_store_should_load_no_cursors() -> Result<()> {
         let db = new_db().await?;
@@ -722,7 +710,7 @@ mod tests {
             hash: Hash::default(),
             slot: 1337,
         };
-        let cursor = CursorEntry { tip, halted: false };
+        let cursor = new_cursor(tip);
         let mut entries = HashMap::new();
         entries.insert("abc".to_string(), cursor.clone());
 
@@ -731,8 +719,7 @@ mod tests {
         let new_entries = dao.load().await?;
         assert_eq!(new_entries.len(), entries.len());
         let new_cursor = new_entries.get("abc").unwrap();
-        assert_eq!(new_cursor.tip, cursor.tip);
-        assert_eq!(new_cursor.halted, cursor.halted);
+        assert_eq!(new_cursor, &cursor);
 
         Ok(())
     }
@@ -746,24 +733,23 @@ mod tests {
             hash: Hash::default(),
             slot: 1337,
         };
-        let mut cursor = CursorEntry { tip, halted: false };
+        let mut cursor = new_cursor(tip);
         let mut entries = HashMap::new();
         entries.insert("abc".to_string(), cursor.clone());
         dao.save(&entries).await?;
 
-        cursor.tip = Point::Specific {
+        cursor.points.push_back(Point::Specific {
             hash: Hash::default(),
             slot: 1338,
-        };
-        cursor.halted = true;
+        });
+        cursor.next_tx = Some(0);
         entries.insert("abc".to_string(), cursor.clone());
         dao.save(&entries).await?;
 
         let new_entries = dao.load().await?;
         assert_eq!(new_entries.len(), entries.len());
         let new_cursor = new_entries.get("abc").unwrap();
-        assert_eq!(new_cursor.tip, cursor.tip);
-        assert_eq!(new_cursor.halted, cursor.halted);
+        assert_eq!(new_cursor, &cursor);
 
         Ok(())
     }
@@ -777,7 +763,7 @@ mod tests {
             hash: Hash::default(),
             slot: 1337,
         };
-        let cursor = CursorEntry { tip, halted: false };
+        let cursor = new_cursor(tip);
         let mut entries = HashMap::new();
         entries.insert("abc".to_string(), cursor.clone());
         dao.save(&entries).await?;
