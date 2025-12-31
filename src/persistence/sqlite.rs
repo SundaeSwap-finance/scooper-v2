@@ -258,7 +258,11 @@ impl CursorDaoImpl for SqliteCursorDaoImpl {
     }
 
     async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<()> {
-        let mut tx = self.pool.begin().await.context("could not open transaction")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("could not open transaction")?;
         sqlx::query("DELETE FROM acropolis_cursors;")
             .execute(&mut *tx)
             .await
@@ -689,7 +693,10 @@ mod tests {
     fn new_cursor(point: Point) -> CursorEntry {
         let mut points = VecDeque::new();
         points.push_back(point);
-        CursorEntry { points, next_tx: None }
+        CursorEntry {
+            points,
+            next_tx: None,
+        }
     }
 
     #[tokio::test]
