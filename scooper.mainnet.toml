@@ -2,7 +2,7 @@
 # Network selection (mainnet or preview)
 network-name = "mainnet"
 # Use Mithril to quick sync without a local node
-method = "snapshot"  # Options: "mithril" | "snapshot"
+sync-mode = "upstream"   # Options: "mithril" | "upstream"
 
 # Upstream peers configuration (example: ["backbone.cardano.iog.io:3001", "backbone.mainnet.emurgornd.com:3001"])
 [module.peer-network-interface]

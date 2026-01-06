@@ -2,7 +2,7 @@ mod sqlite;
 
 use std::{collections::HashMap, sync::Arc};
 
-use acropolis_module_custom_indexer::cursor_store::{CursorEntry, CursorSaveError, CursorStore};
+use acropolis_module_custom_indexer::cursor_store::{CursorEntry, CursorStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -91,15 +91,16 @@ pub struct CursorDao(Box<dyn CursorDaoImpl>);
 #[async_trait]
 trait CursorDaoImpl: Send + Sync + 'static {
     async fn load(&self) -> Result<HashMap<String, CursorEntry>>;
-    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError>;
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<()>;
 }
 
+#[async_trait]
 impl CursorStore for CursorDao {
     async fn load(&self) -> Result<HashMap<String, CursorEntry>> {
         self.0.load().await
     }
 
-    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<(), CursorSaveError> {
+    async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<()> {
         self.0.save(entries).await
     }
 }

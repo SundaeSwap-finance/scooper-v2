@@ -315,13 +315,10 @@ async fn manager_loop(
         let protocol = protocol.clone();
         let default_start = default_start.clone();
         let broadcaster = broadcaster.clone();
-        let enable_mithril = config::use_mithril(&config);
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
-        if enable_mithril {
-            MithrilSnapshotFetcher::register(&mut process);
-        }
+        MithrilSnapshotFetcher::register(&mut process);
         BlockUnpacker::register(&mut process);
         PeerNetworkInterface::register(&mut process);
 
