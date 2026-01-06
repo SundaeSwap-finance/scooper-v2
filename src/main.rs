@@ -9,13 +9,11 @@ use anyhow::{Result, anyhow};
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
-use pallas_addresses::ScriptHash;
 use tokio::select;
 use tokio::signal::ctrl_c;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +29,7 @@ mod persistence;
 mod scooper;
 mod sundaev3;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use cardano_types::TransactionInput;
 use sundaev3::{Ident, validate_order};
@@ -45,28 +43,17 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::cardano_types::AssetClass;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{
-    PoolError, SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update, ValidationError,
+    PoolError, SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Protocol, SundaeV3Update,
+    ValidationError,
 };
-
-#[derive(Clone, Deserialize)]
-struct SundaeV3Protocol {
-    order_script_hashes: Vec<ScriptHash>,
-    pool_script_hash: ScriptHash,
-    settings_script_hash: ScriptHash,
-    settings_nft: AssetClass,
-}
 
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
     #[arg(short, long)]
     config: Vec<String>,
-
-    #[arg(short, long)]
-    protocol: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
@@ -239,7 +226,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
 
-    let protocol_config_file = args.protocol;
     let default_start = match args.command {
         Commands::SyncFromOrigin => Point::Origin,
         Commands::SyncFromPoint { slot, block_hash } => Point::Specific {
@@ -251,11 +237,6 @@ async fn main() -> Result<()> {
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
     let shutdown = CancellationToken::new();
 
-    let protocol: SundaeV3Protocol = {
-        let f = std::fs::File::open(protocol_config_file)?;
-        serde_json::from_reader(f)?
-    };
-
     let persistence = persistence::connect(&config.persistence).await?;
 
     let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
@@ -266,7 +247,7 @@ async fn main() -> Result<()> {
         resync_tx.clone(),
         broadcaster.clone(),
         config.acropolis_config()?,
-        protocol.clone(),
+        config.protocol.v3.clone(),
         persistence.clone(),
         default_start,
         shutdown.child_token(),

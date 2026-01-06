@@ -2,7 +2,7 @@
 
 [acropolis.global.startup]
 topic = "cardano.sequence.start"
-startup-mode = "snapshot"
+sync-mode = "upstream"
 
 [acropolis.module.genesis-bootstrapper]
 
@@ -12,6 +12,8 @@ sync-point = "dynamic"
 
 [acropolis.module.mithril-snapshot-fetcher]
 block-publish-topic = "cardano.block.proposed"
+# Download max age in hours. E.g. 8 means 8 hours (if there isn't any snapshot within this time range download from Mithril)
+download-max-age = "never"
 
 [acropolis.module.block-unpacker]
 

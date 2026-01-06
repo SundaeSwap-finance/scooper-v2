@@ -1,8 +1,14 @@
+[protocol.v3]
+order-script-hashes = [
+    "fa6a58bbe2d0ff05534431c8e2f0ef2cbdc1602a8456e4b13c8f3077",
+]
+pool-script-hash = "e0302560ced2fdcbfcb2602697df970cd0d6a38f94b32703f51c312b"
+settings-script-hash = "6d9d7acac59a4469ec52bb207106167c5cbfa689008ffa6ee92acc50"
+settings-nft = "6d9d7acac59a4469ec52bb207106167c5cbfa689008ffa6ee92acc50.73657474696e6773"
+
 [acropolis.global.startup]
 # Network selection (mainnet or preview)
 network-name = "mainnet"
-# Use Mithril to quick sync without a local node
-sync-mode = "upstream"   # Options: "mithril" | "upstream"
 
 # Upstream peers configuration (example: ["backbone.cardano.iog.io:3001", "backbone.mainnet.emurgornd.com:3001"])
 [acropolis.module.peer-network-interface]
@@ -12,5 +18,3 @@ node-addresses = ["backbone.mainnet.emurgornd.com:3001"]
 [acropolis.module.mithril-snapshot-fetcher]
 aggregator-url = "https://aggregator.release-mainnet.api.mithril.network/aggregator"
 genesis-key = "5b3139312c36362c3134302c3138352c3133382c31312c3233372c3230372c3235302c3134342c32372c322c3138382c33302c31322c38312c3135352c3230342c31302c3137392c37352c32332c3133382c3139362c3231372c352c31342c32302c35372c37392c33392c3137365d"
-# Download max age in hours. E.g. 8 means 8 hours (if there isn't any snapshot within this time range download from Mithril)
-download-max-age = "never"

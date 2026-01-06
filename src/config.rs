@@ -4,7 +4,7 @@ use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
 
-use crate::persistence::PersistenceConfig;
+use crate::{persistence::PersistenceConfig, sundaev3::SundaeV3Protocol};
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
 
@@ -12,6 +12,7 @@ pub const ROLLBACK_LIMIT: u64 = 2160;
 pub struct AppConfig {
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    pub protocol: ProtocolConfig,
     #[serde(default)]
     pub acropolis: config::Map<String, config::Value>,
 }
@@ -22,6 +23,11 @@ impl AppConfig {
             .build()?;
         Ok(Arc::new(config))
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProtocolConfig {
+    pub v3: SundaeV3Protocol,
 }
 
 pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> Result<AppConfig> {
