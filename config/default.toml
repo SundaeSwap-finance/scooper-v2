@@ -1,0 +1,31 @@
+# Acropolis
+
+[acropolis.global.startup]
+topic = "cardano.sequence.start"
+startup-mode = "snapshot"
+
+[acropolis.module.genesis-bootstrapper]
+
+[acropolis.module.peer-network-interface]
+block-topic = "cardano.block.proposed"
+sync-point = "dynamic"
+
+[acropolis.module.mithril-snapshot-fetcher]
+block-publish-topic = "cardano.block.proposed"
+
+[acropolis.module.block-unpacker]
+
+[acropolis.module.custom-indexer]
+
+[acropolis.message-bus.internal]
+class = "in-memory"
+workers = 50
+dispatch-queue-size = 1000
+worker-queue-size = 100
+bulk-block-capacity = 50
+bulk-resume-capacity = 75
+
+# Message routing
+[[acropolis.message-router.route]]
+pattern = "#"
+bus = "internal"

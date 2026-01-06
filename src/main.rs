@@ -46,7 +46,6 @@ use std::pin::Pin;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::cardano_types::AssetClass;
-use crate::config::AppConfig;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{
@@ -64,13 +63,13 @@ struct SundaeV3Protocol {
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
     #[arg(short, long)]
+    config: Vec<String>,
+
+    #[arg(short, long)]
     protocol: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
-
-    #[arg(long, value_name = "PATH", default_value = "scooper.toml")]
-    config: PathBuf,
 }
 
 const BLOCK_HASH_SIZE: usize = 32;
@@ -238,10 +237,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     event!(Level::INFO, "Started scooper");
     let args = Args::parse();
-    let scooper_config_file = args.config;
-
-    let config = config::load_config(&scooper_config_file)?;
-    let app_config = config.clone().try_deserialize::<AppConfig>()?;
+    let config = config::load_config(&args.config)?;
 
     let protocol_config_file = args.protocol;
     let default_start = match args.command {
@@ -260,7 +256,7 @@ async fn main() -> Result<()> {
         serde_json::from_reader(f)?
     };
 
-    let persistence = persistence::connect(&app_config.persistence).await?;
+    let persistence = persistence::connect(&config.persistence).await?;
 
     let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
     let broadcaster = tokio::sync::watch::Sender::default();
@@ -269,7 +265,7 @@ async fn main() -> Result<()> {
         index.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
-        Arc::new(config),
+        config.acropolis_config()?,
         protocol.clone(),
         persistence.clone(),
         default_start,
