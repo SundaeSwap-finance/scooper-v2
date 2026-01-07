@@ -1,0 +1,41 @@
+{
+  "acropolis": {
+    "global": {
+      "startup": {
+        "topic": "cardano.sequence.start",
+        "sync-mode": "upstream"
+      }
+    },
+    "module": {
+      "genesis-bootstrapper": {},
+      "peer-network-interface": {
+        "block-topic": "cardano.block.proposed",
+        "sync-point": "dynamic"
+      },
+      "mithril-snapshot-fetcher": {
+        "block-publish-topic": "cardano.block.proposed",
+        "download-max-age": "never"
+      },
+      "block-unpacker": {},
+      "custom-indexer": {}
+    },
+    "message-bus": {
+      "internal": {
+        "class": "in-memory",
+        "workers": 50,
+        "dispatch-queue-size": 1000,
+        "worker-queue-size": 100,
+        "bulk-block-capacity": 50,
+        "bulk-resume-capacity": 75
+      }
+    },
+    "message-router": {
+      "route": [
+        {
+          "pattern": "#",
+          "bus": "internal"
+        }
+      ]
+    }
+  }
+}

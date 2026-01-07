@@ -395,6 +395,7 @@ pub struct StrategyExecution {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct SundaeV3Protocol {
     pub order_script_hashes: Vec<ScriptHash>,
     pub pool_script_hash: ScriptHash,

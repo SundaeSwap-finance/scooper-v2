@@ -32,8 +32,8 @@ pub struct ProtocolConfig {
 
 pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> Result<AppConfig> {
     let mut builder = Config::builder().add_source(File::from_str(
-        include_str!("../config/default.toml"),
-        config::FileFormat::Toml,
+        include_str!("../config/default.json"),
+        config::FileFormat::Json,
     ));
     for config_file in config_files {
         builder = builder.add_source(File::with_name(config_file.as_ref()));
