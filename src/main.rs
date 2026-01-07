@@ -1,11 +1,10 @@
 use acropolis_common::messages::Message;
-use acropolis_common::{BlockHash, Point};
 use acropolis_module_block_unpacker::BlockUnpacker;
 use acropolis_module_custom_indexer::CustomIndexer;
 use acropolis_module_genesis_bootstrapper::GenesisBootstrapper;
 use acropolis_module_mithril_snapshot_fetcher::MithrilSnapshotFetcher;
 use acropolis_module_peer_network_interface::PeerNetworkInterface;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use caryatid_process::Process;
 use caryatid_sdk::module_registry::ModuleRegistry;
 use clap::Parser;
@@ -54,33 +53,6 @@ use crate::sundaev3::{
 struct Args {
     #[arg(short, long)]
     config: Vec<String>,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-const BLOCK_HASH_SIZE: usize = 32;
-
-fn parse_block_hash(bh: &str) -> Result<BlockHash> {
-    let bytes = hex::decode(bh)?;
-    BlockHash::try_from(bytes).map_err(|v| {
-        anyhow!(
-            "invalid block hash length: expected {BLOCK_HASH_SIZE} bytes, got {} bytes",
-            v.len()
-        )
-    })
-}
-
-#[derive(clap::Subcommand, Clone, Debug)]
-enum Commands {
-    SyncFromOrigin,
-    SyncFromPoint {
-        #[arg(short, long)]
-        slot: u64,
-
-        #[arg(short, long, value_parser=parse_block_hash)]
-        block_hash: BlockHash,
-    },
 }
 
 #[derive(Clone)]
@@ -226,14 +198,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
 
-    let default_start = match args.command {
-        Commands::SyncFromOrigin => Point::Origin,
-        Commands::SyncFromPoint { slot, block_hash } => Point::Specific {
-            slot,
-            hash: block_hash,
-        },
-    };
-
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
     let shutdown = CancellationToken::new();
 
@@ -249,7 +213,6 @@ async fn main() -> Result<()> {
         config.acropolis_config()?,
         config.protocol.v3.clone(),
         persistence.clone(),
-        default_start,
         shutdown.child_token(),
     ));
     let scooper_handle =
@@ -273,7 +236,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
@@ -281,7 +243,6 @@ async fn manager_loop(
     config: Arc<::config::Config>,
     protocol: SundaeV3Protocol,
     persistence: Arc<dyn Persistence>,
-    default_start: Point,
     shutdown: CancellationToken,
 ) {
     let mut force_restart = false;
@@ -290,7 +251,7 @@ async fn manager_loop(
         let mut resync_tx = resync_tx.subscribe();
         let config = config.clone();
         let protocol = protocol.clone();
-        let default_start = default_start.clone();
+        let default_start = protocol.starting_point.clone();
         let broadcaster = broadcaster.clone();
 
         let mut process = Process::<Message>::create(config).await;

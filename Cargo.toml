@@ -8,12 +8,12 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_common" }
-acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_module_block_unpacker" }
-acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_module_custom_indexer" }
-acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_module_genesis_bootstrapper" }
-acropolis_module_mithril_snapshot_fetcher = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_module_mithril_snapshot_fetcher" }
-acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "a76b29e", package = "acropolis_module_peer_network_interface" }
+acropolis-common = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_common" }
+acropolis_module_block_unpacker = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_module_block_unpacker" }
+acropolis_module_custom_indexer = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_module_custom_indexer" }
+acropolis_module_genesis_bootstrapper = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_module_genesis_bootstrapper" }
+acropolis_module_mithril_snapshot_fetcher = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_module_mithril_snapshot_fetcher" }
+acropolis_module_peer_network_interface = { git = "https://github.com/input-output-hk/acropolis", rev = "490b267", package = "acropolis_module_peer_network_interface" }
 anyhow = "1"
 async-trait = "0.1"
 caryatid_sdk = "0.14"
@@ -22,6 +22,9 @@ chrono = "0.4"
 clap = { version = "4.5.41", features = ["derive"] }
 config = "0.15.11"
 hex = { version = "0.4", features = ["serde"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
 minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
@@ -30,6 +33,9 @@ pallas-crypto = "0.34"
 pallas-primitives = "0.34"
 pallas-traverse = "0.34"
 plutus-parser = { version = "0.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = "3"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
 thiserror = "2"
 tokio = { version = "1.46.1", features = ["full"] }
@@ -40,12 +46,6 @@ tracing-subscriber = { version = "0.3", features = [
   "std",
   "json",
 ] }
-
-hyper = { version = "1", features = ["full"] }
-http-body-util = "0.1"
-hyper-util = { version = "0.1", features = ["full"] }
-serde_json = "1.0.145"
-serde = { version = "1.0.228", features = ["derive"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -1,3 +1,4 @@
+use acropolis_common::Point;
 use pallas_addresses::{PaymentKeyHash, ScriptHash};
 use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
@@ -394,6 +395,7 @@ pub struct StrategyExecution {
     pub extensions: PlutusData,
 }
 
+#[serde_with::serde_as]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SundaeV3Protocol {
@@ -401,6 +403,8 @@ pub struct SundaeV3Protocol {
     pub pool_script_hash: ScriptHash,
     pub settings_script_hash: ScriptHash,
     pub settings_nft: AssetClass,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub starting_point: Point,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]

@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acropolis_codec"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -19,7 +19,7 @@ dependencies = [
 [[package]]
 name = "acropolis_common"
 version = "0.3.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",
@@ -58,7 +58,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_block_unpacker"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_custom_indexer"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_genesis_bootstrapper"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_mithril_snapshot_fetcher"
 version = "0.1.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_codec",
  "acropolis_common",
@@ -129,7 +129,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_peer_network_interface"
 version = "0.2.0"
-source = "git+https://github.com/input-output-hk/acropolis?rev=a76b29e#a76b29eb8036f7fde9dce22694a27ccc227be6a4"
+source = "git+https://github.com/input-output-hk/acropolis?rev=490b267#490b26734a6445451547eb302c2ac7d1b3e10c83"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -4539,6 +4539,7 @@ dependencies = [
  "plutus-parser",
  "serde",
  "serde_json",
+ "serde_with 3.16.1",
  "sqlx",
  "thiserror 2.0.17",
  "tokio",
