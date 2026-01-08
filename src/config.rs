@@ -4,7 +4,7 @@ use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
 
-use crate::{persistence::PersistenceConfig, sundaev3::SundaeV3Protocol};
+use crate::{persistence::PersistenceConfig, server::ServerConfig, sundaev3::SundaeV3Protocol};
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
 
@@ -13,6 +13,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub persistence: PersistenceConfig,
     pub protocol: ProtocolConfig,
+    pub server: ServerConfig,
     #[serde(default)]
     pub acropolis: config::Map<String, config::Value>,
 }
