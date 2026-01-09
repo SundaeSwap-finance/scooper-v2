@@ -1,4 +1,7 @@
 {
+  "log": {
+    "level": "info"
+  },
   "server": {
     "address": "0.0.0.0:9999"
   },

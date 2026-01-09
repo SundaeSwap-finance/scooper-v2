@@ -4,12 +4,16 @@ use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
 
-use crate::{persistence::PersistenceConfig, server::ServerConfig, sundaev3::SundaeV3Protocol};
+use crate::{
+    instrumentation::LogConfig, persistence::PersistenceConfig, server::ServerConfig,
+    sundaev3::SundaeV3Protocol,
+};
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    pub log: LogConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
     pub protocol: ProtocolConfig,

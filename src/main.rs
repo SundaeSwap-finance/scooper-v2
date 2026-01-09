@@ -16,13 +16,14 @@ use tokio_util::sync::CancellationToken;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{Level, event, info, warn};
+use tracing::{info, warn};
 
 mod bigint;
 mod cardano_types;
 mod config;
 mod datum_lookup;
 mod historical_state;
+mod instrumentation;
 mod multisig;
 mod persistence;
 mod scooper;
@@ -41,10 +42,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
-    event!(Level::INFO, "Started scooper");
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
+    instrumentation::init(&config.log)?;
+    info!("Started scooper");
 
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
     let shutdown = CancellationToken::new();
