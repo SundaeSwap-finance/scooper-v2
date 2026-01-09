@@ -1,6 +1,7 @@
 {
   "log": {
-    "level": "info"
+    "level": "info",
+    "trace-directory": null
   },
   "server": {
     "address": "0.0.0.0:9999"

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use serde::Deserialize;
 use tracing::Level;
@@ -7,9 +9,11 @@ use tracing_subscriber::{
 
 #[serde_with::serde_as]
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct LogConfig {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub level: Level,
+    pub trace_directory: Option<PathBuf>,
 }
 
 pub fn init(config: &LogConfig) -> Result<()> {
