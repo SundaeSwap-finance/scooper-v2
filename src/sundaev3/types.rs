@@ -1,3 +1,5 @@
+use acropolis_common::Point;
+use pallas_addresses::{PaymentKeyHash, ScriptHash};
 use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
 use serde::ser::SerializeStruct;
@@ -335,12 +337,9 @@ pub struct PlutusAddress {
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Credential {
-    VerificationKey(VerificationKeyHash),
+    VerificationKey(PaymentKeyHash),
     Script(ScriptHash),
 }
-
-type VerificationKeyHash = Vec<u8>;
-type ScriptHash = Vec<u8>;
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Referenced<T: AsPlutus> {
@@ -394,6 +393,18 @@ pub struct StrategyExecution {
     pub validity_range: ValidityRange,
     pub details: Order,
     pub extensions: PlutusData,
+}
+
+#[serde_with::serde_as]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SundaeV3Protocol {
+    pub order_script_hashes: Vec<ScriptHash>,
+    pub pool_script_hash: ScriptHash,
+    pub settings_script_hash: ScriptHash,
+    pub settings_nft: AssetClass,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub starting_point: Point,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
@@ -469,8 +480,7 @@ mod tests {
             hex::decode("99999999999999999999999999999999999999999999999999999999").unwrap();
         let expected_signature =
             hex::decode("88888888888888888888888888888888888888888888888888888888").unwrap();
-        let expected_vkey =
-            hex::decode("77777777777777777777777777777777777777777777777777777777").unwrap();
+        let expected_vkey = PaymentKeyHash::new([0x77; 28]);
         assert_eq!(order.ident.unwrap().to_bytes(), expected_ident);
         assert_eq!(order.owner, Multisig::Signature(expected_signature));
         assert_eq!(order.scoop_fee, BigInt::from(10));

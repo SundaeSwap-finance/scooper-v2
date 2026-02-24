@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_block() {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
-        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn test_rollback() {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
-        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),
@@ -686,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn test_metadata_datums() {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
-        let protocol_file = fs::File::open("testdata/protocol").unwrap();
+        let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),

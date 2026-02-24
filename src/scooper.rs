@@ -13,8 +13,6 @@ use tokio::{select, sync::watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-const LOG_DIR: &str = "logs";
-
 use crate::{
     bigint::BigInt,
     cardano_types::TransactionInput,
@@ -29,15 +27,22 @@ pub struct Scooper {
     sundaev3: watch::Receiver<SundaeV3Update>,
     pools: BTreeMap<Ident, PoolSummary>,
     orders: BTreeMap<TransactionInput, OrderValidity>,
+    trace_directory: Option<PathBuf>,
 }
 
 impl Scooper {
-    pub fn new(sundaev3: watch::Receiver<SundaeV3Update>) -> Result<Self> {
-        fs::create_dir_all(LOG_DIR)?;
+    pub fn new(
+        trace_directory: Option<PathBuf>,
+        sundaev3: watch::Receiver<SundaeV3Update>,
+    ) -> Result<Self> {
+        if let Some(dir) = &trace_directory {
+            fs::create_dir_all(dir)?;
+        }
         Ok(Self {
             sundaev3,
             pools: BTreeMap::new(),
             orders: BTreeMap::new(),
+            trace_directory,
         })
     }
 
@@ -252,7 +257,10 @@ impl Scooper {
             .format("%Y-%m-%d")
             .to_string();
         let filename = format!("{date}.jsonl");
-        let path: PathBuf = [LOG_DIR, &filename].iter().collect();
+        let Some(dir) = self.trace_directory.as_ref() else {
+            return Ok(());
+        };
+        let path = dir.join(filename);
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)

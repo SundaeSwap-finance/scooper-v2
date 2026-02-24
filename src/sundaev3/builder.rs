@@ -240,6 +240,7 @@ fn is_efficient(
 mod tests {
     use std::str::FromStr as _;
 
+    use pallas_addresses::ScriptHash;
     use pallas_primitives::Hash;
 
     use crate::{
@@ -257,12 +258,12 @@ mod tests {
             datum: SettingsDatum {
                 settings_admin: Multisig::After(BigInt::ZERO),
                 metadata_admin: PlutusAddress {
-                    payment_credential: Credential::Script(vec![]),
+                    payment_credential: Credential::Script(ScriptHash::new([0; 28])),
                     stake_credential: None,
                 },
                 treasury_admin: Multisig::After(BigInt::ZERO),
                 treasury_address: PlutusAddress {
-                    payment_credential: Credential::Script(vec![]),
+                    payment_credential: Credential::Script(ScriptHash::new([0; 28])),
                     stake_credential: None,
                 },
                 treasury_allowance: (BigInt::from(1), BigInt::from(10)),
