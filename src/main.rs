@@ -31,10 +31,11 @@ mod scooper;
 mod server;
 mod sundaev3;
 
+use crate::config::ProtocolConfig;
 use crate::events::IndexEvent;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
-use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Protocol, SundaeV3Update};
+use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update};
 
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
@@ -55,16 +56,16 @@ async fn main() -> Result<()> {
 
     let persistence = persistence::connect(&config.persistence).await?;
 
-    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
+    let v3_state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
-        index.clone(),
+        v3_state.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
         event_tx.clone(),
         config.acropolis_config()?,
-        config.protocol.v3.clone(),
+        config.protocol.clone(),
         persistence.clone(),
         shutdown.child_token(),
     ));
@@ -74,7 +75,7 @@ async fn main() -> Result<()> {
     );
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
-        index.clone(),
+        v3_state.clone(),
         resync_tx,
         shutdown.child_token(),
     ));
@@ -93,22 +94,21 @@ async fn main() -> Result<()> {
 }
 
 async fn manager_loop(
-    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     config: Arc<::config::Config>,
-    protocol: SundaeV3Protocol,
+    protocol: ProtocolConfig,
     persistence: Arc<dyn Persistence>,
     shutdown: CancellationToken,
 ) {
     let mut force_restart = false;
     loop {
-        let index = index.clone();
+        let v3_state = v3_state.clone();
         let mut resync_tx = resync_tx.subscribe();
         let config = config.clone();
         let protocol = protocol.clone();
-        let default_start = protocol.starting_point.clone();
         let broadcaster = broadcaster.clone();
         let event_tx = event_tx.clone();
 
@@ -121,20 +121,22 @@ async fn manager_loop(
         let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
-        let mut v3_index = SundaeV3Indexer::new(
-            index,
-            broadcaster,
-            event_tx,
-            protocol,
-            config::ROLLBACK_LIMIT,
-            persistence.indexer_dao("sundae_v3"),
-        );
-        v3_index.load().await.unwrap();
+        if let Some(v3_config) = &protocol.v3 {
+            let mut v3_index = SundaeV3Indexer::new(
+                v3_state.clone(),
+                broadcaster.clone(),
+                event_tx.clone(),
+                v3_config.clone(),
+                config::ROLLBACK_LIMIT,
+                persistence.indexer_dao("sundae_v3"),
+            );
+            v3_index.load().await.unwrap();
 
-        indexer
-            .add_index(v3_index, default_start, force_restart)
-            .await
-            .unwrap();
+            indexer
+                .add_index(v3_index, v3_config.starting_point.clone(), force_restart)
+                .await
+                .unwrap();
+        }
 
         match process.start().await {
             Ok(running_process) => {

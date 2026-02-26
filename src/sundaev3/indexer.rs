@@ -17,7 +17,6 @@ use tokio::sync::{Mutex, broadcast, watch};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    SundaeV3Protocol,
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
     events::IndexEvent,
@@ -25,8 +24,8 @@ use crate::{
     persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
     sundaev3::{
         Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SignedStrategyExecution,
-        SundaeV3Order, SundaeV3Pool, SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder,
-        validate_order,
+        SundaeV3Order, SundaeV3Pool, SundaeV3Protocol, SundaeV3Settings, WrappedRedeemer,
+        builder::ScoopBuilder, validate_order,
     },
 };
 

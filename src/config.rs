@@ -30,9 +30,10 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ProtocolConfig {
-    pub v3: SundaeV3Protocol,
+    pub v3: Option<SundaeV3Protocol>,
+    // pub v4: Option<SundaeV4Protocol>,  // added when v4 specs arrive
 }
 
 pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> Result<AppConfig> {
