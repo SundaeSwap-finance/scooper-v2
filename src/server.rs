@@ -21,6 +21,8 @@ use crate::{
     sundaev3::{Ident, PoolError, SundaeV3HistoricalState, ValidationError, validate_order},
 };
 
+type V3State = Option<Arc<Mutex<SundaeV3HistoricalState>>>;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub address: SocketAddr,
@@ -28,7 +30,7 @@ pub struct ServerConfig {
 
 pub async fn admin_server(
     config: ServerConfig,
-    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: V3State,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     shutdown: CancellationToken,
 ) {
@@ -41,13 +43,13 @@ pub async fn admin_server(
         };
 
         let resync_tx = resync_tx.clone();
-        let index = index.clone();
+        let v3_state = v3_state.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             select! {
                 _ = child.cancelled() => {},
-                _ = handle_request(stream, index, resync_tx) => {}
+                _ = handle_request(stream, v3_state, resync_tx) => {}
             }
         });
     }
@@ -55,12 +57,15 @@ pub async fn admin_server(
 
 async fn handle_request(
     stream: TcpStream,
-    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: V3State,
     resync_tx: tokio::sync::broadcast::Sender<()>,
 ) {
     let io = TokioIo::new(stream);
 
-    let admin_server = AdminServer { index, resync_tx };
+    let admin_server = AdminServer {
+        v3_state,
+        resync_tx,
+    };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
         .await
@@ -71,7 +76,7 @@ async fn handle_request(
 
 #[derive(Clone)]
 struct AdminServer {
-    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: V3State,
     resync_tx: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -110,97 +115,128 @@ struct OrderUnrecoverable<'a> {
 
 impl AdminServer {
     async fn do_call(&self, req: Request<IncomingBody>) -> String {
-        if let Some(pool_id) = req.uri().path().strip_prefix("/pool/") {
-            let state = self.index.lock().await.latest().into_owned();
-            let id_bytes = hex::decode(pool_id).unwrap();
-            let ident = Ident::new(&id_bytes);
-            let pool = match state.pools.get(&ident).cloned() {
-                Some(p) => p,
-                None => {
-                    return "No such pool".into();
-                }
-            };
-            let mut response = QueryPoolResponse {
-                valid: vec![],
-                out_of_range: vec![],
-                unrecoverable: vec![],
-            };
-            for order in &state.orders {
-                if order.datum.ident.as_ref() != Some(&ident) {
-                    continue;
-                }
-                if let Err(err) =
-                    validate_order(&order.datum, &order.value, &pool.pool_datum, &pool.value)
-                {
-                    if let ValidationError::PoolError(PoolError::OutOfRange {
-                        swap_price,
-                        pool_price,
-                    }) = err
-                    {
-                        response.out_of_range.push(OrderOutOfRange {
-                            order: &order.input,
-                            reason: (swap_price, pool_price),
-                        });
-                    } else {
-                        response.unrecoverable.push(OrderUnrecoverable {
-                            order: &order.input,
-                            reason: err.to_string(),
-                        });
-                    }
-                } else {
-                    response.valid.push(&order.input);
-                }
-            }
-            return serde_json::to_string(&response).unwrap();
-        }
+        let path = req.uri().path();
 
-        match req.uri().path() {
+        match path {
             "/resync-from-acropolis" => {
                 let _ = self.resync_tx.send(());
                 "resync".into()
             }
             "/health" => "health".into(),
-            "/pools" => {
-                let state = self.index.lock().await.latest().into_owned();
-                let mut json_map = serde_json::Map::new();
+            _ => self.route_protocol(path).await,
+        }
+    }
 
-                for (ident, pool) in state.pools {
-                    json_map.insert(
-                        hex::encode(ident.to_bytes()),
-                        serde_json::to_value(pool).unwrap(),
-                    );
-                }
+    async fn route_protocol(&self, path: &str) -> String {
+        // /v3/... routes and backward-compatible aliases (/ → /v3/)
+        let v3_path = path
+            .strip_prefix("/v3")
+            .or_else(|| Some(path))
+            .unwrap();
 
-                serde_json::to_string_pretty(&json_map).unwrap()
-            }
-            "/orders" => {
-                let state = self.index.lock().await.latest().into_owned();
+        if let Some(pool_id) = v3_path.strip_prefix("/pool/") {
+            return self.v3_query_pool(pool_id).await;
+        }
 
-                let mut json_map = serde_json::Map::new();
-                for order in &state.orders {
-                    let hex = match order.datum.ident.as_ref() {
-                        Some(id) => hex::encode(id.to_bytes()),
-                        None => "null".to_string(),
-                    };
-
-                    match serde_json::to_value(order) {
-                        Ok(val) => {
-                            json_map.insert(hex, val);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to serialize order {:?}: {}",
-                                order.datum.ident,
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                serde_json::to_string_pretty(&json_map).unwrap()
-            }
+        match v3_path {
+            "/pools" => self.v3_list_pools().await,
+            "/orders" => self.v3_list_orders().await,
             _ => "unknown".into(),
         }
+    }
+
+    async fn v3_query_pool(&self, pool_id: &str) -> String {
+        let Some(v3) = &self.v3_state else {
+            return "v3 indexer not configured".into();
+        };
+        let state = v3.lock().await.latest().into_owned();
+        let id_bytes = hex::decode(pool_id).unwrap();
+        let ident = Ident::new(&id_bytes);
+        let pool = match state.pools.get(&ident).cloned() {
+            Some(p) => p,
+            None => {
+                return "No such pool".into();
+            }
+        };
+        let mut response = QueryPoolResponse {
+            valid: vec![],
+            out_of_range: vec![],
+            unrecoverable: vec![],
+        };
+        for order in &state.orders {
+            if order.datum.ident.as_ref() != Some(&ident) {
+                continue;
+            }
+            if let Err(err) =
+                validate_order(&order.datum, &order.value, &pool.pool_datum, &pool.value)
+            {
+                if let ValidationError::PoolError(PoolError::OutOfRange {
+                    swap_price,
+                    pool_price,
+                }) = err
+                {
+                    response.out_of_range.push(OrderOutOfRange {
+                        order: &order.input,
+                        reason: (swap_price, pool_price),
+                    });
+                } else {
+                    response.unrecoverable.push(OrderUnrecoverable {
+                        order: &order.input,
+                        reason: err.to_string(),
+                    });
+                }
+            } else {
+                response.valid.push(&order.input);
+            }
+        }
+        serde_json::to_string(&response).unwrap()
+    }
+
+    async fn v3_list_pools(&self) -> String {
+        let Some(v3) = &self.v3_state else {
+            return "v3 indexer not configured".into();
+        };
+        let state = v3.lock().await.latest().into_owned();
+        let mut json_map = serde_json::Map::new();
+
+        for (ident, pool) in state.pools {
+            json_map.insert(
+                hex::encode(ident.to_bytes()),
+                serde_json::to_value(pool).unwrap(),
+            );
+        }
+
+        serde_json::to_string_pretty(&json_map).unwrap()
+    }
+
+    async fn v3_list_orders(&self) -> String {
+        let Some(v3) = &self.v3_state else {
+            return "v3 indexer not configured".into();
+        };
+        let state = v3.lock().await.latest().into_owned();
+
+        let mut json_map = serde_json::Map::new();
+        for order in &state.orders {
+            let hex = match order.datum.ident.as_ref() {
+                Some(id) => hex::encode(id.to_bytes()),
+                None => "null".to_string(),
+            };
+
+            match serde_json::to_value(order) {
+                Ok(val) => {
+                    json_map.insert(hex, val);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to serialize order {:?}: {}",
+                        order.datum.ident,
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+
+        serde_json::to_string_pretty(&json_map).unwrap()
     }
 }

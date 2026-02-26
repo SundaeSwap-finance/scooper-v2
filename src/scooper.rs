@@ -24,7 +24,7 @@ use crate::{
 
 pub struct Scooper {
     event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
-    v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
     trace_directory: Option<PathBuf>,
 }
 
@@ -32,7 +32,7 @@ impl Scooper {
     pub fn new(
         trace_directory: Option<PathBuf>,
         event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
-        v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
+        v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -69,8 +69,11 @@ impl Scooper {
     async fn process_events(&self, slot: u64, events: Vec<IndexEvent>) {
         let mut updates: Vec<serde_json::Value> = vec![];
 
-        // Get current state snapshot for order validation
-        let state = self.v3_state.lock().await.latest().into_owned();
+        // Get current v3 state snapshot for order validation (if v3 is configured)
+        let v3_state = match &self.v3_state {
+            Some(s) => Some(s.lock().await.latest().into_owned()),
+            None => None,
+        };
 
         for event in events {
             match event {
@@ -101,7 +104,13 @@ impl Scooper {
                     }).unwrap());
                 }
                 IndexEvent::V3OrderCreated { order } => {
-                    let validity = validate_order(&order, &state.pools);
+                    let pools = v3_state.as_ref().map(|s| &s.pools);
+                    let validity = match pools {
+                        Some(pools) => validate_order(&order, pools),
+                        None => OrderValidity::Invalid {
+                            reason: OrderInvalidReason::NoPools,
+                        },
+                    };
                     trace!(slot, order = %order.input, "order created");
                     updates.push(serde_json::to_value(OrderState {
                         slot,

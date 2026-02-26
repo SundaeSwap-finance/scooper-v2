@@ -56,7 +56,11 @@ async fn main() -> Result<()> {
 
     let persistence = persistence::connect(&config.persistence).await?;
 
-    let v3_state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
+    let v3_state = config
+        .protocol
+        .v3
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(SundaeV3HistoricalState::new())));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
@@ -98,7 +102,7 @@ async fn main() -> Result<()> {
 }
 
 async fn manager_loop(
-    v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -125,7 +129,7 @@ async fn manager_loop(
         let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
-        if let Some(v3_config) = &protocol.v3 {
+        if let (Some(v3_config), Some(v3_state)) = (&protocol.v3, &v3_state) {
             let mut v3_index = SundaeV3Indexer::new(
                 v3_state.clone(),
                 broadcaster.clone(),
