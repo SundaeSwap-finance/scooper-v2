@@ -137,6 +137,27 @@ impl Scooper {
                 IndexEvent::V3SettingsUpdated { .. } => {
                     trace!(slot, "settings updated");
                 }
+                IndexEvent::V4PoolCreated { id, .. } => {
+                    trace!(slot, pool = %id, "v4 pool created");
+                }
+                IndexEvent::V4PoolUpdated { id, .. } => {
+                    trace!(slot, pool = %id, "v4 pool updated");
+                }
+                IndexEvent::V4PoolRemoved { id } => {
+                    trace!(slot, pool = %id, "v4 pool removed");
+                }
+                IndexEvent::V4OrderCreated { order } => {
+                    trace!(slot, order = %order.input, "v4 order created");
+                }
+                IndexEvent::V4OrderScooped { order, pool_id } => {
+                    trace!(slot, order = %order.input, pool = %pool_id, "v4 order scooped");
+                }
+                IndexEvent::V4OrderCancelled { order } => {
+                    trace!(slot, order = %order.input, "v4 order cancelled");
+                }
+                IndexEvent::V4SettingsUpdated { .. } => {
+                    trace!(slot, "v4 settings updated");
+                }
                 IndexEvent::Rollback { to_slot } => {
                     trace!(to_slot, "rollback");
                 }
