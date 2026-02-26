@@ -21,7 +21,7 @@ use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
     historical_state::HistoricalState,
-    persistence::{PersistedDatum, PersistedTxo, SundaeV3Dao, SundaeV3TxChanges},
+    persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
     sundaev3::{
         Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SignedStrategyExecution,
         SundaeV3Order, SundaeV3Pool, SundaeV3Settings, WrappedRedeemer, builder::ScoopBuilder,
@@ -60,7 +60,7 @@ pub struct SundaeV3Indexer {
     broadcaster: watch::Sender<SundaeV3Update>,
     protocol: SundaeV3Protocol,
     rollback_limit: u64,
-    dao: Box<dyn SundaeV3Dao>,
+    dao: Box<dyn IndexerDao>,
 }
 
 impl SundaeV3Indexer {
@@ -69,7 +69,7 @@ impl SundaeV3Indexer {
         broadcaster: watch::Sender<SundaeV3Update>,
         protocol: SundaeV3Protocol,
         rollback_limit: u64,
-        dao: Box<dyn SundaeV3Dao>,
+        dao: Box<dyn IndexerDao>,
     ) -> Self {
         Self {
             state,
@@ -260,7 +260,7 @@ impl ChainIndex for SundaeV3Indexer {
         let mut updated_pools = BTreeMap::new();
         let mut new_orders = vec![];
         let mut new_settings = None;
-        let mut changes = SundaeV3TxChanges::new(info.slot, info.number);
+        let mut changes = TxChanges::new(info.slot, info.number);
 
         let state = history.update_slot(slot)?;
 
@@ -551,11 +551,11 @@ mod tests {
     use pallas_primitives::DatumHash;
     use pallas_traverse::MultiEraBlock;
 
-    struct NoOpSundaeV3Dao;
+    struct NoOpIndexerDao;
 
     #[async_trait]
-    impl SundaeV3Dao for NoOpSundaeV3Dao {
-        async fn apply_tx_changes(&self, changes: SundaeV3TxChanges) -> Result<()> {
+    impl IndexerDao for NoOpIndexerDao {
+        async fn apply_tx_changes(&self, changes: TxChanges) -> Result<()> {
             let _ = changes;
             Ok(())
         }
@@ -606,7 +606,7 @@ mod tests {
             watch::Sender::default(),
             protocol,
             2160,
-            Box::new(NoOpSundaeV3Dao),
+            Box::new(NoOpIndexerDao),
         );
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
@@ -652,7 +652,7 @@ mod tests {
             watch::Sender::default(),
             protocol,
             2160,
-            Box::new(NoOpSundaeV3Dao),
+            Box::new(NoOpIndexerDao),
         );
         let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
@@ -693,7 +693,7 @@ mod tests {
             watch::Sender::default(),
             protocol,
             2160,
-            Box::new(NoOpSundaeV3Dao),
+            Box::new(NoOpIndexerDao),
         );
         let block_bytes = std::fs::read("testdata/metadata.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();

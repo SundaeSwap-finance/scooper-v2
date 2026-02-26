@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, PersistedDatum, PersistedTxo, Persistence, SundaeV3Dao, SundaeV3TxChanges,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, TxChanges,
     },
 };
 
@@ -56,9 +56,10 @@ impl SqlitePersistence {
 }
 
 impl Persistence for SqlitePersistence {
-    fn sundae_v3_dao(&self) -> Box<dyn super::SundaeV3Dao> {
-        Box::new(SqliteSundaeV3Dao {
+    fn indexer_dao(&self, namespace: &str) -> Box<dyn super::IndexerDao> {
+        Box::new(SqliteIndexerDao {
             pool: self.pool.clone(),
+            namespace: namespace.to_string(),
         })
     }
 
@@ -69,17 +70,30 @@ impl Persistence for SqlitePersistence {
     }
 }
 
-pub struct SqliteSundaeV3Dao {
+pub struct SqliteIndexerDao {
     pool: Pool<Sqlite>,
+    namespace: String,
+}
+
+impl SqliteIndexerDao {
+    fn txos_table(&self) -> String {
+        format!("{}_txos", self.namespace)
+    }
+
+    fn datums_table(&self) -> String {
+        format!("{}_datums", self.namespace)
+    }
 }
 
 #[async_trait]
-impl SundaeV3Dao for SqliteSundaeV3Dao {
-    async fn apply_tx_changes(&self, changes: SundaeV3TxChanges) -> Result<()> {
+impl IndexerDao for SqliteIndexerDao {
+    async fn apply_tx_changes(&self, changes: TxChanges) -> Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
 
+        let txos_table = self.txos_table();
+        let datums_table = self.datums_table();
         let mut tx = self.pool.begin().await?;
 
         if !changes.created_txos.is_empty() {
@@ -88,7 +102,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
                 let values_clauses =
                     vec!["(?,?,?,?,NULL,NULL,?,?,?,?)".to_string(); changes.created_txos.len()]
                         .join(",");
-                format!("INSERT INTO sundae_v3_txos ({column_names}) VALUES {values_clauses};")
+                format!("INSERT INTO {txos_table} ({column_names}) VALUES {values_clauses};")
             };
             let mut query = sqlx::query(&insert_created_txo_query);
 
@@ -108,9 +122,9 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
         }
 
         for spent_txo in changes.spent_txos {
-            sqlx::query(
-                "UPDATE sundae_v3_txos SET spent_slot = ?, spent_height = ? WHERE tx_id = ? AND txo_index = ?;",
-            )
+            sqlx::query(&format!(
+                "UPDATE {txos_table} SET spent_slot = ?, spent_height = ? WHERE tx_id = ? AND txo_index = ?;"
+            ))
             .bind(changes.slot as i64)
             .bind(changes.height as i64)
             .bind(spent_txo.0.transaction_id.to_vec())
@@ -125,7 +139,7 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
                 let values_clauses =
                     vec!["(?,?,?)".to_string(); changes.metadata_datums.len()].join(",");
                 format!(
-                    "INSERT INTO sundae_v3_datums ({column_names}) VALUES {values_clauses} ON CONFLICT DO UPDATE SET created_slot = excluded.created_slot;"
+                    "INSERT INTO {datums_table} ({column_names}) VALUES {values_clauses} ON CONFLICT DO UPDATE SET created_slot = excluded.created_slot;"
                 )
             };
             let mut query = sqlx::query(&insert_datum_query);
@@ -145,54 +159,58 @@ impl SundaeV3Dao for SqliteSundaeV3Dao {
     }
 
     async fn rollback(&self, slot: u64) -> Result<()> {
+        let txos_table = self.txos_table();
+        let datums_table = self.datums_table();
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM sundae_v3_txos WHERE created_slot > ?;")
+        sqlx::query(&format!("DELETE FROM {txos_table} WHERE created_slot > ?;"))
             .bind(slot as i64)
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query(
-            "UPDATE sundae_v3_txos SET spent_slot = NULL, spent_height = NULL WHERE spent_slot > ?",
-        )
+        sqlx::query(&format!(
+            "UPDATE {txos_table} SET spent_slot = NULL, spent_height = NULL WHERE spent_slot > ?"
+        ))
         .bind(slot as i64)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM sundae_v3_datums WHERE created_slot > ?;")
-            .bind(slot as i64)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {datums_table} WHERE created_slot > ?;"
+        ))
+        .bind(slot as i64)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())
     }
 
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>> {
-        let query = "
-            SELECT hash, datum, created_slot
-            FROM sundae_v3_datums
-            ORDER BY created_slot, hash
-        ";
-        Ok(sqlx::query_as(query).fetch_all(&self.pool).await?)
+        let datums_table = self.datums_table();
+        let query = format!(
+            "SELECT hash, datum, created_slot FROM {datums_table} ORDER BY created_slot, hash"
+        );
+        Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
 
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
-        let query = "
-            SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum
-            FROM sundae_v3_txos
-            WHERE spent_slot IS NULL
-            ORDER BY created_slot, tx_id, txo_index;
-        ";
-        Ok(sqlx::query_as(query).fetch_all(&self.pool).await?)
+        let txos_table = self.txos_table();
+        let query = format!(
+            "SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum FROM {txos_table} WHERE spent_slot IS NULL ORDER BY created_slot, tx_id, txo_index;"
+        );
+        Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
 
     async fn prune_txos(&self, min_height: u64) -> Result<()> {
+        let txos_table = self.txos_table();
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM sundae_v3_txos WHERE spent_height < ?")
-            .bind(min_height as i64)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {txos_table} WHERE spent_height < ?"
+        ))
+        .bind(min_height as i64)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -432,10 +450,10 @@ mod tests {
     #[tokio::test]
     async fn should_load_txos() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let pool = preview_pool();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: pool.created_slot,
             height: 1,
             created_txos: vec![pool.clone()],
@@ -444,7 +462,7 @@ mod tests {
         })
         .await?;
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot,
             height: 2,
             created_txos: vec![order.clone()],
@@ -462,10 +480,10 @@ mod tests {
     #[tokio::test]
     async fn should_load_datums() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let datum = preview_datum();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: datum.created_slot,
             height: 0,
             created_txos: vec![],
@@ -482,10 +500,10 @@ mod tests {
     #[tokio::test]
     async fn should_update_datums_created_slot() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let datum = preview_datum();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: datum.created_slot,
             height: 0,
             created_txos: vec![],
@@ -496,7 +514,7 @@ mod tests {
 
         let mut datum2 = datum.clone();
         datum2.created_slot = datum.created_slot + 20;
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: datum.created_slot,
             height: 0,
             created_txos: vec![],
@@ -513,10 +531,10 @@ mod tests {
     #[tokio::test]
     async fn should_not_load_spent_txos() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let pool = preview_pool();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: pool.created_slot,
             height: 1,
             created_txos: vec![pool.clone()],
@@ -525,7 +543,7 @@ mod tests {
         })
         .await?;
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot,
             height: 2,
             created_txos: vec![order.clone()],
@@ -536,7 +554,7 @@ mod tests {
 
         // The order TXO was spent
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
@@ -554,10 +572,10 @@ mod tests {
     #[tokio::test]
     async fn should_remove_rolled_back_txos() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let pool = preview_pool();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: pool.created_slot,
             height: 1,
             created_txos: vec![pool.clone()],
@@ -566,7 +584,7 @@ mod tests {
         })
         .await?;
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot,
             height: 2,
             created_txos: vec![order.clone()],
@@ -587,10 +605,10 @@ mod tests {
     #[tokio::test]
     async fn should_load_rolled_back_spends() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         let pool = preview_pool();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: pool.created_slot,
             height: 1,
             created_txos: vec![pool.clone()],
@@ -599,7 +617,7 @@ mod tests {
         })
         .await?;
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot,
             height: 2,
             created_txos: vec![order.clone()],
@@ -610,7 +628,7 @@ mod tests {
 
         // the order was spent
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
@@ -631,11 +649,11 @@ mod tests {
     #[tokio::test]
     async fn should_prune_history() -> Result<()> {
         let db = new_db().await?;
-        let dao = db.sundae_v3_dao();
+        let dao = db.indexer_dao("sundae_v3");
 
         // Height 1: pool created
         let pool = preview_pool();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: pool.created_slot,
             height: 1,
             created_txos: vec![pool.clone()],
@@ -646,7 +664,7 @@ mod tests {
 
         // Height 2: order created
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot,
             height: 2,
             created_txos: vec![order.clone()],
@@ -657,7 +675,7 @@ mod tests {
 
         // Height 3: order spent
         let order = preview_order();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
@@ -668,7 +686,7 @@ mod tests {
 
         // Height 6: new order placed
         let order_2 = preview_order_2();
-        dao.apply_tx_changes(SundaeV3TxChanges {
+        dao.apply_tx_changes(TxChanges {
             slot: order_2.created_slot,
             height: 6,
             created_txos: vec![order_2],

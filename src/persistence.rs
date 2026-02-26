@@ -25,7 +25,7 @@ impl Default for PersistenceConfig {
 }
 
 pub trait Persistence: Send + Sync {
-    fn sundae_v3_dao(&self) -> Box<dyn SundaeV3Dao>;
+    fn indexer_dao(&self, namespace: &str) -> Box<dyn IndexerDao>;
     fn cursor_store(&self) -> CursorDao;
 }
 
@@ -35,14 +35,14 @@ pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>>
     })
 }
 
-pub struct SundaeV3TxChanges {
+pub struct TxChanges {
     pub slot: u64,
     pub height: u64,
     pub created_txos: Vec<PersistedTxo>,
     pub spent_txos: Vec<TransactionInput>,
     pub metadata_datums: Vec<PersistedDatum>,
 }
-impl SundaeV3TxChanges {
+impl TxChanges {
     pub fn new(slot: u64, height: u64) -> Self {
         Self {
             slot,
@@ -60,8 +60,8 @@ impl SundaeV3TxChanges {
 }
 
 #[async_trait]
-pub trait SundaeV3Dao: Send + Sync + 'static {
-    async fn apply_tx_changes(&self, changes: SundaeV3TxChanges) -> Result<()>;
+pub trait IndexerDao: Send + Sync + 'static {
+    async fn apply_tx_changes(&self, changes: TxChanges) -> Result<()>;
     async fn rollback(&self, slot: u64) -> Result<()>;
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>>;
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;

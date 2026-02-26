@@ -120,7 +120,7 @@ async fn manager_loop(
             broadcaster,
             protocol,
             config::ROLLBACK_LIMIT,
-            persistence.sundae_v3_dao(),
+            persistence.indexer_dao("sundae_v3"),
         );
         v3_index.load().await.unwrap();
 
