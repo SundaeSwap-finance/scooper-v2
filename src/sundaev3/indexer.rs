@@ -13,13 +13,14 @@ use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
 use plutus_parser::{AsPlutus, PlutusData};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 use tracing::{debug, trace, warn};
 
 use crate::{
     SundaeV3Protocol,
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
+    events::IndexEvent,
     historical_state::HistoricalState,
     persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
     sundaev3::{
@@ -58,6 +59,7 @@ const METADATA_DATUM_KEY: u64 = 103251;
 pub struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3HistoricalState>>,
     broadcaster: watch::Sender<SundaeV3Update>,
+    event_tx: broadcast::Sender<(u64, Vec<IndexEvent>)>,
     protocol: SundaeV3Protocol,
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
@@ -67,6 +69,7 @@ impl SundaeV3Indexer {
     pub fn new(
         state: Arc<Mutex<SundaeV3HistoricalState>>,
         broadcaster: watch::Sender<SundaeV3Update>,
+        event_tx: broadcast::Sender<(u64, Vec<IndexEvent>)>,
         protocol: SundaeV3Protocol,
         rollback_limit: u64,
         dao: Box<dyn IndexerDao>,
@@ -74,6 +77,7 @@ impl SundaeV3Indexer {
         Self {
             state,
             broadcaster,
+            event_tx,
             protocol,
             rollback_limit,
             dao,
@@ -261,6 +265,7 @@ impl ChainIndex for SundaeV3Indexer {
         let mut new_orders = vec![];
         let mut new_settings = None;
         let mut changes = TxChanges::new(info.slot, info.number);
+        let mut events: Vec<IndexEvent> = vec![];
 
         let state = history.update_slot(slot)?;
 
@@ -361,6 +366,7 @@ impl ChainIndex for SundaeV3Indexer {
         spent_inputs.sort();
 
         let mut scoops = vec![];
+        let mut removed_pool_ids: Vec<Ident> = vec![];
 
         // Remove spent pools. If they were spent to produce a scoop, track that.
         state.pools.retain(|ident, pool| {
@@ -387,13 +393,17 @@ impl ChainIndex for SundaeV3Indexer {
                 Some(WrappedRedeemer(PoolRedeemer::Manage)) => {
                     // pool's settings were updated, but no scoop was made
                 }
-                None => warn!(slot, %ident, "pool spent without a valid redeemer!"),
+                None => {
+                    warn!(slot, %ident, "pool spent without a valid redeemer!");
+                    removed_pool_ids.push(ident.clone());
+                }
             }
             changes.spent_txos.push(pool.input.clone());
             false
         });
 
         let mut scooped_orders = BTreeSet::new();
+        let mut scoop_pool_id: Option<Ident> = None;
         if scoops.len() > 1 {
             warn!(slot, tx = %tx.hash(), "one transaction contained multiple scoops");
         } else if let Some(mut scoop) = scoops.pop() {
@@ -409,6 +419,7 @@ impl ChainIndex for SundaeV3Indexer {
             );
             // Validate the scoop
             let ident = scoop.builder.pool.ident.clone();
+            scoop_pool_id = Some(ident.clone());
             for (order_index, sse) in scoop.orders {
                 scooped_orders.insert(order_index);
                 let Some(input) = spent_inputs.get(order_index) else {
@@ -453,17 +464,31 @@ impl ChainIndex for SundaeV3Indexer {
                     if !scooped_orders.contains(&spend_index) {
                         warn!(slot, order = %order.input, spend_index, tx = %tx.hash(), "order had a Scoop redeemer but was not scooped");
                     }
+                    if let Some(pool_id) = &scoop_pool_id {
+                        events.push(IndexEvent::V3OrderScooped {
+                            order: order.clone(),
+                            pool_id: pool_id.clone(),
+                        });
+                    }
                 }
                 Some(OrderRedeemer::Cancel) => {
                     if scooped_orders.contains(&spend_index) {
                         warn!(slot, order = %order.input, "order did not have a Scoop redeemer, but was scooped");
                     }
+                    events.push(IndexEvent::V3OrderCancelled {
+                        order: order.clone(),
+                    });
                 }
                 None => warn!(slot, order = %order.input, "order spent without a valid redeemer!"),
             }
             changes.spent_txos.push(order.input.clone());
             false
         });
+
+        // Emit pool removed events for pools spent without scoop/manage
+        for id in removed_pool_ids {
+            events.push(IndexEvent::V3PoolRemoved { id });
+        }
 
         // remove old settings too
         if let Some(settings) = &state.settings
@@ -473,10 +498,34 @@ impl ChainIndex for SundaeV3Indexer {
             state.settings = None;
         }
 
-        // And apply the new state
+        // And apply the new state — emit events for new/updated pools
+        for (id, pool) in &updated_pools {
+            if state.pools.contains_key(id) {
+                events.push(IndexEvent::V3PoolUpdated {
+                    id: id.clone(),
+                    pool: pool.clone(),
+                });
+            } else {
+                events.push(IndexEvent::V3PoolCreated {
+                    id: id.clone(),
+                    pool: pool.clone(),
+                });
+            }
+        }
         state.pools.append(&mut updated_pools);
+
+        // Emit events for new orders
+        for order in &new_orders {
+            events.push(IndexEvent::V3OrderCreated {
+                order: order.clone(),
+            });
+        }
         state.orders.append(&mut new_orders);
+
         if let Some(settings) = new_settings {
+            events.push(IndexEvent::V3SettingsUpdated {
+                settings: settings.clone(),
+            });
             state.settings = Some(settings);
         }
 
@@ -487,6 +536,10 @@ impl ChainIndex for SundaeV3Indexer {
                 tip_slot: info.tip_slot,
                 state: state.clone(),
             });
+        }
+
+        if !events.is_empty() {
+            let _ = self.event_tx.send((slot, events));
         }
 
         if history.prune_history(self.rollback_limit)
@@ -509,12 +562,16 @@ impl ChainIndex for SundaeV3Indexer {
                 history.rollback_to_slot(*slot);
             }
         }
-        self.dao.rollback(point.slot()).await?;
+        let to_slot = point.slot();
+        self.dao.rollback(to_slot).await?;
         self.broadcaster.send_replace(SundaeV3Update {
-            slot: point.slot(),
+            slot: to_slot,
             tip_slot: None,
             state: self.state.lock().await.latest().into_owned(),
         });
+        let _ = self
+            .event_tx
+            .send((to_slot, vec![IndexEvent::Rollback { to_slot }]));
         Ok(())
     }
 
@@ -601,9 +658,11 @@ mod tests {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
         let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let (event_tx, _) = broadcast::channel(16);
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),
             watch::Sender::default(),
+            event_tx,
             protocol,
             2160,
             Box::new(NoOpIndexerDao),
@@ -647,9 +706,11 @@ mod tests {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
         let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let (event_tx, _) = broadcast::channel(16);
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),
             watch::Sender::default(),
+            event_tx,
             protocol,
             2160,
             Box::new(NoOpIndexerDao),
@@ -688,9 +749,11 @@ mod tests {
         let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
         let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
         let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let (event_tx, _) = broadcast::channel(16);
         let mut indexer = SundaeV3Indexer::new(
             state.clone(),
             watch::Sender::default(),
+            event_tx,
             protocol,
             2160,
             Box::new(NoOpIndexerDao),

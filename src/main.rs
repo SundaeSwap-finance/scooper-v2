@@ -22,6 +22,7 @@ mod bigint;
 mod cardano_types;
 mod config;
 mod datum_lookup;
+mod events;
 mod historical_state;
 mod instrumentation;
 mod multisig;
@@ -30,6 +31,7 @@ mod scooper;
 mod server;
 mod sundaev3;
 
+use crate::events::IndexEvent;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Protocol, SundaeV3Update};
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
     info!("Started scooper");
 
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<(u64, Vec<IndexEvent>)>(256);
     let shutdown = CancellationToken::new();
 
     let persistence = persistence::connect(&config.persistence).await?;
@@ -59,6 +62,7 @@ async fn main() -> Result<()> {
         index.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
+        event_tx.clone(),
         config.acropolis_config()?,
         config.protocol.v3.clone(),
         persistence.clone(),
@@ -92,6 +96,7 @@ async fn manager_loop(
     index: Arc<Mutex<SundaeV3HistoricalState>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
+    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     config: Arc<::config::Config>,
     protocol: SundaeV3Protocol,
     persistence: Arc<dyn Persistence>,
@@ -105,6 +110,7 @@ async fn manager_loop(
         let protocol = protocol.clone();
         let default_start = protocol.starting_point.clone();
         let broadcaster = broadcaster.clone();
+        let event_tx = event_tx.clone();
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
@@ -118,6 +124,7 @@ async fn manager_loop(
         let mut v3_index = SundaeV3Indexer::new(
             index,
             broadcaster,
+            event_tx,
             protocol,
             config::ROLLBACK_LIMIT,
             persistence.indexer_dao("sundae_v3"),
