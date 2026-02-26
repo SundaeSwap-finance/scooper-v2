@@ -4,254 +4,144 @@ use std::{
     io::{BufWriter, Write as _},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Result;
 use serde::Serialize;
-use tokio::{select, sync::watch};
+use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::{
     bigint::BigInt,
     cardano_types::TransactionInput,
+    events::IndexEvent,
     sundaev3::{
-        Ident, PoolError, SingletonValue, SundaeV3Order, SundaeV3Pool, SundaeV3State,
-        SundaeV3Update, ValueError, estimate_whether_in_range, validate_order_for_pool,
-        validate_order_value,
+        Ident, PoolError, SingletonValue, SundaeV3HistoricalState, SundaeV3Order, SundaeV3Pool,
+        ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value,
     },
 };
 
 pub struct Scooper {
-    sundaev3: watch::Receiver<SundaeV3Update>,
-    pools: BTreeMap<Ident, PoolSummary>,
-    orders: BTreeMap<TransactionInput, OrderValidity>,
+    event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
+    v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
     trace_directory: Option<PathBuf>,
 }
 
 impl Scooper {
     pub fn new(
         trace_directory: Option<PathBuf>,
-        sundaev3: watch::Receiver<SundaeV3Update>,
+        event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
+        v3_state: Arc<Mutex<SundaeV3HistoricalState>>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
         }
         Ok(Self {
-            sundaev3,
-            pools: BTreeMap::new(),
-            orders: BTreeMap::new(),
+            event_rx,
+            v3_state,
             trace_directory,
         })
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) {
         loop {
-            select! {
+            let (slot, events) = select! {
                 _ = shutdown.cancelled() => { break; }
-                res = self.sundaev3.changed() => {
-                    if res.is_err() {
-                        break;
+                res = self.event_rx.recv() => {
+                    match res {
+                        Ok(batch) => batch,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("scooper lagged behind by {n} event batches");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
                     }
                 }
-            }
-
-            // Sleep a bit to deduplicate updates to the state.
-            tokio::time::sleep(Duration::from_millis(250)).await;
-
-            let update = self.sundaev3.borrow_and_update().clone();
-            // TODO: only "scoop" when we're at the head of the chain
-            self.log_changes(update.slot, &update.state);
-        }
-    }
-
-    fn log_changes(&mut self, slot: u64, state: &SundaeV3State) {
-        self.log_orders(slot, state);
-        self.log_pools(slot, state);
-    }
-
-    fn log_pools(&mut self, slot: u64, state: &SundaeV3State) {
-        let mut new_pools = BTreeMap::new();
-        for (ident, pool) in &state.pools {
-            let (asset_a, asset_b) = pool.pool_datum.assets.clone();
-            let amount_a = pool.value.get(&asset_a);
-            let amount_b = pool.value.get(&asset_b);
-            let summary = PoolSummary {
-                assets: (
-                    SingletonValue::new(asset_a, amount_a),
-                    SingletonValue::new(asset_b, amount_b),
-                ),
-                liquidity: pool.pool_datum.circulating_lp.clone(),
-                protocol_fees: pool.pool_datum.protocol_fees.clone(),
             };
-            new_pools.insert(ident.clone(), summary);
-        }
 
-        let mut updates = vec![];
-        for (ident, summary) in &new_pools {
-            match self.pools.get(ident) {
-                None => updates.push(PoolState {
-                    slot,
-                    pool: ident,
-                    action: PoolAction::Added { summary },
-                }),
-                Some(old_summary) => {
-                    if old_summary != summary {
-                        updates.push(PoolState {
-                            slot,
-                            pool: ident,
-                            action: PoolAction::Changed { summary },
-                        });
-                    }
-                }
-            }
-        }
-        for ident in self.pools.keys() {
-            if !new_pools.contains_key(ident) {
-                updates.push(PoolState {
-                    slot,
-                    pool: ident,
-                    action: PoolAction::Removed,
-                });
-            }
-        }
-
-        if !updates.is_empty()
-            && let Err(err) = self.write_updates(&updates)
-        {
-            warn!("could not log updates: {err:#}");
-        }
-
-        self.pools = new_pools;
-    }
-
-    fn log_orders(&mut self, slot: u64, state: &SundaeV3State) {
-        let mut new_orders = BTreeMap::new();
-        for order in &state.orders {
-            let validity = self.validate_order(order, &state.pools);
-            new_orders.insert(order.input.clone(), validity);
-        }
-
-        let mut updates = vec![];
-        for (txo, validity) in &new_orders {
-            match self.orders.get(txo) {
-                None => updates.push(OrderState {
-                    order: txo,
-                    slot,
-                    action: OrderAction::Added { valid: validity },
-                }),
-                Some(old_validity) => {
-                    if self.validity_changed(old_validity, validity) {
-                        updates.push(OrderState {
-                            order: txo,
-                            slot,
-                            action: OrderAction::Changed { valid: validity },
-                        });
-                    }
-                }
-            }
-        }
-        for txo in self.orders.keys() {
-            if !new_orders.contains_key(txo) {
-                updates.push(OrderState {
-                    order: txo,
-                    slot,
-                    action: OrderAction::Removed,
-                });
-            }
-        }
-
-        if !updates.is_empty()
-            && let Err(err) = self.write_updates(&updates)
-        {
-            warn!("could not log updates: {err:#}");
-        }
-
-        self.orders = new_orders;
-    }
-
-    // Log if the order's valid state has changed, unless the change is just becuase the pool price changed
-    fn validity_changed(&self, old: &OrderValidity, new: &OrderValidity) -> bool {
-        match (old, new) {
-            (
-                OrderValidity::Invalid {
-                    reason: OrderInvalidReason::PoolErrors(old_errors),
-                },
-                OrderValidity::Invalid {
-                    reason: OrderInvalidReason::PoolErrors(new_errors),
-                },
-            ) => {
-                if old_errors.len() != new_errors.len() {
-                    return true;
-                }
-                for (ident, old_error) in old_errors {
-                    let Some(new_error) = new_errors.get(ident) else {
-                        return true;
-                    };
-                    let matching = match (old_error, new_error) {
-                        (
-                            PoolError::OutOfRange {
-                                swap_price: old_price,
-                                ..
-                            },
-                            PoolError::OutOfRange {
-                                swap_price: new_price,
-                                ..
-                            },
-                        ) => old_price != new_price,
-                        (o, n) => o != n,
-                    };
-                    if !matching {
-                        return true;
-                    }
-                }
-                false
-            }
-            (o, n) => o != n,
+            self.process_events(slot, events).await;
         }
     }
 
-    fn validate_order(
-        &self,
-        order: &SundaeV3Order,
-        pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
-    ) -> OrderValidity {
-        if let Err(err) = validate_order_value(&order.datum, &order.value) {
-            return OrderValidity::Invalid {
-                reason: OrderInvalidReason::ValueError(err),
-            };
-        }
-        let mut valid_pools = vec![];
-        let mut errors = BTreeMap::new();
-        for (ident, pool) in pools {
-            if let Err(error) = validate_order_for_pool(&order.datum, &pool.pool_datum) {
-                if matches!(error, PoolError::IdentMismatch) {
-                    continue;
+    async fn process_events(&self, slot: u64, events: Vec<IndexEvent>) {
+        let mut updates: Vec<serde_json::Value> = vec![];
+
+        // Get current state snapshot for order validation
+        let state = self.v3_state.lock().await.latest().into_owned();
+
+        for event in events {
+            match event {
+                IndexEvent::V3PoolCreated { id, pool } => {
+                    let summary = pool_summary(&pool);
+                    trace!(slot, pool = %id, "pool created");
+                    updates.push(serde_json::to_value(PoolState {
+                        slot,
+                        pool: id,
+                        action: PoolAction::Added { summary },
+                    }).unwrap());
                 }
-                errors.insert(ident.clone(), error);
-            } else if let Err(error) =
-                estimate_whether_in_range(&order.datum, &pool.pool_datum, &pool.value)
-            {
-                errors.insert(ident.clone(), error);
-            } else {
-                valid_pools.push(ident.clone());
+                IndexEvent::V3PoolUpdated { id, pool } => {
+                    let summary = pool_summary(&pool);
+                    trace!(slot, pool = %id, "pool updated");
+                    updates.push(serde_json::to_value(PoolState {
+                        slot,
+                        pool: id,
+                        action: PoolAction::Changed { summary },
+                    }).unwrap());
+                }
+                IndexEvent::V3PoolRemoved { id } => {
+                    trace!(slot, pool = %id, "pool removed");
+                    updates.push(serde_json::to_value(PoolState {
+                        slot,
+                        pool: id,
+                        action: PoolAction::Removed,
+                    }).unwrap());
+                }
+                IndexEvent::V3OrderCreated { order } => {
+                    let validity = validate_order(&order, &state.pools);
+                    trace!(slot, order = %order.input, "order created");
+                    updates.push(serde_json::to_value(OrderState {
+                        slot,
+                        order: order.input.clone(),
+                        action: OrderAction::Added { valid: validity },
+                    }).unwrap());
+                }
+                IndexEvent::V3OrderScooped { order, pool_id } => {
+                    trace!(slot, order = %order.input, pool = %pool_id, "order scooped");
+                    updates.push(serde_json::to_value(OrderState {
+                        slot,
+                        order: order.input.clone(),
+                        action: OrderAction::Scooped { pool_id },
+                    }).unwrap());
+                }
+                IndexEvent::V3OrderCancelled { order } => {
+                    trace!(slot, order = %order.input, "order cancelled");
+                    updates.push(serde_json::to_value(OrderState {
+                        slot,
+                        order: order.input.clone(),
+                        action: OrderAction::Cancelled,
+                    }).unwrap());
+                }
+                IndexEvent::V3SettingsUpdated { .. } => {
+                    trace!(slot, "settings updated");
+                }
+                IndexEvent::Rollback { to_slot } => {
+                    trace!(to_slot, "rollback");
+                }
             }
         }
-        if !valid_pools.is_empty() {
-            OrderValidity::Valid { pools: valid_pools }
-        } else if !errors.is_empty() {
-            OrderValidity::Invalid {
-                reason: OrderInvalidReason::PoolErrors(errors),
-            }
-        } else {
-            OrderValidity::Invalid {
-                reason: OrderInvalidReason::NoPools,
+
+        if !updates.is_empty() {
+            if let Err(err) = self.write_updates(&updates) {
+                warn!("could not log updates: {err:#}");
             }
         }
     }
 
-    fn write_updates<T: Serialize>(&self, updates: &[T]) -> Result<()> {
+    fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
         let date = chrono::Utc::now()
             .date_naive()
             .format("%Y-%m-%d")
@@ -274,23 +164,75 @@ impl Scooper {
     }
 }
 
+fn pool_summary(pool: &SundaeV3Pool) -> PoolSummary {
+    let (asset_a, asset_b) = pool.pool_datum.assets.clone();
+    let amount_a = pool.value.get(&asset_a);
+    let amount_b = pool.value.get(&asset_b);
+    PoolSummary {
+        assets: (
+            SingletonValue::new(asset_a, amount_a),
+            SingletonValue::new(asset_b, amount_b),
+        ),
+        liquidity: pool.pool_datum.circulating_lp.clone(),
+        protocol_fees: pool.pool_datum.protocol_fees.clone(),
+    }
+}
+
+fn validate_order(
+    order: &SundaeV3Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV3Pool>>,
+) -> OrderValidity {
+    if let Err(err) = validate_order_value(&order.datum, &order.value) {
+        return OrderValidity::Invalid {
+            reason: OrderInvalidReason::ValueError(err),
+        };
+    }
+    let mut valid_pools = vec![];
+    let mut errors = BTreeMap::new();
+    for (ident, pool) in pools {
+        if let Err(error) = validate_order_for_pool(&order.datum, &pool.pool_datum) {
+            if matches!(error, PoolError::IdentMismatch) {
+                continue;
+            }
+            errors.insert(ident.clone(), error);
+        } else if let Err(error) =
+            estimate_whether_in_range(&order.datum, &pool.pool_datum, &pool.value)
+        {
+            errors.insert(ident.clone(), error);
+        } else {
+            valid_pools.push(ident.clone());
+        }
+    }
+    if !valid_pools.is_empty() {
+        OrderValidity::Valid { pools: valid_pools }
+    } else if !errors.is_empty() {
+        OrderValidity::Invalid {
+            reason: OrderInvalidReason::PoolErrors(errors),
+        }
+    } else {
+        OrderValidity::Invalid {
+            reason: OrderInvalidReason::NoPools,
+        }
+    }
+}
+
 #[derive(Serialize)]
-struct PoolState<'a> {
+struct PoolState {
     slot: u64,
-    pool: &'a Ident,
-    action: PoolAction<'a>,
+    pool: Ident,
+    action: PoolAction,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type")]
-enum PoolAction<'a> {
+enum PoolAction {
     Added {
         #[serde(flatten)]
-        summary: &'a PoolSummary,
+        summary: PoolSummary,
     },
     Changed {
         #[serde(flatten)]
-        summary: &'a PoolSummary,
+        summary: PoolSummary,
     },
     Removed,
 }
@@ -303,23 +245,22 @@ struct PoolSummary {
 }
 
 #[derive(Serialize)]
-struct OrderState<'a> {
+struct OrderState {
     slot: u64,
-    order: &'a TransactionInput,
-    action: OrderAction<'a>,
+    order: TransactionInput,
+    action: OrderAction,
 }
 #[derive(Serialize)]
 #[serde(tag = "type")]
-enum OrderAction<'a> {
+enum OrderAction {
     Added {
         #[serde(flatten)]
-        valid: &'a OrderValidity,
+        valid: OrderValidity,
     },
-    Changed {
-        #[serde(flatten)]
-        valid: &'a OrderValidity,
+    Scooped {
+        pool_id: Ident,
     },
-    Removed,
+    Cancelled,
 }
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "validity")]

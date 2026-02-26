@@ -70,8 +70,12 @@ async fn main() -> Result<()> {
         shutdown.child_token(),
     ));
     let scooper_handle = tokio::spawn(
-        Scooper::new(config.log.trace_directory.clone(), broadcaster.subscribe())?
-            .run(shutdown.child_token()),
+        Scooper::new(
+            config.log.trace_directory.clone(),
+            event_tx.subscribe(),
+            v3_state.clone(),
+        )?
+        .run(shutdown.child_token()),
     );
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
