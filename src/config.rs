@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::{
     instrumentation::LogConfig, persistence::PersistenceConfig, server::ServerConfig,
-    sundaev3::SundaeV3Protocol,
+    sundaev3::SundaeV3Protocol, sundaev4::SundaeV4Protocol,
 };
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
@@ -33,7 +33,7 @@ impl AppConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProtocolConfig {
     pub v3: Option<SundaeV3Protocol>,
-    // pub v4: Option<SundaeV4Protocol>,  // added when v4 specs arrive
+    pub v4: Option<SundaeV4Protocol>,
 }
 
 pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> Result<AppConfig> {

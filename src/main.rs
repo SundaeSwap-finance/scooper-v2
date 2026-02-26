@@ -37,6 +37,7 @@ use crate::events::IndexEvent;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
 use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update};
+use crate::sundaev4::{SundaeV4HistoricalState, SundaeV4Indexer};
 
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
@@ -62,10 +63,16 @@ async fn main() -> Result<()> {
         .v3
         .as_ref()
         .map(|_| Arc::new(Mutex::new(SundaeV3HistoricalState::new())));
+    let v4_state = config
+        .protocol
+        .v4
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(SundaeV4HistoricalState::new())));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     let manager_handle = tokio::spawn(manager_loop(
         v3_state.clone(),
+        v4_state.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
         event_tx.clone(),
@@ -104,6 +111,7 @@ async fn main() -> Result<()> {
 
 async fn manager_loop(
     v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
+    v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -115,6 +123,7 @@ async fn manager_loop(
     let mut force_restart = false;
     loop {
         let v3_state = v3_state.clone();
+        let v4_state = v4_state.clone();
         let mut resync_tx = resync_tx.subscribe();
         let config = config.clone();
         let protocol = protocol.clone();
@@ -143,6 +152,22 @@ async fn manager_loop(
 
             indexer
                 .add_index(v3_index, v3_config.starting_point.clone(), force_restart)
+                .await
+                .unwrap();
+        }
+
+        if let (Some(v4_config), Some(v4_state)) = (&protocol.v4, &v4_state) {
+            let mut v4_index = SundaeV4Indexer::new(
+                v4_state.clone(),
+                event_tx.clone(),
+                v4_config.clone(),
+                config::ROLLBACK_LIMIT,
+                persistence.indexer_dao("sundae_v4"),
+            );
+            v4_index.load().await.unwrap();
+
+            indexer
+                .add_index(v4_index, v4_config.starting_point.clone(), force_restart)
                 .await
                 .unwrap();
         }
