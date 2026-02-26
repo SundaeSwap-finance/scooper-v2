@@ -30,6 +30,7 @@ mod persistence;
 mod scooper;
 mod server;
 mod sundaev3;
+mod sundaev4;
 
 use crate::config::ProtocolConfig;
 use crate::events::IndexEvent;
