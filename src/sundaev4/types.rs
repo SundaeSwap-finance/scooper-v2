@@ -299,6 +299,9 @@ pub struct ScriptRefInfo {
     pub hash: ScriptHash,
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub ref_utxo: crate::cardano_types::TransactionInput,
+    /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
+    #[serde(default)]
+    pub script_cbor: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
