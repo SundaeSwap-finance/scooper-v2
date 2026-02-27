@@ -37,6 +37,7 @@ pub struct SundaeV4State {
     pub pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
     pub orders: Vec<Arc<SundaeV4Order>>,
     pub settings: Option<Arc<SundaeV4Settings>>,
+    pub tip_slot: u64,
     datums: DatumLookup,
 }
 
@@ -224,6 +225,7 @@ impl ChainIndex for SundaeV4Indexer {
         let mut events: Vec<IndexEvent> = vec![];
 
         let state = history.update_slot(slot)?;
+        state.tip_slot = info.slot;
 
         for new_datum in self.extract_metadata_datums(&tx) {
             let persisted = PersistedDatum {

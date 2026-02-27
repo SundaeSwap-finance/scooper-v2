@@ -164,26 +164,3 @@ pub async fn evaluate_tx(ogmios_url: &str, cbor: &[u8]) -> Result<serde_json::Va
     Ok(json)
 }
 
-/// Fetch the current chain tip slot from Ogmios.
-pub async fn fetch_tip_slot(ogmios_url: &str) -> Result<u64> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(ogmios_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "queryLedgerState/tip",
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("ogmios tip query failed")?;
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios tip response parse failed")?;
-
-    json["result"]["slot"]
-        .as_u64()
-        .context("missing slot in tip response")
-}

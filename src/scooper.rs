@@ -233,14 +233,7 @@ impl Scooper {
             }
         };
 
-        // Fetch the current chain tip slot for the validity interval
-        let current_slot = match crate::sundaev4::submit::fetch_tip_slot(&exec.ogmios_url).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "failed to fetch tip slot from ogmios");
-                return;
-            }
-        };
+        let current_slot = v4_state.tip_slot;
 
         // Find a matching pool: look for a pool whose assets overlap with the order
         let pool = match self.find_matching_v4_pool(&v4_state.pools, order) {
