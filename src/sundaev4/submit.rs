@@ -1,4 +1,4 @@
-//! Network interactions: submit transactions, fetch protocol parameters.
+//! Network interactions: submit transactions via cardano-submit-api.
 
 use anyhow::{Context, Result, bail};
 
@@ -41,36 +41,3 @@ pub fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
     }
     buf
 }
-
-
-
-/// Evaluate a transaction via Ogmios to get script execution costs and trace output.
-///
-/// Returns the raw JSON response on success, or an error with trace messages on failure.
-pub async fn evaluate_tx(ogmios_url: &str, cbor: &[u8]) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let cbor_hex = hex::encode(cbor);
-    let resp = client
-        .post(ogmios_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "evaluateTransaction",
-            "params": { "transaction": { "cbor": cbor_hex } },
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("ogmios evaluate request failed")?;
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios evaluate response parse failed")?;
-
-    if let Some(err) = json.get("error") {
-        bail!("evaluate failed: {}", serde_json::to_string_pretty(err).unwrap_or_default());
-    }
-
-    Ok(json)
-}
-
