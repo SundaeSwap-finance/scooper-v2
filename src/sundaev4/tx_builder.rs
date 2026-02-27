@@ -23,6 +23,9 @@ use crate::sundaev4::types::*;
 type PallasBytes = pallas_primitives::Bytes;
 type ConwayValue = conway::Value;
 
+use std::collections::BTreeMap;
+use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
+
 /// Per-redeemer ExUnits budget (tx max / 10 so 6 redeemers fit comfortably).
 const EX_MEM: u64 = 14_000_000 / 10;
 const EX_STEPS: u64 = 10_000_000_000 / 10;
@@ -31,9 +34,21 @@ const FULFILLMENT_ADA: u64 = 2_000_000;
 const POOL_MIN_ADA: u64 = 50_000_000;
 const VALIDITY_RANGE: u64 = 60;
 
+/// Result of building a scoop transaction, containing everything needed
+/// for local evaluation and the final signed CBOR.
+pub struct BuildResult {
+    pub cbor: Vec<u8>,
+    pub tx_hash: Hash<32>,
+    pub tx_hash_hex: String,
+    pub tx_body: conway::PseudoTransactionBody<TransactionOutput>,
+    pub resolved_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
+    pub resolved_ref_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
+    pub redeemers: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)>,
+}
+
 /// Build a signed scoop transaction for 1 pool + 1 order.
 ///
-/// Returns `(signed_tx_cbor, tx_hash_hex)`.
+/// If `ex_units` is `Some`, uses those per-redeemer budgets. Otherwise uses generous defaults.
 pub fn build_scoop_tx(
     pool: &SundaeV4Pool,
     order: &SundaeV4Order,
@@ -43,7 +58,9 @@ pub fn build_scoop_tx(
     language_views: &[u8],
     collateral_utxo: &TransactionInput,
     collateral_value: &crate::cardano_types::Value,
-) -> Result<(Vec<u8>, String)> {
+    ex_units: Option<&[(RedeemersKey, ExUnits)]>,
+    ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
+) -> Result<BuildResult> {
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
     let pk = sk.public_key();
     let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
@@ -287,7 +304,7 @@ pub fn build_scoop_tx(
     let pool_output_value = build_pool_output_value(pool, &new_assets)?;
     let pool_output = TransactionOutput::PostAlonzo(
         pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
-            address: pool_address,
+            address: pool_address.clone(),
             value: pool_output_value,
             datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(pool_datum_pd))),
             script_ref: None,
@@ -331,112 +348,41 @@ pub fn build_scoop_tx(
     let fs_wd_account = reward_account(&exec.module_scripts.fee_split.hash);
     let fair_wd_account = reward_account(&exec.module_scripts.fairness.hash);
 
-    let redeemer_pairs: Vec<(RedeemersKey, RedeemersValue)> = vec![
-        // Vault (pool) spend redeemer
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Spend,
-                index: pool_sorted_idx as u32,
-            },
-            RedeemersValue {
-                data: vault_redeemer.to_plutus(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
-        // Order spend redeemer
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Spend,
-                index: order_sorted_idx as u32,
-            },
-            RedeemersValue {
-                data: order_redeemer.to_plutus(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
-        // Order validator withdrawal
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Reward,
-                index: withdrawal_index(&sorted_withdrawal_accounts, &order_wd_account),
-            },
-            RedeemersValue {
-                data: sorted_withdrawals
-                    .iter()
-                    .find(|(a, _)| *a == order_wd_account)
-                    .unwrap()
-                    .1
-                    .clone(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
-        // CP withdrawal
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Reward,
-                index: withdrawal_index(&sorted_withdrawal_accounts, &cp_wd_account),
-            },
-            RedeemersValue {
-                data: sorted_withdrawals
-                    .iter()
-                    .find(|(a, _)| *a == cp_wd_account)
-                    .unwrap()
-                    .1
-                    .clone(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
-        // FeeSplit withdrawal
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Reward,
-                index: withdrawal_index(&sorted_withdrawal_accounts, &fs_wd_account),
-            },
-            RedeemersValue {
-                data: sorted_withdrawals
-                    .iter()
-                    .find(|(a, _)| *a == fs_wd_account)
-                    .unwrap()
-                    .1
-                    .clone(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
-        // Fairness withdrawal
-        (
-            RedeemersKey {
-                tag: RedeemerTag::Reward,
-                index: withdrawal_index(&sorted_withdrawal_accounts, &fair_wd_account),
-            },
-            RedeemersValue {
-                data: sorted_withdrawals
-                    .iter()
-                    .find(|(a, _)| *a == fair_wd_account)
-                    .unwrap()
-                    .1
-                    .clone(),
-                ex_units: ExUnits {
-                    mem: EX_MEM,
-                    steps: EX_STEPS,
-                },
-            },
-        ),
+    // Helper: look up ExUnits from provided map or use defaults
+    let lookup_eu = |key: &RedeemersKey| -> ExUnits {
+        ex_units
+            .and_then(|eus| eus.iter().find(|(k, _)| k == key).map(|(_, eu)| eu.clone()))
+            .unwrap_or(ExUnits { mem: EX_MEM, steps: EX_STEPS })
+    };
+
+    let vault_key = RedeemersKey { tag: RedeemerTag::Spend, index: pool_sorted_idx as u32 };
+    let order_key = RedeemersKey { tag: RedeemerTag::Spend, index: order_sorted_idx as u32 };
+    let order_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &order_wd_account) };
+    let cp_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &cp_wd_account) };
+    let fs_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fs_wd_account) };
+    let fair_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fair_wd_account) };
+
+    let vault_redeemer_pd = vault_redeemer.to_plutus();
+    let order_redeemer_pd = order_redeemer.to_plutus();
+    let order_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == order_wd_account).unwrap().1.clone();
+    let cp_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == cp_wd_account).unwrap().1.clone();
+    let fs_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fs_wd_account).unwrap().1.clone();
+    let fair_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fair_wd_account).unwrap().1.clone();
+
+    // Collect redeemer info for BuildResult
+    let redeemer_info: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)> = vec![
+        (vault_key.clone(), vault_redeemer_pd.clone(), lookup_eu(&vault_key)),
+        (order_key.clone(), order_redeemer_pd.clone(), lookup_eu(&order_key)),
+        (order_wd_key.clone(), order_wd_data.clone(), lookup_eu(&order_wd_key)),
+        (cp_wd_key.clone(), cp_wd_data.clone(), lookup_eu(&cp_wd_key)),
+        (fs_wd_key.clone(), fs_wd_data.clone(), lookup_eu(&fs_wd_key)),
+        (fair_wd_key.clone(), fair_wd_data.clone(), lookup_eu(&fair_wd_key)),
     ];
+
+    let redeemer_pairs: Vec<(RedeemersKey, RedeemersValue)> = redeemer_info
+        .iter()
+        .map(|(key, data, eu)| (key.clone(), RedeemersValue { data: data.clone(), ex_units: eu.clone() }))
+        .collect();
 
     let redeemers =
         Redeemers::Map(pallas_primitives::NonEmptyKeyValuePairs::Def(redeemer_pairs));
@@ -489,7 +435,7 @@ pub fn build_scoop_tx(
             },
         )),
         total_collateral: Some(TX_FEE * 3 / 2), // 150% of fee
-        reference_inputs: pallas_primitives::NonEmptySet::from_vec(all_ref_inputs),
+        reference_inputs: pallas_primitives::NonEmptySet::from_vec(all_ref_inputs.clone()),
         voting_procedures: None,
         proposal_procedures: None,
         treasury_value: None,
@@ -519,6 +465,65 @@ pub fn build_scoop_tx(
         plutus_v3_script: None,
     };
 
+    let tx_hash_hex = hex::encode(body_hash);
+
+    // Build resolved inputs for the evaluator (before body is consumed)
+    let mut resolved_inputs = BTreeMap::new();
+    // Pool input
+    resolved_inputs.insert(pool.input.clone(), ResolvedTxOut {
+        address: pool_address.to_vec(),
+        value: pool.value.clone(),
+        datum: DatumOption::InlineDatum(pool.pool_datum.clone().to_plutus()),
+        script_ref: None,
+    });
+    // Order input
+    resolved_inputs.insert(order.input.clone(), ResolvedTxOut {
+        address: {
+            // Reconstruct order script address
+            let order_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                ShelleyDelegationPart::Null,
+            );
+            order_addr.to_vec()
+        },
+        value: order.value.clone(),
+        datum: DatumOption::InlineDatum(order.datum.clone().to_plutus()),
+        script_ref: None,
+    });
+
+    // Build resolved reference inputs
+    let mut resolved_ref_inputs = BTreeMap::new();
+    for ref_input_key in all_ref_inputs.iter() {
+        let ref_input_ct = crate::cardano_types::TransactionInput(ref_input_key.clone());
+        if let Some(txo) = ref_utxo_outputs.get(&ref_input_ct) {
+            resolved_ref_inputs.insert(ref_input_ct, ResolvedTxOut {
+                address: txo.address.to_vec(),
+                value: txo.value.clone(),
+                datum: match &txo.datum {
+                    crate::cardano_types::RawDatum::None => DatumOption::None,
+                    crate::cardano_types::RawDatum::Inline(d) => DatumOption::InlineDatum(d.clone()),
+                    crate::cardano_types::RawDatum::Hash(h) => DatumOption::DatumHash(*h),
+                },
+                script_ref: None,
+            });
+        }
+    }
+    // Settings UTxO as a reference input (last in all_ref_inputs)
+    resolved_ref_inputs.insert(settings.input.clone(), ResolvedTxOut {
+        address: {
+            let settings_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
+                ShelleyDelegationPart::Null,
+            );
+            settings_addr.to_vec()
+        },
+        value: crate::cardano_types::Value::default(),
+        datum: DatumOption::InlineDatum(settings.datum.clone().to_plutus()),
+        script_ref: None,
+    });
+
     let tx = conway::PseudoTx {
         transaction_body: body,
         transaction_witness_set: witness_set,
@@ -527,9 +532,16 @@ pub fn build_scoop_tx(
     };
 
     let tx_cbor = minicbor::to_vec(&tx).context("encode tx")?;
-    let tx_hash_hex = hex::encode(body_hash);
 
-    Ok((tx_cbor, tx_hash_hex))
+    Ok(BuildResult {
+        cbor: tx_cbor,
+        tx_hash: body_hash,
+        tx_hash_hex,
+        tx_body: tx.transaction_body,
+        resolved_inputs,
+        resolved_ref_inputs,
+        redeemers: redeemer_info,
+    })
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

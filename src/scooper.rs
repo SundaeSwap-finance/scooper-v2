@@ -237,20 +237,80 @@ impl Scooper {
             }
         };
 
-        match crate::sundaev4::tx_builder::build_scoop_tx(&pool, order, &settings, exec, current_slot, language_views, &collateral_input.0, &collateral_value) {
-            Ok((cbor, hash)) => {
-                info!(tx_hash = %hash, pool = %pool.pool_datum.identifier, "v4 scoop tx built, submitting");
-                match crate::sundaev4::submit::submit_tx(&exec.submit_url, &cbor).await {
-                    Ok(submitted_hash) => {
-                        info!(tx_hash = %submitted_hash, "v4 scoop tx submitted");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, tx_hash = %hash, "v4 scoop tx submit failed");
-                    }
+        // Two-pass build→evaluate→rebuild→submit
+        // First pass: build with generous default ExUnits
+        let first_pass = match crate::sundaev4::tx_builder::build_scoop_tx(
+            &pool, order, &settings, exec, current_slot, language_views,
+            &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, order = %order.input, "v4 scoop tx build failed (first pass)");
+                return;
+            }
+        };
+
+        // Evaluate locally to get realistic ExUnits
+        let script_store = match crate::sundaev4::evaluator::ScriptStore::from_config(&[]) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to build script store");
+                return;
+            }
+        };
+
+        let eval_result = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+            &first_pass.tx_body,
+            &first_pass.redeemers,
+            &first_pass.resolved_inputs,
+            &first_pass.resolved_ref_inputs,
+            &script_store,
+            &exec.plutus_v3_cost_model,
+            first_pass.tx_hash,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "v4 local evaluation failed, submitting first pass");
+                // Fall back to submitting the first pass with generous ExUnits
+                match crate::sundaev4::submit::submit_tx(&exec.submit_url, &first_pass.cbor).await {
+                    Ok(h) => info!(tx_hash = %h, "v4 scoop tx submitted (unevaluated)"),
+                    Err(e) => warn!(error = %e, "v4 scoop tx submit failed"),
                 }
+                return;
+            }
+        };
+
+        // Apply 20% safety margin to evaluated budgets
+        let padded_budgets: Vec<_> = eval_result.budgets.iter().map(|(k, eu)| {
+            (k.clone(), pallas_primitives::ExUnits {
+                mem: eu.mem * 6 / 5,
+                steps: eu.steps * 6 / 5,
+            })
+        }).collect();
+
+        // Second pass: rebuild with realistic ExUnits
+        let final_tx = match crate::sundaev4::tx_builder::build_scoop_tx(
+            &pool, order, &settings, exec, current_slot, language_views,
+            &collateral_input.0, &collateral_value, Some(&padded_budgets), &v4_state.ref_utxo_outputs,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, order = %order.input, "v4 scoop tx build failed (second pass)");
+                return;
+            }
+        };
+
+        info!(
+            tx_hash = %final_tx.tx_hash_hex,
+            pool = %pool.pool_datum.identifier,
+            "v4 scoop tx built with evaluated ExUnits, submitting"
+        );
+        match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
+            Ok(submitted_hash) => {
+                info!(tx_hash = %submitted_hash, "v4 scoop tx submitted");
             }
             Err(e) => {
-                warn!(error = %e, order = %order.input, "v4 scoop tx build failed");
+                warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "v4 scoop tx submit failed");
             }
         }
     }
