@@ -274,10 +274,10 @@ pub struct FairnessOperateEntry {
 pub struct ScooperExecution {
     pub scooper_secret_key: String,
     pub submit_url: String,
-    pub ogmios_url: String,
     pub fee: (u64, u64),
     pub protocol_share: (u64, u64),
     pub module_scripts: ModuleScripts,
+    pub plutus_v3_cost_model: Vec<i64>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

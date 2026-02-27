@@ -189,18 +189,10 @@ impl Scooper {
         exec: &ScooperExecution,
         _event_slot: u64,
     ) {
-        // Lazily fetch and cache language views (PlutusV3 cost model) from Ogmios
         if self.v4_language_views.is_none() {
-            match crate::sundaev4::submit::fetch_language_views(&exec.ogmios_url).await {
-                Ok(lv) => {
-                    info!("fetched PlutusV3 cost model ({} bytes)", lv.len());
-                    self.v4_language_views = Some(lv);
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to fetch cost models from ogmios");
-                    return;
-                }
-            }
+            let lv = crate::sundaev4::submit::encode_language_views(&exec.plutus_v3_cost_model);
+            info!("computed PlutusV3 language views ({} bytes) from config cost model ({} params)", lv.len(), exec.plutus_v3_cost_model.len());
+            self.v4_language_views = Some(lv);
         }
         let language_views = self.v4_language_views.as_ref().unwrap();
 
@@ -247,17 +239,7 @@ impl Scooper {
 
         match crate::sundaev4::tx_builder::build_scoop_tx(&pool, order, &settings, exec, current_slot, language_views, &collateral_input.0, &collateral_value) {
             Ok((cbor, hash)) => {
-                info!(tx_hash = %hash, pool = %pool.pool_datum.identifier, "v4 scoop tx built, evaluating");
-                // Evaluate first to get trace output on failure
-                match crate::sundaev4::submit::evaluate_tx(&exec.ogmios_url, &cbor).await {
-                    Ok(eval) => {
-                        info!(tx_hash = %hash, result = %eval, "v4 scoop tx evaluated OK, submitting");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, tx_hash = %hash, "v4 scoop tx evaluation failed (traces above)");
-                        return;
-                    }
-                }
+                info!(tx_hash = %hash, pool = %pool.pool_datum.identifier, "v4 scoop tx built, submitting");
                 match crate::sundaev4::submit::submit_tx(&exec.submit_url, &cbor).await {
                     Ok(submitted_hash) => {
                         info!(tx_hash = %submitted_hash, "v4 scoop tx submitted");

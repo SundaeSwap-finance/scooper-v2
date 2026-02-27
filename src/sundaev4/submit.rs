@@ -27,42 +27,8 @@ pub async fn submit_tx(url: &str, cbor: &[u8]) -> Result<String> {
     }
 }
 
-/// Fetch PlutusV3 cost model parameters from an Ogmios endpoint and encode
-/// them as CBOR "language views" for use in the `script_data_hash` computation.
-///
-/// Returns the CBOR-encoded `{2: [param1, param2, ...]}` bytes.
-pub async fn fetch_language_views(ogmios_url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(ogmios_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "queryLedgerState/protocolParameters",
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("ogmios request failed")?;
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios response parse failed")?;
-
-    let params = json["result"]["plutusCostModels"]["plutus:v3"]
-        .as_array()
-        .context("missing plutus:v3 cost model in protocol parameters")?;
-
-    let v3_params: Vec<i64> = params
-        .iter()
-        .map(|v| v.as_i64().context("cost model param not i64"))
-        .collect::<Result<_>>()?;
-
-    Ok(encode_language_views(&v3_params))
-}
-
 /// Encode PlutusV3 cost model parameters as CBOR language views: `{2: [params...]}`.
-fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
+pub fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut enc = minicbor::Encoder::new(&mut buf);
