@@ -6,11 +6,11 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde::Serialize;
 use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::{
     bigint::BigInt,
@@ -20,11 +20,15 @@ use crate::{
         Ident, PoolError, SingletonValue, SundaeV3HistoricalState, SundaeV3Order, SundaeV3Pool,
         ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value,
     },
+    sundaev4::{SundaeV4HistoricalState, SundaeV4Order, SundaeV4Pool, ScooperExecution},
 };
 
 pub struct Scooper {
     event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
     v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
+    v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
+    v4_execution: Option<ScooperExecution>,
+    v4_language_views: Option<Vec<u8>>,
     trace_directory: Option<PathBuf>,
 }
 
@@ -33,6 +37,8 @@ impl Scooper {
         trace_directory: Option<PathBuf>,
         event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
         v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
+        v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
+        v4_execution: Option<ScooperExecution>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -40,6 +46,9 @@ impl Scooper {
         Ok(Self {
             event_rx,
             v3_state,
+            v4_state,
+            v4_execution,
+            v4_language_views: None,
             trace_directory,
         })
     }
@@ -66,7 +75,7 @@ impl Scooper {
         }
     }
 
-    async fn process_events(&self, slot: u64, events: Vec<IndexEvent>) {
+    async fn process_events(&mut self, slot: u64, events: Vec<IndexEvent>) {
         let mut updates: Vec<serde_json::Value> = vec![];
 
         // Get current v3 state snapshot for order validation (if v3 is configured)
@@ -148,6 +157,9 @@ impl Scooper {
                 }
                 IndexEvent::V4OrderCreated { order } => {
                     trace!(slot, order = %order.input, "v4 order created");
+                    if let Some(exec) = self.v4_execution.clone() {
+                        self.try_scoop_v4_order(&order, &exec, slot).await;
+                    }
                 }
                 IndexEvent::V4OrderScooped { order, pool_id } => {
                     trace!(slot, order = %order.input, pool = %pool_id, "v4 order scooped");
@@ -169,6 +181,129 @@ impl Scooper {
                 warn!("could not log updates: {err:#}");
             }
         }
+    }
+
+    async fn try_scoop_v4_order(
+        &mut self,
+        order: &Arc<SundaeV4Order>,
+        exec: &ScooperExecution,
+        _event_slot: u64,
+    ) {
+        // Lazily fetch and cache language views (PlutusV3 cost model) from Ogmios
+        if self.v4_language_views.is_none() {
+            match crate::sundaev4::submit::fetch_language_views(&exec.ogmios_url).await {
+                Ok(lv) => {
+                    info!("fetched PlutusV3 cost model ({} bytes)", lv.len());
+                    self.v4_language_views = Some(lv);
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to fetch cost models from ogmios");
+                    return;
+                }
+            }
+        }
+        let language_views = self.v4_language_views.as_ref().unwrap();
+
+        // Fetch a collateral UTxO from the scooper's wallet (always fresh — may change between txs)
+        let scooper_addr = match derive_scooper_address(&exec.scooper_secret_key) {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!(error = %e, "failed to derive scooper address");
+                return;
+            }
+        };
+        let collateral = match crate::sundaev4::submit::fetch_collateral_utxo(&exec.ogmios_url, &scooper_addr).await {
+            Ok(col) => col,
+            Err(e) => {
+                warn!(error = %e, "failed to fetch collateral UTxO");
+                return;
+            }
+        };
+
+        let v4_state = match &self.v4_state {
+            Some(s) => s.lock().await.latest().into_owned(),
+            None => return,
+        };
+
+        let settings = match &v4_state.settings {
+            Some(s) => s.clone(),
+            None => {
+                warn!("v4 scoop: no settings available");
+                return;
+            }
+        };
+
+        // Fetch the current chain tip slot for the validity interval
+        let current_slot = match crate::sundaev4::submit::fetch_tip_slot(&exec.ogmios_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to fetch tip slot from ogmios");
+                return;
+            }
+        };
+
+        // Find a matching pool: look for a pool whose assets overlap with the order
+        let pool = match self.find_matching_v4_pool(&v4_state.pools, order) {
+            Some(p) => p,
+            None => {
+                trace!(order = %order.input, "v4 scoop: no matching pool found");
+                return;
+            }
+        };
+
+        match crate::sundaev4::tx_builder::build_scoop_tx(&pool, order, &settings, exec, current_slot, language_views, &collateral.input, &collateral.value) {
+            Ok((cbor, hash)) => {
+                info!(tx_hash = %hash, pool = %pool.pool_datum.identifier, "v4 scoop tx built, evaluating");
+                // Evaluate first to get trace output on failure
+                match crate::sundaev4::submit::evaluate_tx(&exec.ogmios_url, &cbor).await {
+                    Ok(eval) => {
+                        info!(tx_hash = %hash, result = %eval, "v4 scoop tx evaluated OK, submitting");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, tx_hash = %hash, "v4 scoop tx evaluation failed (traces above)");
+                        return;
+                    }
+                }
+                match crate::sundaev4::submit::submit_tx(&exec.submit_url, &cbor).await {
+                    Ok(submitted_hash) => {
+                        info!(tx_hash = %submitted_hash, "v4 scoop tx submitted");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, tx_hash = %hash, "v4 scoop tx submit failed");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, order = %order.input, "v4 scoop tx build failed");
+            }
+        }
+    }
+
+    fn find_matching_v4_pool(
+        &self,
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+        order: &SundaeV4Order,
+    ) -> Option<Arc<SundaeV4Pool>> {
+        // Match via structured constraints: the order specifies a pool_ident
+        if let crate::sundaev4::OrderConstraints::Structured { steps } = &order.datum.constraints {
+            if let Some(step) = steps.first() {
+                return pools.get(&step.pool_ident).cloned();
+            }
+        }
+
+        // For simple constraints: find a pool where the order's non-ADA token matches a pool asset
+        for (_ident, pool) in pools {
+            for (asset, _) in &pool.pool_datum.assets {
+                if asset.policy.is_empty() && asset.token.is_empty() {
+                    continue;
+                }
+                let amount = order.value.get(asset);
+                if amount > BigInt::from(0) {
+                    return Some(pool.clone());
+                }
+            }
+        }
+        None
     }
 
     fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
@@ -304,4 +439,30 @@ enum OrderInvalidReason {
     NoPools,
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
+}
+
+/// Derive the scooper's bech32 enterprise address from the secret key hex.
+fn derive_scooper_address(secret_key_hex: &str) -> anyhow::Result<String> {
+    use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+    use pallas_crypto::hash::Hasher;
+    use pallas_crypto::key::ed25519::SecretKey;
+    use pallas_primitives::Hash;
+
+    let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
+    let sk = SecretKey::from(arr);
+    let pk = sk.public_key();
+    let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
+    let keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
+
+    let shelley = ShelleyAddress::new(
+        Network::Testnet,
+        ShelleyPaymentPart::Key(keyhash),
+        ShelleyDelegationPart::Null,
+    );
+    let addr = pallas_addresses::Address::from(shelley);
+    addr.to_bech32()
+        .map_err(|e| anyhow::anyhow!("failed to encode address as bech32: {e}"))
 }

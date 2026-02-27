@@ -105,8 +105,8 @@ impl AsPlutus for AssetClass {
     }
 
     fn to_plutus(self) -> PlutusData {
-        let tuple = (self.policy, self.token);
-        tuple.to_plutus()
+        // Aiken encodes AssetClass as Constr(0, [policy, token])
+        plutus_parser::create_constr(0, vec![self.policy.to_plutus(), self.token.to_plutus()])
     }
 }
 
@@ -308,6 +308,17 @@ impl serde::ser::Serialize for TransactionInput {
 impl fmt::Display for TransactionInput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}#{}", hex::encode(self.0.transaction_id), self.0.index)
+    }
+}
+
+impl FromStr for TransactionInput {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (tx_hex, idx_str) = s.split_once('#').ok_or_else(|| anyhow::anyhow!("missing '#'"))?;
+        let tx_bytes = hex::decode(tx_hex)?;
+        let tx_id: [u8; 32] = tx_bytes.try_into().map_err(|_| anyhow::anyhow!("tx hash not 32 bytes"))?;
+        let index: u64 = idx_str.parse()?;
+        Ok(TransactionInput::new(tx_id.into(), index))
     }
 }
 

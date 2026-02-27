@@ -1,4 +1,5 @@
 {
+  "log": { "level": "trace" },
   "protocol": {
     "v4": {
       "vault-script-hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
@@ -8,7 +9,44 @@
       "settings-script-hash": "03260b316dfc3e3744cb08463b1d71d4490608943b422586171890a0",
       "settings-nft": "35a98a94fb936993259612746054dd4b80c6fe33f3163780db1a9e1e.",
       "pool-nft-policy": "02b729d2f6cc1f19704e1e0ab2b9c060a001fb0f4224dd777c527464",
-      "starting-point": "origin"
+      "starting-point": "origin",
+      "execution": {
+        "scooper-secret-key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "submit-url": "http://localhost:8090/api/submit/tx",
+        "ogmios-url": "http://localhost:1337",
+        "fee": [3, 1000],
+        "protocol-share": [1, 2],
+        "module-scripts": {
+          "constant-product": {
+            "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
+            "ref-utxo": "c19d64d4218564d22c6243a6f48e0fd434f3b9f90ef6ec04e2a8296c09f802a7#0"
+          },
+          "fee-split": {
+            "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
+            "ref-utxo": "2f90435a7f8537c80289ba4d94becbac6ad3403d35666c417b31a5a4780afa37#0"
+          },
+          "fairness": {
+            "hash": "9346d056441dd9c58ddd91c1128c0fd71c4653e226555883d0112192",
+            "ref-utxo": "9ceae06802ce1b1686e0e6e315a750c4ba3d18a7c2a8a91ac99c1b8194dee0c3#0"
+          },
+          "vault": {
+            "hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
+            "ref-utxo": "2b5e811df944d4ef6365e1a1115494d58e91d38015ae7f287989e85500638c17#0"
+          },
+          "order": {
+            "hash": "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39",
+            "ref-utxo": "bfefb8c2f88f8148ebf05e90663ac52cbc060ea7b8d9abac2d138bb20b965fec#0"
+          },
+          "pool-mint": {
+            "hash": "02b729d2f6cc1f19704e1e0ab2b9c060a001fb0f4224dd777c527464",
+            "ref-utxo": "a0759f3ff32d25560f9f28ff642c0894783f4952e41a7c5b97605d3f86ee9cac#0"
+          },
+          "settings": {
+            "hash": "03260b316dfc3e3744cb08463b1d71d4490608943b422586171890a0",
+            "ref-utxo": "3dd15e8cc4bbcbb7f4b612bb001eacc2d8ca7d1118961ca4b82d430444ed1391#0"
+          }
+        }
+      }
     }
   },
   "acropolis": {

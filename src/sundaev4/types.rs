@@ -183,12 +183,122 @@ pub struct PoolConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Shared Plutus types (must be structs, not tuples, to match Aiken's Constr encoding)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Aiken `Rational { num, den }` — encoded as Constr(0, [num, den]).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Rational {
+    pub num: BigInt,
+    pub den: BigInt,
+}
+
+/// Aiken `OutputReference { transaction_id, output_index }` — encoded as Constr(0, [txid, idx]).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OutputRef {
+    pub transaction_id: Vec<u8>,
+    pub output_index: u64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Module config types
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantProductConfig {
-    pub fee: (BigInt, BigInt),
+    pub fee: Rational,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Withdrawal redeemer types
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OrderValidatorRedeemer {
+    pub entries: Vec<OrderValidatorEntry>,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OrderValidatorEntry {
+    pub input_index: u64,
+    pub output_index: u64,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum ConstantProductRedeemer {
+    Create,
+    Operate { entries: Vec<CPOperateEntry> },
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct CPOperateEntry {
+    pub vault_oref: OutputRef,
+    pub config: ConstantProductConfig,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct FeeSplitConfig {
+    pub protocol_share: Rational,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum FeeSplitRedeemer {
+    Create { config: FeeSplitConfig },
+    Operate { entries: Vec<FSOperateEntry> },
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct FSOperateEntry {
+    pub vault_oref: OutputRef,
+    pub config: FeeSplitConfig,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum FairnessRedeemer {
+    Create,
+    Operate { entries: Vec<FairnessOperateEntry> },
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct FairnessOperateEntry {
+    pub pool_ident: Ident,
+    pub scooper: Vec<u8>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Execution configuration
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ScooperExecution {
+    pub scooper_secret_key: String,
+    pub submit_url: String,
+    pub ogmios_url: String,
+    pub fee: (u64, u64),
+    pub protocol_share: (u64, u64),
+    pub module_scripts: ModuleScripts,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ModuleScripts {
+    pub constant_product: ScriptRefInfo,
+    pub fee_split: ScriptRefInfo,
+    pub fairness: ScriptRefInfo,
+    pub vault: ScriptRefInfo,
+    pub order: ScriptRefInfo,
+    pub pool_mint: ScriptRefInfo,
+    pub settings: ScriptRefInfo,
+}
+
+#[serde_with::serde_as]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ScriptRefInfo {
+    pub hash: ScriptHash,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    pub ref_utxo: crate::cardano_types::TransactionInput,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -239,6 +349,7 @@ pub struct SundaeV4Protocol {
     pub pool_nft_policy: ScriptHash,
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub starting_point: Point,
+    pub execution: Option<ScooperExecution>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -435,12 +546,13 @@ mod tests {
 
     #[test]
     fn test_decode_v4_constant_product_config() {
-        // ConstantProductConfig { fee: (3, 1000) }
-        let bytes = hex::decode("d8799f9f031903e8ffff").unwrap();
+        // ConstantProductConfig { fee: Rational { num: 3, den: 1000 } }
+        // Constr(0, [Constr(0, [3, 1000])]) — both struct and Rational are Constr-encoded
+        let bytes = hex::decode("d8799fd8799f031903e8ffff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
         let config: ConstantProductConfig = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(config.fee.0, BigInt::from(3));
-        assert_eq!(config.fee.1, BigInt::from(1000));
+        assert_eq!(config.fee.num, BigInt::from(3));
+        assert_eq!(config.fee.den, BigInt::from(1000));
     }
 
     #[test]
@@ -462,5 +574,50 @@ mod tests {
         assert_eq!(state.total_lp, pool.total_lp);
         assert_eq!(state.circulating_lp, pool.circulating_lp);
         assert_eq!(state.preminted_lp, pool.preminted_lp);
+    }
+
+    #[test]
+    fn test_vault_redeemer_encoding() {
+        use crate::cardano_types::AssetClass;
+
+        // Build a minimal VaultRedeemer::Action and check its CBOR hex
+        let state = VaultState {
+            assets: vec![
+                (AssetClass { policy: vec![0xaa], token: vec![0xbb] }, BigInt::from(100)),
+            ],
+            total_lp: BigInt::from(1000),
+            circulating_lp: BigInt::from(500),
+            preminted_lp: BigInt::from(500),
+        };
+        let entry = TranscriptEntry {
+            state_after: state.clone(),
+            fee_budget: BigInt::from(1),
+            operation_tag: BigInt::from(100),
+            operation_data: VaultState {
+                assets: vec![],
+                total_lp: BigInt::from(0),
+                circulating_lp: BigInt::from(0),
+                preminted_lp: BigInt::from(0),
+            }.to_plutus(),
+        };
+        let redeemer = VaultRedeemer::Action {
+            tag: BigInt::from(100),
+            transcript: vec![entry],
+            pool_input_index: BigInt::from(0u64),
+            pool_output_index: BigInt::from(0u64),
+        };
+        let pd = redeemer.to_plutus();
+        let cbor = minicbor::to_vec(&pd).unwrap();
+        let hex = hex::encode(&cbor);
+        eprintln!("VaultRedeemer CBOR hex: {hex}");
+
+        // Verify structure: should be Constr(3, [tag, transcript, pool_input_idx, pool_output_idx])
+        if let PlutusData::Constr(c) = &pd {
+            assert_eq!(c.tag, 124, "Action should be variant 3 → tag 124");
+            let fields = c.fields.clone().to_vec();
+            assert_eq!(fields.len(), 4, "Action should have 4 fields");
+        } else {
+            panic!("expected Constr");
+        }
     }
 }

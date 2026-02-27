@@ -81,11 +81,18 @@ async fn main() -> Result<()> {
         persistence.clone(),
         shutdown.child_token(),
     ));
+    let v4_execution = config
+        .protocol
+        .v4
+        .as_ref()
+        .and_then(|v4| v4.execution.clone());
     let scooper_handle = tokio::spawn(
         Scooper::new(
             config.log.trace_directory.clone(),
             event_tx.subscribe(),
             v3_state.clone(),
+            v4_state.clone(),
+            v4_execution,
         )?
         .run(shutdown.child_token()),
     );
