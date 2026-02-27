@@ -83,8 +83,25 @@ impl serde::Serialize for AssetClass {
 
 impl AsPlutus for AssetClass {
     fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
-        let (policy, token) = AsPlutus::from_plutus(data)?;
-        Ok(AssetClass { policy, token })
+        match &data {
+            PlutusData::Constr(_) => {
+                // Aiken encodes AssetClass as Constr(0, [policy, token])
+                let (variant, fields) = plutus_parser::parse_constr(data)?;
+                if variant != 0 {
+                    return Err(plutus_parser::DecodeError::unexpected_variant(variant));
+                }
+                let [policy_data, token_data] =
+                    plutus_parser::parse_variant(variant, fields)?;
+                let policy = AsPlutus::from_plutus(policy_data)?;
+                let token = AsPlutus::from_plutus(token_data)?;
+                Ok(AssetClass { policy, token })
+            }
+            _ => {
+                // Legacy encoding: Array([policy, token])
+                let (policy, token) = AsPlutus::from_plutus(data)?;
+                Ok(AssetClass { policy, token })
+            }
+        }
     }
 
     fn to_plutus(self) -> PlutusData {

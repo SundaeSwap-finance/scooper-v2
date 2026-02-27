@@ -8,7 +8,7 @@ use serde::Serializer;
 use crate::bigint::BigInt;
 use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::multisig::Multisig;
-use crate::sundaev3::{Destination, Ident};
+use crate::sundaev3::{Ident, PlutusAddress};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Pool / Vault types
@@ -84,6 +84,28 @@ pub enum VaultRedeemer {
 // ──────────────────────────────────────────────────────────────────────────────
 // Order types
 // ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
+pub enum Destination {
+    Fixed(PlutusAddress, Option<PlutusData>),
+    SelfDestination,
+}
+
+impl serde::Serialize for Destination {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Destination::SelfDestination => serializer.serialize_str("self"),
+            Destination::Fixed(addr, _datum) => {
+                let mut s = serializer.serialize_struct("Destination", 1)?;
+                s.serialize_field("address", addr)?;
+                s.end()
+            }
+        }
+    }
+}
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OrderDatum {
