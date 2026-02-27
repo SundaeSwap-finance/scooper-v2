@@ -42,7 +42,7 @@ pub fn build_scoop_tx(
     current_slot: u64,
     language_views: &[u8],
     collateral_utxo: &TransactionInput,
-    collateral_value: &serde_json::Value,
+    collateral_value: &crate::cardano_types::Value,
 ) -> Result<(Vec<u8>, String)> {
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
     let pk = sk.public_key();
@@ -722,45 +722,39 @@ fn resolve_destination(dest: &Destination, owner: &crate::multisig::Multisig) ->
     }
 }
 
-/// Build the collateral return output value from Ogmios value JSON, subtracting total_collateral
+/// Build the collateral return output value, subtracting total_collateral
 /// from the ADA portion. Native assets are passed through unchanged.
 fn build_collateral_return_value(
-    ogmios_value: &serde_json::Value,
+    value: &crate::cardano_types::Value,
     total_collateral: u64,
 ) -> Result<ConwayValue> {
+    use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
 
-    let lovelace = ogmios_value["ada"]["lovelace"]
-        .as_u64()
-        .context("missing ada.lovelace in collateral value")?;
+    let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+    let lovelace = value
+        .get(&ada_asset)
+        .clone()
+        .unwrap()
+        .to_u64()
+        .context("ada amount doesn't fit u64")?;
     let return_lovelace = lovelace
         .checked_sub(total_collateral)
         .context("collateral UTxO doesn't have enough ADA")?;
 
-    // Collect native assets from the Ogmios value (keys other than "ada")
-    let obj = ogmios_value
-        .as_object()
-        .context("collateral value not an object")?;
-
     let mut policy_pairs: Vec<(Hash<28>, NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>)> =
         Vec::new();
 
-    for (policy_hex, tokens) in obj {
-        if policy_hex == "ada" {
-            continue;
+    for (policy_bytes, tokens) in &value.0 {
+        if policy_bytes.is_empty() {
+            continue; // skip ADA
         }
-        let policy_bytes = hex::decode(policy_hex).context("invalid policy hex in collateral")?;
         let policy_hash: Hash<28> = Hash::from(policy_bytes.as_slice());
-
-        let token_obj = tokens
-            .as_object()
-            .context("token value not an object")?;
         let mut token_pairs: Vec<(PallasBytes, PositiveCoin)> = Vec::new();
-        for (name_hex, qty) in token_obj {
-            let name_bytes = hex::decode(name_hex).unwrap_or_default();
-            let amount = qty.as_u64().unwrap_or(0);
+        for (name_bytes, qty) in tokens {
+            let amount = qty.clone().unwrap().to_u64().unwrap_or(0);
             if let Ok(pc) = PositiveCoin::try_from(amount) {
-                token_pairs.push((PallasBytes::from(name_bytes), pc));
+                token_pairs.push((PallasBytes::from(name_bytes.clone()), pc));
             }
         }
         if !token_pairs.is_empty() {

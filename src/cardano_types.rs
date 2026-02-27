@@ -17,7 +17,7 @@ use crate::bigint::BigInt;
 use crate::datum_lookup::ScopedDatumLookup;
 pub type Bytes = Vec<u8>;
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -246,7 +246,7 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RawDatum {
     None,
     Inline(PlutusData),
@@ -267,7 +267,7 @@ impl RawDatum {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TransactionOutput {
     pub address: Address,
     pub value: Value,

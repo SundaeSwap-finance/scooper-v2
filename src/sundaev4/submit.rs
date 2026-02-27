@@ -1,7 +1,6 @@
 //! Network interactions: submit transactions, fetch protocol parameters.
 
 use anyhow::{Context, Result, bail};
-use pallas_primitives::TransactionInput;
 
 /// Submit a CBOR-encoded signed transaction.
 ///
@@ -77,62 +76,7 @@ fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
     buf
 }
 
-/// Collateral UTxO with its full value (needed to build collateral return output).
-pub struct CollateralUtxo {
-    pub input: TransactionInput,
-    pub value: serde_json::Value, // raw Ogmios value object
-}
 
-/// Fetch a suitable collateral UTxO (>= 5 ADA) from the scooper's wallet via Ogmios.
-pub async fn fetch_collateral_utxo(
-    ogmios_url: &str,
-    address: &str,
-) -> Result<CollateralUtxo> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(ogmios_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "queryLedgerState/utxo",
-            "params": { "addresses": [address] },
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("ogmios utxo query failed")?;
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios utxo response parse failed")?;
-
-    let utxos = json["result"]
-        .as_array()
-        .context("missing utxo result from ogmios")?;
-
-    for utxo in utxos {
-        let lovelace = utxo["value"]["ada"]["lovelace"].as_u64().unwrap_or(0);
-        if lovelace >= 5_000_000 {
-            let tx_id_hex = utxo["transaction"]["id"]
-                .as_str()
-                .context("missing tx id")?;
-            let tx_id_bytes = hex::decode(tx_id_hex).context("invalid tx id hex")?;
-            let tx_id: [u8; 32] = tx_id_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("tx id not 32 bytes"))?;
-            let index = utxo["index"].as_u64().context("missing utxo index")?;
-            return Ok(CollateralUtxo {
-                input: TransactionInput {
-                    transaction_id: tx_id.into(),
-                    index,
-                },
-                value: utxo["value"].clone(),
-            });
-        }
-    }
-
-    bail!("no suitable collateral UTxO found (need >= 5 ADA)")
-}
 
 /// Evaluate a transaction via Ogmios to get script execution costs and trace output.
 ///

@@ -38,6 +38,8 @@ pub struct SundaeV4State {
     pub orders: Vec<Arc<SundaeV4Order>>,
     pub settings: Option<Arc<SundaeV4Settings>>,
     pub tip_slot: u64,
+    pub wallet_utxos: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::Value>,
+    pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     datums: DatumLookup,
 }
 
@@ -49,6 +51,8 @@ pub struct SundaeV4Indexer {
     protocol: SundaeV4Protocol,
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
+    scooper_address: Option<Address>,
+    ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
 }
 
 impl SundaeV4Indexer {
@@ -59,12 +63,36 @@ impl SundaeV4Indexer {
         rollback_limit: u64,
         dao: Box<dyn IndexerDao>,
     ) -> Self {
+        let scooper_address = protocol.execution.as_ref().and_then(|exec| {
+            derive_scooper_pallas_address(&exec.scooper_secret_key).ok()
+        });
+        let ref_utxo_inputs = protocol
+            .execution
+            .as_ref()
+            .map(|exec| {
+                let scripts = &exec.module_scripts;
+                [
+                    &scripts.vault,
+                    &scripts.order,
+                    &scripts.constant_product,
+                    &scripts.fee_split,
+                    &scripts.fairness,
+                    &scripts.pool_mint,
+                    &scripts.settings,
+                ]
+                .iter()
+                .map(|s| s.ref_utxo.clone())
+                .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         Self {
             state,
             event_tx,
             protocol,
             rollback_limit,
             dao,
+            scooper_address,
+            ref_utxo_inputs,
         }
     }
 
@@ -313,6 +341,26 @@ impl ChainIndex for SundaeV4Indexer {
                     }));
                 }
             }
+
+            // Track wallet UTxOs (scooper's own address)
+            if let Some(scooper_addr) = &self.scooper_address {
+                if address_equals(&address, scooper_addr) {
+                    let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                    let tx_out = cardano_types::convert_txo(output);
+                    trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
+                    state.wallet_utxos.insert(this_input, tx_out.value);
+                }
+            }
+
+            // Track reference UTxO outputs (for ScriptContext building)
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                if self.ref_utxo_inputs.contains(&this_input) {
+                    let tx_out = cardano_types::convert_txo(output);
+                    trace!(slot, utxo = %this_input, "v4: ref UTxO output spotted");
+                    state.ref_utxo_outputs.insert(this_input, tx_out);
+                }
+            }
         }
 
         let mut spent_inputs = tx
@@ -321,6 +369,11 @@ impl ChainIndex for SundaeV4Indexer {
             .map(|i| TransactionInput::new(*i.hash(), i.index()))
             .collect::<Vec<_>>();
         spent_inputs.sort();
+
+        // Remove spent wallet UTxOs
+        for input in &spent_inputs {
+            state.wallet_utxos.remove(input);
+        }
 
         let mut scooped_orders = BTreeSet::new();
         let mut scoop_pool_id: Option<Ident> = None;
@@ -464,6 +517,33 @@ impl ChainIndex for SundaeV4Indexer {
         self.state.lock().await.rollback_to_origin();
         Ok(point.clone())
     }
+}
+
+fn derive_scooper_pallas_address(secret_key_hex: &str) -> Result<Address> {
+    use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+    use pallas_crypto::hash::Hasher;
+    use pallas_crypto::key::ed25519::SecretKey;
+    use pallas_primitives::Hash;
+
+    let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
+    let sk = SecretKey::from(arr);
+    let pk = sk.public_key();
+    let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
+    let keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
+
+    let shelley = ShelleyAddress::new(
+        Network::Testnet,
+        ShelleyPaymentPart::Key(keyhash),
+        ShelleyDelegationPart::Null,
+    );
+    Ok(Address::from(shelley))
+}
+
+fn address_equals(a: &Address, b: &Address) -> bool {
+    a.to_vec() == b.to_vec()
 }
 
 fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {

@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use serde::Serialize;
 use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
@@ -204,22 +204,6 @@ impl Scooper {
         }
         let language_views = self.v4_language_views.as_ref().unwrap();
 
-        // Fetch a collateral UTxO from the scooper's wallet (always fresh — may change between txs)
-        let scooper_addr = match derive_scooper_address(&exec.scooper_secret_key) {
-            Ok(addr) => addr,
-            Err(e) => {
-                warn!(error = %e, "failed to derive scooper address");
-                return;
-            }
-        };
-        let collateral = match crate::sundaev4::submit::fetch_collateral_utxo(&exec.ogmios_url, &scooper_addr).await {
-            Ok(col) => col,
-            Err(e) => {
-                warn!(error = %e, "failed to fetch collateral UTxO");
-                return;
-            }
-        };
-
         let v4_state = match &self.v4_state {
             Some(s) => s.lock().await.latest().into_owned(),
             None => return,
@@ -235,6 +219,23 @@ impl Scooper {
 
         let current_slot = v4_state.tip_slot;
 
+        // Select a collateral UTxO from tracked wallet UTxOs (>= 5 ADA)
+        let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let collateral = v4_state
+            .wallet_utxos
+            .iter()
+            .find(|(_, v)| {
+                use num_traits::ToPrimitive;
+                v.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0) >= 5_000_000
+            });
+        let (collateral_input, collateral_value) = match collateral {
+            Some((input, value)) => (input.clone(), value.clone()),
+            None => {
+                warn!("v4 scoop: no suitable collateral UTxO found (need >= 5 ADA)");
+                return;
+            }
+        };
+
         // Find a matching pool: look for a pool whose assets overlap with the order
         let pool = match self.find_matching_v4_pool(&v4_state.pools, order) {
             Some(p) => p,
@@ -244,7 +245,7 @@ impl Scooper {
             }
         };
 
-        match crate::sundaev4::tx_builder::build_scoop_tx(&pool, order, &settings, exec, current_slot, language_views, &collateral.input, &collateral.value) {
+        match crate::sundaev4::tx_builder::build_scoop_tx(&pool, order, &settings, exec, current_slot, language_views, &collateral_input.0, &collateral_value) {
             Ok((cbor, hash)) => {
                 info!(tx_hash = %hash, pool = %pool.pool_datum.identifier, "v4 scoop tx built, evaluating");
                 // Evaluate first to get trace output on failure
@@ -434,28 +435,3 @@ enum OrderInvalidReason {
     PoolErrors(BTreeMap<Ident, PoolError>),
 }
 
-/// Derive the scooper's bech32 enterprise address from the secret key hex.
-fn derive_scooper_address(secret_key_hex: &str) -> anyhow::Result<String> {
-    use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
-    use pallas_crypto::hash::Hasher;
-    use pallas_crypto::key::ed25519::SecretKey;
-    use pallas_primitives::Hash;
-
-    let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
-    let sk = SecretKey::from(arr);
-    let pk = sk.public_key();
-    let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
-    let keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
-
-    let shelley = ShelleyAddress::new(
-        Network::Testnet,
-        ShelleyPaymentPart::Key(keyhash),
-        ShelleyDelegationPart::Null,
-    );
-    let addr = pallas_addresses::Address::from(shelley);
-    addr.to_bech32()
-        .map_err(|e| anyhow::anyhow!("failed to encode address as bech32: {e}"))
-}
