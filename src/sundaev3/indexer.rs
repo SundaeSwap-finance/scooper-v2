@@ -644,6 +644,7 @@ mod tests {
             tip_slot: None,
             timestamp: 0,
             era: Era::Conway,
+            is_new_era: false,
         };
         for tx in block.txs() {
             let raw_tx = tx.encode();
