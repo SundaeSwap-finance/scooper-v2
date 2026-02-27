@@ -1,0 +1,37 @@
+{
+  "protocol": {
+    "v4": {
+      "vault-script-hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
+      "order-script-hashes": [
+        "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"
+      ],
+      "settings-script-hash": "03260b316dfc3e3744cb08463b1d71d4490608943b422586171890a0",
+      "settings-nft": "35a98a94fb936993259612746054dd4b80c6fe33f3163780db1a9e1e.",
+      "pool-nft-policy": "02b729d2f6cc1f19704e1e0ab2b9c060a001fb0f4224dd777c527464",
+      "starting-point": "origin"
+    }
+  },
+  "acropolis": {
+    "global": {
+      "startup": {
+        "network-name": "devnet"
+      }
+    },
+    "module": {
+      "genesis-bootstrapper": {
+        "byron-genesis-file": "config/devnet/byron-genesis.json",
+        "shelley-genesis-file": "config/devnet/shelley-genesis.json",
+        "first-block-era": "conway",
+        "shelley-start-epoch": 0
+      },
+      "peer-network-interface": {
+        "node-addresses": [
+          "localhost:3001"
+        ]
+      },
+      "mithril-snapshot-fetcher": {
+        "download-max-age": "never"
+      }
+    }
+  }
+}
