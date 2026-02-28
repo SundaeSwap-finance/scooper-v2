@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
-    events::IndexEvent,
+    events::{IndexEvent, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
     persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
     sundaev3::{
@@ -34,6 +34,8 @@ pub struct SundaeV3State {
     pub pools: BTreeMap<Ident, Arc<SundaeV3Pool>>,
     pub orders: Vec<Arc<SundaeV3Order>>,
     pub settings: Option<Arc<SundaeV3Settings>>,
+    pub spent_orders: Vec<SpentOrder<SundaeV3Order>>,
+    pub spent_pools: Vec<SpentPool<SundaeV3Pool>>,
     datums: DatumLookup,
 }
 
@@ -364,6 +366,7 @@ impl ChainIndex for SundaeV3Indexer {
             .collect::<Vec<_>>();
         spent_inputs.sort();
 
+        let tx_id_hex = hex::encode(this_tx_hash);
         let mut scoops = vec![];
         let mut removed_pool_ids: Vec<Ident> = vec![];
 
@@ -373,6 +376,14 @@ impl ChainIndex for SundaeV3Indexer {
                 // not spent
                 return true;
             };
+            // Record spent pool (new_pool filled in later if updated)
+            state.spent_pools.push(SpentPool {
+                id: ident.clone(),
+                old_pool: pool.clone(),
+                new_pool: None,
+                tx_id: tx_id_hex.clone(),
+                slot,
+            });
             match self.parse_redeemer(&tx, spend_index) {
                 Some(WrappedRedeemer(PoolRedeemer::PoolScoop { input_order, .. })) => {
                     // TODO: validate scooper/SSEs
@@ -464,9 +475,16 @@ impl ChainIndex for SundaeV3Indexer {
                         warn!(slot, order = %order.input, spend_index, tx = %tx.hash(), "order had a Scoop redeemer but was not scooped");
                     }
                     if let Some(pool_id) = &scoop_pool_id {
+                        state.spent_orders.push(SpentOrder {
+                            order: order.clone(),
+                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone() },
+                            tx_id: tx_id_hex.clone(),
+                            slot,
+                        });
                         events.push(IndexEvent::V3OrderScooped {
                             order: order.clone(),
                             pool_id: pool_id.clone(),
+                            tx_id: tx_id_hex.clone(),
                         });
                     }
                 }
@@ -474,8 +492,15 @@ impl ChainIndex for SundaeV3Indexer {
                     if scooped_orders.contains(&spend_index) {
                         warn!(slot, order = %order.input, "order did not have a Scoop redeemer, but was scooped");
                     }
+                    state.spent_orders.push(SpentOrder {
+                        order: order.clone(),
+                        reason: SpentOrderReason::Cancelled,
+                        tx_id: tx_id_hex.clone(),
+                        slot,
+                    });
                     events.push(IndexEvent::V3OrderCancelled {
                         order: order.clone(),
+                        tx_id: tx_id_hex.clone(),
                     });
                 }
                 None => warn!(slot, order = %order.input, "order spent without a valid redeemer!"),
@@ -486,7 +511,7 @@ impl ChainIndex for SundaeV3Indexer {
 
         // Emit pool removed events for pools spent without scoop/manage
         for id in removed_pool_ids {
-            events.push(IndexEvent::V3PoolRemoved { id });
+            events.push(IndexEvent::V3PoolRemoved { id, tx_id: tx_id_hex.clone() });
         }
 
         // remove old settings too
@@ -499,10 +524,18 @@ impl ChainIndex for SundaeV3Indexer {
 
         // And apply the new state — emit events for new/updated pools
         for (id, pool) in &updated_pools {
+            // Fill in new_pool on matching spent pool entries
+            for sp in state.spent_pools.iter_mut().rev() {
+                if sp.id == *id && sp.slot == slot && sp.new_pool.is_none() {
+                    sp.new_pool = Some(pool.clone());
+                    break;
+                }
+            }
             if state.pools.contains_key(id) {
                 events.push(IndexEvent::V3PoolUpdated {
                     id: id.clone(),
                     pool: pool.clone(),
+                    tx_id: tx_id_hex.clone(),
                 });
             } else {
                 events.push(IndexEvent::V3PoolCreated {
@@ -540,6 +573,11 @@ impl ChainIndex for SundaeV3Indexer {
         if !events.is_empty() {
             let _ = self.event_tx.send((slot, events));
         }
+
+        // Prune spent collections older than rollback window
+        let cutoff = slot.saturating_sub(self.rollback_limit);
+        state.spent_orders.retain(|s| s.slot >= cutoff);
+        state.spent_pools.retain(|s| s.slot >= cutoff);
 
         if history.prune_history(self.rollback_limit)
             && let Some(min_height) = info.number.checked_sub(self.rollback_limit)

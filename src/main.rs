@@ -108,6 +108,7 @@ async fn main() -> Result<()> {
         v4_fee,
         v4_module_preimages,
         resync_tx,
+        event_tx.clone(),
         shutdown.child_token(),
     ));
 

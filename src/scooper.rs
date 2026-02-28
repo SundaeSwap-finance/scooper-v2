@@ -213,7 +213,7 @@ impl Scooper {
                         action: PoolAction::Added { summary },
                     }).unwrap());
                 }
-                IndexEvent::V3PoolUpdated { id, pool } => {
+                IndexEvent::V3PoolUpdated { id, pool, .. } => {
                     let summary = pool_summary(&pool);
                     trace!(slot, pool = %id, "pool updated");
                     updates.push(serde_json::to_value(PoolState {
@@ -222,7 +222,7 @@ impl Scooper {
                         action: PoolAction::Changed { summary },
                     }).unwrap());
                 }
-                IndexEvent::V3PoolRemoved { id } => {
+                IndexEvent::V3PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "pool removed");
                     updates.push(serde_json::to_value(PoolState {
                         slot,
@@ -245,7 +245,7 @@ impl Scooper {
                         action: OrderAction::Added { valid: validity },
                     }).unwrap());
                 }
-                IndexEvent::V3OrderScooped { order, pool_id } => {
+                IndexEvent::V3OrderScooped { order, pool_id, .. } => {
                     trace!(slot, order = %order.input, pool = %pool_id, "order scooped");
                     updates.push(serde_json::to_value(OrderState {
                         slot,
@@ -253,7 +253,7 @@ impl Scooper {
                         action: OrderAction::Scooped { pool_id },
                     }).unwrap());
                 }
-                IndexEvent::V3OrderCancelled { order } => {
+                IndexEvent::V3OrderCancelled { order, .. } => {
                     trace!(slot, order = %order.input, "order cancelled");
                     updates.push(serde_json::to_value(OrderState {
                         slot,
@@ -267,7 +267,7 @@ impl Scooper {
                 IndexEvent::V4PoolCreated { id, .. } => {
                     trace!(slot, pool = %id, "v4 pool created");
                 }
-                IndexEvent::V4PoolUpdated { id, pool } => {
+                IndexEvent::V4PoolUpdated { id, pool, .. } => {
                     trace!(slot, pool = %id, "v4 pool updated");
                     // Check if this update settles one of our in-flight txs
                     if let Some(tx_hash) = self.v4_chain_tracker.find_settled_tx(&id, &pool.input) {
@@ -279,7 +279,7 @@ impl Scooper {
                         self.v4_chain_tracker.discard_chain(&id);
                     }
                 }
-                IndexEvent::V4PoolRemoved { id } => {
+                IndexEvent::V4PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "v4 pool removed");
                     self.v4_chain_tracker.discard_chain(&id);
                 }
@@ -287,10 +287,10 @@ impl Scooper {
                     trace!(slot, order = %order.input, "v4 order created");
                     // No immediate action — batch cycle picks it up
                 }
-                IndexEvent::V4OrderScooped { order, pool_id } => {
+                IndexEvent::V4OrderScooped { order, pool_id, .. } => {
                     trace!(slot, order = %order.input, pool = %pool_id, "v4 order scooped");
                 }
-                IndexEvent::V4OrderCancelled { order } => {
+                IndexEvent::V4OrderCancelled { order, .. } => {
                     trace!(slot, order = %order.input, "v4 order cancelled");
                 }
                 IndexEvent::V4SettingsUpdated { .. } => {

@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
-    events::IndexEvent,
+    events::{IndexEvent, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
     persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
     sundaev3::Ident,
@@ -37,6 +37,8 @@ pub struct SundaeV4State {
     pub pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
     pub orders: Vec<Arc<SundaeV4Order>>,
     pub settings: Option<Arc<SundaeV4Settings>>,
+    pub spent_orders: Vec<SpentOrder<SundaeV4Order>>,
+    pub spent_pools: Vec<SpentPool<SundaeV4Pool>>,
     pub tip_slot: u64,
     /// The actual network tip slot, as reported by the upstream node.
     /// `None` until the upstream node reports it (Dolos may not always provide this).
@@ -56,6 +58,7 @@ pub struct SundaeV4Indexer {
     dao: Box<dyn IndexerDao>,
     scooper_address: Option<Address>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
+    tip_event_counter: u64,
 }
 
 impl SundaeV4Indexer {
@@ -96,6 +99,7 @@ impl SundaeV4Indexer {
             dao,
             scooper_address,
             ref_utxo_inputs,
+            tip_event_counter: 0,
         }
     }
 
@@ -250,13 +254,19 @@ impl ChainIndex for SundaeV4Indexer {
         if let Some(tip) = info.tip_slot {
             state.network_tip_slot = Some(tip);
         }
-        let _ = self.event_tx.send((
-            info.slot,
-            vec![IndexEvent::TipAdvanced {
-                slot: info.slot,
-                network_tip_slot: info.tip_slot,
-            }],
-        ));
+        // Throttle tip events: every 100 blocks while syncing, every block once synced.
+        self.tip_event_counter += 1;
+        let at_tip = state.network_tip_slot
+            .is_some_and(|net| info.slot + 10 >= net);
+        if at_tip || self.tip_event_counter % 100 == 0 {
+            let _ = self.event_tx.send((
+                info.slot,
+                vec![IndexEvent::TipAdvanced {
+                    slot: info.slot,
+                    network_tip_slot: info.tip_slot,
+                }],
+            ));
+        }
         Ok(())
     }
 
@@ -405,11 +415,21 @@ impl ChainIndex for SundaeV4Indexer {
         // so we can distinguish V4PoolUpdated (scoop) from V4PoolCreated (new).
         let known_pool_idents: BTreeSet<Ident> = state.pools.keys().cloned().collect();
 
+        let tx_id_hex = hex::encode(this_tx_hash);
+
         // Remove spent pools. Track vault redeemer actions.
         state.pools.retain(|ident, pool| {
             let Ok(spend_index) = spent_inputs.binary_search(&pool.input) else {
                 return true;
             };
+            // Record spent pool (new_pool filled in later if updated)
+            state.spent_pools.push(SpentPool {
+                id: ident.clone(),
+                old_pool: pool.clone(),
+                new_pool: None,
+                tx_id: tx_id_hex.clone(),
+                slot,
+            });
             match self.parse_redeemer::<VaultRedeemer>(&tx, spend_index) {
                 Some(VaultRedeemer::Action { .. }) => {
                     // Pool was scooped — we track the pool ident for order event attribution
@@ -438,15 +458,29 @@ impl ChainIndex for SundaeV4Indexer {
                 Some(OrderRedeemer::Scoop { .. }) => {
                     scooped_orders.insert(spend_index);
                     if let Some(pool_id) = &scoop_pool_id {
+                        state.spent_orders.push(SpentOrder {
+                            order: order.clone(),
+                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone() },
+                            tx_id: tx_id_hex.clone(),
+                            slot,
+                        });
                         events.push(IndexEvent::V4OrderScooped {
                             order: order.clone(),
                             pool_id: pool_id.clone(),
+                            tx_id: tx_id_hex.clone(),
                         });
                     }
                 }
                 Some(OrderRedeemer::Cancel) => {
+                    state.spent_orders.push(SpentOrder {
+                        order: order.clone(),
+                        reason: SpentOrderReason::Cancelled,
+                        tx_id: tx_id_hex.clone(),
+                        slot,
+                    });
                     events.push(IndexEvent::V4OrderCancelled {
                         order: order.clone(),
+                        tx_id: tx_id_hex.clone(),
                     });
                 }
                 None => {
@@ -459,7 +493,7 @@ impl ChainIndex for SundaeV4Indexer {
 
         // Emit pool removed events
         for id in removed_pool_ids {
-            events.push(IndexEvent::V4PoolRemoved { id });
+            events.push(IndexEvent::V4PoolRemoved { id, tx_id: tx_id_hex.clone() });
         }
 
         // Remove old settings if spent
@@ -474,10 +508,18 @@ impl ChainIndex for SundaeV4Indexer {
         // Use known_pool_idents (captured before retain) so that scoops
         // (which remove then re-add the pool) emit Updated, not Created.
         for (id, pool) in &updated_pools {
+            // Fill in new_pool on matching spent pool entries
+            for sp in state.spent_pools.iter_mut().rev() {
+                if sp.id == *id && sp.slot == slot && sp.new_pool.is_none() {
+                    sp.new_pool = Some(pool.clone());
+                    break;
+                }
+            }
             if known_pool_idents.contains(id) {
                 events.push(IndexEvent::V4PoolUpdated {
                     id: id.clone(),
                     pool: pool.clone(),
+                    tx_id: tx_id_hex.clone(),
                 });
             } else {
                 events.push(IndexEvent::V4PoolCreated {
@@ -510,6 +552,11 @@ impl ChainIndex for SundaeV4Indexer {
         if !events.is_empty() {
             let _ = self.event_tx.send((slot, events));
         }
+
+        // Prune spent collections older than rollback window
+        let cutoff = slot.saturating_sub(self.rollback_limit);
+        state.spent_orders.retain(|s| s.slot >= cutoff);
+        state.spent_pools.retain(|s| s.slot >= cutoff);
 
         if history.prune_history(self.rollback_limit)
             && let Some(min_height) = info.number.checked_sub(self.rollback_limit)
