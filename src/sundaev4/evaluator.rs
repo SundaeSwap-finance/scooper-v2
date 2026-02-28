@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
+use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutput};
 use pallas_primitives::{ExUnits, Hash, PlutusData};
 use tracing::{debug, warn};
@@ -21,25 +22,58 @@ pub struct ScriptStore {
 }
 
 impl ScriptStore {
-    /// Build a ScriptStore from hex-encoded CBOR-wrapped scripts in config.
+    /// Build a ScriptStore from reference UTxO outputs.
     ///
-    /// Each script is double-wrapped: the hex decodes to a CBOR bytestring
-    /// that contains FLAT-encoded UPLC.
-    pub fn from_config(scripts: &[(Hash<28>, &str)]) -> Result<Self> {
+    /// Extracts PlutusV3 scripts from `script_ref` fields, computes their
+    /// script hashes, and CBOR-unwraps to get FLAT-encoded UPLC bytes.
+    ///
+    /// Pallas decodes the outer CBOR bytestring of `PlutusScript`, but Cardano
+    /// scripts are double-wrapped: `bytes(bytes(FLAT))`. So `as_ref()` gives us
+    /// the inner CBOR bytestring (used for hashing), and we unwrap once more to
+    /// get the raw FLAT bytes for the evaluator.
+    pub fn from_ref_utxos(
+        ref_utxo_outputs: &BTreeMap<cardano_types::TransactionInput, cardano_types::TransactionOutput>,
+    ) -> Result<Self> {
         let mut store = BTreeMap::new();
-        for (hash, hex_cbor) in scripts {
-            let cbor_bytes = hex::decode(hex_cbor)
-                .with_context(|| format!("invalid hex for script {}", hex::encode(hash)))?;
-            // CBOR unwrap: the outer layer is a CBOR bytestring wrapping FLAT bytes
-            let flat_bytes: Vec<u8> = minicbor::decode(&cbor_bytes)
-                .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
-            store.insert(*hash, flat_bytes);
+        for (_input, txo) in ref_utxo_outputs {
+            if let Some(cardano_types::ScriptRef::PlutusV3(script)) = &txo.script_ref {
+                let script_cbor: &[u8] = script.as_ref();
+                // PlutusV3 script hash = blake2b_224(0x03 || script_cbor)
+                let mut preimage = Vec::with_capacity(1 + script_cbor.len());
+                preimage.push(0x03);
+                preimage.extend_from_slice(script_cbor);
+                let hash: Hash<28> = Hasher::<224>::hash(&preimage);
+                // CBOR unwrap: handles both definite and indefinite-length bytestrings
+                let flat_bytes = cbor_unwrap_bytes(script_cbor)
+                    .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
+                debug!(script = %hex::encode(hash), cbor_len = script_cbor.len(), flat_len = flat_bytes.len(), "loaded script into store from ref UTxO");
+                store.insert(hash, flat_bytes);
+            }
         }
         Ok(ScriptStore { scripts: store })
     }
 
     pub fn get(&self, hash: &Hash<28>) -> Option<&[u8]> {
         self.scripts.get(hash).map(|v| v.as_slice())
+    }
+}
+
+/// Unwrap a CBOR bytestring, handling both definite and indefinite-length encoding.
+///
+/// Large Cardano scripts are often encoded as indefinite-length (chunked) CBOR
+/// bytestrings which `minicbor::decode::<Vec<u8>>` doesn't handle.
+fn cbor_unwrap_bytes(data: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = minicbor::Decoder::new(data);
+    match decoder.datatype()? {
+        minicbor::data::Type::Bytes => Ok(decoder.bytes()?.to_vec()),
+        minicbor::data::Type::BytesIndef => {
+            let mut result = Vec::new();
+            for chunk in decoder.bytes_iter()? {
+                result.extend_from_slice(chunk?);
+            }
+            Ok(result)
+        }
+        t => bail!("expected CBOR bytes, got {:?}", t),
     }
 }
 

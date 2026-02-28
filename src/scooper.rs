@@ -251,10 +251,10 @@ impl Scooper {
         };
 
         // Evaluate locally to get realistic ExUnits
-        let script_store = match crate::sundaev4::evaluator::ScriptStore::from_config(&[]) {
+        let script_store = match crate::sundaev4::evaluator::ScriptStore::from_ref_utxos(&v4_state.ref_utxo_outputs) {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "failed to build script store");
+                warn!(error = %e, "failed to build script store from ref UTxOs");
                 return;
             }
         };
@@ -270,12 +270,7 @@ impl Scooper {
         ) {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "v4 local evaluation failed, submitting first pass");
-                // Fall back to submitting the first pass with generous ExUnits
-                match crate::sundaev4::submit::submit_tx(&exec.submit_url, &first_pass.cbor).await {
-                    Ok(h) => info!(tx_hash = %h, "v4 scoop tx submitted (unevaluated)"),
-                    Err(e) => warn!(error = %e, "v4 scoop tx submit failed"),
-                }
+                warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "v4 local evaluation failed, not submitting (would risk collateral)");
                 return;
             }
         };
