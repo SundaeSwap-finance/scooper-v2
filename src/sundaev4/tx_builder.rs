@@ -1,6 +1,4 @@
 //! Builds a V4 scoop transaction using pallas 0.34 primitives.
-//!
-//! MVP: 1 constant-product pool, 1 swap order, devnet only.
 
 use anyhow::{Context, Result, bail};
 use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
@@ -17,6 +15,7 @@ use plutus_parser::AsPlutus;
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::{Credential, PlutusAddress, Referenced};
+use crate::sundaev4::batch::Batch;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::*;
 
@@ -30,13 +29,11 @@ use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 const EX_MEM: u64 = 14_000_000 / 10;
 const EX_STEPS: u64 = 10_000_000_000 / 10;
 const TX_FEE: u64 = 2_000_000;
-const FULFILLMENT_ADA: u64 = 2_000_000;
 const POOL_MIN_ADA: u64 = 50_000_000;
 const VALIDITY_RANGE: u64 = 60;
 
-/// Result of building a scoop transaction, containing everything needed
-/// for local evaluation and the final signed CBOR.
-pub struct BuildResult {
+/// Result of building a batch scoop transaction, with predicted pool UTxO for chaining.
+pub struct BatchBuildResult {
     pub cbor: Vec<u8>,
     pub tx_hash: Hash<32>,
     pub tx_hash_hex: String,
@@ -44,14 +41,19 @@ pub struct BuildResult {
     pub resolved_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
     pub resolved_ref_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
     pub redeemers: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)>,
+    /// Predicted pool UTxO after this tx settles: (input_ref, updated_pool)
+    pub predicted_pool: (crate::cardano_types::TransactionInput, SundaeV4Pool),
+    /// The TTL used for this transaction
+    pub ttl: u64,
 }
 
-/// Build a signed scoop transaction for 1 pool + 1 order.
+/// Build a signed scoop transaction for 1 pool + N orders (a Batch).
 ///
-/// If `ex_units` is `Some`, uses those per-redeemer budgets. Otherwise uses generous defaults.
-pub fn build_scoop_tx(
-    pool: &SundaeV4Pool,
-    order: &SundaeV4Order,
+/// Handles multiple inputs, N fulfillment outputs, cumulative transcript
+/// entries, and per-order redeemers. Returns a `BatchBuildResult` with the
+/// predicted pool UTxO for transaction chaining.
+pub fn build_batch_scoop_tx(
+    batch: &Batch,
     settings: &SundaeV4Settings,
     exec: &ScooperExecution,
     current_slot: u64,
@@ -60,70 +62,85 @@ pub fn build_scoop_tx(
     collateral_value: &crate::cardano_types::Value,
     ex_units: Option<&[(RedeemersKey, ExUnits)]>,
     ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
-) -> Result<BuildResult> {
+) -> Result<BatchBuildResult> {
+    let pool = &batch.pool;
+    let swaps = &batch.swaps;
+    let n_orders = swaps.len();
+    if n_orders == 0 {
+        bail!("batch has no swaps");
+    }
+
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
     let pk = sk.public_key();
     let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
     let scooper_keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
 
-    // ── Step 1: Compute swap ────────────────────────────────────────────────
+    // ── Step 1: Build per-order transcript entries ─────────────────────────
+    //
+    // Each order gets its own transcript entry (matching the reference impl).
+    // - state_after.assets: cumulative reserves after this order
+    // - state_after.total_lp: unchanged from initial (except last entry)
+    // - fee_budget: per-order CP headroom from intermediate reserves
+    //
+    // Protocol LP is computed once from the total fee budget across all
+    // orders and applied only to the last entry.
 
-    let (input_idx, output_idx) = detect_swap_direction(order, &pool.pool_datum)?;
-    let reserve_in = &pool.pool_datum.assets[input_idx].1;
-    let reserve_out = &pool.pool_datum.assets[output_idx].1;
+    let initial_total_lp = pool.pool_datum.total_lp.clone();
+    let mut running_assets = pool.pool_datum.assets.clone();
+    let mut total_fee_budget = BigInt::from(0);
 
-    // dx = amount of offered asset in the order UTxO
-    let offered_asset = &pool.pool_datum.assets[input_idx].0;
-    let dx = order.value.get(offered_asset);
-    if dx <= BigInt::from(0) {
-        bail!("order has no amount of the offered asset");
+    let void_vault_state = VaultState {
+        assets: vec![],
+        total_lp: BigInt::from(0),
+        circulating_lp: BigInt::from(0),
+        preminted_lp: BigInt::from(0),
+    };
+
+    let mut transcript_entries: Vec<TranscriptEntry> = Vec::new();
+
+    for swap in swaps {
+        let prev_a = running_assets[0].1.clone();
+        let prev_b = running_assets[1].1.clone();
+
+        running_assets[swap.input_idx].1 = &running_assets[swap.input_idx].1 + &swap.dx;
+        running_assets[swap.output_idx].1 = &running_assets[swap.output_idx].1 - &swap.dy;
+
+        let fee_budget = swap_math::cp_fee_budget(
+            &prev_a, &prev_b,
+            &running_assets[0].1, &running_assets[1].1,
+            &initial_total_lp,
+        );
+        total_fee_budget = &total_fee_budget + &fee_budget;
+
+        transcript_entries.push(TranscriptEntry {
+            state_after: VaultState {
+                assets: running_assets.clone(),
+                total_lp: initial_total_lp.clone(),
+                circulating_lp: pool.pool_datum.circulating_lp.clone(),
+                preminted_lp: pool.pool_datum.preminted_lp.clone(),
+            },
+            fee_budget,
+            operation_tag: BigInt::from(100),
+            operation_data: void_vault_state.clone().to_plutus(),
+        });
     }
 
-    let dy = swap_math::cp_swap_result(
-        reserve_in,
-        reserve_out,
-        &dx,
-        exec.fee.0,
-        exec.fee.1,
-    );
-
-    let a0 = &pool.pool_datum.assets[0].1;
-    let b0 = &pool.pool_datum.assets[1].1;
-    let a1 = if input_idx == 0 { a0 + &dx } else { a0 - &dy };
-    let b1 = if input_idx == 0 { b0 - &dy } else { b0 + &dx };
-    let lp_before = &pool.pool_datum.total_lp;
-
-    let fee_budget = swap_math::cp_fee_budget(a0, b0, &a1, &b1, lp_before);
+    // Apply protocol LP to last entry only
     let protocol_lp = swap_math::compute_protocol_lp(
-        &fee_budget,
-        exec.protocol_share.0,
-        exec.protocol_share.1,
+        &total_fee_budget, exec.protocol_share.0, exec.protocol_share.1,
     );
+    let final_total_lp = &initial_total_lp + &protocol_lp;
+
+    if let Some(last) = transcript_entries.last_mut() {
+        last.fee_budget = &last.fee_budget - &protocol_lp;
+        last.state_after.total_lp = final_total_lp.clone();
+    }
 
     // ── Step 2: Build updated PoolDatum ─────────────────────────────────────
 
-    let new_assets = pool
-        .pool_datum
-        .assets
-        .iter()
-        .enumerate()
-        .map(|(idx, (ac, _))| {
-            let new_amt = if idx == input_idx {
-                &pool.pool_datum.assets[idx].1 + &dx
-            } else if idx == output_idx {
-                &pool.pool_datum.assets[idx].1 - &dy
-            } else {
-                pool.pool_datum.assets[idx].1.clone()
-            };
-            (ac.clone(), new_amt)
-        })
-        .collect::<Vec<_>>();
-
-    let new_total_lp = lp_before + &protocol_lp;
-
     let updated_pool_datum = PoolDatum {
-        assets: new_assets.clone(),
-        total_lp: new_total_lp.clone(),
+        assets: batch.final_assets.clone(),
+        total_lp: final_total_lp.clone(),
         circulating_lp: pool.pool_datum.circulating_lp.clone(),
         preminted_lp: pool.pool_datum.preminted_lp.clone(),
         identifier: pool.pool_datum.identifier.clone(),
@@ -134,8 +151,12 @@ pub fn build_scoop_tx(
     // ── Step 3: Determine canonical input order ─────────────────────────────
 
     let pool_oref = &pool.input.0;
-    let order_oref = &order.input.0;
-    let mut sorted_inputs = vec![pool_oref.clone(), order_oref.clone()];
+    let mut all_input_orefs: Vec<TransactionInput> = vec![pool_oref.clone()];
+    for swap in swaps {
+        all_input_orefs.push(swap.order.input.0.clone());
+    }
+
+    let mut sorted_inputs = all_input_orefs.clone();
     sorted_inputs.sort_by(|a, b| {
         a.transaction_id
             .cmp(&b.transaction_id)
@@ -146,59 +167,65 @@ pub fn build_scoop_tx(
         .iter()
         .position(|i| i == pool_oref)
         .unwrap();
-    let order_sorted_idx = sorted_inputs
+
+    // Each order's position in sorted inputs
+    let order_sorted_indices: Vec<usize> = swaps
         .iter()
-        .position(|i| i == order_oref)
-        .unwrap();
+        .map(|swap| {
+            sorted_inputs
+                .iter()
+                .position(|i| i == &swap.order.input.0)
+                .unwrap()
+        })
+        .collect();
+
+    // Filtered order indices: position among order-script inputs only
+    // (excluding pool input). The on-chain OrderValidator expects these.
+    let mut order_orefs_sorted: Vec<TransactionInput> = swaps
+        .iter()
+        .map(|s| s.order.input.0.clone())
+        .collect();
+    order_orefs_sorted.sort_by(|a, b| {
+        a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
+    });
+
+    // For each swap (in batch order), find its position in the filtered
+    // order-only sorted list
+    let order_filtered_indices: Vec<u64> = swaps
+        .iter()
+        .map(|swap| {
+            order_orefs_sorted
+                .iter()
+                .position(|o| o == &swap.order.input.0)
+                .unwrap() as u64
+        })
+        .collect();
 
     // ── Step 4: Build redeemers ─────────────────────────────────────────────
 
-    let void_vault_state = VaultState {
-        assets: vec![],
-        total_lp: BigInt::from(0),
-        circulating_lp: BigInt::from(0),
-        preminted_lp: BigInt::from(0),
-    };
-
-    let state_after = VaultState {
-        assets: new_assets.clone(),
-        total_lp: new_total_lp.clone(),
-        circulating_lp: pool.pool_datum.circulating_lp.clone(),
-        preminted_lp: pool.pool_datum.preminted_lp.clone(),
-    };
-
-    let transcript_entry = TranscriptEntry {
-        state_after,
-        fee_budget: &fee_budget - &protocol_lp,
-        operation_tag: BigInt::from(100),
-        operation_data: void_vault_state.to_plutus(),
-    };
-
     let vault_redeemer = VaultRedeemer::Action {
         tag: BigInt::from(100),
-        transcript: vec![transcript_entry],
+        transcript: transcript_entries,
         pool_input_index: BigInt::from(pool_sorted_idx as u64),
         pool_output_index: BigInt::from(0u64),
     };
 
-    let order_redeemer = OrderRedeemer::Scoop {
-        own_input_index: order_sorted_idx as u64,
-    };
-
-    // Withdrawal redeemers
     let pool_oref_plutus = OutputRef {
         transaction_id: pool_oref.transaction_id.to_vec(),
         output_index: pool_oref.index,
     };
 
-    // input_index is the index into the *filtered* list of order-script inputs
-    // (not the full sorted tx inputs). With 1 order, this is always 0.
-    let order_filtered_idx = 0u64;
+    // N OrderValidator entries: each maps filtered_input_idx → output_idx
+    // Pool output is index 0, fulfillment outputs are 1..N
+    let order_validator_entries: Vec<OrderValidatorEntry> = (0..n_orders)
+        .map(|i| OrderValidatorEntry {
+            input_index: order_filtered_indices[i],
+            output_index: (1 + i) as u64,
+        })
+        .collect();
+
     let order_validator_redeemer = OrderValidatorRedeemer {
-        entries: vec![OrderValidatorEntry {
-            input_index: order_filtered_idx,
-            output_index: 1, // pool output is 0, fulfillment is 1
-        }],
+        entries: order_validator_entries,
     };
 
     let cp_redeemer = ConstantProductRedeemer::Operate {
@@ -247,16 +274,13 @@ pub fn build_scoop_tx(
     .map(|s| s.ref_utxo.0.clone())
     .collect();
 
-    // Also include the settings UTxO as a reference input
     let mut all_ref_inputs = ref_inputs;
     all_ref_inputs.push(settings.input.0.clone());
 
     // ── Step 6: Build withdrawal map ────────────────────────────────────────
-    // Withdrawals keyed by reward account (e_network + script_hash)
-    // For V3 scripts on testnet: reward account = 0xf0 + script_hash
 
     fn reward_account(script_hash: &Hash<28>) -> PallasBytes {
-        let mut account = vec![0xf0u8]; // testnet script reward
+        let mut account = vec![0xf0u8];
         account.extend_from_slice(script_hash.as_ref());
         PallasBytes::from(account)
     }
@@ -280,28 +304,22 @@ pub fn build_scoop_tx(
         ),
     ];
 
-    // Sort withdrawals by reward account for canonical ordering
     let mut sorted_withdrawals = withdrawals;
     sorted_withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     // ── Step 7: Build outputs ───────────────────────────────────────────────
 
-    // Pool output: same address, updated datum, adjusted value
-    let pool_address = match &pool.input.0.transaction_id {
-        _ => {
-            // Reconstruct vault address from script hash
-            let vault_addr = ShelleyAddress::new(
-                Network::Testnet,
-                ShelleyPaymentPart::Script(exec.module_scripts.vault.hash),
-                ShelleyDelegationPart::Null,
-            );
-            PallasBytes::from(vault_addr.to_vec())
-        }
+    let pool_address = {
+        let vault_addr = ShelleyAddress::new(
+            Network::Testnet,
+            ShelleyPaymentPart::Script(exec.module_scripts.vault.hash),
+            ShelleyDelegationPart::Null,
+        );
+        PallasBytes::from(vault_addr.to_vec())
     };
 
-    let pool_datum_pd = updated_pool_datum.to_plutus();
-
-    let pool_output_value = build_pool_output_value(pool, &new_assets)?;
+    let pool_datum_pd = updated_pool_datum.clone().to_plutus();
+    let pool_output_value = build_pool_output_value(pool, &batch.final_assets)?;
     let pool_output = TransactionOutput::PostAlonzo(
         pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
             address: pool_address.clone(),
@@ -311,31 +329,39 @@ pub fn build_scoop_tx(
         },
     );
 
-    // Fulfillment output: send dy of output asset to destination.
-    // The ADA for the fulfillment comes from the order's ADA minus the tx fee.
-    let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
-    let output_asset = &pool.pool_datum.assets[output_idx].0;
-    let ada_asset = AssetClass { policy: vec![], token: vec![] };
-    let order_ada = {
-        use num_traits::ToPrimitive;
-        order.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0)
-    };
-    let fulfillment_ada = order_ada.saturating_sub(TX_FEE);
-    let fulfillment_value = build_fulfillment_value(output_asset, &dy, fulfillment_ada)?;
-    let fulfillment_output = TransactionOutput::PostAlonzo(
-        pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
-            address: PallasBytes::from(dest_address),
-            value: fulfillment_value,
-            datum_option: None,
-            script_ref: None,
-        },
-    );
+    let mut outputs = vec![pool_output];
 
-    let outputs = vec![pool_output, fulfillment_output];
+    // Fee split: divide TX_FEE across all orders, last order absorbs remainder
+    let per_order_fee = TX_FEE / n_orders as u64;
+    let last_order_fee = TX_FEE - per_order_fee * (n_orders as u64 - 1);
+
+    // Build fulfillment outputs for each swap
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    for (i, swap) in swaps.iter().enumerate() {
+        let dest_address = resolve_destination(
+            &swap.order.datum.destination,
+            &swap.order.datum.owner,
+        )?;
+        let output_asset = &pool.pool_datum.assets[swap.output_idx].0;
+        let order_ada = {
+            use num_traits::ToPrimitive;
+            swap.order.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0)
+        };
+        let fee = if i == n_orders - 1 { last_order_fee } else { per_order_fee };
+        let fulfillment_ada = order_ada.saturating_sub(fee);
+        let fulfillment_value = build_fulfillment_value(output_asset, &swap.dy, fulfillment_ada)?;
+        outputs.push(TransactionOutput::PostAlonzo(
+            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+                address: PallasBytes::from(dest_address),
+                value: fulfillment_value,
+                datum_option: None,
+                script_ref: None,
+            },
+        ));
+    }
 
     // ── Step 8: Build redeemer map ──────────────────────────────────────────
 
-    // Build withdrawal index map: sorted position in withdrawals
     let sorted_withdrawal_accounts: Vec<PallasBytes> =
         sorted_withdrawals.iter().map(|(a, _)| a.clone()).collect();
 
@@ -348,7 +374,6 @@ pub fn build_scoop_tx(
     let fs_wd_account = reward_account(&exec.module_scripts.fee_split.hash);
     let fair_wd_account = reward_account(&exec.module_scripts.fairness.hash);
 
-    // Helper: look up ExUnits from provided map or use defaults
     let lookup_eu = |key: &RedeemersKey| -> ExUnits {
         ex_units
             .and_then(|eus| eus.iter().find(|(k, _)| k == key).map(|(_, eu)| eu.clone()))
@@ -356,28 +381,37 @@ pub fn build_scoop_tx(
     };
 
     let vault_key = RedeemersKey { tag: RedeemerTag::Spend, index: pool_sorted_idx as u32 };
-    let order_key = RedeemersKey { tag: RedeemerTag::Spend, index: order_sorted_idx as u32 };
+    let vault_redeemer_pd = vault_redeemer.to_plutus();
+
     let order_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &order_wd_account) };
     let cp_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &cp_wd_account) };
     let fs_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fs_wd_account) };
     let fair_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fair_wd_account) };
 
-    let vault_redeemer_pd = vault_redeemer.to_plutus();
-    let order_redeemer_pd = order_redeemer.to_plutus();
     let order_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == order_wd_account).unwrap().1.clone();
     let cp_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == cp_wd_account).unwrap().1.clone();
     let fs_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fs_wd_account).unwrap().1.clone();
     let fair_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fair_wd_account).unwrap().1.clone();
 
-    // Collect redeemer info for BuildResult
-    let redeemer_info: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)> = vec![
-        (vault_key.clone(), vault_redeemer_pd.clone(), lookup_eu(&vault_key)),
-        (order_key.clone(), order_redeemer_pd.clone(), lookup_eu(&order_key)),
-        (order_wd_key.clone(), order_wd_data.clone(), lookup_eu(&order_wd_key)),
-        (cp_wd_key.clone(), cp_wd_data.clone(), lookup_eu(&cp_wd_key)),
-        (fs_wd_key.clone(), fs_wd_data.clone(), lookup_eu(&fs_wd_key)),
-        (fair_wd_key.clone(), fair_wd_data.clone(), lookup_eu(&fair_wd_key)),
+    let mut redeemer_info: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)> = vec![
+        (vault_key.clone(), vault_redeemer_pd, lookup_eu(&vault_key)),
     ];
+
+    // N order spend redeemers
+    for (i, swap) in swaps.iter().enumerate() {
+        let _ = swap;
+        let order_key = RedeemersKey { tag: RedeemerTag::Spend, index: order_sorted_indices[i] as u32 };
+        let order_redeemer = OrderRedeemer::Scoop {
+            own_input_index: order_sorted_indices[i] as u64,
+        };
+        redeemer_info.push((order_key.clone(), order_redeemer.to_plutus(), lookup_eu(&order_key)));
+    }
+
+    // Withdrawal redeemers
+    redeemer_info.push((order_wd_key.clone(), order_wd_data, lookup_eu(&order_wd_key)));
+    redeemer_info.push((cp_wd_key.clone(), cp_wd_data, lookup_eu(&cp_wd_key)));
+    redeemer_info.push((fs_wd_key.clone(), fs_wd_data, lookup_eu(&fs_wd_key)));
+    redeemer_info.push((fair_wd_key.clone(), fair_wd_data, lookup_eu(&fair_wd_key)));
 
     let redeemer_pairs: Vec<(RedeemersKey, RedeemersValue)> = redeemer_info
         .iter()
@@ -390,7 +424,6 @@ pub fn build_scoop_tx(
     // ── Step 9: Compute script_data_hash ────────────────────────────────────
 
     let redeemers_cbor = minicbor::to_vec(&redeemers).context("encode redeemers")?;
-    // No datums in witness set → omit datums from hash entirely (per Alonzo spec)
     let mut hasher = Hasher::<256>::new();
     hasher.input(&redeemers_cbor);
     hasher.input(language_views);
@@ -398,11 +431,13 @@ pub fn build_scoop_tx(
 
     // ── Step 10: Assemble TransactionBody ───────────────────────────────────
 
+    let ttl = current_slot + VALIDITY_RANGE;
+
     let body = conway::PseudoTransactionBody {
         inputs: sorted_inputs.into(),
         outputs,
         fee: TX_FEE,
-        ttl: Some(current_slot + VALIDITY_RANGE),
+        ttl: Some(ttl),
         certificates: None,
         withdrawals: Some(pallas_primitives::NonEmptyKeyValuePairs::Def(
             sorted_withdrawals
@@ -434,7 +469,7 @@ pub fn build_scoop_tx(
                 script_ref: None,
             },
         )),
-        total_collateral: Some(TX_FEE * 3 / 2), // 150% of fee
+        total_collateral: Some(TX_FEE * 3 / 2),
         reference_inputs: pallas_primitives::NonEmptySet::from_vec(all_ref_inputs.clone()),
         voting_procedures: None,
         proposal_procedures: None,
@@ -467,30 +502,29 @@ pub fn build_scoop_tx(
 
     let tx_hash_hex = hex::encode(body_hash);
 
-    // Build resolved inputs for the evaluator (before body is consumed)
+    // Build resolved inputs for the evaluator
     let mut resolved_inputs = BTreeMap::new();
-    // Pool input
     resolved_inputs.insert(pool.input.clone(), ResolvedTxOut {
         address: pool_address.to_vec(),
         value: pool.value.clone(),
         datum: DatumOption::InlineDatum(pool.pool_datum.clone().to_plutus()),
         script_ref: None,
     });
-    // Order input
-    resolved_inputs.insert(order.input.clone(), ResolvedTxOut {
-        address: {
-            // Reconstruct order script address
-            let order_addr = ShelleyAddress::new(
-                Network::Testnet,
-                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
-                ShelleyDelegationPart::Null,
-            );
-            order_addr.to_vec()
-        },
-        value: order.value.clone(),
-        datum: DatumOption::InlineDatum(order.datum.clone().to_plutus()),
-        script_ref: None,
-    });
+    for swap in swaps {
+        resolved_inputs.insert(swap.order.input.clone(), ResolvedTxOut {
+            address: {
+                let order_addr = ShelleyAddress::new(
+                    Network::Testnet,
+                    ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                    ShelleyDelegationPart::Null,
+                );
+                order_addr.to_vec()
+            },
+            value: swap.order.value.clone(),
+            datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
+            script_ref: None,
+        });
+    }
 
     // Build resolved reference inputs
     let mut resolved_ref_inputs = BTreeMap::new();
@@ -509,7 +543,6 @@ pub fn build_scoop_tx(
             });
         }
     }
-    // Settings UTxO as a reference input (last in all_ref_inputs)
     resolved_ref_inputs.insert(settings.input.clone(), ResolvedTxOut {
         address: {
             let settings_addr = ShelleyAddress::new(
@@ -524,6 +557,19 @@ pub fn build_scoop_tx(
         script_ref: None,
     });
 
+    // Build predicted pool UTxO for chaining
+    let predicted_pool_input = crate::cardano_types::TransactionInput::new(body_hash, 0);
+    let mut predicted_pool_value = pool.value.clone();
+    for (asset, new_amount) in &batch.final_assets {
+        predicted_pool_value.insert(asset, new_amount.clone());
+    }
+    let predicted_pool = SundaeV4Pool {
+        input: predicted_pool_input.clone(),
+        value: predicted_pool_value,
+        pool_datum: updated_pool_datum,
+        slot: current_slot,
+    };
+
     let tx = conway::PseudoTx {
         transaction_body: body,
         transaction_witness_set: witness_set,
@@ -533,7 +579,7 @@ pub fn build_scoop_tx(
 
     let tx_cbor = minicbor::to_vec(&tx).context("encode tx")?;
 
-    Ok(BuildResult {
+    Ok(BatchBuildResult {
         cbor: tx_cbor,
         tx_hash: body_hash,
         tx_hash_hex,
@@ -541,6 +587,8 @@ pub fn build_scoop_tx(
         resolved_inputs,
         resolved_ref_inputs,
         redeemers: redeemer_info,
+        predicted_pool: (predicted_pool_input, predicted_pool),
+        ttl,
     })
 }
 
@@ -552,34 +600,6 @@ fn parse_secret_key(hex_str: &str) -> Result<SecretKey> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
     Ok(SecretKey::from(arr))
-}
-
-/// Detect which pool asset the order is offering by checking the order UTxO value.
-fn detect_swap_direction(
-    order: &SundaeV4Order,
-    pool_datum: &PoolDatum,
-) -> Result<(usize, usize)> {
-    for (idx, (asset, _)) in pool_datum.assets.iter().enumerate() {
-        // Skip lovelace — it's always present for min UTxO
-        if asset.policy.is_empty() && asset.token.is_empty() {
-            continue;
-        }
-        let amount = order.value.get(asset);
-        if amount > BigInt::from(0) {
-            let output_idx = if idx == 0 { 1 } else { 0 };
-            return Ok((idx, output_idx));
-        }
-    }
-    // Fallback: if the order has only ADA beyond min-utxo, it's offering ADA (asset 0)
-    let ada = AssetClass {
-        policy: vec![],
-        token: vec![],
-    };
-    let ada_amount = order.value.get(&ada);
-    if ada_amount > BigInt::from(FULFILLMENT_ADA as i64) {
-        return Ok((0, 1));
-    }
-    bail!("cannot determine swap direction from order value")
 }
 
 /// Build the pool output Value (pallas conway::Value) from the pool's existing
