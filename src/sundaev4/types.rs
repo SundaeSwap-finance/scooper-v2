@@ -193,7 +193,8 @@ pub struct Rational {
     pub den: BigInt,
 }
 
-/// Aiken `OutputReference { transaction_id, output_index }` — encoded as Constr(0, [txid, idx]).
+/// Aiken `OutputReference { transaction_id, output_index }`.
+/// In PlutusV3, TxId is de-newtyped so this is Constr(0, [bytes, idx]).
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct OutputRef {
     pub transaction_id: Vec<u8>,
@@ -333,6 +334,7 @@ pub struct SundaeV4Order {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV4Settings {
     pub input: TransactionInput,
+    pub value: crate::cardano_types::Value,
     pub datum: SettingsDatum,
     pub slot: u64,
 }

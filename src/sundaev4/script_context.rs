@@ -209,7 +209,7 @@ fn build_script_info(purpose: &ScriptPurpose) -> PlutusData {
         }
         ScriptPurpose::Rewarding(cred) => {
             let cred_pd = encode_credential(cred);
-            constr(4, vec![cred_pd])
+            constr(2, vec![cred_pd])
         }
     }
 }
@@ -251,7 +251,8 @@ fn constr_tag(variant: u64) -> u64 {
 }
 
 fn encode_output_reference(oref: &OutputReference) -> PlutusData {
-    let tx_id = constr(0, vec![PlutusData::BoundedBytes(oref.tx_hash.to_vec().into())]);
+    // PlutusV3: TxId is de-newtyped, so OutputReference = Constr(0, [bytes, int])
+    let tx_id = PlutusData::BoundedBytes(oref.tx_hash.to_vec().into());
     let index = pd_int(oref.index as i64);
     constr(0, vec![tx_id, index])
 }
@@ -565,12 +566,12 @@ fn encode_redeemer_purpose(
                 let sorted_accounts: Vec<_> = withdrawals.iter().map(|(a, _)| a.clone()).collect();
                 if let Some(account) = sorted_accounts.get(key.index as usize) {
                     let cred = encode_reward_account_credential(account);
-                    constr(4, vec![cred]) // Rewarding
+                    constr(2, vec![cred]) // Rewarding
                 } else {
-                    constr(4, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
+                    constr(2, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
                 }
             } else {
-                constr(4, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
+                constr(2, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
             }
         }
         RedeemerTag::Mint => {
