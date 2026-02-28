@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SundaeSwap Scooper Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-dim: #8b90a0;
+    --accent: #6c5ce7;
+    --green: #00b894;
+    --red: #e17055;
+    --yellow: #fdcb6e;
+    --blue: #74b9ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .conn-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .conn-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+  }
+  .conn-dot.connected { background: var(--green); }
+
+  .sync-bar-container {
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .sync-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .sync-bar {
+    height: 6px;
+    background: var(--surface2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .sync-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.5s ease;
+    width: 0%;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+  }
+  .tab {
+    padding: 8px 20px;
+    cursor: pointer;
+    color: var(--text-dim);
+    border-bottom: 2px solid transparent;
+    font-size: 13px;
+    transition: color 0.2s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .content { padding: 16px 20px; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .section-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 16px 0 8px;
+  }
+  .section-title:first-child { margin-top: 0; }
+
+  .stats {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    min-width: 120px;
+  }
+  .stat-card .label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .stat-card .value {
+    font-size: 20px;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-green { background: rgba(0,184,148,0.15); color: var(--green); }
+  .badge-red { background: rgba(225,112,85,0.15); color: var(--red); }
+  .badge-yellow { background: rgba(253,203,110,0.15); color: var(--yellow); }
+  .badge-blue { background: rgba(116,185,255,0.15); color: var(--blue); }
+
+  .event-log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  .event-entry {
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+  }
+  .event-entry:last-child { border-bottom: none; }
+  .event-time { color: var(--text-dim); flex-shrink: 0; }
+  .event-type { color: var(--accent); flex-shrink: 0; min-width: 140px; }
+  .event-detail { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .empty-state {
+    text-align: center;
+    padding: 32px;
+    color: var(--text-dim);
+  }
+  .not-configured {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SundaeSwap Scooper</h1>
+  <div class="conn-status">
+    <div class="conn-dot" id="connDot"></div>
+    <span id="connLabel">Connecting...</span>
+  </div>
+</header>
+
+<div class="sync-bar-container">
+  <div class="sync-label">
+    <span id="syncSlots">-- / --</span>
+    <span id="syncPct">--%</span>
+  </div>
+  <div class="sync-bar"><div class="sync-fill" id="syncFill"></div></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="v3">V3</div>
+  <div class="tab" data-tab="v4">V4</div>
+  <div class="tab" data-tab="events">Event Log</div>
+</div>
+
+<div class="content">
+  <!-- V3 Tab -->
+  <div class="tab-panel active" id="panel-v3">
+    <div class="stats" id="v3-stats"></div>
+    <div class="section-title">Pools</div>
+    <table id="v3-pools-table">
+      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
+      <tbody id="v3-pools-body"></tbody>
+    </table>
+    <div class="section-title">Orders</div>
+    <table id="v3-orders-table">
+      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Direction</th></tr></thead>
+      <tbody id="v3-orders-body"></tbody>
+    </table>
+    <div class="section-title">Spent Orders</div>
+    <table id="v3-spent-orders-table">
+      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
+      <tbody id="v3-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- V4 Tab -->
+  <div class="tab-panel" id="panel-v4">
+    <div class="stats" id="v4-stats"></div>
+    <div class="section-title">Pools</div>
+    <table id="v4-pools-table">
+      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
+      <tbody id="v4-pools-body"></tbody>
+    </table>
+    <div class="section-title">Orders</div>
+    <table id="v4-orders-table">
+      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody id="v4-orders-body"></tbody>
+    </table>
+    <div class="section-title">Spent Orders</div>
+    <table id="v4-spent-orders-table">
+      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
+      <tbody id="v4-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Event Log Tab -->
+  <div class="tab-panel" id="panel-events">
+    <div class="event-log" id="eventLog">
+      <div class="empty-state">Waiting for events...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // --- Tab switching ---
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabs.forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
+  // --- Helpers ---
+  function truncate(s, n) {
+    if (!s) return '';
+    return s.length > n ? s.slice(0, n) + '...' : s;
+  }
+
+  function timeStr() {
+    return new Date().toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  function formatAssetClass(ac) {
+    if (!ac) return 'ADA';
+    if (typeof ac === 'string') {
+      if (ac === '' || ac === 'lovelace') return 'ADA';
+      return truncate(ac, 16);
+    }
+    if (ac.policy_id === '' || (ac.policy_id === '0'.repeat(56))) return 'ADA';
+    return truncate(ac.policy_id, 8) + '.' + truncate(ac.asset_name || '', 8);
+  }
+
+  // --- Status / sync bar ---
+  let status = {};
+
+  async function fetchStatus() {
+    try {
+      const res = await fetch('/status');
+      status = await res.json();
+      updateSyncBar();
+      updateStats();
+    } catch (e) { /* ignore */ }
+  }
+
+  function updateSyncBar() {
+    const v4 = status.v4 || {};
+    const slot = v4.tip_slot || 0;
+    const netSlot = v4.network_tip_slot || 0;
+    const pct = v4.sync_pct || 0;
+
+    document.getElementById('syncSlots').textContent =
+      slot.toLocaleString() + ' / ' + (netSlot || '?').toLocaleString();
+    document.getElementById('syncPct').textContent = pct.toFixed(1) + '%';
+    document.getElementById('syncFill').style.width = Math.min(pct, 100) + '%';
+  }
+
+  function updateStats() {
+    const v3s = document.getElementById('v3-stats');
+    const v4s = document.getElementById('v4-stats');
+    const v3 = status.v3 || {};
+    const v4 = status.v4 || {};
+
+    if (v3.configured) {
+      v3s.innerHTML = statCard('Pools', v3.pool_count) + statCard('Orders', v3.order_count);
+    } else {
+      v3s.innerHTML = '<div class="not-configured">V3 indexer not configured</div>';
+    }
+    if (v4.configured) {
+      v4s.innerHTML = statCard('Pools', v4.pool_count) + statCard('Orders', v4.order_count)
+        + statCard('Tip Slot', (v4.tip_slot || 0).toLocaleString());
+    } else {
+      v4s.innerHTML = '<div class="not-configured">V4 indexer not configured</div>';
+    }
+  }
+
+  function statCard(label, value) {
+    return '<div class="stat-card"><div class="label">' + label +
+      '</div><div class="value">' + value + '</div></div>';
+  }
+
+  // --- V3 data loading ---
+  async function loadV3Pools() {
+    try {
+      const res = await fetch('/v3/pools');
+      const text = await res.text();
+      // Returns either JSON map or error string
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+      const tbody = document.getElementById('v3-pools-body');
+      tbody.innerHTML = '';
+      for (const [id, pool] of Object.entries(data)) {
+        const row = document.createElement('tr');
+        const assets = pool.pool_datum || {};
+        row.innerHTML = '<td title="' + id + '">' + truncate(id, 16) + '</td>' +
+          '<td>' + formatPoolAssets(assets) + '</td>' +
+          '<td>' + (assets.circulating_lp || '?') + '</td>';
+        tbody.appendChild(row);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV3Orders() {
+    try {
+      const res = await fetch('/v3/orders');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+      const tbody = document.getElementById('v3-orders-body');
+      tbody.innerHTML = '';
+      for (const [poolId, order] of Object.entries(data)) {
+        const row = document.createElement('tr');
+        const input = order.input || {};
+        const datum = order.datum || {};
+        row.innerHTML = '<td title="' + poolId + '">' + truncate(poolId, 16) + '</td>' +
+          '<td>' + truncate(input.transaction_id || '', 12) + '#' + (input.index || 0) + '</td>' +
+          '<td>' + (datum.direction || '?') + '</td>';
+        tbody.appendChild(row);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // --- V4 data loading ---
+  async function loadV4Pools() {
+    try {
+      const res = await fetch('/v4/pools');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+      const tbody = document.getElementById('v4-pools-body');
+      tbody.innerHTML = '';
+      for (const [id, pool] of Object.entries(data)) {
+        const row = document.createElement('tr');
+        const pd = pool.pool_datum || {};
+        row.innerHTML = '<td title="' + id + '">' + truncate(id, 16) + '</td>' +
+          '<td>' + formatV4PoolAssets(pd) + '</td>' +
+          '<td>' + formatBigint(pd.total_lp) + '</td>';
+        tbody.appendChild(row);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV4Orders() {
+    try {
+      const res = await fetch('/v4/orders');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+
+      // Fetch executability info per pool
+      var execInfo = {}; // orderRef -> { executable: bool, detail: string }
+      var poolIds = Object.keys(data).filter(function(k) { return k !== 'unmatched'; });
+      await Promise.all(poolIds.map(async function(poolId) {
+        try {
+          var pres = await fetch('/v4/pool/' + poolId);
+          var pdata = await pres.json();
+          for (var e of (pdata.executable || [])) {
+            execInfo[e.order] = { executable: true, detail: 'output: ' + e.output_amount };
+          }
+          for (var ne of (pdata.non_executable || [])) {
+            execInfo[ne.order] = { executable: false, detail: ne.reason || '' };
+          }
+        } catch (e) { /* ignore */ }
+      }));
+
+      const tbody = document.getElementById('v4-orders-body');
+      tbody.innerHTML = '';
+      for (const [poolId, orders] of Object.entries(data)) {
+        if (!Array.isArray(orders)) continue;
+        for (const order of orders) {
+          const row = document.createElement('tr');
+          const orderRef = typeof order.input === 'string' ? order.input : '';
+          const info = execInfo[orderRef];
+          var statusBadge, detail;
+          if (!info) {
+            statusBadge = '<span class="badge badge-yellow">unknown</span>';
+            detail = '';
+          } else if (info.executable) {
+            statusBadge = '<span class="badge badge-green">executable</span>';
+            detail = info.detail;
+          } else {
+            statusBadge = '<span class="badge badge-red">blocked</span>';
+            detail = info.detail;
+          }
+          row.innerHTML = '<td title="' + poolId + '">' + truncate(poolId, 16) + '</td>' +
+            '<td title="' + orderRef + '">' + truncate(orderRef, 24) + '</td>' +
+            '<td>' + statusBadge + '</td>' +
+            '<td>' + truncate(detail, 50) + '</td>';
+          tbody.appendChild(row);
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function formatPoolAssets(datum) {
+    if (!datum) return '?';
+    const a = datum.coin_a || datum.asset_a;
+    const b = datum.coin_b || datum.asset_b;
+    return formatAssetClass(a) + ' / ' + formatAssetClass(b);
+  }
+
+  function formatV4PoolAssets(pd) {
+    if (!pd || !pd.assets) return '?';
+    const assets = pd.assets;
+    if (Array.isArray(assets) && assets.length >= 2) {
+      return formatAssetClass(assets[0][0]) + ': ' + formatBigint(assets[0][1]) +
+        ' / ' + formatAssetClass(assets[1][0]) + ': ' + formatBigint(assets[1][1]);
+    }
+    return JSON.stringify(assets).slice(0, 60);
+  }
+
+  function formatBigint(v) {
+    if (v == null) return '?';
+    if (typeof v === 'object' && v.Int) return Number(v.Int).toLocaleString();
+    if (typeof v === 'object' && v.BigInt) return v.BigInt;
+    return String(v);
+  }
+
+  function formatSpentOrderRef(order) {
+    var input = (order || {}).input || '';
+    if (typeof input === 'string') return truncate(input, 24);
+    return truncate(input.transaction_id || '', 12) + '#' + (input.index || 0);
+  }
+
+  function formatSpentReason(reason) {
+    if (reason === 'Cancelled') return { text: 'Cancelled', poolId: '', badge: 'badge-red' };
+    if (reason && reason.Scooped) {
+      var pid = reason.Scooped.pool_id || '';
+      return { text: 'Scooped', poolId: pid, badge: 'badge-green' };
+    }
+    return { text: 'Unknown', poolId: '', badge: 'badge-yellow' };
+  }
+
+  function renderSpentOrderRows(tbody, data) {
+    tbody.innerHTML = '';
+    for (const entry of data) {
+      const row = document.createElement('tr');
+      const r = formatSpentReason(entry.reason);
+      row.innerHTML = '<td>' + formatSpentOrderRef(entry.order) + '</td>' +
+        '<td title="' + r.poolId + '">' + truncate(r.poolId, 16) + '</td>' +
+        '<td><span class="badge ' + r.badge + '">' + r.text + '</span></td>' +
+        '<td title="' + (entry.tx_id || '') + '">' + truncate(entry.tx_id || '', 16) + '</td>' +
+        '<td>' + (entry.slot || '') + '</td>';
+      tbody.appendChild(row);
+    }
+  }
+
+  async function loadV3SpentOrders() {
+    try {
+      const res = await fetch('/v3/spent-orders');
+      const data = await res.json();
+      renderSpentOrderRows(document.getElementById('v3-spent-orders-body'), data);
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV4SpentOrders() {
+    try {
+      const res = await fetch('/v4/spent-orders');
+      const data = await res.json();
+      renderSpentOrderRows(document.getElementById('v4-spent-orders-body'), data);
+    } catch (e) { /* ignore */ }
+  }
+
+  function formatV4OrderDetail(datum) {
+    if (!datum) return '';
+    const details = datum.details || datum.action || '';
+    if (typeof details === 'string') return truncate(details, 40);
+    return truncate(JSON.stringify(details), 40);
+  }
+
+  // --- SSE ---
+  let eventSource = null;
+  const MAX_LOG_ENTRIES = 200;
+
+  function connectSSE() {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource('/events');
+
+    eventSource.onopen = function() {
+      document.getElementById('connDot').classList.add('connected');
+      document.getElementById('connLabel').textContent = 'Connected';
+    };
+    eventSource.onerror = function() {
+      document.getElementById('connDot').classList.remove('connected');
+      document.getElementById('connLabel').textContent = 'Reconnecting...';
+    };
+
+    eventSource.addEventListener('tip', function(e) {
+      try {
+        const d = JSON.parse(e.data);
+        const v4 = status.v4 || {};
+        v4.tip_slot = d.slot;
+        if (d.network_tip_slot) v4.network_tip_slot = d.network_tip_slot;
+        if (v4.network_tip_slot && v4.network_tip_slot > 0) {
+          v4.sync_pct = (d.slot / v4.network_tip_slot) * 100;
+        }
+        status.v4 = v4;
+        updateSyncBar();
+      } catch (ex) { /* ignore */ }
+      addLogEntry('tip', e.data);
+    });
+
+    const refreshEvents = [
+      'v3_pool_created', 'v3_pool_updated', 'v3_pool_removed',
+      'v3_order_created', 'v3_order_scooped', 'v3_order_cancelled',
+      'v4_pool_created', 'v4_pool_updated', 'v4_pool_removed',
+      'v4_order_created', 'v4_order_scooped', 'v4_order_cancelled',
+      'v3_settings_updated', 'v4_settings_updated', 'rollback'
+    ];
+
+    // Track pending refreshes to debounce
+    let refreshTimer = null;
+
+    refreshEvents.forEach(function(evtType) {
+      eventSource.addEventListener(evtType, function(e) {
+        addLogEntry(evtType, e.data);
+        // Debounced refresh
+        if (!refreshTimer) {
+          refreshTimer = setTimeout(function() {
+            refreshTimer = null;
+            fetchStatus();
+            if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
+            if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
+            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
+          }, 500);
+        }
+      });
+    });
+  }
+
+  function addLogEntry(type, dataStr) {
+    const log = document.getElementById('eventLog');
+    // Remove empty state message
+    const empty = log.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    const entry = document.createElement('div');
+    entry.className = 'event-entry';
+
+    let summary = dataStr;
+    try {
+      const d = JSON.parse(dataStr);
+      if (d.id) summary = 'id=' + truncate(d.id, 16);
+      else if (d.order) summary = 'ref=' + truncate(d.order, 20);
+      else if (d.slot) summary = 'slot=' + d.slot;
+      else if (d.to_slot != null) summary = 'to_slot=' + d.to_slot;
+      else summary = truncate(dataStr, 60);
+    } catch { summary = truncate(dataStr, 60); }
+
+    entry.innerHTML =
+      '<span class="event-time">' + timeStr() + '</span>' +
+      '<span class="event-type">' + type + '</span>' +
+      '<span class="event-detail">' + summary + '</span>';
+
+    log.insertBefore(entry, log.firstChild);
+
+    // Trim log
+    while (log.children.length > MAX_LOG_ENTRIES) {
+      log.removeChild(log.lastChild);
+    }
+  }
+
+  // --- Init ---
+  fetchStatus();
+  loadV3Pools();
+  loadV3Orders();
+  loadV3SpentOrders();
+  loadV4Pools();
+  loadV4Orders();
+  loadV4SpentOrders();
+  connectSSE();
+})();
+</script>
+</body>
+</html>
