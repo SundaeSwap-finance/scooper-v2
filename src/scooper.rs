@@ -421,10 +421,10 @@ impl Scooper {
             ) {
                 Some(b) => b,
                 None => {
-                    info!(
+                    trace!(
                         pool = %pool_ident,
                         n_candidates = pool_orders.len(),
-                        "no executable orders for pool (all fail min_received or swap math)"
+                        "no executable orders for pool"
                     );
                     continue;
                 }

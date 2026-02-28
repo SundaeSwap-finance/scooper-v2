@@ -1,5 +1,5 @@
 {
-  "log": { "level": "trace" },
+  "log": { "level": "info" },
   "protocol": {
     "v4": {
       "vault-script-hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
