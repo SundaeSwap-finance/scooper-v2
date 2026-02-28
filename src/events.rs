@@ -53,6 +53,11 @@ pub enum IndexEvent {
     V4SettingsUpdated {
         settings: Arc<SundaeV4Settings>,
     },
+    /// Emitted for every block (including empty ones) with current tip info.
+    TipAdvanced {
+        slot: u64,
+        network_tip_slot: Option<u64>,
+    },
     Rollback {
         to_slot: u64,
     },

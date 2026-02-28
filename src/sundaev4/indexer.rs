@@ -38,6 +38,9 @@ pub struct SundaeV4State {
     pub orders: Vec<Arc<SundaeV4Order>>,
     pub settings: Option<Arc<SundaeV4Settings>>,
     pub tip_slot: u64,
+    /// The actual network tip slot, as reported by the upstream node.
+    /// `None` until the upstream node reports it (Dolos may not always provide this).
+    pub network_tip_slot: Option<u64>,
     pub wallet_utxos: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::Value>,
     pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     datums: DatumLookup,
@@ -240,6 +243,23 @@ impl ChainIndex for SundaeV4Indexer {
         "sundae-v4".to_string()
     }
 
+    async fn handle_block(&mut self, info: &BlockInfo) -> Result<()> {
+        let mut history = self.state.lock().await;
+        let state = history.update_slot(info.slot)?;
+        state.tip_slot = info.slot;
+        if let Some(tip) = info.tip_slot {
+            state.network_tip_slot = Some(tip);
+        }
+        let _ = self.event_tx.send((
+            info.slot,
+            vec![IndexEvent::TipAdvanced {
+                slot: info.slot,
+                network_tip_slot: info.tip_slot,
+            }],
+        ));
+        Ok(())
+    }
+
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
         let slot = info.slot;
         let tx = MultiEraTx::decode(raw_tx)?;
@@ -253,8 +273,9 @@ impl ChainIndex for SundaeV4Indexer {
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
 
+        // handle_block already called update_slot for this slot;
+        // this just retrieves the existing mutable reference.
         let state = history.update_slot(slot)?;
-        state.tip_slot = info.slot;
 
         for new_datum in self.extract_metadata_datums(&tx) {
             let persisted = PersistedDatum {
@@ -380,6 +401,9 @@ impl ChainIndex for SundaeV4Indexer {
         let mut scooped_orders = BTreeSet::new();
         let mut scoop_pool_id: Option<Ident> = None;
         let mut removed_pool_ids: Vec<Ident> = vec![];
+        // Track which pool idents existed before we remove spent UTxOs,
+        // so we can distinguish V4PoolUpdated (scoop) from V4PoolCreated (new).
+        let known_pool_idents: BTreeSet<Ident> = state.pools.keys().cloned().collect();
 
         // Remove spent pools. Track vault redeemer actions.
         state.pools.retain(|ident, pool| {
@@ -446,9 +470,11 @@ impl ChainIndex for SundaeV4Indexer {
             state.settings = None;
         }
 
-        // Apply new pool state — emit events for new/updated pools
+        // Apply new pool state — emit events for new/updated pools.
+        // Use known_pool_idents (captured before retain) so that scoops
+        // (which remove then re-add the pool) emit Updated, not Created.
         for (id, pool) in &updated_pools {
-            if state.pools.contains_key(id) {
+            if known_pool_idents.contains(id) {
                 events.push(IndexEvent::V4PoolUpdated {
                     id: id.clone(),
                     pool: pool.clone(),

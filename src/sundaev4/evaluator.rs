@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutput};
 use pallas_primitives::{ExUnits, Hash, PlutusData};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::cardano_types;
 use crate::sundaev4::script_context::{
@@ -156,7 +156,7 @@ pub fn evaluate_scoop_tx(
                     mem: result.info.consumed_budget.mem.max(0) as u64,
                     steps: result.info.consumed_budget.cpu.max(0) as u64,
                 };
-                debug!(
+                trace!(
                     script = %hex::encode(script_hash),
                     tag = ?key.tag,
                     index = key.index,
