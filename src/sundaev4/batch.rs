@@ -211,7 +211,7 @@ fn try_execute_order(
     _protocol_share: (u64, u64),
 ) -> Option<ResolvedSwap> {
     let Some((input_idx, output_idx)) = detect_swap_direction_from_assets(order, running_assets) else {
-        tracing::debug!(order = %order.input, "swap direction detection failed");
+
         return None;
     };
 
@@ -221,7 +221,7 @@ fn try_execute_order(
     let offered_asset = &running_assets[input_idx].0;
     let dx = order.value.get(offered_asset);
     if !dx.is_positive() {
-        tracing::debug!(order = %order.input, "dx not positive");
+
         return None;
     }
 
@@ -232,7 +232,7 @@ fn try_execute_order(
 
     // Check min_received constraint
     if !satisfies_min_received(order, &running_assets[output_idx].0, &dy) {
-        tracing::debug!(order = %order.input, %dy, "fails min_received");
+
         return None;
     }
 

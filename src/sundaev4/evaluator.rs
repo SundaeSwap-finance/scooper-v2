@@ -46,7 +46,6 @@ impl ScriptStore {
                 // CBOR unwrap: handles both definite and indefinite-length bytestrings
                 let flat_bytes = cbor_unwrap_bytes(script_cbor)
                     .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
-                debug!(script = %hex::encode(hash), cbor_len = script_cbor.len(), flat_len = flat_bytes.len(), "loaded script into store from ref UTxO");
                 store.insert(hash, flat_bytes);
             }
         }
@@ -156,14 +155,6 @@ pub fn evaluate_scoop_tx(
                     mem: result.info.consumed_budget.mem.max(0) as u64,
                     steps: result.info.consumed_budget.cpu.max(0) as u64,
                 };
-                trace!(
-                    script = %hex::encode(script_hash),
-                    tag = ?key.tag,
-                    index = key.index,
-                    mem = consumed.mem,
-                    steps = consumed.steps,
-                    "script evaluation succeeded"
-                );
                 budgets.push((key.clone(), consumed));
             }
             Err(e) => {
