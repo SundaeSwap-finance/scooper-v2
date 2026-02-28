@@ -245,8 +245,57 @@ fn try_execute_order(
     })
 }
 
+/// Check whether an order can execute against the given pool state.
+/// Returns a `ResolvedSwap` on success, or a descriptive error string explaining
+/// why the order cannot execute.
+pub fn check_order_executability(
+    order: &Arc<SundaeV4Order>,
+    pool_assets: &[(AssetClass, BigInt)],
+    _total_lp: &BigInt,
+    fee: (u64, u64),
+    _protocol_share: (u64, u64),
+) -> Result<ResolvedSwap, String> {
+    let (input_idx, output_idx) = detect_swap_direction_from_assets(order, pool_assets)
+        .ok_or_else(|| "no matching pool asset in order value".to_string())?;
+
+    let reserve_in = &pool_assets[input_idx].1;
+    let reserve_out = &pool_assets[output_idx].1;
+
+    let offered_asset = &pool_assets[input_idx].0;
+    let dx = order.value.get(offered_asset);
+    if !dx.is_positive() {
+        return Err("offered amount not positive".to_string());
+    }
+
+    let dy = swap_math::cp_swap_result(reserve_in, reserve_out, &dx, fee.0, fee.1);
+    if !dy.is_positive() {
+        return Err("swap output not positive".to_string());
+    }
+
+    // Check min_received constraint
+    let output_asset = &pool_assets[output_idx].0;
+    match &order.datum.constraints {
+        OrderConstraints::Simple { min_received } => {
+            for (asset, min_qty) in min_received {
+                if asset == output_asset && &dy < min_qty {
+                    return Err(format!("below min_received: got {dy}, need {min_qty}"));
+                }
+            }
+        }
+        OrderConstraints::Structured { .. } => {}
+    }
+
+    Ok(ResolvedSwap {
+        order: order.clone(),
+        input_idx,
+        output_idx,
+        dx,
+        dy,
+    })
+}
+
 /// Detect swap direction by checking which pool asset the order offers.
-fn detect_swap_direction_from_assets(
+pub fn detect_swap_direction_from_assets(
     order: &SundaeV4Order,
     assets: &[(AssetClass, BigInt)],
 ) -> Option<(usize, usize)> {

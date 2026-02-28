@@ -86,6 +86,11 @@ async fn main() -> Result<()> {
         .v4
         .as_ref()
         .and_then(|v4| v4.execution.clone());
+    let v4_fee = v4_execution.as_ref().map(|e| e.fee);
+    let v4_module_preimages = v4_execution
+        .as_ref()
+        .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
+        .unwrap_or_default();
     let scooper_handle = tokio::spawn(
         Scooper::new(
             config.log.trace_directory.clone(),
@@ -99,6 +104,9 @@ async fn main() -> Result<()> {
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
         v3_state.clone(),
+        v4_state.clone(),
+        v4_fee,
+        v4_module_preimages,
         resync_tx,
         shutdown.child_token(),
     ));

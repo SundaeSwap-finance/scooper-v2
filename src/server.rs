@@ -16,12 +16,51 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use std::collections::BTreeMap;
+
 use crate::{
     cardano_types::TransactionInput,
     sundaev3::{Ident, PoolError, SundaeV3HistoricalState, ValidationError, validate_order},
+    sundaev4::{SundaeV4HistoricalState, batch},
 };
 
 type V3State = Option<Arc<Mutex<SundaeV3HistoricalState>>>;
+type V4State = Option<Arc<Mutex<SundaeV4HistoricalState>>>;
+
+/// Module state preimage map: state_hash bytes → config CBOR bytes.
+/// Computed at startup from the scooper's execution config.
+pub type ModuleStatePreimages = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// Build the preimage map from an execution config's fee and protocol_share.
+pub fn compute_module_state_preimages(
+    fee: (u64, u64),
+    protocol_share: (u64, u64),
+) -> ModuleStatePreimages {
+    use pallas_crypto::hash::Hasher;
+    use plutus_parser::AsPlutus;
+    use crate::sundaev4::{ConstantProductConfig, FeeSplitConfig, Rational};
+    use crate::bigint::BigInt;
+
+    let configs = [
+        minicbor::to_vec(
+            &ConstantProductConfig {
+                fee: Rational { num: BigInt::from(fee.0), den: BigInt::from(fee.1) },
+            }.to_plutus(),
+        ).unwrap(),
+        minicbor::to_vec(
+            &FeeSplitConfig {
+                protocol_share: Rational { num: BigInt::from(protocol_share.0), den: BigInt::from(protocol_share.1) },
+            }.to_plutus(),
+        ).unwrap(),
+    ];
+
+    let mut map = BTreeMap::new();
+    for cbor in configs {
+        let hash = Hasher::<256>::hash(&cbor).to_vec();
+        map.insert(hash, cbor);
+    }
+    map
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
@@ -31,9 +70,13 @@ pub struct ServerConfig {
 pub async fn admin_server(
     config: ServerConfig,
     v3_state: V3State,
+    v4_state: V4State,
+    v4_fee: Option<(u64, u64)>,
+    v4_module_preimages: ModuleStatePreimages,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     shutdown: CancellationToken,
 ) {
+    let v4_module_preimages = Arc::new(v4_module_preimages);
     let listener = TcpListener::bind(config.address).await.unwrap();
 
     loop {
@@ -44,12 +87,14 @@ pub async fn admin_server(
 
         let resync_tx = resync_tx.clone();
         let v3_state = v3_state.clone();
+        let v4_state = v4_state.clone();
+        let v4_module_preimages = v4_module_preimages.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             select! {
                 _ = child.cancelled() => {},
-                _ = handle_request(stream, v3_state, resync_tx) => {}
+                _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx) => {}
             }
         });
     }
@@ -58,12 +103,18 @@ pub async fn admin_server(
 async fn handle_request(
     stream: TcpStream,
     v3_state: V3State,
+    v4_state: V4State,
+    v4_fee: Option<(u64, u64)>,
+    v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
 ) {
     let io = TokioIo::new(stream);
 
     let admin_server = AdminServer {
         v3_state,
+        v4_state,
+        v4_fee,
+        v4_module_preimages,
         resync_tx,
     };
     if let Err(err) = http1::Builder::new()
@@ -77,6 +128,9 @@ async fn handle_request(
 #[derive(Clone)]
 struct AdminServer {
     v3_state: V3State,
+    v4_state: V4State,
+    v4_fee: Option<(u64, u64)>,
+    v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -128,6 +182,11 @@ impl AdminServer {
     }
 
     async fn route_protocol(&self, path: &str) -> String {
+        // /v4/... routes
+        if let Some(v4_path) = path.strip_prefix("/v4") {
+            return self.route_v4(v4_path).await;
+        }
+
         // /v3/... routes and backward-compatible aliases (/ → /v3/)
         let v3_path = path
             .strip_prefix("/v3")
@@ -141,6 +200,18 @@ impl AdminServer {
         match v3_path {
             "/pools" => self.v3_list_pools().await,
             "/orders" => self.v3_list_orders().await,
+            _ => "unknown".into(),
+        }
+    }
+
+    async fn route_v4(&self, path: &str) -> String {
+        if let Some(pool_id) = path.strip_prefix("/pool/") {
+            return self.v4_query_pool(pool_id).await;
+        }
+
+        match path {
+            "/pools" => self.v4_list_pools().await,
+            "/orders" => self.v4_list_orders().await,
             _ => "unknown".into(),
         }
     }
@@ -235,6 +306,145 @@ impl AdminServer {
                     continue;
                 }
             }
+        }
+
+        serde_json::to_string_pretty(&json_map).unwrap()
+    }
+
+    // ── V4 helpers ──────────────────────────────────────────────────────
+
+    /// Serialize a V4 pool to JSON, enriching `module_state` with preimage values.
+    fn v4_pool_json(
+        pool: &crate::sundaev4::SundaeV4Pool,
+        preimages: &ModuleStatePreimages,
+    ) -> serde_json::Value {
+        let mut pool_json = serde_json::to_value(pool).unwrap_or_default();
+        if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
+            let mut enriched = serde_json::Map::new();
+            for (module_hash, state_bytes) in &pool.pool_datum.module_state {
+                let state_hex = hex::encode(state_bytes);
+                // Try to find a preimage whose blake2b-256 matches state_bytes
+                let value_hex = preimages.get(state_bytes).map(hex::encode);
+                let mut entry = serde_json::Map::new();
+                entry.insert("state".into(), state_hex.into());
+                if let Some(v) = value_hex {
+                    entry.insert("value".into(), v.into());
+                }
+                enriched.insert(hex::encode(module_hash), serde_json::Value::Object(entry));
+            }
+            *obj = serde_json::Value::Object(enriched);
+        }
+        pool_json
+    }
+
+    // ── V4 endpoints ─────────────────────────────────────────────────────
+
+    async fn v4_query_pool(&self, pool_id: &str) -> String {
+        let Some(v4) = &self.v4_state else {
+            return "v4 indexer not configured".into();
+        };
+        let Some(fee) = self.v4_fee else {
+            return "v4 execution not configured (no fee)".into();
+        };
+        let state = v4.lock().await.latest().into_owned();
+        let id_bytes = match hex::decode(pool_id) {
+            Ok(b) => b,
+            Err(_) => return "invalid hex in pool id".into(),
+        };
+        let ident = Ident::new(&id_bytes);
+        let pool = match state.pools.get(&ident) {
+            Some(p) => p.clone(),
+            None => return "No such pool".into(),
+        };
+
+        let groups = batch::group_orders_by_pool(&state.orders, &state.pools);
+        let candidates = groups.get(&ident).cloned().unwrap_or_default();
+
+        let mut executable = Vec::new();
+        let mut non_executable = Vec::new();
+
+        // protocol_share is not in the fee config — use (0,1) as neutral default
+        // since check_order_executability ignores it (it only affects LP math, not swap result)
+        let protocol_share = (0u64, 1u64);
+
+        for order in &candidates {
+            match batch::check_order_executability(
+                order,
+                &pool.pool_datum.assets,
+                &pool.pool_datum.total_lp,
+                fee,
+                protocol_share,
+            ) {
+                Ok(swap) => {
+                    executable.push(serde_json::json!({
+                        "order": order.input.to_string(),
+                        "output_amount": swap.dy.to_string(),
+                    }));
+                }
+                Err(reason) => {
+                    non_executable.push(serde_json::json!({
+                        "order": order.input.to_string(),
+                        "reason": reason,
+                    }));
+                }
+            }
+        }
+
+        let response = serde_json::json!({
+            "pool": Self::v4_pool_json(&pool, &self.v4_module_preimages),
+            "executable": executable,
+            "non_executable": non_executable,
+        });
+        serde_json::to_string_pretty(&response).unwrap()
+    }
+
+    async fn v4_list_pools(&self) -> String {
+        let Some(v4) = &self.v4_state else {
+            return "v4 indexer not configured".into();
+        };
+        let state = v4.lock().await.latest().into_owned();
+        let mut json_map = serde_json::Map::new();
+
+        for (ident, pool) in &state.pools {
+            json_map.insert(
+                hex::encode(ident.to_bytes()),
+                Self::v4_pool_json(pool, &self.v4_module_preimages),
+            );
+        }
+
+        serde_json::to_string_pretty(&json_map).unwrap()
+    }
+
+    async fn v4_list_orders(&self) -> String {
+        let Some(v4) = &self.v4_state else {
+            return "v4 indexer not configured".into();
+        };
+        let state = v4.lock().await.latest().into_owned();
+        let groups = batch::group_orders_by_pool(&state.orders, &state.pools);
+
+        let mut json_map = serde_json::Map::new();
+
+        for (ident, orders) in &groups {
+            let order_vals: Vec<serde_json::Value> = orders
+                .iter()
+                .filter_map(|o| serde_json::to_value(o.as_ref()).ok())
+                .collect();
+            json_map.insert(hex::encode(ident.to_bytes()), order_vals.into());
+        }
+
+        // Collect unmatched orders (those not in any group)
+        let matched: std::collections::BTreeSet<&TransactionInput> = groups
+            .values()
+            .flat_map(|orders| orders.iter().map(|o| &o.input))
+            .collect();
+        let unmatched: Vec<serde_json::Value> = state
+            .orders
+            .iter()
+            .filter(|o| !matched.contains(&o.input))
+            .filter_map(|o| serde_json::to_value(o.as_ref()).ok())
+            .collect();
+        if !unmatched.is_empty() {
+            json_map.insert("unmatched".to_string(), unmatched.into());
         }
 
         serde_json::to_string_pretty(&json_map).unwrap()
