@@ -519,7 +519,7 @@ pub fn build_scoop_tx(
             );
             settings_addr.to_vec()
         },
-        value: crate::cardano_types::Value::default(),
+        value: settings.value.clone(),
         datum: DatumOption::InlineDatum(settings.datum.clone().to_plutus()),
         script_ref: None,
     });

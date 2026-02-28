@@ -154,6 +154,7 @@ impl SundaeV4Indexer {
                     };
                     state.settings = Some(Arc::new(SundaeV4Settings {
                         input: txo.txo_id,
+                        value: output.value,
                         datum,
                         slot: txo.created_slot,
                     }));
@@ -336,6 +337,7 @@ impl ChainIndex for SundaeV4Indexer {
                     });
                     new_settings = Some(Arc::new(SundaeV4Settings {
                         input: this_input,
+                        value: tx_out.value,
                         datum: sd,
                         slot,
                     }));
