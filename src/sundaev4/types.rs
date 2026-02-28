@@ -10,6 +10,36 @@ use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::multisig::Multisig;
 use crate::sundaev3::{Ident, PlutusAddress};
 
+/// Serde helpers for encoding `Vec<u8>` fields as hex strings in JSON.
+mod hex_ser {
+    use serde::Serializer;
+
+    pub fn bytes<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(v))
+    }
+
+    pub fn vec_bytes<S: Serializer>(v: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for b in v { seq.serialize_element(&hex::encode(b))?; }
+        seq.end()
+    }
+
+    pub fn vec_bytes_pair_as_map<S: Serializer>(v: &Vec<(Vec<u8>, Vec<u8>)>, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(v.len()))?;
+        for (k, v) in v { map.serialize_entry(&hex::encode(k), &hex::encode(v))?; }
+        map.end()
+    }
+
+    pub fn opt_vec_bytes<S: Serializer>(v: &Option<Vec<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(list) => vec_bytes(list, s),
+            None => s.serialize_none(),
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Pool / Vault types
 // ──────────────────────────────────────────────────────────────────────────────
@@ -22,6 +52,7 @@ pub struct PoolDatum {
     pub preminted_lp: BigInt,
     pub identifier: Ident,
     pub actions: Vec<ActionEntry>,
+    #[serde(serialize_with = "hex_ser::vec_bytes_pair_as_map")]
     pub module_state: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -29,6 +60,7 @@ pub struct PoolDatum {
 pub struct ActionEntry {
     pub tag: BigInt,
     pub enabled: bool,
+    #[serde(serialize_with = "hex_ser::vec_bytes")]
     pub modules: Vec<Vec<u8>>,
 }
 
@@ -166,7 +198,9 @@ pub enum OrderRedeemer {
 pub struct SettingsDatum {
     pub settings_admin: Multisig,
     pub treasury_admin: Multisig,
+    #[serde(serialize_with = "hex_ser::bytes")]
     pub treasury_address: Vec<u8>,
+    #[serde(serialize_with = "hex_ser::opt_vec_bytes")]
     pub authorized_scoopers: Option<Vec<Vec<u8>>>,
 }
 
