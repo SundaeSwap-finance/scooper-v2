@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{BufWriter, Write as _},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
 };
 
 use anyhow::Result;
@@ -39,6 +39,11 @@ pub struct Scooper {
     v4_chain_tracker: ChainTracker,
     v4_batch_limits: BatchLimits,
     trace_directory: Option<PathBuf>,
+    paused: Arc<AtomicBool>,
+    /// Set to the tip slot when we lose a scoop race; skip batch cycles
+    /// until the tip advances past this slot, giving the indexer time to
+    /// process the competitor's block and remove spent UTxOs.
+    backoff_until_after_slot: Option<u64>,
 }
 
 impl Scooper {
@@ -48,6 +53,7 @@ impl Scooper {
         v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
         v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
         v4_execution: Option<ScooperExecution>,
+        paused: Arc<AtomicBool>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -62,6 +68,8 @@ impl Scooper {
             v4_chain_tracker: ChainTracker::new(),
             v4_batch_limits: BatchLimits::default(),
             trace_directory,
+            paused,
+            backoff_until_after_slot: None,
         })
     }
 
@@ -123,8 +131,25 @@ impl Scooper {
                 self.v4_chain_tracker.expire_stale(tip_slot);
             }
 
-            // 3. Attempt batch cycle (build/eval/submit for each pool)
-            let did_work = self.run_v4_batch_cycle().await;
+            // 3. Attempt batch cycle (skip if paused or backing off after lost race)
+            let did_work = if self.paused.load(Ordering::Relaxed) {
+                trace!("scooper paused, skipping batch cycle");
+                false
+            } else if let Some(backoff_slot) = self.backoff_until_after_slot {
+                if let Some(tip) = self.current_tip_slot().await {
+                    if tip > backoff_slot {
+                        self.backoff_until_after_slot = None;
+                        self.run_v4_batch_cycle().await
+                    } else {
+                        trace!(tip, backoff_slot, "waiting for tip to advance past lost-race slot");
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                self.run_v4_batch_cycle().await
+            };
 
             // 4. If nothing to do, block on next event
             if !did_work {
@@ -290,8 +315,8 @@ impl Scooper {
                     trace!(slot, order = %order.input, "v4 order created");
                     // No immediate action — batch cycle picks it up
                 }
-                IndexEvent::V4OrderScooped { order, pool_id, .. } => {
-                    trace!(slot, order = %order.input, pool = %pool_id, "v4 order scooped");
+                IndexEvent::V4OrderScooped { order, pool_ids, .. } => {
+                    trace!(slot, order = %order.input, pools = ?pool_ids, "v4 order scooped");
                 }
                 IndexEvent::V4OrderCancelled { order, .. } => {
                     trace!(slot, order = %order.input, "v4 order cancelled");
@@ -628,9 +653,22 @@ impl Scooper {
                 true
             }
             Err(e) => {
-                warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
+                let msg = e.to_string();
+                if msg.contains("BadInputsUTxO") {
+                    let pool_strs: Vec<String> = pool_idents.iter().map(|i| i.to_string()).collect();
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        pools = ?pool_strs,
+                        "lost scoop race — pool or order UTxO already spent by another scooper"
+                    );
+                } else {
+                    warn!(error = %msg, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
+                }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
+                }
+                if let Some(tip) = self.current_tip_slot().await {
+                    self.backoff_until_after_slot = Some(tip);
                 }
                 false
             }

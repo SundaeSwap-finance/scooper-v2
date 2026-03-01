@@ -503,7 +503,7 @@ impl ChainIndex for SundaeV4Indexer {
         }
 
         let mut scooped_orders = BTreeSet::new();
-        let mut scoop_pool_id: Option<Ident> = None;
+        let mut scoop_pool_ids: Vec<Ident> = vec![];
         let mut removed_pool_ids: Vec<Ident> = vec![];
         // Track which pool idents existed before we remove spent UTxOs,
         // so we can distinguish V4PoolUpdated (scoop) from V4PoolCreated (new).
@@ -534,8 +534,8 @@ impl ChainIndex for SundaeV4Indexer {
             });
             match self.parse_redeemer::<VaultRedeemer>(&tx, spend_index) {
                 Some(VaultRedeemer::Action { .. }) => {
-                    // Pool was scooped — we track the pool ident for order event attribution
-                    scoop_pool_id = Some(ident.clone());
+                    // Pool was scooped — collect all scooped pool idents
+                    scoop_pool_ids.push(ident.clone());
                 }
                 Some(VaultRedeemer::EscapeHatch { .. })
                 | Some(VaultRedeemer::Upgrade)
@@ -562,16 +562,16 @@ impl ChainIndex for SundaeV4Indexer {
             match self.parse_redeemer::<OrderRedeemer>(&tx, spend_index) {
                 Some(OrderRedeemer::Scoop { .. }) => {
                     scooped_orders.insert(spend_index);
-                    if let Some(pool_id) = &scoop_pool_id {
+                    if !scoop_pool_ids.is_empty() {
                         state.spent_orders.push(SpentOrder {
                             order: order.clone(),
-                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone(), scooper: scooper_hex.clone() },
+                            reason: SpentOrderReason::Scooped { pool_ids: scoop_pool_ids.clone(), scooper: scooper_hex.clone() },
                             tx_id: tx_id_hex.clone(),
                             slot,
                         });
                         events.push(IndexEvent::V4OrderScooped {
                             order: order.clone(),
-                            pool_id: pool_id.clone(),
+                            pool_ids: scoop_pool_ids.clone(),
                             tx_id: tx_id_hex.clone(),
                             scooper: scooper_hex.clone(),
                         });
@@ -601,11 +601,11 @@ impl ChainIndex for SundaeV4Indexer {
         });
 
         // Record scoop if orders were scooped
-        if !scooped_orders.is_empty() {
-            if let Some(pool_id) = &scoop_pool_id {
-                let n_orders = scooped_orders.len() as u32;
-                let scooper_bytes = scooper_keyhash_bytes.clone().unwrap_or_default();
+        if !scooped_orders.is_empty() && !scoop_pool_ids.is_empty() {
+            let n_orders = scooped_orders.len() as u32;
+            let scooper_bytes = scooper_keyhash_bytes.clone().unwrap_or_default();
 
+            for pool_id in &scoop_pool_ids {
                 changes.scoop_records.push(ScoopRecord {
                     tx_id: this_tx_hash.to_vec(),
                     slot,
@@ -613,29 +613,32 @@ impl ChainIndex for SundaeV4Indexer {
                     n_orders,
                     scooper: scooper_bytes.clone(),
                 });
-
-                // Update in-memory stats
-                let scooper_key = scooper_hex.clone();
-                if let Some(total) = state.scoop_stats.scooper_totals.iter_mut().find(|t| t.scooper == scooper_key) {
-                    total.scoop_txs += 1;
-                    total.orders_processed += n_orders as u64;
-                } else {
-                    state.scoop_stats.scooper_totals.push(ScooperTotal {
-                        scooper: scooper_key,
-                        scoop_txs: 1,
-                        orders_processed: n_orders as u64,
-                    });
-                }
-
-                state.scoop_stats.recent_scoops.insert(0, ScoopRecordView {
-                    tx_id: tx_id_hex.clone(),
-                    slot,
-                    pool_id: hex::encode(pool_id.to_bytes()),
-                    n_orders,
-                    scooper: scooper_hex.clone(),
-                });
-                state.scoop_stats.recent_scoops.truncate(50);
             }
+
+            // Update in-memory stats (once per tx, not per pool)
+            let scooper_key = scooper_hex.clone();
+            if let Some(total) = state.scoop_stats.scooper_totals.iter_mut().find(|t| t.scooper == scooper_key) {
+                total.scoop_txs += 1;
+                total.orders_processed += n_orders as u64;
+            } else {
+                state.scoop_stats.scooper_totals.push(ScooperTotal {
+                    scooper: scooper_key,
+                    scoop_txs: 1,
+                    orders_processed: n_orders as u64,
+                });
+            }
+
+            let pool_ids_hex: Vec<String> = scoop_pool_ids.iter()
+                .map(|id| hex::encode(id.to_bytes()))
+                .collect();
+            state.scoop_stats.recent_scoops.insert(0, ScoopRecordView {
+                tx_id: tx_id_hex.clone(),
+                slot,
+                pool_ids: pool_ids_hex,
+                n_orders,
+                scooper: scooper_hex.clone(),
+            });
+            state.scoop_stats.recent_scoops.truncate(50);
         }
 
         // Emit pool removed events
@@ -794,18 +797,29 @@ fn build_scoop_stats(
         })
         .collect();
 
-    let recent_scoops: Vec<ScoopRecordView> = records
-        .iter()
-        .rev()
-        .take(50)
-        .map(|r| ScoopRecordView {
-            tx_id: hex::encode(&r.tx_id),
-            slot: r.slot,
-            pool_id: hex::encode(&r.pool_id),
-            n_orders: r.n_orders,
-            scooper: hex::encode(&r.scooper),
-        })
-        .collect();
+    // DB records are per-pool; group by tx_id to collect all pool_ids per scoop tx.
+    let mut seen_tx_ids = std::collections::BTreeSet::new();
+    let mut recent_scoops: Vec<ScoopRecordView> = Vec::new();
+    for r in records.iter().rev() {
+        let tx_hex = hex::encode(&r.tx_id);
+        let pool_hex = hex::encode(&r.pool_id);
+        if let Some(existing) = recent_scoops.iter_mut().find(|s| s.tx_id == tx_hex) {
+            if !existing.pool_ids.contains(&pool_hex) {
+                existing.pool_ids.push(pool_hex);
+            }
+        } else if seen_tx_ids.insert(tx_hex.clone()) {
+            recent_scoops.push(ScoopRecordView {
+                tx_id: tx_hex,
+                slot: r.slot,
+                pool_ids: vec![pool_hex],
+                n_orders: r.n_orders,
+                scooper: hex::encode(&r.scooper),
+            });
+            if recent_scoops.len() >= 50 {
+                break;
+            }
+        }
+    }
 
     ScoopStats {
         our_keyhash: our_hex,

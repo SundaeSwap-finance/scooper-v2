@@ -50,6 +50,38 @@
   }
   .conn-dot.connected { background: var(--green); }
 
+  .pause-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 4px 12px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .pause-btn:hover { border-color: var(--accent); }
+  .pause-btn.paused {
+    background: var(--red);
+    border-color: var(--red);
+    color: #fff;
+  }
+
+  .paused-banner {
+    display: none;
+    padding: 8px 20px;
+    background: rgba(225, 112, 85, 0.15);
+    border-bottom: 1px solid var(--red);
+    color: var(--red);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: center;
+  }
+  .paused-banner.visible { display: block; }
+
   .sync-bar-container {
     padding: 12px 20px;
     background: var(--surface);
@@ -266,8 +298,9 @@
 <body>
 
 <header>
-  <h1>SundaeSwap Scooper</h1>
+  <h1>SundaeSwap Scooper <span id="scooperIdent" style="font-size:11px;color:var(--text-dim);font-weight:400"></span></h1>
   <div class="conn-status">
+    <button class="pause-btn" id="pauseBtn">Pause</button>
     <div class="conn-dot" id="connDot"></div>
     <span id="connLabel">Connecting...</span>
   </div>
@@ -280,6 +313,8 @@
   </div>
   <div class="sync-bar"><div class="sync-fill" id="syncFill"></div></div>
 </div>
+
+<div class="paused-banner" id="pausedBanner">Scooping paused</div>
 
 <div class="tabs">
   <div class="tab" data-tab="v3">V3</div>
@@ -330,7 +365,7 @@
     <div class="section-title">Spent Orders</div>
     <div class="search-bar"><input type="text" data-filter="v4-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v4-spent-orders-table">
-      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
+      <thead><tr><th>Order Ref</th><th>Pool(s)</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
       <tbody id="v4-spent-orders-body"></tbody>
     </table>
   </div>
@@ -343,7 +378,10 @@
       <thead><tr><th>Scooper</th><th>Scoops</th><th>Orders</th></tr></thead>
       <tbody id="health-leaderboard-body"></tbody>
     </table>
-    <div class="section-title">Recent Scoops</div>
+    <div class="section-title" style="display:flex;align-items:center;gap:10px">
+      Recent Scoops
+      <button class="pause-btn" id="mineToggle" style="font-size:10px;padding:2px 8px;text-transform:none;letter-spacing:0">Mine</button>
+    </div>
     <table id="health-recent-table">
       <thead><tr><th>Tx ID</th><th>Slot</th><th>Pool</th><th>Orders</th><th>Scooper</th></tr></thead>
       <tbody id="health-recent-body"></tbody>
@@ -421,7 +459,53 @@
       status = await res.json();
       updateSyncBar();
       updateStats();
+      updatePauseBtn(status.paused);
     } catch (e) { /* ignore */ }
+  }
+
+  function updatePauseBtn(paused) {
+    var btn = document.getElementById('pauseBtn');
+    var banner = document.getElementById('pausedBanner');
+    if (paused) {
+      btn.textContent = 'Resume';
+      btn.classList.add('paused');
+      banner.classList.add('visible');
+    } else {
+      btn.textContent = 'Pause';
+      btn.classList.remove('paused');
+      banner.classList.remove('visible');
+    }
+  }
+
+  async function togglePause() {
+    try {
+      var res = await fetch('/pause');
+      var data = await res.json();
+      updatePauseBtn(data.paused);
+    } catch (e) { /* ignore */ }
+  }
+
+  document.getElementById('pauseBtn').addEventListener('click', togglePause);
+
+  var mineOnly = false;
+  document.getElementById('mineToggle').addEventListener('click', function() {
+    mineOnly = !mineOnly;
+    var btn = document.getElementById('mineToggle');
+    btn.style.background = mineOnly ? 'var(--accent)' : '';
+    btn.style.borderColor = mineOnly ? 'var(--accent)' : '';
+    btn.style.color = mineOnly ? '#fff' : '';
+    applyMineFilter();
+  });
+
+  function applyMineFilter() {
+    var rows = document.querySelectorAll('#health-recent-body tr');
+    rows.forEach(function(row) {
+      if (mineOnly && !row.classList.contains('our-row')) {
+        row.style.display = 'none';
+      } else {
+        row.style.display = '';
+      }
+    });
   }
 
   function updateSyncBar() {
@@ -662,8 +746,8 @@
   function formatSpentReason(reason) {
     if (reason === 'Cancelled') return { text: 'Cancelled', poolId: '', badge: 'badge-red' };
     if (reason && reason.Scooped) {
-      var pid = reason.Scooped.pool_id || '';
-      return { text: 'Scooped', poolId: pid, badge: 'badge-green' };
+      var pids = (reason.Scooped.pool_ids || []).join(', ');
+      return { text: 'Scooped', poolId: pids, badge: 'badge-green' };
     }
     return { text: 'Unknown', poolId: '', badge: 'badge-yellow' };
   }
@@ -713,6 +797,9 @@
         return;
       }
       healthData = data;
+      if (data.our_keyhash) {
+        document.getElementById('scooperIdent').textContent = '(' + data.our_keyhash.slice(0, 8) + '...)';
+      }
       renderHealthCards(data);
       renderLeaderboard(data);
       renderRecentScoops(data);
@@ -773,13 +860,15 @@
       if (isOurs) row.className = 'our-row';
       var scooperLabel = truncate(s.scooper, 12);
       if (isOurs) scooperLabel += ' <span class="badge badge-accent">You</span>';
+      var poolIds = (s.pool_ids || []).join(', ');
       row.innerHTML = '<td>' + copyable(truncate(s.tx_id, 16), s.tx_id) + '</td>' +
         '<td>' + s.slot + '</td>' +
-        '<td>' + copyable(truncate(s.pool_id, 12), s.pool_id) + '</td>' +
+        '<td>' + copyable(truncate(poolIds, 12), poolIds) + '</td>' +
         '<td>' + s.n_orders + '</td>' +
         '<td>' + copyable(scooperLabel, s.scooper) + '</td>';
       tbody.appendChild(row);
     }
+    applyMineFilter();
   }
 
   function formatV4OrderDetail(datum) {

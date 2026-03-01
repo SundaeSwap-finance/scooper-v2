@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{net::SocketAddr, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}};
 
 use http_body_util::{Either, Full};
 use hyper::{
@@ -102,6 +102,7 @@ pub async fn admin_server(
     v4_module_preimages: ModuleStatePreimages,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
+    paused: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) {
     let v4_module_preimages = Arc::new(v4_module_preimages);
@@ -118,12 +119,13 @@ pub async fn admin_server(
         let v3_state = v3_state.clone();
         let v4_state = v4_state.clone();
         let v4_module_preimages = v4_module_preimages.clone();
+        let paused = paused.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             select! {
                 _ = child.cancelled() => {},
-                _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx) => {}
+                _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
             }
         });
     }
@@ -137,6 +139,7 @@ async fn handle_request(
     v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
+    paused: Arc<AtomicBool>,
 ) {
     let io = TokioIo::new(stream);
 
@@ -147,6 +150,7 @@ async fn handle_request(
         v4_module_preimages,
         resync_tx,
         event_tx,
+        paused,
     };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
@@ -164,6 +168,7 @@ struct AdminServer {
     v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
+    paused: Arc<AtomicBool>,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -224,6 +229,13 @@ impl AdminServer {
                 Self::text_response("resync")
             }
             "/health" => Self::json_response(self.serve_health_stats().await),
+            "/pause" => {
+                let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
+                let now_paused = !was_paused;
+                Self::json_response(
+                    serde_json::to_string(&serde_json::json!({ "paused": now_paused })).unwrap(),
+                )
+            }
             _ => Self::json_response(self.route_protocol(path).await),
         }
     }
@@ -269,6 +281,7 @@ impl AdminServer {
         serde_json::to_string(&serde_json::json!({
             "v3": v3_info,
             "v4": v4_info,
+            "paused": self.paused.load(Ordering::Relaxed),
         }))
         .unwrap()
     }
@@ -713,11 +726,11 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_order_created",
             serde_json::json!({ "order": order.input.to_string() }).to_string(),
         ),
-        IndexEvent::V4OrderScooped { order, pool_id, tx_id, scooper } => (
+        IndexEvent::V4OrderScooped { order, pool_ids, tx_id, scooper } => (
             "v4_order_scooped",
             serde_json::json!({
                 "order": order.input.to_string(),
-                "pool_id": pool_id.to_string(),
+                "pool_ids": pool_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                 "tx_id": tx_id,
                 "scooper": scooper,
             })

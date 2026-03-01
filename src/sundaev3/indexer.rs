@@ -533,7 +533,7 @@ impl ChainIndex for SundaeV3Indexer {
                     if let Some(pool_id) = &scoop_pool_id {
                         state.spent_orders.push(SpentOrder {
                             order: order.clone(),
-                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone(), scooper: String::new() },
+                            reason: SpentOrderReason::Scooped { pool_ids: vec![pool_id.clone()], scooper: String::new() },
                             tx_id: tx_id_hex.clone(),
                             slot,
                         });

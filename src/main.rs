@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -91,6 +92,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
         .unwrap_or_default();
+    let paused = Arc::new(AtomicBool::new(false));
     let scooper_handle = tokio::spawn(
         Scooper::new(
             config.log.trace_directory.clone(),
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
             v3_state.clone(),
             v4_state.clone(),
             v4_execution,
+            paused.clone(),
         )?
         .run(shutdown.child_token()),
     );
@@ -109,6 +112,7 @@ async fn main() -> Result<()> {
         v4_module_preimages,
         resync_tx,
         event_tx.clone(),
+        paused.clone(),
         shutdown.child_token(),
     ));
 
