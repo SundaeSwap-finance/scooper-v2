@@ -208,6 +208,57 @@
     border: 1px solid var(--border);
     border-radius: 6px;
   }
+
+  .search-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+  .search-bar input {
+    width: 100%;
+    max-width: 360px;
+    padding: 5px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+  }
+  .search-bar input:focus {
+    border-color: var(--accent);
+  }
+  .search-bar input::placeholder {
+    color: var(--text-dim);
+  }
+  .show-all-link {
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .show-all-link:hover {
+    text-decoration: underline;
+  }
+
+  .copy-btn {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 2px;
+    cursor: pointer;
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity 0.15s;
+    vertical-align: middle;
+    font-size: 11px;
+    line-height: 1;
+  }
+  td:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { color: var(--accent); }
+  .copy-btn.copied { color: var(--green); opacity: 1; }
 </style>
 </head>
 <body>
@@ -239,16 +290,19 @@
   <div class="tab-panel" id="panel-v3">
     <div class="stats" id="v3-stats"></div>
     <div class="section-title">Pools</div>
+    <div class="search-bar"><input type="text" data-filter="v3-pools-body" placeholder="Filter pools..."></div>
     <table id="v3-pools-table">
       <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
       <tbody id="v3-pools-body"></tbody>
     </table>
     <div class="section-title">Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v3-orders-body" placeholder="Filter orders..."></div>
     <table id="v3-orders-table">
       <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Direction</th></tr></thead>
       <tbody id="v3-orders-body"></tbody>
     </table>
     <div class="section-title">Spent Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v3-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v3-spent-orders-table">
       <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
       <tbody id="v3-spent-orders-body"></tbody>
@@ -259,16 +313,19 @@
   <div class="tab-panel active" id="panel-v4">
     <div class="stats" id="v4-stats"></div>
     <div class="section-title">Pools</div>
+    <div class="search-bar"><input type="text" data-filter="v4-pools-body" placeholder="Filter pools..."></div>
     <table id="v4-pools-table">
       <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
       <tbody id="v4-pools-body"></tbody>
     </table>
     <div class="section-title">Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v4-orders-body" placeholder="Filter orders..."></div>
     <table id="v4-orders-table">
       <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Status</th><th>Detail</th></tr></thead>
       <tbody id="v4-orders-body"></tbody>
     </table>
     <div class="section-title">Spent Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v4-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v4-spent-orders-table">
       <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
       <tbody id="v4-spent-orders-body"></tbody>
@@ -305,6 +362,27 @@
   function timeStr() {
     return new Date().toLocaleTimeString('en-US', { hour12: false });
   }
+
+  // Copy-to-clipboard: renders truncated text + a small copy icon
+  var copySvg = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M5.5 10.5h-1a1.5 1.5 0 01-1.5-1.5v-5a1.5 1.5 0 011.5-1.5h5a1.5 1.5 0 011.5 1.5v1"/></svg>';
+
+  function copyable(display, fullValue) {
+    if (!fullValue) return display || '';
+    var escaped = fullValue.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    return '<span title="' + escaped + '">' + display +
+      '<span class="copy-btn" data-copy="' + escaped + '">' + copySvg + '</span></span>';
+  }
+
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.copy-btn');
+    if (!btn) return;
+    var text = btn.getAttribute('data-copy');
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(function() {
+      btn.classList.add('copied');
+      setTimeout(function() { btn.classList.remove('copied'); }, 1000);
+    });
+  });
 
   function formatAssetClass(ac) {
     if (!ac) return 'ADA';
@@ -364,24 +442,67 @@
       '</div><div class="value">' + value + '</div></div>';
   }
 
+  // --- Row limiting ---
+  var TABLE_LIMIT = 10;
+  // Track which tables the user has expanded
+  var expandedTables = {};
+
+  function renderLimited(tbodyId, rows) {
+    var tbody = document.getElementById(tbodyId);
+    tbody.innerHTML = '';
+    var expanded = expandedTables[tbodyId];
+    var limit = expanded ? rows.length : TABLE_LIMIT;
+    for (var i = 0; i < Math.min(rows.length, limit); i++) {
+      tbody.appendChild(rows[i]);
+    }
+    updateShowAllLink(tbodyId, rows.length);
+    applyFilter(tbodyId);
+  }
+
+  function updateShowAllLink(tbodyId, total) {
+    var input = document.querySelector('input[data-filter="' + tbodyId + '"]');
+    if (!input) return;
+    var bar = input.parentElement;
+    var existing = bar.querySelector('.show-all-link');
+    if (existing) existing.remove();
+    if (total <= TABLE_LIMIT) return;
+    var link = document.createElement('span');
+    link.className = 'show-all-link';
+    var expanded = expandedTables[tbodyId];
+    link.textContent = expanded ? 'Show first ' + TABLE_LIMIT : 'Show all (' + total + ')';
+    link.onclick = function() {
+      expandedTables[tbodyId] = !expanded;
+      // Re-trigger the load for this table
+      var loaders = {
+        'v3-pools-body': loadV3Pools, 'v3-orders-body': loadV3Orders,
+        'v3-spent-orders-body': loadV3SpentOrders,
+        'v4-pools-body': loadV4Pools, 'v4-orders-body': loadV4Orders,
+        'v4-spent-orders-body': loadV4SpentOrders,
+      };
+      if (loaders[tbodyId]) loaders[tbodyId]();
+    };
+    bar.appendChild(link);
+  }
+
   // --- V3 data loading ---
   async function loadV3Pools() {
     try {
       const res = await fetch('/v3/pools');
       const text = await res.text();
-      // Returns either JSON map or error string
       let data;
       try { data = JSON.parse(text); } catch { return; }
-      const tbody = document.getElementById('v3-pools-body');
-      tbody.innerHTML = '';
-      for (const [id, pool] of Object.entries(data)) {
-        const row = document.createElement('tr');
-        const assets = pool.pool_datum || {};
-        row.innerHTML = '<td title="' + id + '">' + truncate(id, 16) + '</td>' +
+      var entries = Object.entries(data);
+      entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
+      var rows = entries.map(function(e) {
+        var id = e[0], pool = e[1];
+        var row = document.createElement('tr');
+        var assets = pool.pool_datum || {};
+        row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + '</td>' +
           '<td>' + formatPoolAssets(assets) + '</td>' +
           '<td>' + (assets.circulating_lp || '?') + '</td>';
-        tbody.appendChild(row);
-      }
+        return row;
+      });
+      renderLimited('v3-pools-body', rows);
     } catch (e) { /* ignore */ }
   }
 
@@ -391,17 +512,22 @@
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { return; }
-      const tbody = document.getElementById('v3-orders-body');
-      tbody.innerHTML = '';
+      var flat = [];
       for (const [poolId, order] of Object.entries(data)) {
-        const row = document.createElement('tr');
-        const input = order.input || {};
-        const datum = order.datum || {};
-        row.innerHTML = '<td title="' + poolId + '">' + truncate(poolId, 16) + '</td>' +
-          '<td>' + truncate(input.transaction_id || '', 12) + '#' + (input.index || 0) + '</td>' +
-          '<td>' + (datum.direction || '?') + '</td>';
-        tbody.appendChild(row);
+        flat.push({ poolId: poolId, order: order });
       }
+      flat.sort(function(a, b) { return (b.order.slot || 0) - (a.order.slot || 0); });
+      var rows = flat.map(function(e) {
+        var row = document.createElement('tr');
+        var input = e.order.input || {};
+        var datum = e.order.datum || {};
+        var ref = (input.transaction_id || '') + '#' + (input.index || 0);
+        row.innerHTML = '<td>' + copyable(truncate(e.poolId, 16), e.poolId) + '</td>' +
+          '<td>' + copyable(truncate(ref, 20), ref) + '</td>' +
+          '<td>' + (datum.direction || '?') + '</td>';
+        return row;
+      });
+      renderLimited('v3-orders-body', rows);
     } catch (e) { /* ignore */ }
   }
 
@@ -412,16 +538,18 @@
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { return; }
-      const tbody = document.getElementById('v4-pools-body');
-      tbody.innerHTML = '';
-      for (const [id, pool] of Object.entries(data)) {
-        const row = document.createElement('tr');
-        const pd = pool.pool_datum || {};
-        row.innerHTML = '<td title="' + id + '">' + truncate(id, 16) + '</td>' +
+      var entries = Object.entries(data);
+      entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
+      var rows = entries.map(function(e) {
+        var id = e[0], pool = e[1];
+        var row = document.createElement('tr');
+        var pd = pool.pool_datum || {};
+        row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + '</td>' +
           '<td>' + formatV4PoolAssets(pd) + '</td>' +
           '<td>' + formatBigint(pd.total_lp) + '</td>';
-        tbody.appendChild(row);
-      }
+        return row;
+      });
+      renderLimited('v4-pools-body', rows);
     } catch (e) { /* ignore */ }
   }
 
@@ -433,7 +561,7 @@
       try { data = JSON.parse(text); } catch { return; }
 
       // Fetch executability info per pool
-      var execInfo = {}; // orderRef -> { executable: bool, detail: string }
+      var execInfo = {};
       var poolIds = Object.keys(data).filter(function(k) { return k !== 'unmatched'; });
       await Promise.all(poolIds.map(async function(poolId) {
         try {
@@ -448,32 +576,38 @@
         } catch (e) { /* ignore */ }
       }));
 
-      const tbody = document.getElementById('v4-orders-body');
-      tbody.innerHTML = '';
+      // Flatten and sort by slot descending
+      var flat = [];
       for (const [poolId, orders] of Object.entries(data)) {
         if (!Array.isArray(orders)) continue;
         for (const order of orders) {
-          const row = document.createElement('tr');
-          const orderRef = typeof order.input === 'string' ? order.input : '';
-          const info = execInfo[orderRef];
-          var statusBadge, detail;
-          if (!info) {
-            statusBadge = '<span class="badge badge-yellow">unknown</span>';
-            detail = '';
-          } else if (info.executable) {
-            statusBadge = '<span class="badge badge-green">executable</span>';
-            detail = info.detail;
-          } else {
-            statusBadge = '<span class="badge badge-red">blocked</span>';
-            detail = info.detail;
-          }
-          row.innerHTML = '<td title="' + poolId + '">' + truncate(poolId, 16) + '</td>' +
-            '<td title="' + orderRef + '">' + truncate(orderRef, 24) + '</td>' +
-            '<td>' + statusBadge + '</td>' +
-            '<td>' + truncate(detail, 50) + '</td>';
-          tbody.appendChild(row);
+          flat.push({ poolId: poolId, order: order });
         }
       }
+      flat.sort(function(a, b) { return (b.order.slot || 0) - (a.order.slot || 0); });
+
+      var rows = flat.map(function(e) {
+        var row = document.createElement('tr');
+        var orderRef = typeof e.order.input === 'string' ? e.order.input : '';
+        var info = execInfo[orderRef];
+        var statusBadge, detail;
+        if (!info) {
+          statusBadge = '<span class="badge badge-yellow">unknown</span>';
+          detail = '';
+        } else if (info.executable) {
+          statusBadge = '<span class="badge badge-green">executable</span>';
+          detail = info.detail;
+        } else {
+          statusBadge = '<span class="badge badge-red">blocked</span>';
+          detail = info.detail;
+        }
+        row.innerHTML = '<td>' + copyable(truncate(e.poolId, 16), e.poolId) + '</td>' +
+          '<td>' + copyable(truncate(orderRef, 24), orderRef) + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + truncate(detail, 50) + '</td>';
+        return row;
+      });
+      renderLimited('v4-orders-body', rows);
     } catch (e) { /* ignore */ }
   }
 
@@ -501,10 +635,10 @@
     return String(v);
   }
 
-  function formatSpentOrderRef(order) {
+  function spentOrderRefFull(order) {
     var input = (order || {}).input || '';
-    if (typeof input === 'string') return truncate(input, 24);
-    return truncate(input.transaction_id || '', 12) + '#' + (input.index || 0);
+    if (typeof input === 'string') return input;
+    return (input.transaction_id || '') + '#' + (input.index || 0);
   }
 
   function formatSpentReason(reason) {
@@ -516,25 +650,27 @@
     return { text: 'Unknown', poolId: '', badge: 'badge-yellow' };
   }
 
-  function renderSpentOrderRows(tbody, data) {
-    tbody.innerHTML = '';
-    for (const entry of data) {
-      const row = document.createElement('tr');
-      const r = formatSpentReason(entry.reason);
-      row.innerHTML = '<td>' + formatSpentOrderRef(entry.order) + '</td>' +
-        '<td title="' + r.poolId + '">' + truncate(r.poolId, 16) + '</td>' +
+  function spentOrderRows(data) {
+    var sorted = data.slice().sort(function(a, b) { return (b.slot || 0) - (a.slot || 0); });
+    return sorted.map(function(entry) {
+      var row = document.createElement('tr');
+      var r = formatSpentReason(entry.reason);
+      var ref = spentOrderRefFull(entry.order);
+      var txId = entry.tx_id || '';
+      row.innerHTML = '<td>' + copyable(truncate(ref, 24), ref) + '</td>' +
+        '<td>' + copyable(truncate(r.poolId, 16), r.poolId) + '</td>' +
         '<td><span class="badge ' + r.badge + '">' + r.text + '</span></td>' +
-        '<td title="' + (entry.tx_id || '') + '">' + truncate(entry.tx_id || '', 16) + '</td>' +
+        '<td>' + copyable(truncate(txId, 16), txId) + '</td>' +
         '<td>' + (entry.slot || '') + '</td>';
-      tbody.appendChild(row);
-    }
+      return row;
+    });
   }
 
   async function loadV3SpentOrders() {
     try {
       const res = await fetch('/v3/spent-orders');
       const data = await res.json();
-      renderSpentOrderRows(document.getElementById('v3-spent-orders-body'), data);
+      renderLimited('v3-spent-orders-body', spentOrderRows(data));
     } catch (e) { /* ignore */ }
   }
 
@@ -542,7 +678,7 @@
     try {
       const res = await fetch('/v4/spent-orders');
       const data = await res.json();
-      renderSpentOrderRows(document.getElementById('v4-spent-orders-body'), data);
+      renderLimited('v4-spent-orders-body', spentOrderRows(data));
     } catch (e) { /* ignore */ }
   }
 
@@ -644,6 +780,29 @@
       log.removeChild(log.lastChild);
     }
   }
+
+  // --- Table filtering ---
+  function applyFilter(tbodyId) {
+    var input = document.querySelector('input[data-filter="' + tbodyId + '"]');
+    if (!input) return;
+    var term = input.value.toLowerCase();
+    var rows = document.getElementById(tbodyId).querySelectorAll('tr');
+    rows.forEach(function(row) {
+      var text = row.textContent.toLowerCase();
+      // Also search full (untruncated) values stored in data-copy attributes
+      var copyEls = row.querySelectorAll('[data-copy]');
+      for (var i = 0; i < copyEls.length; i++) {
+        text += ' ' + copyEls[i].getAttribute('data-copy').toLowerCase();
+      }
+      row.style.display = text.includes(term) ? '' : 'none';
+    });
+  }
+
+  document.querySelectorAll('.search-bar input').forEach(function(input) {
+    input.addEventListener('input', function() {
+      applyFilter(input.dataset.filter);
+    });
+  });
 
   // --- Init ---
   fetchStatus();
