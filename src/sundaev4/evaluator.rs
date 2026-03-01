@@ -52,6 +52,31 @@ impl ScriptStore {
         Ok(ScriptStore { scripts: store })
     }
 
+    /// Build a ScriptStore from a Blueprint's compiled code.
+    ///
+    /// For each validator with `compiled_code`, hex-decodes the script CBOR,
+    /// computes the PlutusV3 hash, and CBOR-unwraps to FLAT bytes.
+    /// This bypasses the need to index reference UTxOs from the chain.
+    pub fn from_blueprint(blueprint: &crate::blueprint::Blueprint) -> Result<Self> {
+        let mut store = BTreeMap::new();
+        for validator in &blueprint.validators {
+            if let Some(code_hex) = &validator.compiled_code {
+                let script_cbor = hex::decode(code_hex)
+                    .with_context(|| format!("invalid hex in compiled_code for '{}'", validator.title))?;
+                // PlutusV3 script hash = blake2b_224(0x03 || script_cbor)
+                let mut preimage = Vec::with_capacity(1 + script_cbor.len());
+                preimage.push(0x03);
+                preimage.extend_from_slice(&script_cbor);
+                let hash: Hash<28> = Hasher::<224>::hash(&preimage);
+                // CBOR unwrap to get FLAT bytes
+                let flat_bytes = cbor_unwrap_bytes(&script_cbor)
+                    .with_context(|| format!("CBOR unwrap failed for '{}' ({})", validator.title, hex::encode(hash)))?;
+                store.insert(hash, flat_bytes);
+            }
+        }
+        Ok(ScriptStore { scripts: store })
+    }
+
     pub fn get(&self, hash: &Hash<28>) -> Option<&[u8]> {
         self.scripts.get(hash).map(|v| v.as_slice())
     }
@@ -161,6 +186,8 @@ pub fn evaluate_scoop_tx(
                 // Log any trace output
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
+                    // Also eprintln for tests where tracing subscriber isn't set up
+                    eprintln!("[script {}] trace: {log}", hex::encode(script_hash));
                 }
                 bail!(
                     "script {} ({:?}[{}]) evaluation failed: {e:?}",

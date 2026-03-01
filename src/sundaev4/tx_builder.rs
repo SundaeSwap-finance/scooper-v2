@@ -28,7 +28,7 @@ use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 /// Per-redeemer ExUnits budget (tx max / 10 so 6 redeemers fit comfortably).
 const EX_MEM: u64 = 14_000_000 / 10;
 const EX_STEPS: u64 = 10_000_000_000 / 10;
-const TX_FEE: u64 = 2_000_000;
+pub const TX_FEE: u64 = 2_000_000;
 const POOL_MIN_ADA: u64 = 50_000_000;
 const VALIDITY_RANGE: u64 = 60;
 

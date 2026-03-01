@@ -389,6 +389,8 @@ pub struct SundaeV4Protocol {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub starting_point: Point,
     pub execution: Option<ScooperExecution>,
+    #[serde(default)]
+    pub blueprint: Option<crate::blueprint::Blueprint>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
