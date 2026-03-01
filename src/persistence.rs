@@ -35,11 +35,16 @@ pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>>
     })
 }
 
+pub struct SpentTxo {
+    pub input: TransactionInput,
+    pub spending_tx_id: Vec<u8>,
+}
+
 pub struct TxChanges {
     pub slot: u64,
     pub height: u64,
     pub created_txos: Vec<PersistedTxo>,
-    pub spent_txos: Vec<TransactionInput>,
+    pub spent_txos: Vec<SpentTxo>,
     pub metadata_datums: Vec<PersistedDatum>,
 }
 impl TxChanges {
@@ -64,6 +69,7 @@ pub trait IndexerDao: Send + Sync + 'static {
     async fn apply_tx_changes(&self, changes: TxChanges) -> Result<()>;
     async fn rollback(&self, slot: u64) -> Result<()>;
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>>;
+    async fn load_spent_txos(&self, since_slot: u64) -> Result<Vec<SpentPersistedTxo>>;
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
 }
@@ -77,6 +83,13 @@ pub struct PersistedTxo {
     pub txo: Vec<u8>,
     pub address: Vec<u8>,
     pub datum: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentPersistedTxo {
+    pub txo: PersistedTxo,
+    pub spent_slot: u64,
+    pub spent_tx_id: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

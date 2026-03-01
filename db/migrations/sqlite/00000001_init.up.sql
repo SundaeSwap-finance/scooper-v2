@@ -5,6 +5,7 @@ CREATE TABLE sundae_v3_txos (
     created_slot BIGINT NOT NULL,
     spent_slot BIGINT,
     spent_height BIGINT,
+    spent_tx_id BLOB NULL,
     era INT NOT NULL,
     txo BLOB NOT NULL,
     PRIMARY KEY (tx_id, txo_index)

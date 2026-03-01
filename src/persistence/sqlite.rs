@@ -13,7 +13,8 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, TxChanges,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, SpentPersistedTxo,
+        TxChanges,
     },
 };
 
@@ -123,12 +124,13 @@ impl IndexerDao for SqliteIndexerDao {
 
         for spent_txo in changes.spent_txos {
             sqlx::query(&format!(
-                "UPDATE {txos_table} SET spent_slot = ?, spent_height = ? WHERE tx_id = ? AND txo_index = ?;"
+                "UPDATE {txos_table} SET spent_slot = ?, spent_height = ?, spent_tx_id = ? WHERE tx_id = ? AND txo_index = ?;"
             ))
             .bind(changes.slot as i64)
             .bind(changes.height as i64)
-            .bind(spent_txo.0.transaction_id.to_vec())
-            .bind(spent_txo.0.index as i64)
+            .bind(&spent_txo.spending_tx_id)
+            .bind(spent_txo.input.0.transaction_id.to_vec())
+            .bind(spent_txo.input.0.index as i64)
             .execute(&mut *tx)
             .await?;
         }
@@ -169,7 +171,7 @@ impl IndexerDao for SqliteIndexerDao {
             .await?;
 
         sqlx::query(&format!(
-            "UPDATE {txos_table} SET spent_slot = NULL, spent_height = NULL WHERE spent_slot > ?"
+            "UPDATE {txos_table} SET spent_slot = NULL, spent_height = NULL, spent_tx_id = NULL WHERE spent_slot > ?"
         ))
         .bind(slot as i64)
         .execute(&mut *tx)
@@ -200,6 +202,17 @@ impl IndexerDao for SqliteIndexerDao {
             "SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum FROM {txos_table} WHERE spent_slot IS NULL ORDER BY created_slot, tx_id, txo_index;"
         );
         Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
+    }
+
+    async fn load_spent_txos(&self, since_slot: u64) -> Result<Vec<SpentPersistedTxo>> {
+        let txos_table = self.txos_table();
+        let query = format!(
+            "SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum, spent_slot, spent_tx_id FROM {txos_table} WHERE spent_slot IS NOT NULL AND spent_slot >= ? ORDER BY spent_slot, tx_id, txo_index;"
+        );
+        Ok(sqlx::query_as(&query)
+            .bind(since_slot as i64)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     async fn prune_txos(&self, min_height: u64) -> Result<()> {
@@ -235,6 +248,19 @@ impl FromRow<'_, SqliteRow> for PersistedTxo {
             txo,
             address,
             datum,
+        })
+    }
+}
+
+impl FromRow<'_, SqliteRow> for SpentPersistedTxo {
+    fn from_row(row: &'_ SqliteRow) -> Result<Self, sqlx::Error> {
+        let txo = PersistedTxo::from_row(row)?;
+        let spent_slot: i64 = row.try_get("spent_slot")?;
+        let spent_tx_id: Option<Vec<u8>> = row.try_get("spent_tx_id")?;
+        Ok(Self {
+            txo,
+            spent_slot: spent_slot as u64,
+            spent_tx_id,
         })
     }
 }
@@ -321,6 +347,7 @@ mod tests {
     use acropolis_module_custom_indexer::cursor_store::CursorStore;
 
     use super::*;
+    use crate::persistence::SpentTxo;
 
     async fn new_db() -> Result<SqlitePersistence> {
         SqlitePersistence::new(&SqliteConfig { filename: None }).await
@@ -558,7 +585,7 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![order.txo_id.clone()],
+            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
         })
         .await?;
@@ -632,7 +659,7 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![order.txo_id.clone()],
+            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
         })
         .await?;
@@ -679,7 +706,7 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![order.txo_id.clone()],
+            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
         })
         .await?;
