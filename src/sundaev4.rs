@@ -11,3 +11,8 @@ mod types;
 
 pub use indexer::*;
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) mod test_harness;
+#[cfg(test)]
+mod scoop_tests;
