@@ -21,7 +21,7 @@ use crate::{
     datum_lookup::{DatumLookup, ScopedDatumLookup},
     events::{IndexEvent, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
-    persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
+    persistence::{IndexerDao, PersistedDatum, PersistedTxo, SpentTxo, TxChanges},
     sundaev3::Ident,
     sundaev4::{
         OrderRedeemer, PoolDatum, SettingsDatum, SundaeV4Order, SundaeV4Pool,
@@ -166,9 +166,67 @@ impl SundaeV4Indexer {
                         slot: txo.created_slot,
                     }));
                 }
+                "wallet" => {
+                    state.wallet_utxos.insert(txo.txo_id, output.value);
+                }
+                "ref" => {
+                    state.ref_utxo_outputs.insert(txo.txo_id, output);
+                }
                 other => bail!("unrecognized txo type \"{other}\""),
             }
         }
+        // Recover spent orders/pools from DB
+        let spent_since = slot.saturating_sub(self.rollback_limit);
+        let spent_txos = self.dao.load_spent_txos(spent_since).await?;
+        for stxo in spent_txos {
+            let era = Era::try_from(stxo.txo.era)?;
+            let parsed = MultiEraOutput::decode(era, &stxo.txo.txo)?;
+            let datum = match &stxo.txo.datum {
+                Some(bytes) => {
+                    let pd = minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
+                    Some(pd)
+                }
+                None => None,
+            };
+            let datums = state.datums.for_persisted_txo(datum);
+            let output = cardano_types::convert_txo(&parsed);
+            let tx_id = stxo.spent_tx_id.map(hex::encode).unwrap_or_default();
+            match stxo.txo.txo_type.as_str() {
+                "order" => {
+                    if let Some(od) = output.datum.parse(&datums) {
+                        state.spent_orders.push(SpentOrder {
+                            order: Arc::new(SundaeV4Order {
+                                input: stxo.txo.txo_id,
+                                datum: od,
+                                value: output.value,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            reason: SpentOrderReason::Unknown,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
+                    }
+                }
+                "pool" => {
+                    if let Some(pd) = self.parse_pool(&output, &datums) {
+                        state.spent_pools.push(SpentPool {
+                            id: pd.identifier.clone(),
+                            old_pool: Arc::new(SundaeV4Pool {
+                                input: stxo.txo.txo_id,
+                                value: output.value,
+                                pool_datum: pd,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            new_pool: None,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
+                    }
+                }
+                _ => {} // skip wallet, ref, settings
+            }
+        }
+
         *self.state.lock().await.update_slot(slot)? = state;
         Ok(())
     }
@@ -381,6 +439,15 @@ impl ChainIndex for SundaeV4Indexer {
                     let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                     let tx_out = cardano_types::convert_txo(output);
                     trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "wallet".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: None,
+                    });
                     state.wallet_utxos.insert(this_input, tx_out.value);
                 }
             }
@@ -391,6 +458,15 @@ impl ChainIndex for SundaeV4Indexer {
                 if self.ref_utxo_inputs.contains(&this_input) {
                     let tx_out = cardano_types::convert_txo(output);
                     trace!(slot, utxo = %this_input, "v4: ref UTxO output spotted");
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "ref".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: None,
+                    });
                     state.ref_utxo_outputs.insert(this_input, tx_out);
                 }
             }
@@ -405,7 +481,12 @@ impl ChainIndex for SundaeV4Indexer {
 
         // Remove spent wallet UTxOs
         for input in &spent_inputs {
-            state.wallet_utxos.remove(input);
+            if state.wallet_utxos.remove(input).is_some() {
+                changes.spent_txos.push(SpentTxo {
+                    input: input.clone(),
+                    spending_tx_id: this_tx_hash.to_vec(),
+                });
+            }
         }
 
         let mut scooped_orders = BTreeSet::new();
@@ -445,7 +526,10 @@ impl ChainIndex for SundaeV4Indexer {
                     removed_pool_ids.push(ident.clone());
                 }
             }
-            changes.spent_txos.push(pool.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: pool.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             false
         });
 
@@ -487,7 +571,10 @@ impl ChainIndex for SundaeV4Indexer {
                     warn!(slot, order = %order.input, "v4: order spent without a valid redeemer!");
                 }
             }
-            changes.spent_txos.push(order.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: order.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             false
         });
 
@@ -500,7 +587,10 @@ impl ChainIndex for SundaeV4Indexer {
         if let Some(settings) = &state.settings
             && spent_inputs.contains(&settings.input)
         {
-            changes.spent_txos.push(settings.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: settings.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             state.settings = None;
         }
 
@@ -576,10 +666,19 @@ impl ChainIndex for SundaeV4Indexer {
                 warn!("v4: rolling back to {point}");
                 let mut history = self.state.lock().await;
                 history.rollback_to_slot(*slot);
+                let needs_reload = history.is_empty();
+                drop(history);
+                self.dao.rollback(*slot).await?;
+                if needs_reload {
+                    warn!("v4: history empty after rollback, rebuilding from DB");
+                    self.load().await?;
+                }
             }
         }
         let to_slot = point.slot();
-        self.dao.rollback(to_slot).await?;
+        if matches!(point, Point::Origin) {
+            self.dao.rollback(to_slot).await?;
+        }
         let _ = self
             .event_tx
             .send((to_slot, vec![IndexEvent::Rollback { to_slot }]));

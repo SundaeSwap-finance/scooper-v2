@@ -21,7 +21,7 @@ use crate::{
     datum_lookup::{DatumLookup, ScopedDatumLookup},
     events::{IndexEvent, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
-    persistence::{IndexerDao, PersistedDatum, PersistedTxo, TxChanges},
+    persistence::{IndexerDao, PersistedDatum, PersistedTxo, SpentTxo, TxChanges},
     sundaev3::{
         Ident, OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SignedStrategyExecution,
         SundaeV3Order, SundaeV3Pool, SundaeV3Protocol, SundaeV3Settings, WrappedRedeemer,
@@ -150,6 +150,59 @@ impl SundaeV3Indexer {
                 other => bail!("unrecognized txo type \"{other}\""),
             }
         }
+
+        // Recover spent orders/pools from DB
+        let spent_since = slot.saturating_sub(self.rollback_limit);
+        let spent_txos = self.dao.load_spent_txos(spent_since).await?;
+        for stxo in spent_txos {
+            let era = Era::try_from(stxo.txo.era)?;
+            let parsed = MultiEraOutput::decode(era, &stxo.txo.txo)?;
+            let datum = match &stxo.txo.datum {
+                Some(bytes) => {
+                    let pd = minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
+                    Some(pd)
+                }
+                None => None,
+            };
+            let datums = state.datums.for_persisted_txo(datum);
+            let output = cardano_types::convert_txo(&parsed);
+            let tx_id = stxo.spent_tx_id.map(hex::encode).unwrap_or_default();
+            match stxo.txo.txo_type.as_str() {
+                "order" => {
+                    if let Some(od) = output.datum.parse(&datums) {
+                        state.spent_orders.push(SpentOrder {
+                            order: Arc::new(SundaeV3Order {
+                                input: stxo.txo.txo_id,
+                                datum: od,
+                                value: output.value,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            reason: SpentOrderReason::Unknown,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
+                    }
+                }
+                "pool" => {
+                    if let Some(pd) = self.parse_pool(&output, &datums) {
+                        state.spent_pools.push(SpentPool {
+                            id: pd.ident.clone(),
+                            old_pool: Arc::new(SundaeV3Pool {
+                                input: stxo.txo.txo_id,
+                                value: output.value,
+                                pool_datum: pd,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            new_pool: None,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
+                    }
+                }
+                _ => {} // skip settings
+            }
+        }
+
         *self.state.lock().await.update_slot(slot)? = state.clone();
         self.broadcaster.send_replace(SundaeV3Update {
             slot,
@@ -408,7 +461,10 @@ impl ChainIndex for SundaeV3Indexer {
                     removed_pool_ids.push(ident.clone());
                 }
             }
-            changes.spent_txos.push(pool.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: pool.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             false
         });
 
@@ -505,7 +561,10 @@ impl ChainIndex for SundaeV3Indexer {
                 }
                 None => warn!(slot, order = %order.input, "order spent without a valid redeemer!"),
             }
-            changes.spent_txos.push(order.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: order.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             false
         });
 
@@ -518,7 +577,10 @@ impl ChainIndex for SundaeV3Indexer {
         if let Some(settings) = &state.settings
             && spent_inputs.contains(&settings.input)
         {
-            changes.spent_txos.push(settings.input.clone());
+            changes.spent_txos.push(SpentTxo {
+                input: settings.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
             state.settings = None;
         }
 
@@ -597,10 +659,19 @@ impl ChainIndex for SundaeV3Indexer {
                 warn!("rolling back to {point}");
                 let mut history = self.state.lock().await;
                 history.rollback_to_slot(*slot);
+                let needs_reload = history.is_empty();
+                drop(history);
+                self.dao.rollback(*slot).await?;
+                if needs_reload {
+                    warn!("v3: history empty after rollback, rebuilding from DB");
+                    self.load().await?;
+                }
             }
         }
         let to_slot = point.slot();
-        self.dao.rollback(to_slot).await?;
+        if matches!(point, Point::Origin) {
+            self.dao.rollback(to_slot).await?;
+        }
         self.broadcaster.send_replace(SundaeV3Update {
             slot: to_slot,
             tip_slot: None,
@@ -658,6 +729,9 @@ mod tests {
             Ok(())
         }
         async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
+            Ok(vec![])
+        }
+        async fn load_spent_txos(&self, _since_slot: u64) -> Result<Vec<crate::persistence::SpentPersistedTxo>> {
             Ok(vec![])
         }
         async fn load_datums(&self) -> Result<Vec<PersistedDatum>> {

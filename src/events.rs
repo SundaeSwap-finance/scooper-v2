@@ -96,6 +96,7 @@ impl<T> Clone for SpentOrder<T> {
 pub enum SpentOrderReason {
     Scooped { pool_id: Ident },
     Cancelled,
+    Unknown,
 }
 
 #[derive(Debug, Serialize)]
