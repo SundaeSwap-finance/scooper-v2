@@ -215,12 +215,19 @@ pub fn build_batch_scoop_tx(
         output_index: pool_oref.index,
     };
 
-    // N OrderValidator entries: each maps filtered_input_idx → output_idx
-    // Pool output is index 0, fulfillment outputs are 1..N
-    let order_validator_entries: Vec<OrderValidatorEntry> = (0..n_orders)
-        .map(|i| OrderValidatorEntry {
-            input_index: order_filtered_indices[i],
-            output_index: (1 + i) as u64,
+    // The on-chain validator iterates both inputs and outputs in ascending
+    // order using skip-based traversal, so entries MUST be sorted by
+    // input_index AND output_index must also be ascending. We achieve this
+    // by building fulfillment outputs in input-sorted order (see below).
+    let mut input_sorted_order: Vec<usize> = (0..n_orders).collect();
+    input_sorted_order.sort_by_key(|&i| order_filtered_indices[i]);
+
+    let order_validator_entries: Vec<OrderValidatorEntry> = input_sorted_order
+        .iter()
+        .enumerate()
+        .map(|(out_pos, &batch_idx)| OrderValidatorEntry {
+            input_index: order_filtered_indices[batch_idx],
+            output_index: (1 + out_pos) as u64,
         })
         .collect();
 
@@ -335,9 +342,11 @@ pub fn build_batch_scoop_tx(
     let per_order_fee = TX_FEE / n_orders as u64;
     let last_order_fee = TX_FEE - per_order_fee * (n_orders as u64 - 1);
 
-    // Build fulfillment outputs for each swap
+    // Build fulfillment outputs in input-sorted order so output indices
+    // ascend together with input indices (required by on-chain validator).
     let ada_asset = AssetClass { policy: vec![], token: vec![] };
-    for (i, swap) in swaps.iter().enumerate() {
+    for (out_pos, &batch_idx) in input_sorted_order.iter().enumerate() {
+        let swap = &swaps[batch_idx];
         let dest_address = resolve_destination(
             &swap.order.datum.destination,
             &swap.order.datum.owner,
@@ -347,7 +356,7 @@ pub fn build_batch_scoop_tx(
             use num_traits::ToPrimitive;
             swap.order.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0)
         };
-        let fee = if i == n_orders - 1 { last_order_fee } else { per_order_fee };
+        let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
         let fulfillment_ada = order_ada.saturating_sub(fee);
         let fulfillment_value = build_fulfillment_value(output_asset, &swap.dy, fulfillment_ada)?;
         outputs.push(TransactionOutput::PostAlonzo(
