@@ -321,7 +321,7 @@ fn encode_resolved_tx_out(txo: &ResolvedTxOut) -> PlutusData {
     let address = encode_address_bytes(&txo.address);
     let value = encode_value(&txo.value);
     let datum_option = match &txo.datum {
-        DatumOption::None => constr(1, vec![]),      // NoOutputDatum
+        DatumOption::None => constr(0, vec![]),      // NoOutputDatum
         DatumOption::DatumHash(h) => {
             constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])  // OutputDatumHash
         }
@@ -359,7 +359,7 @@ fn encode_tx_out(output: &TransactionOutput) -> PlutusData {
             let address = encode_address_bytes(&o.address);
             let value = encode_conway_value(&o.value);
             let datum_option = match &o.datum_option {
-                None => constr(1, vec![]),  // NoOutputDatum
+                None => constr(0, vec![]),  // NoOutputDatum
                 Some(conway::PseudoDatumOption::Hash(h)) => {
                     constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])
                 }
