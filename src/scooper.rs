@@ -22,8 +22,10 @@ use crate::{
     },
     sundaev4::{
         SundaeV4HistoricalState, ScooperExecution,
+        accumulator::Accumulator,
         batch::{self, BatchLimits},
         chain_tracker::{ChainTracker, InFlightTx, PredictedPoolUtxo},
+        tx_builder::MultiPoolBuildResult,
     },
 };
 
@@ -275,13 +277,14 @@ impl Scooper {
                     } else if self.v4_chain_tracker.latest_predicted_pool(&id).is_some() {
                         // Pool was updated but doesn't match any of our
                         // in-flight txs — a competitor scooped, discard chain
+                        // (cascade to related pools in multi-pool txs)
                         info!(pool = %id, "v4 pool updated by competitor, discarding chain");
-                        self.v4_chain_tracker.discard_chain(&id);
+                        self.v4_chain_tracker.discard_chain_and_related(&id);
                     }
                 }
                 IndexEvent::V4PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "v4 pool removed");
-                    self.v4_chain_tracker.discard_chain(&id);
+                    self.v4_chain_tracker.discard_chain_and_related(&id);
                 }
                 IndexEvent::V4OrderCreated { order } => {
                     trace!(slot, order = %order.input, "v4 order created");
@@ -314,8 +317,19 @@ impl Scooper {
         }
     }
 
-    /// Run one cycle of batch assembly → build → evaluate → submit for
-    /// all pools with pending orders. Returns true if any batch was submitted.
+    /// Protocol-level limits for transaction building.
+    const MAX_TX_EX_MEM: u64 = 14_000_000;
+    const MAX_TX_EX_STEPS: u64 = 10_000_000_000;
+    const MAX_TX_SIZE: usize = 16_384;
+
+    /// Run one cycle of incremental accumulation → build → evaluate → submit.
+    ///
+    /// Iterates candidate orders one at a time. For each: clone accumulator,
+    /// try adding the order, build+evaluate, check limits. If within limits,
+    /// accept the candidate; if over limits, submit the previous state.
+    ///
+    /// This naturally supports multi-pool transactions when orders target
+    /// different pools.
     async fn run_v4_batch_cycle(&mut self) -> bool {
         let exec = match &self.v4_execution {
             Some(e) => e.clone(),
@@ -363,26 +377,19 @@ impl Scooper {
             None => return false,
         };
 
-        // Filter orders: exclude in-flight ones
+        // Filter orders: exclude in-flight ones, sort oldest first
         let in_flight_inputs = self.v4_chain_tracker.in_flight_order_inputs();
-        let candidates: Vec<_> = v4_state
+        let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
             .filter(|o| !in_flight_inputs.contains(&o.input))
             .cloned()
             .collect();
+        candidates.sort_by_key(|o| o.slot);
 
         if candidates.is_empty() {
             return false;
         }
-
-        // Group candidates by pool
-        let groups = batch::group_orders_by_pool(&candidates, &v4_state.pools);
-        if groups.is_empty() {
-            return false;
-        }
-
-        let mut submitted_any = false;
 
         // Build script store once (cached across cycles)
         if self.v4_script_store.is_none() {
@@ -400,144 +407,234 @@ impl Scooper {
         }
         let script_store = self.v4_script_store.as_ref().unwrap();
 
-        for (pool_ident, pool_orders) in &groups {
-            // Get effective pool: use predicted pool from chain tracker if
-            // we have an in-flight chain, otherwise use on-chain state
-            let effective_pool = match self.v4_chain_tracker.latest_predicted_pool(pool_ident) {
-                Some(predicted) => predicted.pool.clone(),
-                None => match v4_state.pools.get(pool_ident) {
-                    Some(p) => p.clone(),
-                    None => continue,
-                },
-            };
+        // ── Incremental accumulation loop ──────────────────────────────────
 
-            // Assemble batch
-            let batch = match batch::assemble_batch(
-                &effective_pool,
-                pool_orders,
-                exec.fee,
-                exec.protocol_share,
-                &self.v4_batch_limits,
-            ) {
-                Some(b) => b,
-                None => {
-                    trace!(
-                        pool = %pool_ident,
-                        n_candidates = pool_orders.len(),
-                        "no executable orders for pool"
-                    );
-                    continue;
+        let mut accum = Accumulator::new(exec.fee, exec.protocol_share);
+        let mut last_good: Option<(Accumulator, MultiPoolBuildResult)> = None;
+
+        for order in &candidates {
+            if accum.order_count() >= self.v4_batch_limits.max_orders {
+                break;
+            }
+
+            // Match order to pool
+            let pool_ident = match &order.datum.constraints {
+                crate::sundaev4::OrderConstraints::Structured { steps } => {
+                    steps.first().map(|s| s.pool_ident.clone())
+                }
+                crate::sundaev4::OrderConstraints::Simple { .. } => {
+                    batch::find_pool_for_simple_order(order, &v4_state.pools)
+                }
+            };
+            let Some(pool_ident) = pool_ident else { continue };
+
+            // Get effective pool for this pool:
+            // 1. If already in the accumulator, it uses its own running state
+            // 2. If chain tracker has a predicted pool, use that
+            // 3. Otherwise, use on-chain state
+            let effective_pool = if accum.pools.contains_key(&pool_ident) {
+                // Pool already in accumulator — the accum handles running state internally
+                // We still need a reference pool for try_add_order's initial state
+                // (but it's only used if the pool isn't already in the accum)
+                accum.pools[&pool_ident].pool.clone()
+            } else {
+                match self.v4_chain_tracker.latest_predicted_pool(&pool_ident) {
+                    Some(predicted) => predicted.pool.clone(),
+                    None => match v4_state.pools.get(&pool_ident) {
+                        Some(p) => p.clone(),
+                        None => continue,
+                    },
                 }
             };
 
-            let n_orders = batch.swaps.len();
+            // Clone + try add
+            let mut candidate = accum.clone();
+            if candidate.try_add_order(&order, &pool_ident, &effective_pool).is_err() {
+                continue;
+            }
 
-            // Debug: log batch info
-            info!(
-                pool = %pool_ident,
-                n_orders,
-                a0 = %effective_pool.pool_datum.assets[0].1,
-                b0 = %effective_pool.pool_datum.assets[1].1,
-                a1 = %batch.final_assets[0].1,
-                b1 = %batch.final_assets[1].1,
-                lp_before = %effective_pool.pool_datum.total_lp,
-                lp_after = %batch.final_total_lp,
-                "assembling batch"
-            );
-
-            // Two-pass build → evaluate → rebuild → submit
-            let first_pass = match crate::sundaev4::tx_builder::build_batch_scoop_tx(
-                &batch, &settings, &exec, current_slot, language_views,
+            // Build + evaluate
+            let batches = candidate.clone().into_batches();
+            let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+                &batches, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(error = %e, pool = %pool_ident, n_orders, "v4 batch tx build failed (first pass)");
+                    trace!(error = %e, order = %order.input, "incremental build failed, skipping order");
                     continue;
                 }
             };
 
-            let eval_result = match crate::sundaev4::evaluator::evaluate_scoop_tx(
-                &first_pass.tx_body,
-                &first_pass.redeemers,
-                &first_pass.resolved_inputs,
-                &first_pass.resolved_ref_inputs,
-                &script_store,
+            let eval = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                &build.tx_body,
+                &build.redeemers,
+                &build.resolved_inputs,
+                &build.resolved_ref_inputs,
+                script_store,
                 &exec.plutus_v3_cost_model,
-                first_pass.tx_hash,
+                build.tx_hash,
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        tx_hash = %first_pass.tx_hash_hex,
-                        pool = %pool_ident,
-                        "v4 batch local evaluation failed"
-                    );
+                    trace!(error = %e, order = %order.input, "incremental eval failed, skipping order");
                     continue;
                 }
             };
 
-            // Apply 20% safety margin
-            let padded_budgets: Vec<_> = eval_result.budgets.iter().map(|(k, eu)| {
-                (k.clone(), pallas_primitives::ExUnits {
-                    mem: eu.mem * 6 / 5,
-                    steps: eu.steps * 6 / 5,
-                })
-            }).collect();
+            // Check limits
+            let total_mem: u64 = eval.budgets.iter().map(|(_, eu)| eu.mem).sum();
+            let total_steps: u64 = eval.budgets.iter().map(|(_, eu)| eu.steps).sum();
+            let tx_size = build.cbor.len();
 
-            let final_tx = match crate::sundaev4::tx_builder::build_batch_scoop_tx(
-                &batch, &settings, &exec, current_slot, language_views,
-                &collateral_input.0, &collateral_value, Some(&padded_budgets),
-                &v4_state.ref_utxo_outputs,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, pool = %pool_ident, "v4 batch tx build failed (second pass)");
-                    continue;
-                }
-            };
+            // Apply 20% safety margin to check whether padded values would exceed limits
+            let padded_mem = total_mem * 6 / 5;
+            let padded_steps = total_steps * 6 / 5;
 
-            info!(
-                tx_hash = %final_tx.tx_hash_hex,
-                pool = %pool_ident,
-                n_orders,
-                "v4 batch scoop tx built, submitting"
+            trace!(
+                order = %order.input,
+                n_orders = candidate.order_count(),
+                mem = total_mem,
+                steps = total_steps,
+                tx_size,
+                "incremental eval"
             );
 
-            match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
-                Ok(submitted_hash) => {
-                    info!(tx_hash = %submitted_hash, pool = %pool_ident, n_orders, "v4 batch scoop tx submitted");
-
-                    // Record in chain tracker
-                    let consumed_orders: Vec<_> = batch.swaps.iter()
-                        .map(|s| s.order.clone())
-                        .collect();
-
-                    let (predicted_input, predicted_pool) = final_tx.predicted_pool;
-                    let in_flight = InFlightTx {
-                        tx_hash: final_tx.tx_hash,
-                        tx_hash_hex: final_tx.tx_hash_hex,
-                        pool_idents: vec![pool_ident.clone()],
-                        consumed_orders,
-                        predicted_pools: vec![(pool_ident.clone(), PredictedPoolUtxo {
-                            input: predicted_input,
-                            pool: Arc::new(predicted_pool),
-                        })],
-                        ttl: final_tx.ttl,
-                        chain_index: self.v4_chain_tracker.next_chain_index(pool_ident),
-                    };
-                    self.v4_chain_tracker.record_submission(in_flight);
-                    submitted_any = true;
-                }
-                Err(e) => {
-                    warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, pool = %pool_ident, "v4 batch scoop tx submit failed");
-                    self.v4_chain_tracker.discard_chain(pool_ident);
-                }
+            if padded_mem > Self::MAX_TX_EX_MEM
+                || padded_steps > Self::MAX_TX_EX_STEPS
+                || tx_size > Self::MAX_TX_SIZE
+            {
+                // Over limits — stop adding orders, submit previous state
+                info!(
+                    n_orders = candidate.order_count(),
+                    mem = padded_mem,
+                    steps = padded_steps,
+                    tx_size,
+                    "over limits, submitting previous accumulation"
+                );
+                break;
             }
+
+            // Within limits — accept this candidate
+            last_good = Some((accum.clone(), build));
+            accum = candidate;
         }
 
-        submitted_any
+        // ── Submit the accumulated tx ──────────────────────────────────────
+
+        if accum.is_empty() {
+            return false;
+        }
+
+        // Use last_good's build result for eval budgets, rebuild with padding
+        let Some((_prev_accum, last_build)) = last_good else {
+            return false;
+        };
+
+        // Re-evaluate the final accumulator state for accurate budgets
+        let final_batches = accum.clone().into_batches();
+        let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+            &final_batches, &settings, &exec, current_slot, language_views,
+            &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "final multi-pool tx build failed");
+                return false;
+            }
+        };
+
+        let eval_result = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+            &first_pass.tx_body,
+            &first_pass.redeemers,
+            &first_pass.resolved_inputs,
+            &first_pass.resolved_ref_inputs,
+            script_store,
+            &exec.plutus_v3_cost_model,
+            first_pass.tx_hash,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "final multi-pool eval failed");
+                return false;
+            }
+        };
+
+        // Apply 20% safety margin
+        let padded_budgets: Vec<_> = eval_result.budgets.iter().map(|(k, eu)| {
+            (k.clone(), pallas_primitives::ExUnits {
+                mem: eu.mem * 6 / 5,
+                steps: eu.steps * 6 / 5,
+            })
+        }).collect();
+
+        let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+            &final_batches, &settings, &exec, current_slot, language_views,
+            &collateral_input.0, &collateral_value, Some(&padded_budgets),
+            &v4_state.ref_utxo_outputs,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "final multi-pool tx rebuild failed");
+                return false;
+            }
+        };
+
+        let n_orders = accum.order_count();
+        let n_pools = accum.pools.len();
+        let pool_idents: Vec<_> = accum.pools.keys().cloned().collect();
+
+        info!(
+            tx_hash = %final_tx.tx_hash_hex,
+            n_orders,
+            n_pools,
+            pools = ?pool_idents.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            "multi-pool scoop tx built, submitting"
+        );
+
+        let _ = last_build; // was used for limit checking during accumulation
+
+        match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
+            Ok(submitted_hash) => {
+                info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
+
+                // Collect consumed orders from all batches
+                let consumed_orders: Vec<_> = final_batches.iter()
+                    .flat_map(|b| b.swaps.iter().map(|s| s.order.clone()))
+                    .collect();
+
+                // Build predicted pools for chain tracker
+                let predicted_pools: Vec<_> = final_tx.predicted_pools
+                    .into_iter()
+                    .map(|(ident, input, pool)| (ident, PredictedPoolUtxo {
+                        input,
+                        pool: Arc::new(pool),
+                    }))
+                    .collect();
+
+                let in_flight = InFlightTx {
+                    tx_hash: final_tx.tx_hash,
+                    tx_hash_hex: final_tx.tx_hash_hex,
+                    pool_idents: pool_idents.clone(),
+                    consumed_orders,
+                    predicted_pools,
+                    ttl: final_tx.ttl,
+                    chain_index: pool_idents.iter()
+                        .map(|i| self.v4_chain_tracker.next_chain_index(i))
+                        .max()
+                        .unwrap_or(0),
+                };
+                self.v4_chain_tracker.record_submission(in_flight);
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
+                for ident in &pool_idents {
+                    self.v4_chain_tracker.discard_chain_and_related(ident);
+                }
+                false
+            }
+        }
     }
 
     fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
