@@ -75,37 +75,49 @@ pub fn group_orders_by_pool(
     groups
 }
 
-/// Find a pool whose assets match the order — either the order's value
-/// contains a pool's non-ADA asset (selling token), or the order's
-/// min_received references a pool's non-ADA asset (buying token with ADA).
+/// Find a pool whose assets match the order's offer AND ask tokens.
+///
+/// For a pool to match, it must have BOTH:
+/// - An asset matching the order's offer (present in the order's UTxO value), AND
+/// - An asset matching the order's ask (from min_received constraints)
+///
+/// For ADA→token buy orders (no non-ADA in order value), the pool must have
+/// the min_received asset and ADA as the other asset.
 fn find_pool_for_simple_order(
     order: &SundaeV4Order,
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
-    // Check if order value contains a pool's non-ADA asset (selling)
+    let min_received_assets: Vec<&AssetClass> =
+        if let OrderConstraints::Simple { min_received } = &order.datum.constraints {
+            min_received.iter().map(|(a, _)| a).collect()
+        } else {
+            vec![]
+        };
+
     for (ident, pool) in pools {
-        for (asset, _) in &pool.pool_datum.assets {
+        // Check if order's offer token is in pool's assets
+        let has_offer = pool.pool_datum.assets.iter().any(|(asset, _)| {
             if asset.policy.is_empty() && asset.token.is_empty() {
-                continue;
+                // ADA: order must have > 2M ADA to count as selling ADA
+                order.value.get(asset) > BigInt::from(2_000_000i64)
+            } else {
+                order.value.get(asset).is_positive()
             }
-            if order.value.get(asset).is_positive() {
-                return Some(ident.clone());
-            }
-        }
-    }
-    // Check if order's min_received references a pool's non-ADA asset (buying)
-    if let OrderConstraints::Simple { min_received } = &order.datum.constraints {
-        for (min_asset, _) in min_received {
-            if min_asset.policy.is_empty() && min_asset.token.is_empty() {
-                continue;
-            }
-            for (ident, pool) in pools {
-                for (asset, _) in &pool.pool_datum.assets {
-                    if asset == min_asset {
-                        return Some(ident.clone());
-                    }
+        });
+
+        // Check if order's ask token is in pool's assets
+        let has_ask = min_received_assets.is_empty()
+            || min_received_assets.iter().all(|ask_asset| {
+                if ask_asset.policy.is_empty() && ask_asset.token.is_empty() {
+                    // Asking for ADA — pool should have an ADA pair
+                    pool.pool_datum.assets.iter().any(|(a, _)| a.policy.is_empty() && a.token.is_empty())
+                } else {
+                    pool.pool_datum.assets.iter().any(|(a, _)| a == *ask_asset)
                 }
-            }
+            });
+
+        if has_offer && has_ask {
+            return Some(ident.clone());
         }
     }
     None
@@ -281,6 +293,12 @@ pub fn check_order_executability(
                     return Err(format!("below min_received: got {dy}, need {min_qty}"));
                 }
             }
+            // Verify the pool actually provides the asked token
+            if !min_received.is_empty()
+                && !min_received.iter().any(|(asset, _)| asset == output_asset)
+            {
+                return Err("pool output asset doesn't match min_received token".to_string());
+            }
         }
         OrderConstraints::Structured { .. } => {}
     }
@@ -330,8 +348,9 @@ fn satisfies_min_received(
                     return dy >= min_qty;
                 }
             }
-            // No constraint on this asset — pass
-            true
+            // min_received doesn't reference the output asset — this pool
+            // can't satisfy the order (wrong token pair)
+            min_received.is_empty()
         }
         OrderConstraints::Structured { .. } => {
             // Structured constraints don't have explicit min_received —
