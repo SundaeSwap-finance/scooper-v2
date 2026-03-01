@@ -1,3 +1,4 @@
+pub mod accumulator;
 pub mod batch;
 pub mod chain_tracker;
 pub mod evaluator;
