@@ -518,12 +518,12 @@ impl Scooper {
                     let in_flight = InFlightTx {
                         tx_hash: final_tx.tx_hash,
                         tx_hash_hex: final_tx.tx_hash_hex,
-                        pool_ident: pool_ident.clone(),
+                        pool_idents: vec![pool_ident.clone()],
                         consumed_orders,
-                        predicted_pool: PredictedPoolUtxo {
+                        predicted_pools: vec![(pool_ident.clone(), PredictedPoolUtxo {
                             input: predicted_input,
                             pool: Arc::new(predicted_pool),
-                        },
+                        })],
                         ttl: final_tx.ttl,
                         chain_index: self.v4_chain_tracker.next_chain_index(pool_ident),
                     };

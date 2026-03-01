@@ -3,6 +3,11 @@
 //! When we submit a scoop tx, we predict the resulting pool UTxO and can
 //! immediately build a chained tx that spends it. This module tracks those
 //! chains and handles settlement confirmation, failure discard, and TTL expiry.
+//!
+//! Multi-pool transactions are supported: a single InFlightTx can reference
+//! multiple pools, and is inserted into each pool's chain. When any one pool's
+//! chain is discarded (e.g. competitor scoops), all related pools' chains are
+//! cascade-discarded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,30 +23,45 @@ use crate::sundaev4::SundaeV4Pool;
 /// A predicted pool UTxO resulting from a submitted tx.
 #[derive(Clone, Debug)]
 pub struct PredictedPoolUtxo {
-    /// The predicted input reference: (tx_hash, output_index=0)
+    /// The predicted input reference: (tx_hash, output_index)
     pub input: TransactionInput,
     /// The predicted pool state after the tx settles
     pub pool: Arc<SundaeV4Pool>,
 }
 
 /// A submitted transaction that hasn't settled yet.
+///
+/// May reference one or more pools (multi-pool transactions).
 #[derive(Clone, Debug)]
 pub struct InFlightTx {
     pub tx_hash: Hash<32>,
     pub tx_hash_hex: String,
-    pub pool_ident: Ident,
+    /// Pool identifiers touched by this transaction.
+    pub pool_idents: Vec<Ident>,
     pub consumed_orders: Vec<Arc<SundaeV4Order>>,
-    pub predicted_pool: PredictedPoolUtxo,
+    /// Predicted pool UTxOs, one per pool in this tx.
+    pub predicted_pools: Vec<(Ident, PredictedPoolUtxo)>,
     /// Transaction validity upper bound (slot)
     pub ttl: u64,
     /// Position in chain (0 = first)
     pub chain_index: usize,
 }
 
+impl InFlightTx {
+    /// Get the predicted pool for a specific ident within this multi-pool tx.
+    pub fn predicted_pool_for(&self, ident: &Ident) -> Option<&PredictedPoolUtxo> {
+        self.predicted_pools
+            .iter()
+            .find(|(id, _)| id == ident)
+            .map(|(_, p)| p)
+    }
+}
+
 /// Tracks in-flight transaction chains per pool.
 ///
 /// Each pool can have at most one chain of transactions. Each tx in the chain
-/// consumes the predicted output of the previous tx.
+/// consumes the predicted output of the previous tx. Multi-pool txs are
+/// inserted into each pool's chain.
 pub struct ChainTracker {
     chains: BTreeMap<Ident, Vec<InFlightTx>>,
 }
@@ -53,13 +73,12 @@ impl ChainTracker {
         }
     }
 
-    /// Record a submitted transaction. Returns the predicted pool UTxO for
-    /// building the next chained tx.
-    pub fn record_submission(&mut self, tx: InFlightTx) -> PredictedPoolUtxo {
-        let predicted = tx.predicted_pool.clone();
-        let ident = tx.pool_ident.clone();
-        self.chains.entry(ident).or_default().push(tx);
-        predicted
+    /// Record a submitted transaction (possibly multi-pool).
+    /// Inserts into each pool's chain.
+    pub fn record_submission(&mut self, tx: InFlightTx) {
+        for ident in &tx.pool_idents {
+            self.chains.entry(ident.clone()).or_default().push(tx.clone());
+        }
     }
 
     /// Get the latest predicted pool state for a given pool, if we have
@@ -68,7 +87,7 @@ impl ChainTracker {
         self.chains
             .get(pool_ident)
             .and_then(|chain| chain.last())
-            .map(|tx| &tx.predicted_pool)
+            .and_then(|tx| tx.predicted_pool_for(pool_ident))
     }
 
     /// Next chain index for a pool (0 if no chain exists).
@@ -82,11 +101,15 @@ impl ChainTracker {
     /// Collect all order inputs consumed by in-flight transactions.
     /// These should be excluded from candidate selection.
     pub fn in_flight_order_inputs(&self) -> BTreeSet<TransactionInput> {
+        // Deduplicate across chains (multi-pool txs appear in multiple chains)
+        let mut seen_tx_hashes = BTreeSet::new();
         let mut inputs = BTreeSet::new();
         for chain in self.chains.values() {
             for tx in chain {
-                for order in &tx.consumed_orders {
-                    inputs.insert(order.input.clone());
+                if seen_tx_hashes.insert(tx.tx_hash) {
+                    for order in &tx.consumed_orders {
+                        inputs.insert(order.input.clone());
+                    }
                 }
             }
         }
@@ -132,6 +155,38 @@ impl ChainTracker {
         }
     }
 
+    /// Discard the chain for a pool and cascade to all related pools.
+    ///
+    /// When a multi-pool tx becomes invalid (e.g. a competitor scoops one of
+    /// the pools), all pools in that tx must be invalidated. This finds all
+    /// tx_hashes in the pool's chain, collects all pool_idents from those txs,
+    /// and discards all their chains.
+    pub fn discard_chain_and_related(&mut self, pool_ident: &Ident) {
+        let Some(chain) = self.chains.get(pool_ident) else {
+            return;
+        };
+
+        // Collect all pool idents referenced by txs in this chain
+        let mut related_idents: BTreeSet<Ident> = BTreeSet::new();
+        for tx in chain {
+            for ident in &tx.pool_idents {
+                related_idents.insert(ident.clone());
+            }
+        }
+
+        if related_idents.len() > 1 {
+            warn!(
+                pool = %pool_ident,
+                related_pools = related_idents.len(),
+                "cascade-discarding related multi-pool chains"
+            );
+        }
+
+        for ident in &related_idents {
+            self.discard_chain(ident);
+        }
+    }
+
     /// Discard all chains (e.g. on rollback).
     pub fn discard_all(&mut self) {
         let count: usize = self.chains.values().map(|c| c.len()).sum();
@@ -143,6 +198,7 @@ impl ChainTracker {
 
     /// Discard chains whose first (oldest) tx TTL has passed.
     /// If the first tx expired, the entire chain is invalid.
+    /// Uses cascade discard for multi-pool awareness.
     pub fn expire_stale(&mut self, current_slot: u64) {
         let stale_pools: Vec<Ident> = self
             .chains
@@ -160,7 +216,7 @@ impl ChainTracker {
 
         for ident in stale_pools {
             warn!(pool = %ident, current_slot, "expiring stale in-flight chain");
-            self.chains.remove(&ident);
+            self.discard_chain_and_related(&ident);
         }
     }
 
@@ -170,7 +226,11 @@ impl ChainTracker {
         self.chains
             .get(pool_ident)?
             .iter()
-            .find(|tx| tx.predicted_pool.input == *pool_input)
+            .find(|tx| {
+                tx.predicted_pool_for(pool_ident)
+                    .map(|p| p.input == *pool_input)
+                    .unwrap_or(false)
+            })
             .map(|tx| tx.tx_hash)
     }
 
@@ -212,15 +272,42 @@ mod tests {
     fn make_in_flight(ident_byte: u8, hash_byte: u8, ttl: u64, chain_index: usize) -> InFlightTx {
         let tx_hash: Hash<32> = [hash_byte; 32].into();
         let pool = make_pool(ident_byte);
+        let ident = Ident::new(&[ident_byte]);
         InFlightTx {
             tx_hash,
             tx_hash_hex: hex::encode(tx_hash),
-            pool_ident: Ident::new(&[ident_byte]),
+            pool_idents: vec![ident.clone()],
             consumed_orders: vec![],
-            predicted_pool: PredictedPoolUtxo {
+            predicted_pools: vec![(ident, PredictedPoolUtxo {
                 input: TransactionInput::new(tx_hash, 0),
                 pool,
-            },
+            })],
+            ttl,
+            chain_index,
+        }
+    }
+
+    fn make_multi_pool_in_flight(
+        ident_bytes: &[u8],
+        hash_byte: u8,
+        ttl: u64,
+        chain_index: usize,
+    ) -> InFlightTx {
+        let tx_hash: Hash<32> = [hash_byte; 32].into();
+        let pool_idents: Vec<Ident> = ident_bytes.iter().map(|&b| Ident::new(&[b])).collect();
+        let predicted_pools: Vec<_> = ident_bytes.iter().enumerate().map(|(i, &b)| {
+            let pool = make_pool(b);
+            (Ident::new(&[b]), PredictedPoolUtxo {
+                input: TransactionInput::new(tx_hash, i as u64),
+                pool,
+            })
+        }).collect();
+        InFlightTx {
+            tx_hash,
+            tx_hash_hex: hex::encode(tx_hash),
+            pool_idents,
+            consumed_orders: vec![],
+            predicted_pools,
             ttl,
             chain_index,
         }
@@ -332,6 +419,71 @@ mod tests {
         tracker.record_submission(tx);
 
         let in_flight = tracker.in_flight_order_inputs();
+        assert!(in_flight.contains(&order_input));
+    }
+
+    #[test]
+    fn test_multi_pool_record_and_latest() {
+        let mut tracker = ChainTracker::new();
+        let ident_a = Ident::new(&[0x01]);
+        let ident_b = Ident::new(&[0x02]);
+
+        let tx = make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0);
+        tracker.record_submission(tx);
+
+        // Both pools should have a chain
+        assert!(tracker.latest_predicted_pool(&ident_a).is_some());
+        assert!(tracker.latest_predicted_pool(&ident_b).is_some());
+        assert_eq!(tracker.next_chain_index(&ident_a), 1);
+        assert_eq!(tracker.next_chain_index(&ident_b), 1);
+    }
+
+    #[test]
+    fn test_multi_pool_cascade_discard() {
+        let mut tracker = ChainTracker::new();
+        let ident_a = Ident::new(&[0x01]);
+        let ident_b = Ident::new(&[0x02]);
+
+        // Multi-pool tx touches both pools
+        let tx = make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0);
+        tracker.record_submission(tx);
+
+        // Discard pool A's chain with cascade — pool B should also be discarded
+        tracker.discard_chain_and_related(&ident_a);
+
+        assert!(tracker.latest_predicted_pool(&ident_a).is_none());
+        assert!(tracker.latest_predicted_pool(&ident_b).is_none());
+        assert!(!tracker.has_in_flight());
+    }
+
+    #[test]
+    fn test_multi_pool_no_duplicate_orders() {
+        // Multi-pool tx appears in both chains but orders should not be
+        // double-counted
+        let mut tracker = ChainTracker::new();
+
+        let order_input = TransactionInput::new([0xff; 32].into(), 7);
+        let order = Arc::new(crate::sundaev4::SundaeV4Order {
+            input: order_input.clone(),
+            value: Value::default(),
+            datum: crate::sundaev4::OrderDatum {
+                owner: crate::multisig::Multisig::Signature(vec![0xaa; 28]),
+                destination: crate::sundaev4::Destination::SelfDestination,
+                constraints: crate::sundaev4::OrderConstraints::Simple { min_received: vec![] },
+                extension: pallas_primitives::PlutusData::Constr(
+                    pallas_primitives::Constr { tag: 121, any_constructor: None, fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]) }
+                ),
+            },
+            slot: 1,
+        });
+
+        let mut tx = make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0);
+        tx.consumed_orders = vec![order];
+        tracker.record_submission(tx);
+
+        let in_flight = tracker.in_flight_order_inputs();
+        // Should contain the order exactly once (set semantics)
+        assert_eq!(in_flight.len(), 1);
         assert!(in_flight.contains(&order_input));
     }
 }
