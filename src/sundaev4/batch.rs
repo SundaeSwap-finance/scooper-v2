@@ -34,15 +34,17 @@ pub struct Batch {
     pub final_total_lp: BigInt,
 }
 
-/// Limits on batch assembly.
+/// Safety cap on total orders per transaction.
+///
+/// With incremental accumulation, the natural constraint is execution unit
+/// limits. This is a backstop to prevent runaway accumulation.
 pub struct BatchLimits {
-    /// Maximum orders per batch. Start conservative (~10), tune empirically.
     pub max_orders: usize,
 }
 
 impl Default for BatchLimits {
     fn default() -> Self {
-        Self { max_orders: 10 }
+        Self { max_orders: 30 }
     }
 }
 

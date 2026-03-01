@@ -144,7 +144,6 @@ pub fn build_multi_pool_scoop_tx(
     struct PerPoolData {
         transcript: Vec<TranscriptEntry>,
         updated_datum: PoolDatum,
-        final_total_lp: BigInt,
     }
 
     let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
@@ -206,7 +205,6 @@ pub fn build_multi_pool_scoop_tx(
         per_pool.push(PerPoolData {
             transcript: transcript_entries,
             updated_datum,
-            final_total_lp,
         });
     }
 
