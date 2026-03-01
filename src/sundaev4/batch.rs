@@ -15,6 +15,7 @@ use crate::sundaev4::swap_math;
 use crate::sundaev4::types::*;
 
 /// A resolved swap with precomputed math.
+#[derive(Clone)]
 pub struct ResolvedSwap {
     pub order: Arc<SundaeV4Order>,
     pub input_idx: usize,
@@ -24,6 +25,7 @@ pub struct ResolvedSwap {
 }
 
 /// A complete batch for one pool, ready for the tx builder.
+#[derive(Clone)]
 pub struct Batch {
     pub pool: Arc<SundaeV4Pool>,
     pub pool_ident: Ident,
@@ -83,7 +85,7 @@ pub fn group_orders_by_pool(
 ///
 /// For ADA→token buy orders (no non-ADA in order value), the pool must have
 /// the min_received asset and ADA as the other asset.
-fn find_pool_for_simple_order(
+pub fn find_pool_for_simple_order(
     order: &SundaeV4Order,
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
@@ -215,7 +217,7 @@ pub fn assemble_batch(
 /// Try to execute a single order against the current running pool state.
 /// Returns a `ResolvedSwap` if the swap produces positive output and
 /// satisfies min_received constraints, or `None` otherwise.
-fn try_execute_order(
+pub fn try_execute_order(
     order: &Arc<SundaeV4Order>,
     running_assets: &[(AssetClass, BigInt)],
     _running_total_lp: &BigInt,
