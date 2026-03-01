@@ -19,9 +19,9 @@ use tracing::{debug, trace, warn};
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
-    events::{IndexEvent, SpentOrder, SpentOrderReason, SpentPool},
+    events::{IndexEvent, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
-    persistence::{IndexerDao, PersistedDatum, PersistedTxo, SpentTxo, TxChanges},
+    persistence::{IndexerDao, PersistedDatum, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
     sundaev3::Ident,
     sundaev4::{
         OrderRedeemer, PoolDatum, SettingsDatum, SundaeV4Order, SundaeV4Pool,
@@ -45,6 +45,7 @@ pub struct SundaeV4State {
     pub network_tip_slot: Option<u64>,
     pub wallet_utxos: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::Value>,
     pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
+    pub scoop_stats: ScoopStats,
     datums: DatumLookup,
 }
 
@@ -57,6 +58,7 @@ pub struct SundaeV4Indexer {
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
     scooper_address: Option<Address>,
+    scooper_keyhash: Option<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
     tip_event_counter: u64,
 }
@@ -71,6 +73,9 @@ impl SundaeV4Indexer {
     ) -> Self {
         let scooper_address = protocol.execution.as_ref().and_then(|exec| {
             derive_scooper_pallas_address(&exec.scooper_secret_key).ok()
+        });
+        let scooper_keyhash = protocol.execution.as_ref().and_then(|exec| {
+            derive_scooper_keyhash(&exec.scooper_secret_key).ok()
         });
         let ref_utxo_inputs = protocol
             .execution
@@ -98,6 +103,7 @@ impl SundaeV4Indexer {
             rollback_limit,
             dao,
             scooper_address,
+            scooper_keyhash,
             ref_utxo_inputs,
             tip_event_counter: 0,
         }
@@ -226,6 +232,13 @@ impl SundaeV4Indexer {
                 _ => {} // skip wallet, ref, settings
             }
         }
+
+        // Load scoop records and build stats
+        let scoop_records = self.dao.load_scoop_records().await?;
+        state.scoop_stats = build_scoop_stats(
+            &scoop_records,
+            self.scooper_keyhash.as_ref(),
+        );
 
         *self.state.lock().await.update_slot(slot)? = state;
         Ok(())
@@ -496,6 +509,14 @@ impl ChainIndex for SundaeV4Indexer {
         // so we can distinguish V4PoolUpdated (scoop) from V4PoolCreated (new).
         let known_pool_idents: BTreeSet<Ident> = state.pools.keys().cloned().collect();
 
+        // Extract scooper keyhash from tx's required_signers
+        let req_signers = tx.required_signers();
+        let signers: Vec<&pallas_primitives::Hash<28>> = req_signers.collect();
+        let scooper_keyhash_bytes: Option<Vec<u8>> = signers.first().map(|h| h.to_vec());
+        let scooper_hex = scooper_keyhash_bytes.as_ref()
+            .map(|b| hex::encode(b))
+            .unwrap_or_default();
+
         let tx_id_hex = hex::encode(this_tx_hash);
 
         // Remove spent pools. Track vault redeemer actions.
@@ -544,7 +565,7 @@ impl ChainIndex for SundaeV4Indexer {
                     if let Some(pool_id) = &scoop_pool_id {
                         state.spent_orders.push(SpentOrder {
                             order: order.clone(),
-                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone() },
+                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone(), scooper: scooper_hex.clone() },
                             tx_id: tx_id_hex.clone(),
                             slot,
                         });
@@ -552,6 +573,7 @@ impl ChainIndex for SundaeV4Indexer {
                             order: order.clone(),
                             pool_id: pool_id.clone(),
                             tx_id: tx_id_hex.clone(),
+                            scooper: scooper_hex.clone(),
                         });
                     }
                 }
@@ -577,6 +599,44 @@ impl ChainIndex for SundaeV4Indexer {
             });
             false
         });
+
+        // Record scoop if orders were scooped
+        if !scooped_orders.is_empty() {
+            if let Some(pool_id) = &scoop_pool_id {
+                let n_orders = scooped_orders.len() as u32;
+                let scooper_bytes = scooper_keyhash_bytes.clone().unwrap_or_default();
+
+                changes.scoop_records.push(ScoopRecord {
+                    tx_id: this_tx_hash.to_vec(),
+                    slot,
+                    pool_id: pool_id.to_bytes().to_vec(),
+                    n_orders,
+                    scooper: scooper_bytes.clone(),
+                });
+
+                // Update in-memory stats
+                let scooper_key = scooper_hex.clone();
+                if let Some(total) = state.scoop_stats.scooper_totals.iter_mut().find(|t| t.scooper == scooper_key) {
+                    total.scoop_txs += 1;
+                    total.orders_processed += n_orders as u64;
+                } else {
+                    state.scoop_stats.scooper_totals.push(ScooperTotal {
+                        scooper: scooper_key,
+                        scoop_txs: 1,
+                        orders_processed: n_orders as u64,
+                    });
+                }
+
+                state.scoop_stats.recent_scoops.insert(0, ScoopRecordView {
+                    tx_id: tx_id_hex.clone(),
+                    slot,
+                    pool_id: hex::encode(pool_id.to_bytes()),
+                    n_orders,
+                    scooper: scooper_hex.clone(),
+                });
+                state.scoop_stats.recent_scoops.truncate(50);
+            }
+        }
 
         // Emit pool removed events
         for id in removed_pool_ids {
@@ -690,6 +750,67 @@ impl ChainIndex for SundaeV4Indexer {
         self.dao.rollback(0).await?;
         self.state.lock().await.rollback_to_origin();
         Ok(point.clone())
+    }
+}
+
+fn derive_scooper_keyhash(secret_key_hex: &str) -> Result<pallas_primitives::Hash<28>> {
+    use pallas_crypto::hash::Hasher;
+    use pallas_crypto::key::ed25519::SecretKey;
+
+    let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
+    let sk = SecretKey::from(arr);
+    let pk = sk.public_key();
+    let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
+    Ok(Hasher::<224>::hash(&pk_bytes))
+}
+
+fn build_scoop_stats(
+    records: &[ScoopRecord],
+    our_keyhash: Option<&pallas_primitives::Hash<28>>,
+) -> ScoopStats {
+    use std::collections::BTreeMap;
+
+    let our_hex = our_keyhash
+        .map(|h| hex::encode(h.as_ref()))
+        .unwrap_or_default();
+
+    let mut totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for r in records {
+        let key = hex::encode(&r.scooper);
+        let entry = totals.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += r.n_orders as u64;
+    }
+
+    let scooper_totals: Vec<ScooperTotal> = totals
+        .into_iter()
+        .map(|(scooper, (scoop_txs, orders_processed))| ScooperTotal {
+            scooper,
+            scoop_txs,
+            orders_processed,
+        })
+        .collect();
+
+    let recent_scoops: Vec<ScoopRecordView> = records
+        .iter()
+        .rev()
+        .take(50)
+        .map(|r| ScoopRecordView {
+            tx_id: hex::encode(&r.tx_id),
+            slot: r.slot,
+            pool_id: hex::encode(&r.pool_id),
+            n_orders: r.n_orders,
+            scooper: hex::encode(&r.scooper),
+        })
+        .collect();
+
+    ScoopStats {
+        our_keyhash: our_hex,
+        scooper_totals,
+        recent_scoops,
     }
 }
 

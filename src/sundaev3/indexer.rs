@@ -533,7 +533,7 @@ impl ChainIndex for SundaeV3Indexer {
                     if let Some(pool_id) = &scoop_pool_id {
                         state.spent_orders.push(SpentOrder {
                             order: order.clone(),
-                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone() },
+                            reason: SpentOrderReason::Scooped { pool_id: pool_id.clone(), scooper: String::new() },
                             tx_id: tx_id_hex.clone(),
                             slot,
                         });
@@ -541,6 +541,7 @@ impl ChainIndex for SundaeV3Indexer {
                             order: order.clone(),
                             pool_id: pool_id.clone(),
                             tx_id: tx_id_hex.clone(),
+                            scooper: String::new(),
                         });
                     }
                 }
@@ -740,6 +741,9 @@ mod tests {
         async fn prune_txos(&self, min_height: u64) -> Result<()> {
             let _ = min_height;
             Ok(())
+        }
+        async fn load_scoop_records(&self) -> Result<Vec<crate::persistence::ScoopRecord>> {
+            Ok(vec![])
         }
     }
 

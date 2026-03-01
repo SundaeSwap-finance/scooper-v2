@@ -22,3 +22,13 @@ CREATE TABLE sundae_v4_datums(
     created_slot BIGINT NOT NULL
 );
 CREATE INDEX sundae_v4_datums_created_slot_idx ON sundae_v4_datums (created_slot);
+
+CREATE TABLE sundae_v4_scoop_records (
+    tx_id BLOB NOT NULL PRIMARY KEY,
+    slot BIGINT NOT NULL,
+    pool_id BLOB NOT NULL,
+    n_orders INT NOT NULL,
+    scooper BLOB NOT NULL
+);
+CREATE INDEX sundae_v4_scoop_records_slot_idx ON sundae_v4_scoop_records (slot);
+CREATE INDEX sundae_v4_scoop_records_scooper_idx ON sundae_v4_scoop_records (scooper);

@@ -27,6 +27,7 @@ pub enum IndexEvent {
         order: Arc<SundaeV3Order>,
         pool_id: Ident,
         tx_id: String,
+        scooper: String,
     },
     V3OrderCancelled {
         order: Arc<SundaeV3Order>,
@@ -55,6 +56,7 @@ pub enum IndexEvent {
         order: Arc<SundaeV4Order>,
         pool_id: Ident,
         tx_id: String,
+        scooper: String,
     },
     V4OrderCancelled {
         order: Arc<SundaeV4Order>,
@@ -94,7 +96,7 @@ impl<T> Clone for SpentOrder<T> {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum SpentOrderReason {
-    Scooped { pool_id: Ident },
+    Scooped { pool_id: Ident, scooper: String },
     Cancelled,
     Unknown,
 }
@@ -118,4 +120,27 @@ impl<T> Clone for SpentPool<T> {
             slot: self.slot,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScoopStats {
+    pub our_keyhash: String,
+    pub scooper_totals: Vec<ScooperTotal>,
+    pub recent_scoops: Vec<ScoopRecordView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScooperTotal {
+    pub scooper: String,
+    pub scoop_txs: u64,
+    pub orders_processed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoopRecordView {
+    pub tx_id: String,
+    pub slot: u64,
+    pub pool_id: String,
+    pub n_orders: u32,
+    pub scooper: String,
 }

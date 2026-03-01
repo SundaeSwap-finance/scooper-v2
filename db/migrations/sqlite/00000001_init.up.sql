@@ -14,6 +14,16 @@ CREATE INDEX sundae_v3_txos_created_slot_idx ON sundae_v3_txos (created_slot);
 CREATE INDEX sundae_v3_txos_spent_slot_idx ON sundae_v3_txos (spent_slot);
 CREATE INDEX sundae_v3_txos_spent_height_idx ON sundae_v3_txos (spent_height);
 
+CREATE TABLE sundae_v3_scoop_records (
+    tx_id BLOB NOT NULL PRIMARY KEY,
+    slot BIGINT NOT NULL,
+    pool_id BLOB NOT NULL,
+    n_orders INT NOT NULL,
+    scooper BLOB NOT NULL
+);
+CREATE INDEX sundae_v3_scoop_records_slot_idx ON sundae_v3_scoop_records (slot);
+CREATE INDEX sundae_v3_scoop_records_scooper_idx ON sundae_v3_scoop_records (scooper);
+
 CREATE TABLE acropolis_cursors (
     id TEXT PRIMARY KEY NOT NULL,
     bytes BLOB NOT NULL

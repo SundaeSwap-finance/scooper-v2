@@ -223,7 +223,7 @@ impl AdminServer {
                 let _ = self.resync_tx.send(());
                 Self::text_response("resync")
             }
-            "/health" => Self::text_response("health"),
+            "/health" => Self::json_response(self.serve_health_stats().await),
             _ => Self::json_response(self.route_protocol(path).await),
         }
     }
@@ -271,6 +271,49 @@ impl AdminServer {
             "v4": v4_info,
         }))
         .unwrap()
+    }
+
+    async fn serve_health_stats(&self) -> String {
+        let Some(v4) = &self.v4_state else {
+            return serde_json::to_string(&serde_json::json!({
+                "error": "v4 indexer not configured"
+            })).unwrap();
+        };
+        let state = v4.lock().await.latest().into_owned();
+
+        let sync_pct = match state.network_tip_slot {
+            Some(net) if net > 0 => (state.tip_slot as f64 / net as f64) * 100.0,
+            _ => 0.0,
+        };
+
+        let ada_balance: f64 = state.wallet_utxos.values()
+            .map(|v| {
+                let lovelace = v.get(&crate::cardano_types::AssetClass { policy: vec![], token: vec![] });
+                lovelace.to_f64().unwrap_or(0.0) / 1_000_000.0
+            })
+            .sum();
+
+        let orders_pending = state.orders.len();
+        let stats = &state.scoop_stats;
+
+        serde_json::to_string(&serde_json::json!({
+            "sync": {
+                "tip_slot": state.tip_slot,
+                "network_tip_slot": state.network_tip_slot,
+                "sync_pct": sync_pct,
+            },
+            "pools": {
+                "count": state.pools.len(),
+                "orders_pending": orders_pending,
+            },
+            "wallet": {
+                "ada_balance": ada_balance,
+                "utxo_count": state.wallet_utxos.len(),
+            },
+            "our_keyhash": stats.our_keyhash,
+            "scooper_totals": stats.scooper_totals,
+            "recent_scoops": stats.recent_scoops,
+        })).unwrap()
     }
 
     fn serve_sse(&self) -> Response<ResponseBody> {
@@ -636,12 +679,13 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v3_order_created",
             serde_json::json!({ "order": order.input.to_string() }).to_string(),
         ),
-        IndexEvent::V3OrderScooped { order, pool_id, tx_id } => (
+        IndexEvent::V3OrderScooped { order, pool_id, tx_id, scooper } => (
             "v3_order_scooped",
             serde_json::json!({
                 "order": order.input.to_string(),
                 "pool_id": pool_id.to_string(),
                 "tx_id": tx_id,
+                "scooper": scooper,
             })
             .to_string(),
         ),
@@ -669,12 +713,13 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_order_created",
             serde_json::json!({ "order": order.input.to_string() }).to_string(),
         ),
-        IndexEvent::V4OrderScooped { order, pool_id, tx_id } => (
+        IndexEvent::V4OrderScooped { order, pool_id, tx_id, scooper } => (
             "v4_order_scooped",
             serde_json::json!({
                 "order": order.input.to_string(),
                 "pool_id": pool_id.to_string(),
                 "tx_id": tx_id,
+                "scooper": scooper,
             })
             .to_string(),
         ),

@@ -13,8 +13,8 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, SpentPersistedTxo,
-        TxChanges,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, ScoopRecord,
+        SpentPersistedTxo, TxChanges,
     },
 };
 
@@ -83,6 +83,10 @@ impl SqliteIndexerDao {
 
     fn datums_table(&self) -> String {
         format!("{}_datums", self.namespace)
+    }
+
+    fn scoop_records_table(&self) -> String {
+        format!("{}_scoop_records", self.namespace)
     }
 }
 
@@ -156,6 +160,30 @@ impl IndexerDao for SqliteIndexerDao {
             query.execute(&mut *tx).await?;
         }
 
+        if !changes.scoop_records.is_empty() {
+            let scoop_records_table = self.scoop_records_table();
+            let insert_scoop_query = {
+                let column_names = "tx_id, slot, pool_id, n_orders, scooper";
+                let values_clauses =
+                    vec!["(?,?,?,?,?)".to_string(); changes.scoop_records.len()].join(",");
+                format!(
+                    "INSERT OR IGNORE INTO {scoop_records_table} ({column_names}) VALUES {values_clauses};"
+                )
+            };
+            let mut query = sqlx::query(&insert_scoop_query);
+
+            for record in changes.scoop_records {
+                query = query
+                    .bind(record.tx_id)
+                    .bind(record.slot as i64)
+                    .bind(record.pool_id)
+                    .bind(record.n_orders as i32)
+                    .bind(record.scooper);
+            }
+
+            query.execute(&mut *tx).await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -163,6 +191,7 @@ impl IndexerDao for SqliteIndexerDao {
     async fn rollback(&self, slot: u64) -> Result<()> {
         let txos_table = self.txos_table();
         let datums_table = self.datums_table();
+        let scoop_records_table = self.scoop_records_table();
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(&format!("DELETE FROM {txos_table} WHERE created_slot > ?;"))
@@ -179,6 +208,13 @@ impl IndexerDao for SqliteIndexerDao {
 
         sqlx::query(&format!(
             "DELETE FROM {datums_table} WHERE created_slot > ?;"
+        ))
+        .bind(slot as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!(
+            "DELETE FROM {scoop_records_table} WHERE slot > ?;"
         ))
         .bind(slot as i64)
         .execute(&mut *tx)
@@ -213,6 +249,14 @@ impl IndexerDao for SqliteIndexerDao {
             .bind(since_slot as i64)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>> {
+        let scoop_records_table = self.scoop_records_table();
+        let query = format!(
+            "SELECT tx_id, slot, pool_id, n_orders, scooper FROM {scoop_records_table} ORDER BY slot;"
+        );
+        Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
 
     async fn prune_txos(&self, min_height: u64) -> Result<()> {
@@ -261,6 +305,23 @@ impl FromRow<'_, SqliteRow> for SpentPersistedTxo {
             txo,
             spent_slot: spent_slot as u64,
             spent_tx_id,
+        })
+    }
+}
+
+impl FromRow<'_, SqliteRow> for ScoopRecord {
+    fn from_row(row: &'_ SqliteRow) -> Result<Self, sqlx::Error> {
+        let tx_id: Vec<u8> = row.try_get("tx_id")?;
+        let slot: i64 = row.try_get("slot")?;
+        let pool_id: Vec<u8> = row.try_get("pool_id")?;
+        let n_orders: i32 = row.try_get("n_orders")?;
+        let scooper: Vec<u8> = row.try_get("scooper")?;
+        Ok(Self {
+            tx_id,
+            slot: slot as u64,
+            pool_id,
+            n_orders: n_orders as u32,
+            scooper,
         })
     }
 }
@@ -486,6 +547,7 @@ mod tests {
             created_txos: vec![pool.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
         let order = preview_order();
@@ -495,6 +557,7 @@ mod tests {
             created_txos: vec![order.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -516,6 +579,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -536,6 +600,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -547,6 +612,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![],
             metadata_datums: vec![datum2.clone()],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -567,6 +633,7 @@ mod tests {
             created_txos: vec![pool.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
         let order = preview_order();
@@ -576,6 +643,7 @@ mod tests {
             created_txos: vec![order.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -587,6 +655,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -608,6 +677,7 @@ mod tests {
             created_txos: vec![pool.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
         let order = preview_order();
@@ -617,6 +687,7 @@ mod tests {
             created_txos: vec![order.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -641,6 +712,7 @@ mod tests {
             created_txos: vec![pool.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
         let order = preview_order();
@@ -650,6 +722,7 @@ mod tests {
             created_txos: vec![order.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -661,6 +734,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -686,6 +760,7 @@ mod tests {
             created_txos: vec![pool.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -697,6 +772,7 @@ mod tests {
             created_txos: vec![order.clone()],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -708,6 +784,7 @@ mod tests {
             created_txos: vec![],
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 
@@ -719,6 +796,7 @@ mod tests {
             created_txos: vec![order_2],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         })
         .await?;
 

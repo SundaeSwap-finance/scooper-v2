@@ -175,6 +175,8 @@
   .badge-red { background: rgba(225,112,85,0.15); color: var(--red); }
   .badge-yellow { background: rgba(253,203,110,0.15); color: var(--yellow); }
   .badge-blue { background: rgba(116,185,255,0.15); color: var(--blue); }
+  .badge-accent { background: rgba(108,92,231,0.15); color: var(--accent); }
+  tr.our-row td { background: rgba(108,92,231,0.06); }
 
   .event-log {
     background: var(--surface);
@@ -282,6 +284,7 @@
 <div class="tabs">
   <div class="tab" data-tab="v3">V3</div>
   <div class="tab active" data-tab="v4">V4</div>
+  <div class="tab" data-tab="health">Health</div>
   <div class="tab" data-tab="events">Event Log</div>
 </div>
 
@@ -329,6 +332,21 @@
     <table id="v4-spent-orders-table">
       <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
       <tbody id="v4-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Health Tab -->
+  <div class="tab-panel" id="panel-health">
+    <div class="stats" id="health-cards"></div>
+    <div class="section-title">Scooper Leaderboard</div>
+    <table id="health-leaderboard-table">
+      <thead><tr><th>Scooper</th><th>Scoops</th><th>Orders</th></tr></thead>
+      <tbody id="health-leaderboard-body"></tbody>
+    </table>
+    <div class="section-title">Recent Scoops</div>
+    <table id="health-recent-table">
+      <thead><tr><th>Tx ID</th><th>Slot</th><th>Pool</th><th>Orders</th><th>Scooper</th></tr></thead>
+      <tbody id="health-recent-body"></tbody>
     </table>
   </div>
 
@@ -682,6 +700,88 @@
     } catch (e) { /* ignore */ }
   }
 
+  // --- Health tab ---
+  var healthData = null;
+
+  async function loadHealthStats() {
+    try {
+      var res = await fetch('/health');
+      var data = await res.json();
+      if (data.error) {
+        document.getElementById('health-cards').innerHTML =
+          '<div class="not-configured">' + data.error + '</div>';
+        return;
+      }
+      healthData = data;
+      renderHealthCards(data);
+      renderLeaderboard(data);
+      renderRecentScoops(data);
+    } catch (e) { /* ignore */ }
+  }
+
+  function renderHealthCards(data) {
+    var sync = data.sync || {};
+    var pools = data.pools || {};
+    var wallet = data.wallet || {};
+    var syncPct = (sync.sync_pct || 0).toFixed(1);
+    var adaBal = (wallet.ada_balance || 0).toFixed(2);
+    var html = statCard('Sync', syncPct + '%') +
+      statCard('Wallet', adaBal + ' ADA') +
+      statCard('UTxOs', wallet.utxo_count || 0) +
+      statCard('Pools', pools.count || 0) +
+      statCard('Pending', pools.orders_pending || 0);
+    document.getElementById('health-cards').innerHTML = html;
+  }
+
+  function renderLeaderboard(data) {
+    var tbody = document.getElementById('health-leaderboard-body');
+    tbody.innerHTML = '';
+    var totals = (data.scooper_totals || []).slice();
+    totals.sort(function(a, b) { return b.scoop_txs - a.scoop_txs; });
+    var ourKey = data.our_keyhash || '';
+    if (totals.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No scoops recorded yet</td></tr>';
+      return;
+    }
+    for (var i = 0; i < totals.length; i++) {
+      var t = totals[i];
+      var row = document.createElement('tr');
+      var isOurs = ourKey && t.scooper === ourKey;
+      if (isOurs) row.className = 'our-row';
+      var label = truncate(t.scooper, 16);
+      if (isOurs) label += ' <span class="badge badge-accent">You</span>';
+      row.innerHTML = '<td>' + copyable(label, t.scooper) + '</td>' +
+        '<td>' + t.scoop_txs + '</td>' +
+        '<td>' + t.orders_processed + '</td>';
+      tbody.appendChild(row);
+    }
+  }
+
+  function renderRecentScoops(data) {
+    var tbody = document.getElementById('health-recent-body');
+    tbody.innerHTML = '';
+    var scoops = data.recent_scoops || [];
+    var ourKey = data.our_keyhash || '';
+    if (scoops.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-dim)">No scoops recorded yet</td></tr>';
+      return;
+    }
+    for (var i = 0; i < scoops.length; i++) {
+      var s = scoops[i];
+      var row = document.createElement('tr');
+      var isOurs = ourKey && s.scooper === ourKey;
+      if (isOurs) row.className = 'our-row';
+      var scooperLabel = truncate(s.scooper, 12);
+      if (isOurs) scooperLabel += ' <span class="badge badge-accent">You</span>';
+      row.innerHTML = '<td>' + copyable(truncate(s.tx_id, 16), s.tx_id) + '</td>' +
+        '<td>' + s.slot + '</td>' +
+        '<td>' + copyable(truncate(s.pool_id, 12), s.pool_id) + '</td>' +
+        '<td>' + s.n_orders + '</td>' +
+        '<td>' + copyable(scooperLabel, s.scooper) + '</td>';
+      tbody.appendChild(row);
+    }
+  }
+
   function formatV4OrderDetail(datum) {
     if (!datum) return '';
     const details = datum.details || datum.action || '';
@@ -742,7 +842,8 @@
             fetchStatus();
             if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
             if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
-            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
+            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); }
+            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); }
           }, 500);
         }
       });
@@ -812,6 +913,7 @@
   loadV4Pools();
   loadV4Orders();
   loadV4SpentOrders();
+  loadHealthStats();
   connectSSE();
 })();
 </script>

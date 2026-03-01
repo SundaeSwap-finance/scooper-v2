@@ -40,12 +40,22 @@ pub struct SpentTxo {
     pub spending_tx_id: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ScoopRecord {
+    pub tx_id: Vec<u8>,
+    pub slot: u64,
+    pub pool_id: Vec<u8>,
+    pub n_orders: u32,
+    pub scooper: Vec<u8>,
+}
+
 pub struct TxChanges {
     pub slot: u64,
     pub height: u64,
     pub created_txos: Vec<PersistedTxo>,
     pub spent_txos: Vec<SpentTxo>,
     pub metadata_datums: Vec<PersistedDatum>,
+    pub scoop_records: Vec<ScoopRecord>,
 }
 impl TxChanges {
     pub fn new(slot: u64, height: u64) -> Self {
@@ -55,12 +65,14 @@ impl TxChanges {
             created_txos: vec![],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
         }
     }
     pub fn is_empty(&self) -> bool {
         self.created_txos.is_empty()
             && self.spent_txos.is_empty()
             && self.metadata_datums.is_empty()
+            && self.scoop_records.is_empty()
     }
 }
 
@@ -72,6 +84,7 @@ pub trait IndexerDao: Send + Sync + 'static {
     async fn load_spent_txos(&self, since_slot: u64) -> Result<Vec<SpentPersistedTxo>>;
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
+    async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
