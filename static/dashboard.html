@@ -336,7 +336,7 @@
     <div class="section-title">Orders</div>
     <div class="search-bar"><input type="text" data-filter="v3-orders-body" placeholder="Filter orders..."></div>
     <table id="v3-orders-table">
-      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Direction</th></tr></thead>
+      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Direction</th><th>Status</th><th>Detail</th></tr></thead>
       <tbody id="v3-orders-body"></tbody>
     </table>
     <div class="section-title">Spent Orders</div>
@@ -353,7 +353,7 @@
     <div class="section-title">Pools</div>
     <div class="search-bar"><input type="text" data-filter="v4-pools-body" placeholder="Filter pools..."></div>
     <table id="v4-pools-table">
-      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
+      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th><th>Protocol Equity</th></tr></thead>
       <tbody id="v4-pools-body"></tbody>
     </table>
     <div class="section-title">Orders</div>
@@ -440,13 +440,59 @@
     });
   });
 
+  // --- Asset name resolution via SundaeSwap GraphQL API ---
+  var assetNameCache = { 'lovelace': 'ADA', '': 'ADA' };
+  var assetNamePending = new Set();
+  var assetNameCallbacks = [];
+
+  function getGraphQLUrl() {
+    var host = window.location.hostname;
+    var m = host.match(/scooper\.(\w+)\.sundae\.fi/);
+    if (m) return 'https://api.' + m[1] + '.sundae.fi/graphql';
+    return 'https://api.preview.sundae.fi/graphql';
+  }
+
+  async function resolveAssetNames(assetIds) {
+    var toFetch = assetIds.filter(function(id) { return id && !assetNameCache[id] && !assetNamePending.has(id); });
+    if (toFetch.length === 0) return;
+    toFetch.forEach(function(id) { assetNamePending.add(id); });
+
+    // Batch into groups of 20 to avoid query size limits
+    for (var i = 0; i < toFetch.length; i += 20) {
+      var batch = toFetch.slice(i, i + 20);
+      var fragments = batch.map(function(id, j) {
+        return 'a' + j + ': assets { byId(id: "' + id + '") { id ticker name } }';
+      });
+      try {
+        var res = await fetch(getGraphQLUrl(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: '{ ' + fragments.join(' ') + ' }' }),
+        });
+        var data = await res.json();
+        if (data && data.data) {
+          for (var key in data.data) {
+            var asset = data.data[key] && data.data[key].byId;
+            if (asset && asset.id) {
+              assetNameCache[asset.id] = asset.ticker || asset.name || asset.id;
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+      batch.forEach(function(id) { assetNamePending.delete(id); });
+    }
+  }
+
   function formatAssetClass(ac) {
     if (!ac) return 'ADA';
     if (typeof ac === 'string') {
       if (ac === '' || ac === 'lovelace') return 'ADA';
+      if (assetNameCache[ac]) return assetNameCache[ac];
       return truncate(ac, 16);
     }
     if (ac.policy_id === '' || (ac.policy_id === '0'.repeat(56))) return 'ADA';
+    var fullId = ac.policy_id + '.' + (ac.asset_name || '');
+    if (assetNameCache[fullId]) return assetNameCache[fullId];
     return truncate(ac.policy_id, 8) + '.' + truncate(ac.asset_name || '', 8);
   }
 
@@ -593,6 +639,17 @@
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { return; }
+
+      // Collect asset IDs and resolve names
+      var assetIds = [];
+      for (const pool of Object.values(data)) {
+        var pd = pool.pool_datum;
+        if (pd && Array.isArray(pd.assets)) {
+          pd.assets.forEach(function(a) { if (a && a !== 'lovelace') assetIds.push(a); });
+        }
+      }
+      await resolveAssetNames(assetIds);
+
       var entries = Object.entries(data);
       entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
       var rows = entries.map(function(e) {
@@ -614,6 +671,33 @@
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { return; }
+
+      // Collect unique pool IDs from orders
+      var poolIds = new Set();
+      for (const order of Object.values(data)) {
+        var ident = order.datum && order.datum.ident;
+        if (ident) poolIds.add(ident);
+      }
+
+      // Fetch executability info per pool
+      var execInfo = {};
+      await Promise.all([...poolIds].map(async function(poolId) {
+        try {
+          var pres = await fetch('/v3/pool/' + poolId);
+          var pdata = await pres.json();
+          for (var ref of (pdata.valid || [])) {
+            execInfo[ref] = { executable: true, detail: '' };
+          }
+          for (var oor of (pdata.out_of_range || [])) {
+            var prices = Array.isArray(oor.reason) ? 'swap: ' + oor.reason[0].toFixed(4) + ' pool: ' + oor.reason[1].toFixed(4) : '';
+            execInfo[oor.order] = { executable: false, detail: 'Out of range (' + prices + ')' };
+          }
+          for (var ur of (pdata.unrecoverable || [])) {
+            execInfo[ur.order] = { executable: false, detail: ur.reason || 'unrecoverable' };
+          }
+        } catch (e) { /* ignore */ }
+      }));
+
       var flat = [];
       for (const [poolId, order] of Object.entries(data)) {
         flat.push({ poolId: poolId, order: order });
@@ -621,12 +705,26 @@
       flat.sort(function(a, b) { return (b.order.slot || 0) - (a.order.slot || 0); });
       var rows = flat.map(function(e) {
         var row = document.createElement('tr');
-        var input = e.order.input || {};
+        var input = e.order.input || '';
         var datum = e.order.datum || {};
-        var ref = (input.transaction_id || '') + '#' + (input.index || 0);
+        var ref = typeof input === 'string' ? input : (input.transaction_id || '') + '#' + (input.index || 0);
+        var info = execInfo[ref];
+        var statusBadge, detail;
+        if (!info) {
+          statusBadge = '<span class="badge badge-yellow">unknown</span>';
+          detail = '';
+        } else if (info.executable) {
+          statusBadge = '<span class="badge badge-green">executable</span>';
+          detail = info.detail;
+        } else {
+          statusBadge = '<span class="badge badge-red">blocked</span>';
+          detail = info.detail;
+        }
         row.innerHTML = '<td>' + copyable(truncate(e.poolId, 16), e.poolId) + '</td>' +
           '<td>' + copyable(truncate(ref, 20), ref) + '</td>' +
-          '<td>' + (datum.direction || '?') + '</td>';
+          '<td>' + (datum.action ? Object.keys(datum.action)[0] : (datum.direction || '?')) + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + truncate(detail, 60) + '</td>';
         return row;
       });
       renderLimited('v3-orders-body', rows);
@@ -640,6 +738,19 @@
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch { return; }
+
+      // Collect asset IDs and resolve names
+      var assetIds = [];
+      for (const pool of Object.values(data)) {
+        var pd = pool.pool_datum;
+        if (pd && Array.isArray(pd.assets)) {
+          pd.assets.forEach(function(pair) {
+            if (Array.isArray(pair) && pair[0] && pair[0] !== 'lovelace') assetIds.push(pair[0]);
+          });
+        }
+      }
+      await resolveAssetNames(assetIds);
+
       var entries = Object.entries(data);
       entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
       var rows = entries.map(function(e) {
@@ -648,7 +759,8 @@
         var pd = pool.pool_datum || {};
         row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + '</td>' +
           '<td>' + formatV4PoolAssets(pd) + '</td>' +
-          '<td>' + formatBigint(pd.total_lp) + '</td>';
+          '<td>' + formatBigint(pd.total_lp) + '</td>' +
+          '<td>' + formatProtocolEquity(pd) + '</td>';
         return row;
       });
       renderLimited('v4-pools-body', rows);
@@ -715,6 +827,9 @@
 
   function formatPoolAssets(datum) {
     if (!datum) return '?';
+    if (Array.isArray(datum.assets) && datum.assets.length >= 2) {
+      return formatAssetClass(datum.assets[0]) + ' / ' + formatAssetClass(datum.assets[1]);
+    }
     const a = datum.coin_a || datum.asset_a;
     const b = datum.coin_b || datum.asset_b;
     return formatAssetClass(a) + ' / ' + formatAssetClass(b);
@@ -728,6 +843,29 @@
         ' / ' + formatAssetClass(assets[1][0]) + ': ' + formatBigint(assets[1][1]);
     }
     return JSON.stringify(assets).slice(0, 60);
+  }
+
+  function parseBigint(v) {
+    if (v == null) return 0;
+    if (typeof v === 'object' && v.Int) return Number(v.Int);
+    if (typeof v === 'object' && v.BigInt) return Number(v.BigInt);
+    return Number(v) || 0;
+  }
+
+  function formatProtocolEquity(pd) {
+    if (!pd || !pd.assets || !Array.isArray(pd.assets)) return '?';
+    var totalLp = parseBigint(pd.total_lp);
+    var circLp = parseBigint(pd.circulating_lp);
+    if (totalLp === 0) return '?';
+    var protocolLp = totalLp - circLp;
+    if (protocolLp <= 0) return '-';
+    var parts = pd.assets.map(function(pair) {
+      if (!Array.isArray(pair)) return '';
+      var reserve = parseBigint(pair[1]);
+      var equity = Math.floor(reserve * protocolLp / totalLp);
+      return formatAssetClass(pair[0]) + ': ' + equity.toLocaleString();
+    });
+    return parts.join(' / ');
   }
 
   function formatBigint(v) {
