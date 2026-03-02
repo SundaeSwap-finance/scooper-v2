@@ -892,7 +892,7 @@ fn build_scoop_stats(
     }
 }
 
-fn derive_scooper_pallas_address(secret_key_hex: &str) -> Result<Address> {
+pub(crate) fn derive_scooper_pallas_address(secret_key_hex: &str) -> Result<Address> {
     use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
     use pallas_crypto::hash::Hasher;
     use pallas_crypto::key::ed25519::SecretKey;

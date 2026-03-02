@@ -1,0 +1,977 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use num_traits::Signed;
+use pallas_addresses::{Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+use plutus_parser::{AsPlutus, PlutusData};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use crate::{
+    bigint::BigInt,
+    cardano_types::{AssetClass, TransactionInput, Value},
+    events::InvalidOrder,
+    sundaev3::{self, SundaeV3HistoricalState, SundaeV3Protocol},
+    sundaev4::{self, SundaeV4HistoricalState, SundaeV4Protocol},
+};
+
+const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Configuration
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum BootstrapConfig {
+    Kupo { url: String },
+    Blockfrost {
+        url: String,
+        #[serde(rename = "project-id")]
+        project_id: String,
+    },
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Internal types
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct FetchedUtxo {
+    tx_hash: [u8; 32],
+    output_index: u64,
+    value: Value,
+    datum_cbor: Option<Vec<u8>>,
+    slot: u64,
+}
+
+pub struct BootstrapResult {
+    pub tip_slot: u64,
+    pub tip_hash: String,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Provider trait
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+trait BootstrapProvider {
+    async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>>;
+    async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
+    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>>;
+    async fn fetch_tip(&self) -> Result<(u64, String)>;
+
+    /// Fetch pool UTxOs by discovering addresses that hold NFTs under the given policy.
+    /// Pools often sit at addresses with staking credentials, so a simple script-hash-to-address
+    /// lookup (with null staking) misses them. This method enumerates NFT holders instead.
+    /// Default: falls back to fetch_script_utxos (works for Kupo's wildcard matching).
+    async fn fetch_pool_utxos_by_nft(
+        &self,
+        _nft_policy: &ScriptHash,
+        pool_script_hash: &ScriptHash,
+    ) -> Result<Vec<FetchedUtxo>> {
+        self.fetch_script_utxos(pool_script_hash).await
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Kupo provider
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct KupoProvider {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl KupoProvider {
+    fn new(url: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            url: url.trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct KupoUtxo {
+    transaction_id: String,
+    output_index: u64,
+    value: KupoValue,
+    datum_hash: Option<String>,
+    datum_type: Option<String>,
+    datum: Option<String>,
+    created_at: KupoSlotRef,
+}
+
+#[derive(Deserialize)]
+struct KupoValue {
+    coins: u64,
+    #[serde(default)]
+    assets: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct KupoSlotRef {
+    slot_no: u64,
+}
+
+#[derive(Deserialize)]
+struct KupoDatumResponse {
+    datum: String,
+}
+
+#[derive(Deserialize)]
+struct KupoHealth {
+    most_recent_checkpoint: Option<KupoSlotRef>,
+    most_recent_node_tip: Option<KupoSlotRef>,
+}
+
+#[derive(Deserialize)]
+struct KupoCheckpoint {
+    slot_no: u64,
+    header_hash: String,
+}
+
+fn parse_kupo_value(kv: &KupoValue) -> Value {
+    let mut value = Value::default();
+    let ada = AssetClass {
+        policy: vec![],
+        token: vec![],
+    };
+    value.insert(&ada, BigInt::from(kv.coins));
+    for (asset_key, qty) in &kv.assets {
+        // asset_key format: "policy_hex.asset_name_hex"
+        let Some((policy_hex, name_hex)) = asset_key.split_once('.') else {
+            continue;
+        };
+        let Ok(policy) = hex::decode(policy_hex) else {
+            continue;
+        };
+        let Ok(token) = hex::decode(name_hex) else {
+            continue;
+        };
+        let quantity = match qty {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    BigInt::from(i)
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        value.insert(&AssetClass { policy, token }, quantity);
+    }
+    value
+}
+
+#[async_trait]
+impl BootstrapProvider for KupoProvider {
+    async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
+        let hash_hex = hex::encode(script_hash.as_ref());
+        let url = format!("{}/matches/{}/*?unspent", self.url, hash_hex);
+        let resp: Vec<KupoUtxo> = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("kupo: fetch script UTxOs")?
+            .error_for_status()
+            .context("kupo: script UTxOs status")?
+            .json()
+            .await
+            .context("kupo: parse script UTxOs")?;
+
+        let mut result = Vec::with_capacity(resp.len());
+        for utxo in resp {
+            let tx_bytes = hex::decode(&utxo.transaction_id)
+                .context("kupo: invalid tx hash hex")?;
+            let tx_hash: [u8; 32] = tx_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
+
+            let value = parse_kupo_value(&utxo.value);
+
+            // Resolve datum: inline datums have datum_type="inline" and datum is the CBOR hex.
+            // Hash datums have datum_type="hash" and datum_hash is set.
+            let datum_cbor = if utxo.datum_type.as_deref() == Some("inline") {
+                utxo.datum
+                    .as_deref()
+                    .and_then(|d| hex::decode(d).ok())
+            } else if let Some(ref dh) = utxo.datum_hash {
+                match self.fetch_datum(dh).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        warn!(datum_hash = %dh, "kupo: could not fetch datum: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            result.push(FetchedUtxo {
+                tx_hash,
+                output_index: utxo.output_index,
+                value,
+                datum_cbor,
+                slot: utxo.created_at.slot_no,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>> {
+        let url = format!("{}/matches/{}?unspent", self.url, address);
+        let resp: Vec<KupoUtxo> = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("kupo: fetch address UTxOs")?
+            .error_for_status()
+            .context("kupo: address UTxOs status")?
+            .json()
+            .await
+            .context("kupo: parse address UTxOs")?;
+
+        let mut result = Vec::with_capacity(resp.len());
+        for utxo in resp {
+            let tx_bytes = hex::decode(&utxo.transaction_id)
+                .context("kupo: invalid tx hash hex")?;
+            let tx_hash: [u8; 32] = tx_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
+
+            result.push(FetchedUtxo {
+                tx_hash,
+                output_index: utxo.output_index,
+                value: parse_kupo_value(&utxo.value),
+                datum_cbor: None, // wallet UTxOs don't need datums
+                slot: utxo.created_at.slot_no,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/datums/{}", self.url, datum_hash);
+        let resp: KupoDatumResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("kupo: fetch datum")?
+            .error_for_status()
+            .context("kupo: datum status")?
+            .json()
+            .await
+            .context("kupo: parse datum")?;
+        hex::decode(&resp.datum).context("kupo: invalid datum hex")
+    }
+
+    async fn fetch_tip(&self) -> Result<(u64, String)> {
+        // Fetch the most recent checkpoint which includes the block header hash.
+        let cp_url = format!("{}/checkpoints", self.url);
+        if let Ok(resp) = self.client.get(&cp_url).send().await {
+            if let Ok(checkpoints) = resp.json::<Vec<KupoCheckpoint>>().await {
+                if let Some(cp) = checkpoints.last() {
+                    return Ok((cp.slot_no, cp.header_hash.clone()));
+                }
+            }
+        }
+        // Fallback to health endpoint (no block hash available).
+        let url = format!("{}/health", self.url);
+        let resp: KupoHealth = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("kupo: fetch health")?
+            .error_for_status()
+            .context("kupo: health status")?
+            .json()
+            .await
+            .context("kupo: parse health")?;
+        let slot = resp
+            .most_recent_node_tip
+            .or(resp.most_recent_checkpoint)
+            .map(|s| s.slot_no)
+            .unwrap_or(0);
+        Ok((slot, String::new()))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Blockfrost provider
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct BlockfrostProvider {
+    client: reqwest::Client,
+    url: String,
+    project_id: String,
+    network: Network,
+}
+
+impl BlockfrostProvider {
+    fn new(url: &str, project_id: &str) -> Self {
+        let network = if url.contains("mainnet") {
+            Network::Mainnet
+        } else {
+            Network::Testnet
+        };
+        Self {
+            client: reqwest::Client::new(),
+            url: url.trim_end_matches('/').to_string(),
+            project_id: project_id.to_string(),
+            network,
+        }
+    }
+
+    fn script_address(&self, script_hash: &ScriptHash) -> String {
+        let shelley = ShelleyAddress::new(
+            self.network,
+            ShelleyPaymentPart::Script(*script_hash),
+            ShelleyDelegationPart::Null,
+        );
+        let addr = Address::from(shelley);
+        addr.to_bech32().unwrap_or_default()
+    }
+}
+
+#[derive(Deserialize)]
+struct BlockfrostUtxo {
+    tx_hash: String,
+    tx_index: u64,
+    amount: Vec<BlockfrostAmount>,
+    data_hash: Option<String>,
+    inline_datum: Option<serde_json::Value>,
+    block: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostAmount {
+    unit: String,
+    quantity: String,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostPolicyAsset {
+    asset: String,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostAssetAddress {
+    address: String,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostDatumCbor {
+    cbor: String,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostBlock {
+    slot: Option<u64>,
+    hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockfrostBlockForUtxo {
+    slot: Option<u64>,
+}
+
+fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
+    let mut value = Value::default();
+    for a in amounts {
+        let quantity: i64 = a.quantity.parse().unwrap_or(0);
+        if a.unit == "lovelace" {
+            value.insert(
+                &AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                BigInt::from(quantity),
+            );
+        } else {
+            // unit format: policy_hex ++ asset_name_hex (56 chars policy + rest asset name)
+            if a.unit.len() < 56 {
+                continue;
+            }
+            let (policy_hex, name_hex) = a.unit.split_at(56);
+            let Ok(policy) = hex::decode(policy_hex) else {
+                continue;
+            };
+            let Ok(token) = hex::decode(name_hex) else {
+                continue;
+            };
+            value.insert(&AssetClass { policy, token }, BigInt::from(quantity));
+        }
+    }
+    value
+}
+
+#[async_trait]
+impl BootstrapProvider for BlockfrostProvider {
+    async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
+        let bech32 = self.script_address(script_hash);
+        self.fetch_address_utxos(&bech32).await
+    }
+
+    async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>> {
+        let mut all_utxos = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "{}/addresses/{}/utxos?page={}&count=100",
+                self.url, address, page
+            );
+            let resp = self
+                .client
+                .get(&url)
+                .header("project_id", &self.project_id)
+                .send()
+                .await
+                .context("blockfrost: fetch UTxOs")?;
+
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                break;
+            }
+            let utxos: Vec<BlockfrostUtxo> = resp
+                .error_for_status()
+                .context("blockfrost: UTxOs status")?
+                .json()
+                .await
+                .context("blockfrost: parse UTxOs")?;
+
+            let batch_len = utxos.len();
+            for utxo in utxos {
+                let tx_bytes =
+                    hex::decode(&utxo.tx_hash).context("blockfrost: invalid tx hash hex")?;
+                let tx_hash: [u8; 32] = tx_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("blockfrost: tx hash not 32 bytes"))?;
+
+                let value = parse_blockfrost_value(&utxo.amount);
+
+                // Resolve datum
+                let datum_cbor = if utxo.inline_datum.is_some() {
+                    // Blockfrost returns inline datum as JSON; we need the CBOR.
+                    // Fall back to the datum CBOR endpoint using data_hash.
+                    if let Some(ref dh) = utxo.data_hash {
+                        match self.fetch_datum(dh).await {
+                            Ok(bytes) => Some(bytes),
+                            Err(e) => {
+                                warn!(datum_hash = %dh, "blockfrost: could not fetch inline datum CBOR: {e:#}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else if let Some(ref dh) = utxo.data_hash {
+                    match self.fetch_datum(dh).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(e) => {
+                            warn!(datum_hash = %dh, "blockfrost: could not fetch datum: {e:#}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Get slot from block hash
+                let slot = if let Some(ref block_hash) = utxo.block {
+                    let block_url = format!("{}/blocks/{}", self.url, block_hash);
+                    match self
+                        .client
+                        .get(&block_url)
+                        .header("project_id", &self.project_id)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => resp
+                            .json::<BlockfrostBlockForUtxo>()
+                            .await
+                            .ok()
+                            .and_then(|b| b.slot)
+                            .unwrap_or(0),
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                };
+
+                all_utxos.push(FetchedUtxo {
+                    tx_hash,
+                    output_index: utxo.tx_index,
+                    value,
+                    datum_cbor,
+                    slot,
+                });
+            }
+
+            if batch_len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all_utxos)
+    }
+
+    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/scripts/datum/{}/cbor", self.url, datum_hash);
+        let resp: BlockfrostDatumCbor = self
+            .client
+            .get(&url)
+            .header("project_id", &self.project_id)
+            .send()
+            .await
+            .context("blockfrost: fetch datum")?
+            .error_for_status()
+            .context("blockfrost: datum status")?
+            .json()
+            .await
+            .context("blockfrost: parse datum")?;
+        hex::decode(&resp.cbor).context("blockfrost: invalid datum CBOR hex")
+    }
+
+    async fn fetch_tip(&self) -> Result<(u64, String)> {
+        let url = format!("{}/blocks/latest", self.url);
+        let resp: BlockfrostBlock = self
+            .client
+            .get(&url)
+            .header("project_id", &self.project_id)
+            .send()
+            .await
+            .context("blockfrost: fetch latest block")?
+            .error_for_status()
+            .context("blockfrost: latest block status")?
+            .json()
+            .await
+            .context("blockfrost: parse latest block")?;
+        Ok((resp.slot.unwrap_or(0), resp.hash.unwrap_or_default()))
+    }
+
+    async fn fetch_pool_utxos_by_nft(
+        &self,
+        nft_policy: &ScriptHash,
+        _pool_script_hash: &ScriptHash,
+    ) -> Result<Vec<FetchedUtxo>> {
+        let policy_hex = hex::encode(nft_policy.as_ref());
+        let cip67_label = "000de140";
+
+        // 1. List all assets under the NFT policy, paginated.
+        let mut nft_assets: Vec<String> = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "{}/assets/policy/{}?page={}&count=100",
+                self.url, policy_hex, page
+            );
+            let resp = self
+                .client
+                .get(&url)
+                .header("project_id", &self.project_id)
+                .send()
+                .await
+                .context("blockfrost: fetch policy assets")?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                break;
+            }
+            let assets: Vec<BlockfrostPolicyAsset> = resp
+                .error_for_status()
+                .context("blockfrost: policy assets status")?
+                .json()
+                .await
+                .context("blockfrost: parse policy assets")?;
+            let batch_len = assets.len();
+            for a in assets {
+                // Filter for CIP-67 label 222 NFTs (token name starts with 000de140).
+                let token_hex = &a.asset[policy_hex.len()..];
+                if token_hex.starts_with(cip67_label) {
+                    nft_assets.push(a.asset);
+                }
+            }
+            if batch_len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        info!(
+            nft_count = nft_assets.len(),
+            "blockfrost: discovered pool NFTs under policy {policy_hex}"
+        );
+
+        // 2. For each NFT, find the address holding it.
+        let mut addresses = std::collections::BTreeSet::new();
+        for asset in &nft_assets {
+            let url = format!("{}/assets/{}/addresses", self.url, asset);
+            let resp = self
+                .client
+                .get(&url)
+                .header("project_id", &self.project_id)
+                .send()
+                .await;
+            if let Ok(resp) = resp {
+                if let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await {
+                    for h in holders {
+                        addresses.insert(h.address);
+                    }
+                }
+            }
+        }
+        info!(
+            address_count = addresses.len(),
+            "blockfrost: discovered pool addresses"
+        );
+
+        // 3. Fetch UTxOs at each unique address.
+        let mut all_utxos = Vec::new();
+        for addr in &addresses {
+            match self.fetch_address_utxos(addr).await {
+                Ok(utxos) => all_utxos.extend(utxos),
+                Err(e) => warn!(address = %addr, "blockfrost: could not fetch pool UTxOs: {e:#}"),
+            }
+        }
+        Ok(all_utxos)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Orchestration
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub async fn run_bootstrap(
+    config: &BootstrapConfig,
+    v3_protocol: Option<&SundaeV3Protocol>,
+    v4_protocol: Option<&SundaeV4Protocol>,
+    v3_state: &Option<Arc<Mutex<SundaeV3HistoricalState>>>,
+    v4_state: &Option<Arc<Mutex<SundaeV4HistoricalState>>>,
+) -> Result<BootstrapResult> {
+    let provider: Box<dyn BootstrapProvider + Send + Sync> = match config {
+        BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
+        BootstrapConfig::Blockfrost { url, project_id } => {
+            Box::new(BlockfrostProvider::new(url, project_id))
+        }
+    };
+
+    let (tip_slot, tip_hash) = provider.fetch_tip().await?;
+    info!(tip_slot, tip_hash = %tip_hash, "bootstrap: fetched chain tip");
+
+    if let (Some(proto), Some(state)) = (v3_protocol, v3_state) {
+        bootstrap_v3(&*provider, proto, state, tip_slot).await?;
+    }
+
+    if let (Some(proto), Some(state)) = (v4_protocol, v4_state) {
+        bootstrap_v4(&*provider, proto, state, tip_slot).await?;
+    }
+
+    Ok(BootstrapResult { tip_slot, tip_hash })
+}
+
+async fn bootstrap_v3(
+    provider: &(dyn BootstrapProvider + Send + Sync),
+    protocol: &SundaeV3Protocol,
+    state: &Arc<Mutex<SundaeV3HistoricalState>>,
+    tip_slot: u64,
+) -> Result<()> {
+    info!("bootstrap: fetching V3 pools...");
+    let pool_utxos = provider
+        .fetch_pool_utxos_by_nft(&protocol.pool_script_hash, &protocol.pool_script_hash)
+        .await
+        .context("bootstrap v3: fetch pool UTxOs")?;
+
+    let mut pools = std::collections::BTreeMap::new();
+    for utxo in &pool_utxos {
+        let Some(ref cbor) = utxo.datum_cbor else {
+            continue;
+        };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
+            warn!(
+                tx_hash = %hex::encode(utxo.tx_hash),
+                "bootstrap v3: could not decode pool datum CBOR"
+            );
+            continue;
+        };
+        let Ok(pool_datum) = sundaev3::PoolDatum::from_plutus(data) else {
+            warn!(
+                tx_hash = %hex::encode(utxo.tx_hash),
+                "bootstrap v3: could not parse pool datum"
+            );
+            continue;
+        };
+        // Verify pool NFT
+        let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
+        asset_name.extend_from_slice(&pool_datum.ident);
+        let nft = AssetClass {
+            policy: protocol.pool_script_hash.to_vec(),
+            token: asset_name,
+        };
+        if !utxo.value.get(&nft).is_positive() {
+            continue;
+        }
+        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+        pools.insert(
+            pool_datum.ident.clone(),
+            Arc::new(sundaev3::SundaeV3Pool {
+                input,
+                value: utxo.value.clone(),
+                pool_datum,
+                slot: utxo.slot,
+            }),
+        );
+    }
+
+    info!("bootstrap: fetching V3 orders...");
+    let mut orders = Vec::new();
+    let mut invalid_orders = Vec::new();
+    for script_hash in &protocol.order_script_hashes {
+        let order_utxos = provider
+            .fetch_script_utxos(script_hash)
+            .await
+            .context("bootstrap v3: fetch order UTxOs")?;
+        for utxo in &order_utxos {
+            let Some(ref cbor) = utxo.datum_cbor else {
+                continue;
+            };
+            let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+            match PlutusData::from_plutus_bytes(cbor)
+                .map_err(|e| format!("{e}"))
+                .and_then(|data| {
+                    sundaev3::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+                }) {
+                Ok(datum) => {
+                    orders.push(Arc::new(sundaev3::SundaeV3Order {
+                        input,
+                        value: utxo.value.clone(),
+                        datum,
+                        slot: utxo.slot,
+                    }));
+                }
+                Err(reason) => {
+                    warn!(input = %input, "bootstrap v3: invalid order datum: {reason}");
+                    invalid_orders.push(InvalidOrder {
+                        input,
+                        slot: utxo.slot,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    info!("bootstrap: fetching V3 settings...");
+    let settings_utxos = provider
+        .fetch_script_utxos(&protocol.settings_script_hash)
+        .await
+        .context("bootstrap v3: fetch settings UTxOs")?;
+    let mut settings = None;
+    for utxo in &settings_utxos {
+        // Check for settings NFT
+        if !utxo.value.get(&protocol.settings_nft).is_positive() {
+            continue;
+        }
+        let Some(ref cbor) = utxo.datum_cbor else {
+            continue;
+        };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
+            continue;
+        };
+        let Ok(datum) = sundaev3::SettingsDatum::from_plutus(data) else {
+            continue;
+        };
+        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+        settings = Some(Arc::new(sundaev3::SundaeV3Settings {
+            input,
+            datum,
+            slot: utxo.slot,
+        }));
+        break;
+    }
+
+    let n_pools = pools.len();
+    let n_orders = orders.len();
+
+    // Populate state
+    {
+        let mut locked = state.lock().await;
+        let s = locked.update_slot(tip_slot)?;
+        s.pools = pools;
+        s.orders = orders;
+        s.invalid_orders = invalid_orders;
+        s.settings = settings;
+    }
+
+    info!(pools = n_pools, orders = n_orders, "V3 bootstrap complete");
+    Ok(())
+}
+
+async fn bootstrap_v4(
+    provider: &(dyn BootstrapProvider + Send + Sync),
+    protocol: &SundaeV4Protocol,
+    state: &Arc<Mutex<SundaeV4HistoricalState>>,
+    tip_slot: u64,
+) -> Result<()> {
+    info!("bootstrap: fetching V4 pools...");
+    let pool_utxos = provider
+        .fetch_pool_utxos_by_nft(&protocol.pool_nft_policy, &protocol.vault_script_hash)
+        .await
+        .context("bootstrap v4: fetch pool UTxOs")?;
+
+    let mut pools = std::collections::BTreeMap::new();
+    for utxo in &pool_utxos {
+        let Some(ref cbor) = utxo.datum_cbor else {
+            continue;
+        };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
+            warn!(
+                tx_hash = %hex::encode(utxo.tx_hash),
+                "bootstrap v4: could not decode pool datum CBOR"
+            );
+            continue;
+        };
+        let Ok(pool_datum) = sundaev4::PoolDatum::from_plutus(data) else {
+            warn!(
+                tx_hash = %hex::encode(utxo.tx_hash),
+                "bootstrap v4: could not parse pool datum"
+            );
+            continue;
+        };
+        // Verify pool NFT
+        let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
+        asset_name.extend_from_slice(&pool_datum.identifier);
+        let nft = AssetClass {
+            policy: protocol.pool_nft_policy.to_vec(),
+            token: asset_name,
+        };
+        if !utxo.value.get(&nft).is_positive() {
+            continue;
+        }
+        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+        pools.insert(
+            pool_datum.identifier.clone(),
+            Arc::new(sundaev4::SundaeV4Pool {
+                input,
+                value: utxo.value.clone(),
+                pool_datum,
+                slot: utxo.slot,
+            }),
+        );
+    }
+
+    info!("bootstrap: fetching V4 orders...");
+    let mut orders = Vec::new();
+    let mut invalid_orders = Vec::new();
+    for script_hash in &protocol.order_script_hashes {
+        let order_utxos = provider
+            .fetch_script_utxos(script_hash)
+            .await
+            .context("bootstrap v4: fetch order UTxOs")?;
+        for utxo in &order_utxos {
+            let Some(ref cbor) = utxo.datum_cbor else {
+                continue;
+            };
+            let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+            match PlutusData::from_plutus_bytes(cbor)
+                .map_err(|e| format!("{e}"))
+                .and_then(|data| {
+                    sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+                }) {
+                Ok(datum) => {
+                    orders.push(Arc::new(sundaev4::SundaeV4Order {
+                        input,
+                        value: utxo.value.clone(),
+                        datum,
+                        slot: utxo.slot,
+                    }));
+                }
+                Err(reason) => {
+                    warn!(input = %input, "bootstrap v4: invalid order datum: {reason}");
+                    invalid_orders.push(InvalidOrder {
+                        input,
+                        slot: utxo.slot,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    info!("bootstrap: fetching V4 settings...");
+    let settings_utxos = provider
+        .fetch_script_utxos(&protocol.settings_script_hash)
+        .await
+        .context("bootstrap v4: fetch settings UTxOs")?;
+    let mut settings = None;
+    for utxo in &settings_utxos {
+        if !utxo.value.get(&protocol.settings_nft).is_positive() {
+            continue;
+        }
+        let Some(ref cbor) = utxo.datum_cbor else {
+            continue;
+        };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
+            continue;
+        };
+        let Ok(datum) = sundaev4::SettingsDatum::from_plutus(data) else {
+            continue;
+        };
+        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+        settings = Some(Arc::new(sundaev4::SundaeV4Settings {
+            input,
+            value: utxo.value.clone(),
+            datum,
+            slot: utxo.slot,
+        }));
+        break;
+    }
+
+    // Fetch wallet UTxOs if execution is configured
+    let mut wallet_utxos = std::collections::BTreeMap::new();
+    if let Some(ref exec) = protocol.execution {
+        if let Ok(addr) = sundaev4::derive_scooper_pallas_address(&exec.scooper_secret_key) {
+            let addr_bech32 = addr.to_bech32().unwrap_or_default();
+            info!("bootstrap: fetching V4 wallet UTxOs at {addr_bech32}...");
+            match provider.fetch_address_utxos(&addr_bech32).await {
+                Ok(utxos) => {
+                    for utxo in &utxos {
+                        let input =
+                            TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                        wallet_utxos.insert(input, utxo.value.clone());
+                    }
+                }
+                Err(e) => {
+                    warn!("bootstrap v4: could not fetch wallet UTxOs: {e:#}");
+                }
+            }
+        }
+    }
+
+    let n_pools = pools.len();
+    let n_orders = orders.len();
+    let n_wallet = wallet_utxos.len();
+
+    // Populate state
+    {
+        let mut locked = state.lock().await;
+        let s = locked.update_slot(tip_slot)?;
+        s.pools = pools;
+        s.orders = orders;
+        s.invalid_orders = invalid_orders;
+        s.settings = settings;
+        s.wallet_utxos = wallet_utxos;
+        s.network_tip_slot = Some(tip_slot);
+        s.tip_slot = tip_slot;
+    }
+
+    info!(
+        pools = n_pools,
+        orders = n_orders,
+        wallet_utxos = n_wallet,
+        "V4 bootstrap complete"
+    );
+    Ok(())
+}

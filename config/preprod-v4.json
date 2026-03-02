@@ -1,0 +1,95 @@
+{
+  "persistence": { "sqlite": { "filename": "scooper-v2.db" } },
+  "protocol": {
+    "v4": {
+      "vault-script-hash": "a4ba144c65744e8fa8c58c026850fae87f3db9b22fc16ce0a657f9ed",
+      "order-script-hashes": ["fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"],
+      "settings-script-hash": "a0929fe6428f6663b0165094b0e17b8664b15b530fe8fc90eb5adc99",
+      "settings-nft": "601580a70de41c680949206c5570974a9bbb53cbc9dcfc4b7537581b.",
+      "pool-nft-policy": "3b21bea20c7091c41c63715802fe6f36aed0db91dcc6513bbe62cc5d",
+      "starting-point": "origin",
+      "execution": {
+        "scooper-secret-key-file": "/home/ec2-user/scooper-v1/preprod-scooper.skey",
+        "submit-url": "http://localhost:1337",
+        "fee": [3, 1000],
+        "protocol-share": [1, 2],
+        "plutus-v3-cost-model": [
+          100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32,
+          201305, 8356, 4, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000,
+          100, 100, 100, 16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0,
+          1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900, 1716, 549, 57,
+          85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1, 898148, 27279,
+          1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
+          76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552,
+          1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32,
+          11546, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 90434, 519,
+          0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1,
+          1, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 955506, 213312, 0,
+          2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788,
+          420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933,
+          32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000,
+          100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868,
+          18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
+          158221314, 26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4,
+          207616, 8310, 4, 1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181,
+          726, 719, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1,
+          107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1,
+          158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
+          1964219, 24520, 3
+        ],
+        "module-scripts": {
+          "constant-product": {
+            "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
+            "ref-utxo": "cefada4daf851a6a87f726e86a933dcec7f6693f76754363392dfe00d9090a0b#0"
+          },
+          "fee-split": {
+            "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
+            "ref-utxo": "316f2c22e9049a00f6dedba95d67068241a74ca8e0f757a5ab657fad4a9bbdcd#0"
+          },
+          "fairness": {
+            "hash": "123c75209ffc6aec1e9282980a06e93d2b471306a94dcd8fbb101c50",
+            "ref-utxo": "04da286aee665cb5ce55f74dc71b8fd58dd5cb2caf5ca686ab3bf3089bf7d413#0"
+          },
+          "vault": {
+            "hash": "a4ba144c65744e8fa8c58c026850fae87f3db9b22fc16ce0a657f9ed",
+            "ref-utxo": "e98f8d3d4cbff86d4c4f99d730217c44b5ebd3c7478b0e6069efb7d31e886597#0"
+          },
+          "order": {
+            "hash": "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39",
+            "ref-utxo": "034f03c72674b2f6c6d07e6f4f3a6c7aa894addf87cab48c2588e4ac6b0b14f6#0"
+          },
+          "pool-mint": {
+            "hash": "3b21bea20c7091c41c63715802fe6f36aed0db91dcc6513bbe62cc5d",
+            "ref-utxo": "6eb0af8c764bedf61e63633cf61ee46d914fa60d41a41d77e4fa94e39bcb7c2d#0"
+          },
+          "settings": {
+            "hash": "a0929fe6428f6663b0165094b0e17b8664b15b530fe8fc90eb5adc99",
+            "ref-utxo": "43b3f9cb8e6a63ff4718b6c7b837517ca7099febfaf7d2357af35d8c2d9886c0#0"
+          }
+        }
+      }
+    }
+  },
+  "acropolis": {
+    "global": {
+      "startup": {
+        "network-name": "preprod"
+      }
+    },
+    "module": {
+      "peer-network-interface": {
+        "node-addresses": [
+          "localhost:44987"
+        ]
+      },
+      "genesis-bootstrapper": {
+        "byron-genesis-file": "/home/ec2-user/cardano-node/share/preprod/byron-genesis.json",
+        "shelley-genesis-file": "/home/ec2-user/cardano-node/share/preprod/shelley-genesis.json"
+      },
+      "mithril-snapshot-fetcher": {
+        "aggregator-url": "https://aggregator.release-preprod.api.mithril.network/aggregator",
+        "genesis-key": "5b3132372c37332c3132342c3136312c362c3133372c3133312c3231332c3230372c3131372c3139382c38352c3137362c3139392c3136322c3234312c36382c3132332c3131392c3134352c31332c3233322c3234332c34392c3232392c322c3234392c3230352c3230352c33392c3233352c34345d"
+      }
+    }
+  }
+}

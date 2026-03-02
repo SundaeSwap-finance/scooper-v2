@@ -1,0 +1,106 @@
+{
+  "persistence": { "sqlite": { "filename": "scooper-v2.db" } },
+  "protocol": {
+    "bootstrap": {
+      "source": "blockfrost",
+      "url": "https://cardano-preview.blockfrost.io/api/v0",
+      "project-id": "previewUJJvqX2v9TOOAis8dZWiuyTPfJxJIKgH"
+    },
+    "v3": {
+      "order-script-hashes": [
+        "cfad1914b599d18bffd14d2bbd696019c2899cbdd6a03325cdf680bc",
+        "a994f40e13745a4adbac25fd9922faf5f784408a60f52b75db08cabe"
+      ],
+      "pool-script-hash": "44a1eb2d9f58add4eb1932bd0048e6a1947e85e3fe4f32956a110414",
+      "settings-script-hash": "85ed0c7060ccd4700927d8b60f0160abe2b3c30446fc0a9ac83b6b76",
+      "settings-nft": "85ed0c7060ccd4700927d8b60f0160abe2b3c30446fc0a9ac83b6b76.73657474696e6773",
+      "starting-point": "48460699.7bfb6a677df577d2f0371236ecf63554b54b35b663d3ad9159695a609306e629"
+    },
+    "v4": {
+      "vault-script-hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
+      "order-script-hashes": ["fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"],
+      "settings-script-hash": "c767266215eb375961303a1e30808ec59d25cfb7cbce85872848cbfa",
+      "settings-nft": "9e0b61ad4207b1e0dee7c291b327ba626e3172ffe236e15992a32424.",
+      "pool-nft-policy": "532d1e9ee1209fb4006f8e2689b5c9be010faa43e76fc00fc6f99b3b",
+      "starting-point": "origin",
+      "execution": {
+        "scooper-secret-key-file": "/home/ec2-user/scooper-v1/foo.skey",
+        "submit-url": "http://localhost:1337",
+        "fee": [3, 1000],
+        "protocol-share": [1, 2],
+        "plutus-v3-cost-model": [
+          100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32,
+          201305, 8356, 4, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000,
+          100, 100, 100, 16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0,
+          1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900, 1716, 549, 57,
+          85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1, 898148, 27279,
+          1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
+          76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552,
+          1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32,
+          11546, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 90434, 519,
+          0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1,
+          1, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 955506, 213312, 0,
+          2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788,
+          420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933,
+          32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000,
+          100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868,
+          18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
+          158221314, 26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4,
+          207616, 8310, 4, 1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181,
+          726, 719, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1,
+          107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1,
+          158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
+          1964219, 24520, 3
+        ],
+        "module-scripts": {
+          "constant-product": {
+            "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
+            "ref-utxo": "7e623ada3840d0d3b03ea85157bd514d84e2f72a03f7ceea2cc4a4b963e140b0#0"
+          },
+          "fee-split": {
+            "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
+            "ref-utxo": "46655fc76eab8cf76695ce4a23e286bc62443eca72e0849ebaa244f8c53dbff6#0"
+          },
+          "fairness": {
+            "hash": "e9f9367f6ca2298c73e2458cb20193850bbc9983de382fa4fcfeb32d",
+            "ref-utxo": "8fcf7283d215a93a32c4472972ff02797c495a57f85b5d5569832809f30c678f#0"
+          },
+          "vault": {
+            "hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
+            "ref-utxo": "90bea82a3d9eb6f446859bc5cda6667e76122b48d670b737687a40b6d9119696#0"
+          },
+          "order": {
+            "hash": "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39",
+            "ref-utxo": "03a4d77ca29662f3b9bead48cf62f280755d69a5518f50a921f48f7a13d467eb#0"
+          },
+          "pool-mint": {
+            "hash": "532d1e9ee1209fb4006f8e2689b5c9be010faa43e76fc00fc6f99b3b",
+            "ref-utxo": "201ee1ec27dd88918b02c271e0d605ca7d35d13c119a66f6a805b635c4ab3e24#0"
+          },
+          "settings": {
+            "hash": "c767266215eb375961303a1e30808ec59d25cfb7cbce85872848cbfa",
+            "ref-utxo": "6a811147541aa3946c40500a127f559d5b6f5ba47c0204ff12f925c466259c15#0"
+          }
+        }
+      }
+    }
+  },
+  "acropolis": {
+    "global": {
+      "startup": {
+        "network-name": "preview"
+      }
+    },
+    "module": {
+      "peer-network-interface": {
+        "node-addresses": [
+          "localhost:41981"
+        ]
+      },
+      "mithril-snapshot-fetcher": {
+        "aggregator-url": "https://aggregator.pre-release-preview.api.mithril.network/aggregator",
+        "genesis-key": "5b3132372c37332c3132342c3136312c362c3133372c3133312c3231332c3230372c3131372c3139382c38352c3137362c3139392c3136322c3234312c36382c3132332c3131392c3134352c31332c3233322c3234332c34392c3232392c322c3234392c3230352c3230352c33392c3233352c34345d"
+      }
+    }
+  }
+}

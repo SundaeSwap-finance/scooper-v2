@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 mod bigint;
 mod blueprint;
+mod bootstrap;
 mod cardano_types;
 mod config;
 mod datum_lookup;
@@ -164,6 +165,8 @@ async fn manager_loop(
         let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
+        // Load indexer state from DB, then optionally bootstrap from external source.
+        let mut v3_index_and_config = None;
         if let (Some(v3_config), Some(v3_state)) = (&protocol.v3, &v3_state) {
             let mut v3_index = SundaeV3Indexer::new(
                 v3_state.clone(),
@@ -174,13 +177,10 @@ async fn manager_loop(
                 persistence.indexer_dao("sundae_v3"),
             );
             v3_index.load().await.unwrap();
-
-            indexer
-                .add_index(v3_index, v3_config.starting_point.clone(), force_restart)
-                .await
-                .unwrap();
+            v3_index_and_config = Some((v3_index, v3_config));
         }
 
+        let mut v4_index_and_config = None;
         if let (Some(v4_config), Some(v4_state)) = (&protocol.v4, &v4_state) {
             let mut v4_index = SundaeV4Indexer::new(
                 v4_state.clone(),
@@ -190,9 +190,70 @@ async fn manager_loop(
                 persistence.indexer_dao("sundae_v4"),
             );
             v4_index.load().await.unwrap();
+            v4_index_and_config = Some((v4_index, v4_config));
+        }
 
+        // Bootstrap from Kupo/Blockfrost if configured and DB is empty.
+        let mut bootstrap_point: Option<acropolis_common::Point> = None;
+        if let Some(ref bootstrap_config) = protocol.bootstrap {
+            let v3_empty = match &v3_state {
+                Some(s) => s.lock().await.latest().pools.is_empty(),
+                None => false,
+            };
+            let v4_empty = match &v4_state {
+                Some(s) => s.lock().await.latest().pools.is_empty(),
+                None => false,
+            };
+            if v3_empty || v4_empty {
+                match bootstrap::run_bootstrap(
+                    bootstrap_config,
+                    protocol.v3.as_ref(),
+                    protocol.v4.as_ref(),
+                    &v3_state,
+                    &v4_state,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if !result.tip_hash.is_empty() {
+                            let point_str =
+                                format!("{}.{}", result.tip_slot, result.tip_hash);
+                            match point_str.parse() {
+                                Ok(point) => bootstrap_point = Some(point),
+                                Err(e) => {
+                                    warn!("Bootstrap: could not parse tip as Point: {e:#}")
+                                }
+                            }
+                        }
+                        if bootstrap_point.is_some() {
+                            info!("Bootstrap succeeded, starting chain sync from tip");
+                        } else {
+                            info!("Bootstrap succeeded but no block hash available; using configured starting point");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Bootstrap failed, falling back to chain sync: {e:#}");
+                    }
+                }
+            }
+        }
+
+        if let Some((v3_index, v3_config)) = v3_index_and_config {
+            let start = bootstrap_point
+                .clone()
+                .unwrap_or_else(|| v3_config.starting_point.clone());
             indexer
-                .add_index(v4_index, v4_config.starting_point.clone(), force_restart)
+                .add_index(v3_index, start, force_restart)
+                .await
+                .unwrap();
+        }
+
+        if let Some((v4_index, v4_config)) = v4_index_and_config {
+            let start = bootstrap_point
+                .clone()
+                .unwrap_or_else(|| v4_config.starting_point.clone());
+            indexer
+                .add_index(v4_index, start, force_restart)
                 .await
                 .unwrap();
         }
