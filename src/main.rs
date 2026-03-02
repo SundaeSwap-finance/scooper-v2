@@ -87,7 +87,11 @@ async fn main() -> Result<()> {
         .protocol
         .v4
         .as_ref()
-        .and_then(|v4| v4.execution.clone());
+        .and_then(|v4| v4.execution.clone())
+        .map(|mut e| {
+            e.resolve_secret_key().expect("failed to resolve scooper secret key");
+            e
+        });
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
     let v4_module_preimages = v4_execution
         .as_ref()

@@ -715,8 +715,23 @@ pub fn build_multi_pool_scoop_tx(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn parse_secret_key(hex_str: &str) -> Result<SecretKey> {
-    let bytes = hex::decode(hex_str).context("invalid secret key hex")?;
+fn parse_secret_key(key_str: &str) -> Result<SecretKey> {
+    let hex_str = if key_str.trim_start().starts_with('{') {
+        // Cardano JSON envelope: {"type":"...","cborHex":"5820<64hex>"}
+        let envelope: serde_json::Value =
+            serde_json::from_str(key_str).context("invalid signing key JSON envelope")?;
+        let cbor_hex = envelope["cborHex"]
+            .as_str()
+            .context("missing cborHex field in signing key envelope")?;
+        // Strip the CBOR prefix "5820" (bytes tag for 32-byte bytestring)
+        cbor_hex
+            .strip_prefix("5820")
+            .context("unexpected cborHex prefix (expected 5820)")?
+            .to_string()
+    } else {
+        key_str.to_string()
+    };
+    let bytes = hex::decode(&hex_str).context("invalid secret key hex")?;
     let arr: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;

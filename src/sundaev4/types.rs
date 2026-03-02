@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use acropolis_common::Point;
 use pallas_addresses::ScriptHash;
 use pallas_primitives::PlutusData;
@@ -307,12 +308,32 @@ pub struct FairnessOperateEntry {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ScooperExecution {
+    #[serde(default)]
     pub scooper_secret_key: String,
+    #[serde(default)]
+    pub scooper_secret_key_file: Option<String>,
     pub submit_url: String,
     pub fee: (u64, u64),
     pub protocol_share: (u64, u64),
     pub module_scripts: ModuleScripts,
     pub plutus_v3_cost_model: Vec<i64>,
+}
+
+impl ScooperExecution {
+    /// If `scooper_secret_key_file` is set, read the file and populate
+    /// `scooper_secret_key`. Call this once at startup.
+    pub fn resolve_secret_key(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = &self.scooper_secret_key_file {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("reading secret key file: {path}"))?;
+            self.scooper_secret_key = contents.trim().to_string();
+        }
+        anyhow::ensure!(
+            !self.scooper_secret_key.is_empty(),
+            "scooper-secret-key or scooper-secret-key-file must be set"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

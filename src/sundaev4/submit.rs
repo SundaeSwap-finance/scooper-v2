@@ -1,11 +1,23 @@
-//! Network interactions: submit transactions via cardano-submit-api.
+//! Network interactions: submit transactions via cardano-submit-api or ogmios.
 
 use anyhow::{Context, Result, bail};
 
 /// Submit a CBOR-encoded signed transaction.
 ///
+/// Automatically detects the backend:
+/// - URLs containing `/api/submit/tx` use cardano-submit-api (raw CBOR POST)
+/// - All other URLs use Ogmios JSON-RPC (`submitTransaction`)
+///
 /// Returns the transaction hash on success.
 pub async fn submit_tx(url: &str, cbor: &[u8]) -> Result<String> {
+    if url.contains("/api/submit/tx") {
+        submit_cardano_api(url, cbor).await
+    } else {
+        submit_ogmios(url, cbor).await
+    }
+}
+
+async fn submit_cardano_api(url: &str, cbor: &[u8]) -> Result<String> {
     let client = reqwest::Client::new();
     let resp = client
         .post(url)
@@ -24,6 +36,45 @@ pub async fn submit_tx(url: &str, cbor: &[u8]) -> Result<String> {
         Ok(hash)
     } else {
         bail!("submit failed ({}): {}", status, body);
+    }
+}
+
+async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "submitTransaction",
+        "params": {
+            "transaction": { "cbor": hex::encode(cbor) }
+        },
+        "id": 1
+    });
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("ogmios submit request failed")?;
+
+    let status = resp.status();
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("ogmios response not valid JSON")?;
+
+    if let Some(result) = json.get("result") {
+        let hash = result
+            .get("transaction")
+            .and_then(|t| t.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or("unknown");
+        Ok(hash.to_string())
+    } else {
+        let error = json
+            .get("error")
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        bail!("ogmios submit failed ({}): {}", status, error);
     }
 }
 

@@ -9,10 +9,12 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
     select,
     sync::Mutex,
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -92,6 +94,32 @@ type ResponseBody = Either<Full<Bytes>, SseBody>;
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub address: SocketAddr,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+}
+
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
+    use rustls_pemfile::{certs, private_key};
+    use std::io::BufReader;
+    use tokio_rustls::rustls;
+
+    let cert_file = std::fs::File::open(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to open TLS cert {cert_path}: {e}"))?;
+    let key_file = std::fs::File::open(key_path)
+        .map_err(|e| anyhow::anyhow!("failed to open TLS key {key_path}: {e}"))?;
+
+    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse TLS certs: {e}"))?;
+    let key = private_key(&mut BufReader::new(key_file))
+        .map_err(|e| anyhow::anyhow!("failed to parse TLS key: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 pub async fn admin_server(
@@ -106,6 +134,21 @@ pub async fn admin_server(
     shutdown: CancellationToken,
 ) {
     let v4_module_preimages = Arc::new(v4_module_preimages);
+
+    let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = build_tls_acceptor(cert, key)
+                .expect("failed to initialize TLS");
+            tracing::info!(cert = %cert, "TLS enabled for admin server");
+            Some(acceptor)
+        }
+        (None, None) => {
+            tracing::info!("Admin server running without TLS");
+            None
+        }
+        _ => panic!("tls_cert and tls_key must both be set or both be absent"),
+    };
+
     let listener = TcpListener::bind(config.address).await.unwrap();
 
     loop {
@@ -120,19 +163,34 @@ pub async fn admin_server(
         let v4_state = v4_state.clone();
         let v4_module_preimages = v4_module_preimages.clone();
         let paused = paused.clone();
+        let tls_acceptor = tls_acceptor.clone();
 
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
-            select! {
-                _ = child.cancelled() => {},
-                _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
+            if let Some(acceptor) = tls_acceptor {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("TLS handshake failed: {:?}", e);
+                        return;
+                    }
+                };
+                select! {
+                    _ = child.cancelled() => {},
+                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
+                }
+            } else {
+                select! {
+                    _ = child.cancelled() => {},
+                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
+                }
             }
         });
     }
 }
 
 async fn handle_request(
-    stream: TcpStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,

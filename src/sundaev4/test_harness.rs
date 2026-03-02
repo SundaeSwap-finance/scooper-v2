@@ -126,6 +126,7 @@ pub(crate) mod test_harness {
 
             let exec = ScooperExecution {
                 scooper_secret_key: SCOOPER_SECRET_KEY.to_string(),
+                scooper_secret_key_file: None,
                 submit_url: String::new(),
                 fee: (3, 1000),
                 protocol_share: (1, 2),
