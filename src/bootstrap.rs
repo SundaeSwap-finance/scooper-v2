@@ -73,6 +73,10 @@ trait BootstrapProvider {
     ) -> Result<Vec<FetchedUtxo>> {
         self.fetch_script_utxos(pool_script_hash).await
     }
+
+    /// Fetch a PlutusV3 script's CBOR by its hash.
+    /// Returns the raw script CBOR bytes (single-wrapped: CBOR bytestring containing FLAT UPLC).
+    async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -300,6 +304,26 @@ impl BootstrapProvider for KupoProvider {
             .map(|s| s.slot_no)
             .unwrap_or(0);
         Ok((slot, String::new()))
+    }
+
+    async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>> {
+        // Kupo stores scripts alongside datums — try /scripts/{hash}
+        let url = format!("{}/scripts/{}", self.url, script_hash);
+        let resp: serde_json::Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("kupo: fetch script")?
+            .error_for_status()
+            .context("kupo: script status")?
+            .json()
+            .await
+            .context("kupo: parse script")?;
+        let script_hex = resp["script"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("kupo: no script field for {script_hash}"))?;
+        hex::decode(script_hex).context("kupo: invalid script hex")
     }
 }
 
@@ -638,6 +662,26 @@ impl BootstrapProvider for BlockfrostProvider {
         }
         Ok(all_utxos)
     }
+
+    async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/scripts/{}/cbor", self.url, script_hash);
+        let resp: serde_json::Value = self
+            .client
+            .get(&url)
+            .header("project_id", &self.project_id)
+            .send()
+            .await
+            .context("blockfrost: fetch script cbor")?
+            .error_for_status()
+            .context("blockfrost: script cbor status")?
+            .json()
+            .await
+            .context("blockfrost: parse script cbor")?;
+        let cbor_hex = resp["cbor"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("blockfrost: no cbor field for script {script_hash}"))?;
+        hex::decode(cbor_hex).context("blockfrost: invalid script CBOR hex")
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -932,27 +976,83 @@ async fn bootstrap_v4(
     // Fetch wallet UTxOs if execution is configured
     let mut wallet_utxos = std::collections::BTreeMap::new();
     if let Some(ref exec) = protocol.execution {
-        if let Ok(addr) = sundaev4::derive_scooper_pallas_address(&exec.scooper_secret_key) {
-            let addr_bech32 = addr.to_bech32().unwrap_or_default();
-            info!("bootstrap: fetching V4 wallet UTxOs at {addr_bech32}...");
-            match provider.fetch_address_utxos(&addr_bech32).await {
-                Ok(utxos) => {
-                    for utxo in &utxos {
-                        let input =
-                            TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-                        wallet_utxos.insert(input, utxo.value.clone());
+        match sundaev4::derive_scooper_pallas_address(&exec.scooper_secret_key) {
+            Err(e) => {
+                warn!("bootstrap v4: could not derive scooper address: {e:#}");
+            }
+            Ok(addr) => {
+                let addr_bech32 = addr.to_bech32().unwrap_or_default();
+                info!("bootstrap: fetching V4 wallet UTxOs at {addr_bech32}...");
+                match provider.fetch_address_utxos(&addr_bech32).await {
+                    Ok(utxos) => {
+                        for utxo in &utxos {
+                            let input =
+                                TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                            wallet_utxos.insert(input, utxo.value.clone());
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!("bootstrap v4: could not fetch wallet UTxOs: {e:#}");
+                    Err(e) => {
+                        warn!("bootstrap v4: could not fetch wallet UTxOs: {e:#}");
+                    }
                 }
             }
         }
     }
 
+    // Fetch reference script UTxOs if execution is configured.
+    // The scooper needs these to build the ScriptStore for tx evaluation.
+    let mut ref_utxo_outputs = std::collections::BTreeMap::new();
+    if let Some(ref exec) = protocol.execution {
+        info!("bootstrap: fetching V4 reference script UTxOs...");
+        let scripts = &exec.module_scripts;
+        let all_refs = [
+            &scripts.constant_product,
+            &scripts.fee_split,
+            &scripts.fairness,
+            &scripts.vault,
+            &scripts.order,
+            &scripts.pool_mint,
+            &scripts.settings,
+        ];
+        for script_ref in all_refs {
+            let hash_hex = hex::encode(script_ref.hash.as_ref());
+            match provider.fetch_script_cbor(&hash_hex).await {
+                Ok(script_cbor) => {
+                    // Blockfrost returns the *outer* CBOR (the full script encoding).
+                    // We need to build a PlutusV3Script from the inner bytes.
+                    // The API returns: CBOR-wrapped script bytes, same as what
+                    // pallas stores in PlutusV3Script.
+                    let script = pallas_primitives::PlutusScript::<3>(script_cbor.into());
+                    // Dummy address — only the script_ref field matters.
+                    let dummy_addr = pallas_addresses::Address::Shelley(
+                        pallas_addresses::ShelleyAddress::new(
+                            pallas_addresses::Network::Testnet,
+                            pallas_addresses::ShelleyPaymentPart::Key(
+                                pallas_primitives::Hash::new([0u8; 28]),
+                            ),
+                            pallas_addresses::ShelleyDelegationPart::Null,
+                        ),
+                    );
+                    let txo = crate::cardano_types::TransactionOutput {
+                        address: dummy_addr,
+                        value: crate::cardano_types::Value::default(),
+                        datum: crate::cardano_types::RawDatum::None,
+                        script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(script)),
+                    };
+                    ref_utxo_outputs.insert(script_ref.ref_utxo.clone(), txo);
+                }
+                Err(e) => {
+                    warn!(hash = %hash_hex, "bootstrap v4: could not fetch script CBOR: {e:#}");
+                }
+            }
+        }
+        info!(count = ref_utxo_outputs.len(), "bootstrap: fetched reference scripts");
+    }
+
     let n_pools = pools.len();
     let n_orders = orders.len();
     let n_wallet = wallet_utxos.len();
+    let n_refs = ref_utxo_outputs.len();
 
     // Populate state
     {
@@ -963,6 +1063,7 @@ async fn bootstrap_v4(
         s.invalid_orders = invalid_orders;
         s.settings = settings;
         s.wallet_utxos = wallet_utxos;
+        s.ref_utxo_outputs = ref_utxo_outputs;
         s.network_tip_slot = Some(tip_slot);
         s.tip_slot = tip_slot;
     }
@@ -971,6 +1072,7 @@ async fn bootstrap_v4(
         pools = n_pools,
         orders = n_orders,
         wallet_utxos = n_wallet,
+        ref_scripts = n_refs,
         "V4 bootstrap complete"
     );
     Ok(())
