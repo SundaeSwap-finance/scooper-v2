@@ -73,6 +73,19 @@ async fn main() -> Result<()> {
         .map(|_| Arc::new(Mutex::new(SundaeV4HistoricalState::new())));
     let broadcaster = tokio::sync::watch::Sender::default();
 
+    // Resolve the secret key file early so both manager_loop (bootstrap) and
+    // scooper see the resolved key.
+    let mut protocol = config.protocol.clone();
+    if let Some(ref mut v4) = protocol.v4 {
+        if let Some(ref mut exec) = v4.execution {
+            exec.resolve_secret_key()
+                .expect("failed to resolve scooper secret key");
+        }
+    }
+    let v4_execution = protocol
+        .v4
+        .as_ref()
+        .and_then(|v4| v4.execution.clone());
     let manager_handle = tokio::spawn(manager_loop(
         v3_state.clone(),
         v4_state.clone(),
@@ -80,19 +93,10 @@ async fn main() -> Result<()> {
         broadcaster.clone(),
         event_tx.clone(),
         config.acropolis_config()?,
-        config.protocol.clone(),
+        protocol,
         persistence.clone(),
         shutdown.child_token(),
     ));
-    let v4_execution = config
-        .protocol
-        .v4
-        .as_ref()
-        .and_then(|v4| v4.execution.clone())
-        .map(|mut e| {
-            e.resolve_secret_key().expect("failed to resolve scooper secret key");
-            e
-        });
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
     let v4_module_preimages = v4_execution
         .as_ref()

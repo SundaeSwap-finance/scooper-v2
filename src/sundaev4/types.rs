@@ -326,7 +326,22 @@ impl ScooperExecution {
         if let Some(path) = &self.scooper_secret_key_file {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("reading secret key file: {path}"))?;
-            self.scooper_secret_key = contents.trim().to_string();
+            let trimmed = contents.trim();
+            // Handle Cardano CLI skey JSON format: { "cborHex": "5820<hex>" }
+            if trimmed.starts_with('{') {
+                let json: serde_json::Value = serde_json::from_str(trimmed)
+                    .with_context(|| format!("parsing skey JSON file: {path}"))?;
+                let cbor_hex = json["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("skey file missing cborHex field: {path}"))?;
+                // Strip CBOR wrapping (5820 = 32-byte bytestring prefix)
+                self.scooper_secret_key = cbor_hex
+                    .strip_prefix("5820")
+                    .unwrap_or(cbor_hex)
+                    .to_string();
+            } else {
+                self.scooper_secret_key = trimmed.to_string();
+            }
         }
         anyhow::ensure!(
             !self.scooper_secret_key.is_empty(),
