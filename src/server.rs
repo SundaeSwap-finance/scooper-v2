@@ -498,6 +498,13 @@ impl AdminServer {
             }
         }
 
+        if !state.invalid_orders.is_empty() {
+            json_map.insert(
+                "invalid".to_string(),
+                serde_json::to_value(&state.invalid_orders).unwrap(),
+            );
+        }
+
         serde_json::to_string_pretty(&json_map).unwrap()
     }
 
@@ -651,6 +658,13 @@ impl AdminServer {
             .collect();
         if !unmatched.is_empty() {
             json_map.insert("unmatched".to_string(), unmatched.into());
+        }
+
+        if !state.invalid_orders.is_empty() {
+            json_map.insert(
+                "invalid".to_string(),
+                serde_json::to_value(&state.invalid_orders).unwrap(),
+            );
         }
 
         serde_json::to_string_pretty(&json_map).unwrap()

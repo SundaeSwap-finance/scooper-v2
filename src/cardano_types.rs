@@ -258,6 +258,13 @@ impl RawDatum {
         T::from_plutus(self.plutus_data(datums)?.clone()).ok()
     }
 
+    pub fn try_parse<T: AsPlutus>(&self, datums: &ScopedDatumLookup) -> Result<T, String> {
+        let pd = self
+            .plutus_data(datums)
+            .ok_or_else(|| "no datum (neither inline nor in witness set)".to_string())?;
+        T::from_plutus(pd.clone()).map_err(|e| format!("{e}"))
+    }
+
     pub fn plutus_data<'a>(&'a self, datums: &'a ScopedDatumLookup<'a>) -> Option<&'a PlutusData> {
         match self {
             Self::None => None,

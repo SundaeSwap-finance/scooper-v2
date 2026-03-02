@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
-    events::{IndexEvent, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder, SpentOrderReason, SpentPool},
+    events::{IndexEvent, InvalidOrder, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
     persistence::{IndexerDao, PersistedDatum, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
     sundaev3::Ident,
@@ -39,6 +39,7 @@ pub struct SundaeV4State {
     pub settings: Option<Arc<SundaeV4Settings>>,
     pub spent_orders: Vec<SpentOrder<SundaeV4Order>>,
     pub spent_pools: Vec<SpentPool<SundaeV4Pool>>,
+    pub invalid_orders: Vec<InvalidOrder>,
     pub tip_slot: u64,
     /// The actual network tip slot, as reported by the upstream node.
     /// `None` until the upstream node reports it (Dolos may not always provide this).
@@ -151,15 +152,43 @@ impl SundaeV4Indexer {
                     );
                 }
                 "order" => {
-                    let Some(datum) = output.datum.parse(&datums) else {
-                        bail!("invalid order datum");
-                    };
-                    state.orders.push(Arc::new(SundaeV4Order {
-                        input: txo.txo_id,
-                        datum,
-                        value: output.value,
-                        slot: txo.created_slot,
-                    }));
+                    match output.datum.try_parse(&datums) {
+                        Ok(datum) => {
+                            state.orders.push(Arc::new(SundaeV4Order {
+                                input: txo.txo_id,
+                                datum,
+                                value: output.value,
+                                slot: txo.created_slot,
+                            }));
+                        }
+                        Err(reason) => {
+                            warn!(slot = txo.created_slot, input = %txo.txo_id, "v4: invalid order datum on load: {reason}");
+                            state.invalid_orders.push(InvalidOrder {
+                                input: txo.txo_id,
+                                slot: txo.created_slot,
+                                reason,
+                            });
+                        }
+                    }
+                }
+                "invalid_order" => {
+                    match output.datum.try_parse(&datums) {
+                        Ok(datum) => {
+                            state.orders.push(Arc::new(SundaeV4Order {
+                                input: txo.txo_id,
+                                datum,
+                                value: output.value,
+                                slot: txo.created_slot,
+                            }));
+                        }
+                        Err(reason) => {
+                            state.invalid_orders.push(InvalidOrder {
+                                input: txo.txo_id,
+                                slot: txo.created_slot,
+                                reason,
+                            });
+                        }
+                    }
                 }
                 "settings" => {
                     let Some(datum) = output.datum.parse(&datums) else {
@@ -350,6 +379,7 @@ impl ChainIndex for SundaeV4Indexer {
 
         let mut updated_pools = BTreeMap::new();
         let mut new_orders = vec![];
+        let mut new_invalid_orders = vec![];
         let mut new_settings = None;
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
@@ -405,24 +435,43 @@ impl ChainIndex for SundaeV4Indexer {
             {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_txo(output);
-                if let Some(od) = tx_out.datum.parse(&datums) {
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "order".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: tx_out.hashed_datum(&datums),
-                    });
+                match tx_out.datum.try_parse(&datums) {
+                    Ok(od) => {
+                        changes.created_txos.push(PersistedTxo {
+                            txo_id: this_input.clone(),
+                            txo_type: "order".to_string(),
+                            created_slot: slot,
+                            era: output.era().into(),
+                            txo: output.encode(),
+                            address: tx_out.address.to_vec(),
+                            datum: tx_out.hashed_datum(&datums),
+                        });
 
-                    let order = SundaeV4Order {
-                        input: this_input,
-                        value: tx_out.value,
-                        datum: od,
-                        slot,
-                    };
-                    new_orders.push(Arc::new(order));
+                        let order = SundaeV4Order {
+                            input: this_input,
+                            value: tx_out.value,
+                            datum: od,
+                            slot,
+                        };
+                        new_orders.push(Arc::new(order));
+                    }
+                    Err(reason) => {
+                        warn!(slot, input = %this_input, "v4: invalid order datum: {reason}");
+                        changes.created_txos.push(PersistedTxo {
+                            txo_id: this_input.clone(),
+                            txo_type: "invalid_order".to_string(),
+                            created_slot: slot,
+                            era: output.era().into(),
+                            txo: output.encode(),
+                            address: tx_out.address.to_vec(),
+                            datum: tx_out.hashed_datum(&datums),
+                        });
+                        new_invalid_orders.push(InvalidOrder {
+                            input: this_input,
+                            slot,
+                            reason,
+                        });
+                    }
                 }
             } else if payment_hash_equals(&address, &self.protocol.settings_script_hash) {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
@@ -552,6 +601,19 @@ impl ChainIndex for SundaeV4Indexer {
                 spending_tx_id: this_tx_hash.to_vec(),
             });
             false
+        });
+
+        // Remove spent invalid orders
+        state.invalid_orders.retain(|io| {
+            if spent_inputs.binary_search(&io.input).is_ok() {
+                changes.spent_txos.push(SpentTxo {
+                    input: io.input.clone(),
+                    spending_tx_id: this_tx_hash.to_vec(),
+                });
+                false
+            } else {
+                true
+            }
         });
 
         // Remove spent orders
@@ -690,6 +752,7 @@ impl ChainIndex for SundaeV4Indexer {
             });
         }
         state.orders.append(&mut new_orders);
+        state.invalid_orders.append(&mut new_invalid_orders);
 
         if let Some(settings) = new_settings {
             events.push(IndexEvent::V4SettingsUpdated {
@@ -710,6 +773,7 @@ impl ChainIndex for SundaeV4Indexer {
         let cutoff = slot.saturating_sub(self.rollback_limit);
         state.spent_orders.retain(|s| s.slot >= cutoff);
         state.spent_pools.retain(|s| s.slot >= cutoff);
+        state.invalid_orders.retain(|io| io.slot >= cutoff);
 
         if history.prune_history(self.rollback_limit)
             && let Some(min_height) = info.number.checked_sub(self.rollback_limit)

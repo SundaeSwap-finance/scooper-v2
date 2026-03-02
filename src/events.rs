@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::cardano_types::TransactionInput;
 use crate::sundaev3::{Ident, SundaeV3Order, SundaeV3Pool, SundaeV3Settings};
 use crate::sundaev4::{SundaeV4Order, SundaeV4Pool, SundaeV4Settings};
 
@@ -120,6 +121,13 @@ impl<T> Clone for SpentPool<T> {
             slot: self.slot,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InvalidOrder {
+    pub input: TransactionInput,
+    pub slot: u64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
