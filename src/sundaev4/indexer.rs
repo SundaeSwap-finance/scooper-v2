@@ -115,6 +115,10 @@ impl SundaeV4Indexer {
         }
     }
 
+    pub fn set_loaded_slot(&mut self, slot: u64) {
+        self.loaded_slot = slot;
+    }
+
     pub async fn load(&mut self) -> Result<()> {
         let txos = self.dao.load_txos().await?;
         let datums = self.dao.load_datums().await?;

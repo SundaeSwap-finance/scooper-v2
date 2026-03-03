@@ -229,6 +229,14 @@ async fn manager_loop(
                                 }
                             }
                         }
+                        // Set loaded_slot on both indexers so blocks before
+                        // the bootstrap tip are skipped during chain sync.
+                        if let Some((ref mut v3_index, _)) = v3_index_and_config {
+                            v3_index.set_loaded_slot(result.tip_slot);
+                        }
+                        if let Some((ref mut v4_index, _)) = v4_index_and_config {
+                            v4_index.set_loaded_slot(result.tip_slot);
+                        }
                         if bootstrap_point.is_some() {
                             info!("Bootstrap succeeded, starting chain sync from tip");
                         } else {

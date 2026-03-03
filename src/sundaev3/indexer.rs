@@ -64,6 +64,10 @@ pub struct SundaeV3Indexer {
     protocol: SundaeV3Protocol,
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
+    /// The slot of the latest block loaded from DB. Blocks at or before this
+    /// slot are skipped in handle_onchain_tx_bytes to avoid the
+    /// "cannot update slot" error when the cursor lags behind the DB state.
+    loaded_slot: u64,
 }
 
 impl SundaeV3Indexer {
@@ -82,7 +86,12 @@ impl SundaeV3Indexer {
             protocol,
             rollback_limit,
             dao,
+            loaded_slot: 0,
         }
+    }
+
+    pub fn set_loaded_slot(&mut self, slot: u64) {
+        self.loaded_slot = slot;
     }
 
     pub async fn load(&mut self) -> Result<()> {
@@ -231,6 +240,7 @@ impl SundaeV3Indexer {
             }
         }
 
+        self.loaded_slot = slot;
         *self.state.lock().await.update_slot(slot)? = state.clone();
         self.broadcaster.send_replace(SundaeV3Update {
             slot,
@@ -336,6 +346,9 @@ impl ChainIndex for SundaeV3Indexer {
     }
 
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
+        if info.slot <= self.loaded_slot {
+            return Ok(());
+        }
         let slot = info.slot;
         let tx = MultiEraTx::decode(raw_tx)?;
         let this_tx_hash = tx.hash();
