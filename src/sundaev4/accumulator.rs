@@ -11,7 +11,8 @@ use std::sync::Arc;
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::Ident;
-use crate::sundaev4::batch::{self, Batch, ResolvedSwap};
+use crate::sundaev4::batch::{self, Batch, ContinuationSwap, FulfillmentOverride, ResolvedSwap};
+use crate::sundaev4::router::RoutingPlan;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::SundaeV4Pool;
 
@@ -23,6 +24,7 @@ pub struct PoolAccum {
     pub running_assets: Vec<(AssetClass, BigInt)>,
     pub initial_total_lp: BigInt,
     pub swaps: Vec<ResolvedSwap>,
+    pub continuations: Vec<ContinuationSwap>,
 }
 
 /// Incrementally-built multi-pool transaction state.
@@ -60,6 +62,7 @@ impl Accumulator {
                 running_assets: effective_pool.pool_datum.assets.clone(),
                 initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
                 swaps: Vec::new(),
+                continuations: Vec::new(),
             }
         });
 
@@ -82,6 +85,234 @@ impl Accumulator {
         Ok(())
     }
 
+    /// Try to add a routed order (multi-hop and/or split) to the accumulator.
+    ///
+    /// For the entry hop's primary pool (largest allocation), creates a
+    /// `ResolvedSwap` with a `fulfillment_override` pointing to the final
+    /// hop's output. For all other pools in the route (including split pools
+    /// on the entry hop), creates `ContinuationSwap` entries.
+    ///
+    /// Returns `Ok(())` on success or `Err(reason)` if the route can't execute
+    /// against the running pool states.
+    pub fn try_add_routed_order(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        route: &RoutingPlan,
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    ) -> Result<(), String> {
+        use num_traits::Signed;
+
+        // Clone pool accums for trial execution
+        let mut trial_pools = self.pools.clone();
+
+        // We'll collect the swaps/continuations to commit if successful
+        struct PendingSwap {
+            pool_ident: Ident,
+            swap: ResolvedSwap,
+        }
+        struct PendingContinuation {
+            pool_ident: Ident,
+            cont: ContinuationSwap,
+        }
+        let mut pending_swaps: Vec<PendingSwap> = Vec::new();
+        let mut pending_continuations: Vec<PendingContinuation> = Vec::new();
+
+        let mut final_output_asset: Option<AssetClass> = None;
+        let mut final_output_amount = BigInt::from(0);
+
+        // Track actual output from previous hop so subsequent hops use the
+        // real dy (not the router's estimate).  This ensures ADA flows cancel
+        // exactly across pools for routed orders.
+        let mut prev_hop_output = BigInt::from(0);
+
+        for (hop_idx, hop) in route.hops.iter().enumerate() {
+            let is_entry_hop = hop_idx == 0;
+            let mut this_hop_output = BigInt::from(0);
+
+            for (split_idx, split) in hop.splits.iter().enumerate() {
+                let pool_ident = &split.pool.ident;
+
+                // Get effective pool — from trial state if already there, else from chain
+                let effective_pool = match trial_pools.get(pool_ident) {
+                    Some(accum) => accum.pool.clone(),
+                    None => match pools.get(pool_ident) {
+                        Some(p) => p.clone(),
+                        None => return Err(format!("pool {} not found", pool_ident)),
+                    },
+                };
+
+                // Initialize pool accum if not already present
+                let accum = trial_pools.entry(pool_ident.clone()).or_insert_with(|| {
+                    PoolAccum {
+                        pool: effective_pool.clone(),
+                        ident: pool_ident.clone(),
+                        running_assets: effective_pool.pool_datum.assets.clone(),
+                        initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
+                        swaps: Vec::new(),
+                        continuations: Vec::new(),
+                    }
+                });
+
+                // Determine input/output direction for this pool
+                let (input_idx, output_idx) = self.find_direction_for_tokens(
+                    &accum.running_assets,
+                    &hop.input_token,
+                    &hop.output_token,
+                ).ok_or_else(|| format!("can't determine direction for pool {}", pool_ident))?;
+
+                // For hop 0, use the router's split amount. For subsequent hops,
+                // use the actual output from the previous hop (single-split) or
+                // distribute proportionally (multi-split).
+                let dx = if is_entry_hop {
+                    split.input_amount.clone()
+                } else if hop.splits.len() == 1 {
+                    prev_hop_output.clone()
+                } else {
+                    // Multi-split on a non-entry hop: scale by the router's
+                    // proportion of this split vs. the hop total
+                    let hop_total: BigInt = hop.splits.iter()
+                        .map(|s| s.input_amount.clone())
+                        .fold(BigInt::from(0), |a, b| &a + &b);
+                    if hop_total.is_positive() {
+                        &prev_hop_output * &split.input_amount / &hop_total
+                    } else {
+                        split.input_amount.clone()
+                    }
+                };
+
+                let dy = swap_math::cp_swap_result(
+                    &accum.running_assets[input_idx].1,
+                    &accum.running_assets[output_idx].1,
+                    &dx,
+                    self.fee.0,
+                    self.fee.1,
+                );
+                if !dy.is_positive() {
+                    return Err(format!("zero output from pool {}", pool_ident));
+                }
+
+                // Update running reserves
+                accum.running_assets[input_idx].1 =
+                    &accum.running_assets[input_idx].1 + &dx;
+                accum.running_assets[output_idx].1 =
+                    &accum.running_assets[output_idx].1 - &dy;
+
+                this_hop_output = &this_hop_output + &dy;
+
+                // Track final output from last hop
+                if hop_idx == route.hops.len() - 1 {
+                    final_output_asset = Some(hop.output_token.clone());
+                    final_output_amount = &final_output_amount + &dy;
+                }
+
+                if is_entry_hop && split_idx == 0 {
+                    // Primary entry swap — creates a ResolvedSwap
+                    pending_swaps.push(PendingSwap {
+                        pool_ident: pool_ident.clone(),
+                        swap: ResolvedSwap {
+                            order: order.clone(),
+                            input_idx,
+                            output_idx,
+                            dx: dx.clone(),
+                            dy: dy.clone(),
+                            fulfillment_override: None, // set below after all hops
+                        },
+                    });
+                } else {
+                    // All other splits/hops — continuation swaps
+                    pending_continuations.push(PendingContinuation {
+                        pool_ident: pool_ident.clone(),
+                        cont: ContinuationSwap {
+                            originating_order: order.clone(),
+                            input_idx,
+                            output_idx,
+                            dx: dx.clone(),
+                            dy: dy.clone(),
+                        },
+                    });
+                }
+
+                // Push to trial accum
+                if is_entry_hop && split_idx == 0 {
+                    accum.swaps.push(ResolvedSwap {
+                        order: order.clone(),
+                        input_idx,
+                        output_idx,
+                        dx: dx.clone(),
+                        dy: dy.clone(),
+                        fulfillment_override: None,
+                    });
+                } else {
+                    accum.continuations.push(ContinuationSwap {
+                        originating_order: order.clone(),
+                        input_idx,
+                        output_idx,
+                        dx: dx.clone(),
+                        dy: dy.clone(),
+                    });
+                }
+            }
+
+            prev_hop_output = this_hop_output;
+        }
+
+        // Check min_received against the final routed output
+        if let crate::sundaev4::OrderConstraints::Simple { min_received } = &order.datum.constraints {
+            for (asset, min_qty) in min_received {
+                if final_output_asset.as_ref() == Some(asset) && &final_output_amount < min_qty {
+                    return Err(format!(
+                        "routed output {} below min_received {}",
+                        final_output_amount, min_qty
+                    ));
+                }
+            }
+        }
+
+        // Set fulfillment override on the primary swap if multi-hop or multi-split.
+        // Must update the swap in trial_pools directly since that's what gets committed.
+        if route.hops.len() > 1 || route.hops.iter().any(|h| h.splits.len() > 1) {
+            if let (Some(ps), Some(out_asset)) = (pending_swaps.first(), &final_output_asset) {
+                if let Some(accum) = trial_pools.get_mut(&ps.pool_ident) {
+                    // The primary swap was the last one pushed to this pool's accum
+                    if let Some(swap) = accum.swaps.last_mut() {
+                        swap.fulfillment_override = Some(FulfillmentOverride {
+                            output_asset: out_asset.clone(),
+                            amount: final_output_amount.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Commit: replace pool states
+        self.pools = trial_pools;
+
+        Ok(())
+    }
+
+    /// Find which pool asset indices correspond to the given input/output tokens.
+    fn find_direction_for_tokens(
+        &self,
+        running_assets: &[(AssetClass, BigInt)],
+        input_token: &AssetClass,
+        output_token: &AssetClass,
+    ) -> Option<(usize, usize)> {
+        let mut input_idx = None;
+        let mut output_idx = None;
+        for (i, (asset, _)) in running_assets.iter().enumerate() {
+            if asset == input_token {
+                input_idx = Some(i);
+            }
+            if asset == output_token {
+                output_idx = Some(i);
+            }
+        }
+        match (input_idx, output_idx) {
+            (Some(i), Some(o)) if i != o => Some((i, o)),
+            _ => None,
+        }
+    }
+
     /// Total number of orders across all pools.
     pub fn order_count(&self) -> usize {
         self.pools.values().map(|a| a.swaps.len()).sum()
@@ -91,21 +322,29 @@ impl Accumulator {
         self.pools.is_empty() || self.order_count() == 0
     }
 
+    /// Total number of orders across all pools (including continuations).
+    pub fn total_transcript_entries(&self) -> usize {
+        self.pools.values().map(|a| a.swaps.len() + a.continuations.len()).sum()
+    }
+
     /// Convert accumulated state into `Vec<Batch>` for the tx builder.
     ///
     /// For each pool, replays the fee_budget computation (matching
-    /// `assemble_batch`) to produce `final_total_lp`.
+    /// `assemble_batch`) to produce `final_total_lp`. Includes both
+    /// swaps and continuations in the replay.
     pub fn into_batches(self) -> Vec<Batch> {
         let mut batches = Vec::new();
 
         for (_ident, accum) in self.pools {
-            if accum.swaps.is_empty() {
+            if accum.swaps.is_empty() && accum.continuations.is_empty() {
                 continue;
             }
 
-            // Replay fee budget computation to get final_total_lp
+            // Replay fee budget computation to get final_total_lp.
+            // Process swaps first, then continuations (matching transcript order).
             let mut total_fee_budget = BigInt::from(0);
             let mut replay_assets = accum.pool.pool_datum.assets.clone();
+
             for swap in &accum.swaps {
                 let prev_a = replay_assets[0].1.clone();
                 let prev_b = replay_assets[1].1.clone();
@@ -122,6 +361,24 @@ impl Accumulator {
                 );
                 total_fee_budget = &total_fee_budget + &fb;
             }
+
+            for cont in &accum.continuations {
+                let prev_a = replay_assets[0].1.clone();
+                let prev_b = replay_assets[1].1.clone();
+                replay_assets[cont.input_idx].1 =
+                    &replay_assets[cont.input_idx].1 + &cont.dx;
+                replay_assets[cont.output_idx].1 =
+                    &replay_assets[cont.output_idx].1 - &cont.dy;
+                let fb = swap_math::cp_fee_budget(
+                    &prev_a,
+                    &prev_b,
+                    &replay_assets[0].1,
+                    &replay_assets[1].1,
+                    &accum.initial_total_lp,
+                );
+                total_fee_budget = &total_fee_budget + &fb;
+            }
+
             let total_protocol_lp = swap_math::compute_protocol_lp(
                 &total_fee_budget,
                 self.protocol_share.0,
@@ -133,6 +390,7 @@ impl Accumulator {
                 pool: accum.pool,
                 pool_ident: accum.ident,
                 swaps: accum.swaps,
+                continuations: accum.continuations,
                 final_assets: accum.running_assets,
                 final_total_lp,
             });

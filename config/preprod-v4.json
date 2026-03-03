@@ -37,6 +37,11 @@
           158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
           1964219, 24520, 3
         ],
+        "slot-config": {
+          "zero-slot": 0,
+          "zero-time": 1654041600000,
+          "slot-length": 1000
+        },
         "module-scripts": {
           "constant-product": {
             "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",

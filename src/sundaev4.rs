@@ -3,6 +3,7 @@ pub mod batch;
 pub mod chain_tracker;
 pub mod evaluator;
 mod indexer;
+pub mod router;
 pub mod script_context;
 pub mod submit;
 pub mod swap_math;

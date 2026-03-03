@@ -2,7 +2,7 @@ use crate::bigint::BigInt;
 use num_traits::{One, Signed};
 
 /// Integer square root via Newton's method (floor).
-fn isqrt(n: &BigInt) -> BigInt {
+pub(crate) fn isqrt(n: &BigInt) -> BigInt {
     if n.is_negative() {
         panic!("isqrt of negative");
     }

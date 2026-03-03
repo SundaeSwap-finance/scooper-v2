@@ -62,6 +62,10 @@ pub struct SundaeV4Indexer {
     scooper_keyhash: Option<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
     tip_event_counter: u64,
+    /// The slot of the latest block loaded from DB. Blocks at or before this
+    /// slot are skipped in handle_block/handle_onchain_tx_bytes to avoid the
+    /// "cannot update slot" error when the cursor lags behind the DB state.
+    loaded_slot: u64,
 }
 
 impl SundaeV4Indexer {
@@ -107,6 +111,7 @@ impl SundaeV4Indexer {
             scooper_keyhash,
             ref_utxo_inputs,
             tip_event_counter: 0,
+            loaded_slot: 0,
         }
     }
 
@@ -269,6 +274,8 @@ impl SundaeV4Indexer {
             self.scooper_keyhash.as_ref(),
         );
 
+        state.tip_slot = slot;
+        self.loaded_slot = slot;
         *self.state.lock().await.update_slot(slot)? = state;
         Ok(())
     }
@@ -348,6 +355,30 @@ impl ChainIndex for SundaeV4Indexer {
     }
 
     async fn handle_block(&mut self, info: &BlockInfo) -> Result<()> {
+        if info.slot <= self.loaded_slot {
+            // Block already covered by load(). Update network tip and emit
+            // TipAdvanced so the scooper can detect sync progress, but skip
+            // the state mutation that would fail with "cannot update slot".
+            let mut history = self.state.lock().await;
+            let state = history.update_slot(self.loaded_slot)?;
+            if let Some(tip) = info.tip_slot {
+                state.network_tip_slot = Some(tip);
+            }
+            self.tip_event_counter += 1;
+            let at_tip = state.network_tip_slot
+                .is_some_and(|net| self.loaded_slot + 10 >= net);
+            if at_tip || self.tip_event_counter % 100 == 0 {
+                let _ = self.event_tx.send((
+                    info.slot,
+                    vec![IndexEvent::TipAdvanced {
+                        slot: info.slot,
+                        network_tip_slot: info.tip_slot,
+                    }],
+                ));
+            }
+            return Ok(());
+        }
+
         let mut history = self.state.lock().await;
         let state = history.update_slot(info.slot)?;
         state.tip_slot = info.slot;
@@ -371,6 +402,9 @@ impl ChainIndex for SundaeV4Indexer {
     }
 
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
+        if info.slot <= self.loaded_slot {
+            return Ok(());
+        }
         let slot = info.slot;
         let tx = MultiEraTx::decode(raw_tx)?;
         let this_tx_hash = tx.hash();

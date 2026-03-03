@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutput};
 use pallas_primitives::{ExUnits, Hash, PlutusData};
-use tracing::{debug, trace, warn};
+use tracing::warn;
 
 use crate::cardano_types;
 use crate::sundaev4::script_context::{
@@ -118,6 +118,7 @@ pub fn evaluate_scoop_tx(
     scripts: &ScriptStore,
     cost_model: &[i64],
     tx_hash: Hash<32>,
+    slot_config: &crate::sundaev4::types::SlotConfig,
 ) -> Result<EvalResult> {
     use uplc_turbo::arena::Arena;
     use uplc_turbo::binder::DeBruijn;
@@ -151,6 +152,7 @@ pub fn evaluate_scoop_tx(
             tx_hash,
             &purpose,
             redeemer_data,
+            slot_config,
         );
 
         // Evaluate in a fresh arena (16MB stack not needed for single-threaded)

@@ -28,8 +28,8 @@ use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 /// Per-redeemer ExUnits budget (tx max / 10 so 6 redeemers fit comfortably).
 const EX_MEM: u64 = 14_000_000 / 10;
 const EX_STEPS: u64 = 10_000_000_000 / 10;
-pub const TX_FEE: u64 = 2_000_000;
-const POOL_MIN_ADA: u64 = 50_000_000;
+pub const TX_FEE: u64 = 3_000_000;
+const POOL_MIN_ADA: u64 = 2_000_000;
 const VALIDITY_RANGE: u64 = 60;
 
 use crate::sundaev3::Ident;
@@ -155,12 +155,41 @@ pub fn build_multi_pool_scoop_tx(
         let mut total_fee_budget = BigInt::from(0);
         let mut transcript_entries: Vec<TranscriptEntry> = Vec::new();
 
+        // Process swaps first, then continuations (matching transcript order)
         for swap in &batch.swaps {
             let prev_a = running_assets[0].1.clone();
             let prev_b = running_assets[1].1.clone();
 
             running_assets[swap.input_idx].1 = &running_assets[swap.input_idx].1 + &swap.dx;
             running_assets[swap.output_idx].1 = &running_assets[swap.output_idx].1 - &swap.dy;
+
+            let fee_budget = swap_math::cp_fee_budget(
+                &prev_a, &prev_b,
+                &running_assets[0].1, &running_assets[1].1,
+                &initial_total_lp,
+            );
+            total_fee_budget = &total_fee_budget + &fee_budget;
+
+            transcript_entries.push(TranscriptEntry {
+                state_after: VaultState {
+                    assets: running_assets.clone(),
+                    total_lp: initial_total_lp.clone(),
+                    circulating_lp: pool.pool_datum.circulating_lp.clone(),
+                    preminted_lp: pool.pool_datum.preminted_lp.clone(),
+                },
+                fee_budget,
+                operation_tag: BigInt::from(100),
+                operation_data: void_vault_state.clone().to_plutus(),
+            });
+        }
+
+        // Continuation swaps (routed orders passing through this pool)
+        for cont in &batch.continuations {
+            let prev_a = running_assets[0].1.clone();
+            let prev_b = running_assets[1].1.clone();
+
+            running_assets[cont.input_idx].1 = &running_assets[cont.input_idx].1 + &cont.dx;
+            running_assets[cont.output_idx].1 = &running_assets[cont.output_idx].1 - &cont.dy;
 
             let fee_budget = swap_math::cp_fee_budget(
                 &prev_a, &prev_b,
@@ -452,11 +481,60 @@ pub fn build_multi_pool_scoop_tx(
 
     let mut outputs: Vec<TransactionOutput> = Vec::new();
 
+    // Precompute per-batch net ADA delta for pool outputs.
+    //
+    // For ADA/TOKEN pools, ADA flows in two ways:
+    //   - sell_outflow: dy for swaps/continuations where output is ADA (pool gives up ADA)
+    //   - cont_buy_inflow: dx for CONTINUATIONS where input is ADA (pool receives ADA
+    //     from routing — this ADA came from another pool's sell outflow)
+    //
+    // Pool output ADA delta: buy orders add ADA to the pool, sell orders remove it.
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let pool_ada_deltas: Vec<i64> = batches.iter().map(|batch| {
+        use num_traits::ToPrimitive;
+
+        // ADA flowing OUT of the pool (sell orders where output is ADA)
+        let sell_outflow: i64 = batch.swaps.iter()
+            .filter(|s| {
+                let out = &batch.pool.pool_datum.assets[s.output_idx].0;
+                out.policy.is_empty() && out.token.is_empty()
+            })
+            .map(|s| s.dy.clone().unwrap().to_i64().unwrap_or(0))
+            .sum::<i64>()
+            + batch.continuations.iter()
+            .filter(|c| {
+                let out = &batch.pool.pool_datum.assets[c.output_idx].0;
+                out.policy.is_empty() && out.token.is_empty()
+            })
+            .map(|c| c.dy.clone().unwrap().to_i64().unwrap_or(0))
+            .sum::<i64>();
+
+        // ADA flowing INTO the pool (buy orders where input is ADA)
+        let buy_inflow: i64 = batch.swaps.iter()
+            .filter(|s| {
+                let inp = &batch.pool.pool_datum.assets[s.input_idx].0;
+                inp.policy.is_empty() && inp.token.is_empty()
+            })
+            .map(|s| s.dx.clone().unwrap().to_i64().unwrap_or(0))
+            .sum::<i64>()
+            + batch.continuations.iter()
+            .filter(|c| {
+                let inp = &batch.pool.pool_datum.assets[c.input_idx].0;
+                inp.policy.is_empty() && inp.token.is_empty()
+            })
+            .map(|c| c.dx.clone().unwrap().to_i64().unwrap_or(0))
+            .sum::<i64>();
+
+        buy_inflow - sell_outflow
+    }).collect();
+
     // Pool outputs in pool_output_order (sorted by input position)
     for &batch_idx in &pool_output_order {
         let batch = &batches[batch_idx];
         let pool_datum_pd = per_pool[batch_idx].updated_datum.clone().to_plutus();
-        let pool_output_value = build_pool_output_value(&batch.pool, &batch.final_assets)?;
+        let pool_output_value = build_pool_output_value(
+            &batch.pool, &batch.final_assets, pool_ada_deltas[batch_idx],
+        )?;
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: pool_address.clone(),
@@ -496,7 +574,6 @@ pub fn build_multi_pool_scoop_tx(
     let mut fulfillment_order: Vec<usize> = (0..n_orders).collect();
     fulfillment_order.sort_by_key(|&i| flat_swaps[i].filtered_idx);
 
-    let ada_asset = AssetClass { policy: vec![], token: vec![] };
     for (out_pos, &flat_idx) in fulfillment_order.iter().enumerate() {
         let fs = &flat_swaps[flat_idx];
         let swap = fs.swap;
@@ -505,14 +582,32 @@ pub fn build_multi_pool_scoop_tx(
             &swap.order.datum.destination,
             &swap.order.datum.owner,
         )?;
-        let output_asset = &batch.pool.pool_datum.assets[swap.output_idx].0;
+
+        // Use fulfillment override if present (routed orders), otherwise use
+        // the direct swap output.
+        let (output_asset, dy) = if let Some(fo) = &swap.fulfillment_override {
+            (&fo.output_asset, &fo.amount)
+        } else {
+            (&batch.pool.pool_datum.assets[swap.output_idx].0, &swap.dy)
+        };
+
         let order_ada = {
             use num_traits::ToPrimitive;
             swap.order.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0)
         };
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
-        let fulfillment_ada = order_ada.saturating_sub(fee);
-        let fulfillment_value = build_fulfillment_value(output_asset, &swap.dy, fulfillment_ada)?;
+        // For ADA buy orders, the swap ADA (dx) goes to the pool. The fulfillment
+        // only gets the base ADA (FULFILLMENT_BASE_ADA) minus the tx fee share.
+        let offered_is_ada = swap.fulfillment_override.is_none() && {
+            let inp = &batch.pool.pool_datum.assets[swap.input_idx].0;
+            inp.policy.is_empty() && inp.token.is_empty()
+        };
+        let fulfillment_ada = if offered_is_ada {
+            crate::sundaev4::batch::FULFILLMENT_BASE_ADA.saturating_sub(fee)
+        } else {
+            order_ada.saturating_sub(fee)
+        };
+        let fulfillment_value = build_fulfillment_value(output_asset, dy, fulfillment_ada)?;
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
@@ -654,7 +749,7 @@ pub fn build_multi_pool_scoop_tx(
                     crate::cardano_types::RawDatum::Inline(d) => DatumOption::InlineDatum(d.clone()),
                     crate::cardano_types::RawDatum::Hash(h) => DatumOption::DatumHash(*h),
                 },
-                script_ref: None,
+                script_ref: txo.script_ref.as_ref().map(compute_script_ref_hash),
             });
         }
     }
@@ -680,7 +775,18 @@ pub fn build_multi_pool_scoop_tx(
         let predicted_input = crate::cardano_types::TransactionInput::new(body_hash, batch_idx as u64);
         let mut predicted_value = batch.pool.value.clone();
         for (asset, new_amount) in &batch.final_assets {
+            if asset.policy.is_empty() && asset.token.is_empty() {
+                continue; // ADA handled below
+            }
             predicted_value.insert(asset, new_amount.clone());
+        }
+        // Set predicted ADA to match the actual pool output (input ADA + delta)
+        {
+            use num_traits::ToPrimitive;
+            let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
+            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128)
+                .max(POOL_MIN_ADA as i128) as u64;
+            predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));
         }
         let predicted_pool = SundaeV4Pool {
             input: predicted_input.clone(),
@@ -715,6 +821,38 @@ pub fn build_multi_pool_scoop_tx(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Compute the script hash from a ScriptRef for the ScriptContext's TxOut encoding.
+fn compute_script_ref_hash(script_ref: &crate::cardano_types::ScriptRef) -> Hash<28> {
+    use pallas_crypto::hash::Hasher;
+    match script_ref {
+        crate::cardano_types::ScriptRef::Native(n) => {
+            use pallas_traverse::ComputeHash;
+            n.compute_hash()
+        }
+        crate::cardano_types::ScriptRef::PlutusV1(s) => {
+            let cbor: &[u8] = s.as_ref();
+            let mut preimage = Vec::with_capacity(1 + cbor.len());
+            preimage.push(0x01);
+            preimage.extend_from_slice(cbor);
+            Hasher::<224>::hash(&preimage)
+        }
+        crate::cardano_types::ScriptRef::PlutusV2(s) => {
+            let cbor: &[u8] = s.as_ref();
+            let mut preimage = Vec::with_capacity(1 + cbor.len());
+            preimage.push(0x02);
+            preimage.extend_from_slice(cbor);
+            Hasher::<224>::hash(&preimage)
+        }
+        crate::cardano_types::ScriptRef::PlutusV3(s) => {
+            let cbor: &[u8] = s.as_ref();
+            let mut preimage = Vec::with_capacity(1 + cbor.len());
+            preimage.push(0x03);
+            preimage.extend_from_slice(cbor);
+            Hasher::<224>::hash(&preimage)
+        }
+    }
+}
+
 fn parse_secret_key(key_str: &str) -> Result<SecretKey> {
     let hex_str = if key_str.trim_start().starts_with('{') {
         // Cardano JSON envelope: {"type":"...","cborHex":"5820<64hex>"}
@@ -740,25 +878,37 @@ fn parse_secret_key(key_str: &str) -> Result<SecretKey> {
 
 /// Build the pool output Value (pallas conway::Value) from the pool's existing
 /// value with asset amounts adjusted to reflect the swap.
+///
+/// `ada_delta` is the net ADA change for this pool's output:
+///   - Negative when ADA leaves the pool (TOKEN→ADA sell orders)
+///   - Positive when ADA enters via routing continuations
+///   - Zero for TOKEN/TOKEN pools or when flows cancel
+///
+/// Regular buy-order ADA (ADA→TOKEN) does NOT appear here because that ADA
+/// stays in the fulfillment output.
 fn build_pool_output_value(
     pool: &SundaeV4Pool,
     new_assets: &[(AssetClass, BigInt)],
+    ada_delta: i64,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
 
-    // Start from ADA
+    // Start from the pool's current ADA
     let ada_asset = AssetClass {
         policy: vec![],
         token: vec![],
     };
     let ada_amount = pool.value.get(&ada_asset);
-    let lovelace = ada_amount
+    let mut lovelace = ada_amount
         .clone()
         .unwrap()
         .to_u64()
         .unwrap_or(POOL_MIN_ADA)
         .max(POOL_MIN_ADA);
+
+    // Apply net ADA delta (positive = pool gains ADA, negative = pool loses ADA)
+    lovelace = (lovelace as i128 + ada_delta as i128).max(POOL_MIN_ADA as i128) as u64;
 
     // Collect all native tokens from the pool's current value, then override
     // the pool asset amounts with new values
@@ -909,6 +1059,16 @@ fn build_collateral_return_value(
     let return_lovelace = lovelace
         .checked_sub(total_collateral)
         .context("collateral UTxO doesn't have enough ADA")?;
+
+    // Cardano requires collateral return output to meet min UTxO (~858K lovelace).
+    // Bail early rather than letting the node reject with BabbageOutputTooSmallUTxO.
+    const MIN_COLLATERAL_RETURN: u64 = 1_000_000;
+    if return_lovelace < MIN_COLLATERAL_RETURN {
+        bail!(
+            "collateral return ({} lovelace) below min UTxO; need a larger collateral UTxO",
+            return_lovelace
+        );
+    }
 
     let mut policy_pairs: Vec<(Hash<28>, NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>)> =
         Vec::new();

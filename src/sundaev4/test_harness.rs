@@ -132,6 +132,11 @@ pub(crate) mod test_harness {
                 protocol_share: (1, 2),
                 module_scripts,
                 plutus_v3_cost_model: PLUTUS_V3_COST_MODEL.to_vec(),
+                slot_config: crate::sundaev4::types::SlotConfig {
+                    zero_slot: 0,
+                    zero_time: 0,
+                    slot_length: 1000,
+                },
             };
 
             // Collateral: deterministic UTxO with enough ADA
@@ -181,6 +186,7 @@ pub(crate) mod test_harness {
                 &self.scripts,
                 PLUTUS_V3_COST_MODEL,
                 build.tx_hash,
+                &self.exec.slot_config,
             )?;
 
             Ok((build, eval))

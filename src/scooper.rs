@@ -25,7 +25,7 @@ use crate::{
         accumulator::Accumulator,
         batch::{self, BatchLimits},
         chain_tracker::{ChainTracker, InFlightTx, PredictedPoolUtxo},
-        tx_builder::MultiPoolBuildResult,
+        router,
     },
 };
 
@@ -76,8 +76,8 @@ impl Scooper {
     pub async fn run(mut self, shutdown: CancellationToken) {
         // Wait for the indexer to catch up to the chain tip before scooping.
         // The indexer updates the shared state (tip_slot, network_tip_slot)
-        // as it processes blocks. We poll the shared state while consuming
-        // events so the broadcast channel doesn't overflow.
+        // as it processes blocks. We consume events (so the broadcast channel
+        // doesn't overflow) and break once is_at_network_tip() reports true.
         info!("scooper waiting for indexer to reach chain tip");
         let mut sync_log_counter: u64 = 0;
         loop {
@@ -103,7 +103,7 @@ impl Scooper {
                 }
             }
 
-            // Wait for next event (TipAdvanced fires every block)
+            // Wait for next event
             select! {
                 _ = shutdown.cancelled() => { return; }
                 res = self.event_rx.recv() => {
@@ -388,14 +388,16 @@ impl Scooper {
         // falling back to the last processed block slot.
         let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
 
-        // Select collateral
+        // Select collateral — needs enough ADA for total_collateral (TX_FEE * 1.5)
+        // plus min UTxO on the collateral return output.
         let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let min_collateral_ada = crate::sundaev4::tx_builder::TX_FEE * 3 / 2 + 1_500_000;
         let collateral = v4_state
             .wallet_utxos
             .iter()
             .find(|(_, v)| {
                 use num_traits::ToPrimitive;
-                v.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0) >= 5_000_000
+                v.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
             });
         let (collateral_input, collateral_value) = match collateral {
             Some((input, value)) => (input.clone(), value.clone()),
@@ -432,17 +434,20 @@ impl Scooper {
         }
         let script_store = self.v4_script_store.as_ref().unwrap();
 
-        // ── Incremental accumulation loop ──────────────────────────────────
+        // ── Phase 1: Accumulate valid orders (cheap, no tx eval) ──────────
+        //
+        // Save checkpoints after each successful add so we can binary search
+        // for the largest batch within execution limits.
 
         let mut accum = Accumulator::new(exec.fee, exec.protocol_share);
-        let mut last_good: Option<(Accumulator, MultiPoolBuildResult)> = None;
+        let mut checkpoints: Vec<Accumulator> = Vec::new();
 
         for order in &candidates {
             if accum.order_count() >= self.v4_batch_limits.max_orders {
                 break;
             }
 
-            // Match order to pool
+            // Match order to pool (direct match first)
             let pool_ident = match &order.datum.constraints {
                 crate::sundaev4::OrderConstraints::Structured { steps } => {
                     steps.first().map(|s| s.pool_ident.clone())
@@ -451,44 +456,79 @@ impl Scooper {
                     batch::find_pool_for_simple_order(order, &v4_state.pools)
                 }
             };
-            let Some(pool_ident) = pool_ident else { continue };
 
-            // Get effective pool for this pool:
-            // 1. If already in the accumulator, it uses its own running state
-            // 2. If chain tracker has a predicted pool, use that
-            // 3. Otherwise, use on-chain state
-            let effective_pool = if accum.pools.contains_key(&pool_ident) {
-                // Pool already in accumulator — the accum handles running state internally
-                // We still need a reference pool for try_add_order's initial state
-                // (but it's only used if the pool isn't already in the accum)
-                accum.pools[&pool_ident].pool.clone()
+            // Clone + try add (direct or routed)
+            let mut candidate = accum.clone();
+            let added = if let Some(ref pool_ident) = pool_ident {
+                let effective_pool = if candidate.pools.contains_key(pool_ident) {
+                    candidate.pools[pool_ident].pool.clone()
+                } else {
+                    match self.v4_chain_tracker.latest_predicted_pool(pool_ident) {
+                        Some(predicted) => predicted.pool.clone(),
+                        None => match v4_state.pools.get(pool_ident) {
+                            Some(p) => p.clone(),
+                            None => { continue; },
+                        },
+                    }
+                };
+
+                candidate.try_add_order(order, pool_ident, &effective_pool).is_ok()
             } else {
-                match self.v4_chain_tracker.latest_predicted_pool(&pool_ident) {
-                    Some(predicted) => predicted.pool.clone(),
-                    None => match v4_state.pools.get(&pool_ident) {
-                        Some(p) => p.clone(),
-                        None => continue,
-                    },
-                }
+                false
             };
 
-            // Clone + try add
-            let mut candidate = accum.clone();
-            if candidate.try_add_order(&order, &pool_ident, &effective_pool).is_err() {
-                continue;
+            // If direct matching failed, try routing (Simple orders only)
+            if !added {
+                if let crate::sundaev4::OrderConstraints::Simple { min_received } = &order.datum.constraints {
+                    if let Some((input_token, output_token, amount)) =
+                        detect_order_tokens(order, &v4_state.pools, min_received)
+                    {
+                        if let Some(route) = router::find_optimal_route(
+                            &v4_state.pools,
+                            exec.fee,
+                            &input_token,
+                            &output_token,
+                            &amount,
+                        ) {
+                            if router::is_routed(&route) {
+                                candidate = accum.clone();
+                                if candidate.try_add_routed_order(
+                                    order, &route, &v4_state.pools,
+                                ).is_err() {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
 
-            // Build + evaluate
-            let batches = candidate.clone().into_batches();
+            accum = candidate;
+            checkpoints.push(accum.clone());
+        }
+
+        if checkpoints.is_empty() {
+            return false;
+        }
+
+        // ── Phase 2: Binary search for largest batch within limits ────────
+
+        let within_limits = |accum: &Accumulator| -> bool {
+            let batches = accum.clone().into_batches();
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &batches, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             ) {
                 Ok(r) => r,
-                Err(e) => {
-                    trace!(error = %e, order = %order.input, "incremental build failed, skipping order");
-                    continue;
-                }
+                Err(_) => return false,
             };
 
             let eval = match crate::sundaev4::evaluator::evaluate_scoop_tx(
@@ -499,51 +539,62 @@ impl Scooper {
                 script_store,
                 &exec.plutus_v3_cost_model,
                 build.tx_hash,
+                &exec.slot_config,
             ) {
                 Ok(r) => r,
-                Err(e) => {
-                    trace!(error = %e, order = %order.input, "incremental eval failed, skipping order");
-                    continue;
-                }
+                Err(_) => return false,
             };
 
-            // Check limits
             let total_mem: u64 = eval.budgets.iter().map(|(_, eu)| eu.mem).sum();
             let total_steps: u64 = eval.budgets.iter().map(|(_, eu)| eu.steps).sum();
             let tx_size = build.cbor.len();
 
-            // Apply 20% safety margin to check whether padded values would exceed limits
             let padded_mem = total_mem * 6 / 5;
             let padded_steps = total_steps * 6 / 5;
 
-            trace!(
-                order = %order.input,
-                n_orders = candidate.order_count(),
-                mem = total_mem,
-                steps = total_steps,
-                tx_size,
-                "incremental eval"
-            );
+            padded_mem <= Self::MAX_TX_EX_MEM
+                && padded_steps <= Self::MAX_TX_EX_STEPS
+                && tx_size <= Self::MAX_TX_SIZE
+        };
 
-            if padded_mem > Self::MAX_TX_EX_MEM
-                || padded_steps > Self::MAX_TX_EX_STEPS
-                || tx_size > Self::MAX_TX_SIZE
-            {
-                // Over limits — stop adding orders, submit previous state
-                info!(
-                    n_orders = candidate.order_count(),
-                    mem = padded_mem,
-                    steps = padded_steps,
-                    tx_size,
-                    "over limits, submitting previous accumulation"
-                );
-                break;
+        // Binary search: find the largest checkpoint index that's within limits.
+        // checkpoints[i] has (i+1) orders.
+        let mut lo: usize = 0;
+        let mut hi: usize = checkpoints.len() - 1;
+        let mut best: Option<usize> = None;
+
+        // Quick check: try the full batch first (common case)
+        if within_limits(&checkpoints[hi]) {
+            best = Some(hi);
+        } else {
+            // Binary search between lo and hi
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if within_limits(&checkpoints[mid]) {
+                    best = Some(mid);
+                    lo = mid + 1;
+                } else {
+                    if mid == 0 { break; }
+                    hi = mid - 1;
+                }
             }
-
-            // Within limits — accept this candidate
-            last_good = Some((accum.clone(), build));
-            accum = candidate;
         }
+
+        let had_successful_build = best.is_some();
+        let accum = match best {
+            Some(idx) => {
+                info!(
+                    n_orders = checkpoints[idx].order_count(),
+                    n_candidates = checkpoints.len(),
+                    "batch size determined"
+                );
+                checkpoints.into_iter().nth(idx).unwrap()
+            }
+            None => {
+                warn!("no valid batch size found within limits");
+                return false;
+            }
+        };
 
         // ── Submit the accumulated tx ──────────────────────────────────────
 
@@ -551,13 +602,13 @@ impl Scooper {
             return false;
         }
 
-        // Use last_good's build result for eval budgets, rebuild with padding
-        let Some((_prev_accum, last_build)) = last_good else {
+        if !had_successful_build {
             return false;
-        };
+        }
 
-        // Re-evaluate the final accumulator state for accurate budgets
+        // Build → evaluate → rebuild with exact budgets.
         let final_batches = accum.clone().into_batches();
+
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_batches, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
@@ -577,6 +628,7 @@ impl Scooper {
             script_store,
             &exec.plutus_v3_cost_model,
             first_pass.tx_hash,
+            &exec.slot_config,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -585,17 +637,9 @@ impl Scooper {
             }
         };
 
-        // Apply 20% safety margin
-        let padded_budgets: Vec<_> = eval_result.budgets.iter().map(|(k, eu)| {
-            (k.clone(), pallas_primitives::ExUnits {
-                mem: eu.mem * 6 / 5,
-                steps: eu.steps * 6 / 5,
-            })
-        }).collect();
-
         let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_batches, &settings, &exec, current_slot, language_views,
-            &collateral_input.0, &collateral_value, Some(&padded_budgets),
+            &collateral_input.0, &collateral_value, Some(&eval_result.budgets),
             &v4_state.ref_utxo_outputs,
         ) {
             Ok(r) => r,
@@ -616,8 +660,6 @@ impl Scooper {
             pools = ?pool_idents.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
             "multi-pool scoop tx built, submitting"
         );
-
-        let _ = last_build; // was used for limit checking during accumulation
 
         match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
             Ok(submitted_hash) => {
@@ -808,4 +850,64 @@ enum OrderInvalidReason {
     NoPools,
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
+}
+
+/// Detect the input token, output token, and input amount for a Simple order
+/// by inspecting the order's value and min_received constraints.
+///
+/// Returns `(input_token, output_token, input_amount)` or `None` if we can't
+/// determine both tokens.
+fn detect_order_tokens(
+    order: &crate::sundaev4::SundaeV4Order,
+    _pools: &BTreeMap<Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
+    min_received: &[(crate::cardano_types::AssetClass, BigInt)],
+) -> Option<(crate::cardano_types::AssetClass, crate::cardano_types::AssetClass, BigInt)> {
+    use num_traits::Signed;
+
+    // Collect all unique assets from pool pairs to know what's tradeable
+    let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+
+    // Determine input token: find a non-ADA token with positive amount in order value,
+    // or ADA if the order has > 2M ADA
+    let mut input_token = None;
+    let mut input_amount = BigInt::from(0i64);
+
+    // Check non-ADA tokens first
+    for (policy, tokens) in &order.value.0 {
+        if policy.is_empty() {
+            continue;
+        }
+        for (token_name, qty) in tokens {
+            if qty.is_positive() {
+                input_token = Some(crate::cardano_types::AssetClass {
+                    policy: policy.clone(),
+                    token: token_name.clone(),
+                });
+                input_amount = qty.clone();
+                break;
+            }
+        }
+        if input_token.is_some() { break; }
+    }
+
+    // Fallback: ADA (if > 2M lovelace)
+    if input_token.is_none() {
+        let ada_qty = order.value.get(&ada_asset);
+        if ada_qty > BigInt::from(2_000_000i64) {
+            input_token = Some(ada_asset.clone());
+            input_amount = ada_qty;
+        }
+    }
+
+    let input_token = input_token?;
+
+    // Determine output token from min_received
+    let output_token = min_received.first().map(|(a, _)| a.clone())?;
+
+    // Don't route if input == output
+    if input_token == output_token {
+        return None;
+    }
+
+    Some((input_token, output_token, input_amount))
 }

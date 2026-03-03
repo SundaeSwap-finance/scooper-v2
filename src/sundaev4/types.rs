@@ -302,6 +302,29 @@ pub struct FairnessOperateEntry {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Slot-to-POSIX-time configuration
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for converting slot numbers to POSIX milliseconds.
+/// The Cardano ledger uses POSIX time in ScriptContext validity ranges.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SlotConfig {
+    /// Slot number at the start of the reference era (e.g. Shelley start).
+    pub zero_slot: u64,
+    /// POSIX time in milliseconds at `zero_slot`.
+    pub zero_time: u64,
+    /// Slot length in milliseconds (typically 1000).
+    pub slot_length: u64,
+}
+
+impl SlotConfig {
+    /// Convert a slot number to POSIX time in milliseconds.
+    pub fn slot_to_posix_ms(&self, slot: u64) -> u64 {
+        self.zero_time + (slot.saturating_sub(self.zero_slot)) * self.slot_length
+    }
+}
+
 // Execution configuration
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -317,6 +340,7 @@ pub struct ScooperExecution {
     pub protocol_share: (u64, u64),
     pub module_scripts: ModuleScripts,
     pub plutus_v3_cost_model: Vec<i64>,
+    pub slot_config: SlotConfig,
 }
 
 impl ScooperExecution {

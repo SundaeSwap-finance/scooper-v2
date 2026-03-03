@@ -14,6 +14,7 @@ use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutp
 use pallas_primitives::{Hash, PlutusData};
 
 use crate::cardano_types;
+use crate::sundaev4::types::SlotConfig;
 
 /// Resolved transaction output data for building TxInInfo.
 pub struct ResolvedTxOut {
@@ -63,8 +64,9 @@ pub fn build_script_context(
     tx_hash: Hash<32>,
     script_purpose: &ScriptPurpose,
     redeemer_data: &PlutusData,
+    slot_config: &SlotConfig,
 ) -> Vec<u8> {
-    let tx_info = build_tx_info(tx_body, redeemers, resolved_inputs, resolved_ref_inputs, tx_hash);
+    let tx_info = build_tx_info(tx_body, redeemers, resolved_inputs, resolved_ref_inputs, tx_hash, slot_config);
     let script_info = build_script_info(script_purpose);
 
     let context = constr(0, vec![tx_info, redeemer_data.clone(), script_info]);
@@ -84,6 +86,7 @@ fn build_tx_info(
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     tx_hash: Hash<32>,
+    slot_config: &SlotConfig,
 ) -> PlutusData {
     // inputs: sorted list of TxInInfo
     let input_vec: Vec<_> = tx_body.inputs.iter().cloned().collect();
@@ -132,10 +135,11 @@ fn build_tx_info(
         None => pd_map(vec![]),
     };
 
-    // valid_range: Interval
+    // valid_range: Interval (slots converted to POSIX milliseconds)
     let valid_range = encode_validity_range(
         tx_body.validity_interval_start,
         tx_body.ttl,
+        slot_config,
     );
 
     // signatories: list of PubKeyHash
@@ -155,8 +159,8 @@ fn build_tx_info(
     // data: Map<DatumHash, Datum> (inline datums don't appear here)
     let data = pd_map(vec![]);
 
-    // id: tx body hash
-    let id = constr(0, vec![PlutusData::BoundedBytes(tx_hash.to_vec().into())]);
+    // id: tx body hash (V3: de-newtyped, bare bytes — no Constr wrapper)
+    let id = PlutusData::BoundedBytes(tx_hash.to_vec().into());
 
     // votes: empty map
     let votes = pd_map(vec![]);
@@ -234,11 +238,18 @@ fn pd_int(n: i64) -> PlutusData {
 }
 
 /// Create a Constr PlutusData node.
+///
+/// Uses indefinite-length CBOR array for non-empty fields, matching the
+/// Cardano node's encoding. This matters for `serialiseData` in scripts.
 fn constr(variant: u64, fields: Vec<PlutusData>) -> PlutusData {
     PlutusData::Constr(pallas_primitives::Constr {
         tag: constr_tag(variant),
         any_constructor: if variant > 6 { Some(variant) } else { None },
-        fields: MaybeIndefArray::Def(fields),
+        fields: if fields.is_empty() {
+            MaybeIndefArray::Def(fields)
+        } else {
+            MaybeIndefArray::Indef(fields)
+        },
     })
 }
 
@@ -351,7 +362,7 @@ fn encode_tx_out(output: &TransactionOutput) -> PlutusData {
                 let ada_token = PlutusData::BoundedBytes(vec![].into());
                 pd_map(vec![(ada_policy, pd_map(vec![(ada_token, pd_int(lovelace as i64))]))])
             };
-            let datum_option = constr(1, vec![]); // NoOutputDatum
+            let datum_option = constr(0, vec![]); // NoOutputDatum
             let script_ref = constr(1, vec![]);   // None
             constr(0, vec![address, value, datum_option, script_ref])
         }
@@ -484,6 +495,7 @@ fn encode_empty_value() -> PlutusData {
 }
 
 /// Encode a validity range as Interval PlutusData.
+/// Slots are converted to POSIX milliseconds, matching the Cardano ledger.
 /// Interval = Constr(0, [LowerBound, UpperBound])
 /// LowerBound = Constr(0, [Bound, Closure])
 /// UpperBound = Constr(0, [Bound, Closure])
@@ -492,10 +504,11 @@ fn encode_empty_value() -> PlutusData {
 /// Bound::PosInf = Constr(2, [])
 /// Closure (True) = Constr(1, [])
 /// Closure (False) = Constr(0, [])
-fn encode_validity_range(start: Option<u64>, ttl: Option<u64>) -> PlutusData {
+fn encode_validity_range(start: Option<u64>, ttl: Option<u64>, slot_config: &SlotConfig) -> PlutusData {
     let lower = match start {
         Some(s) => {
-            let finite = constr(1, vec![pd_int(s as i64)]);
+            let posix_ms = slot_config.slot_to_posix_ms(s);
+            let finite = constr(1, vec![pd_int(posix_ms as i64)]);
             constr(0, vec![finite, constr(1, vec![])]) // Closed (True)
         }
         None => {
@@ -506,8 +519,9 @@ fn encode_validity_range(start: Option<u64>, ttl: Option<u64>) -> PlutusData {
 
     let upper = match ttl {
         Some(t) => {
-            let finite = constr(1, vec![pd_int(t as i64)]);
-            constr(0, vec![finite, constr(1, vec![])]) // Closed (True)
+            let posix_ms = slot_config.slot_to_posix_ms(t);
+            let finite = constr(1, vec![pd_int(posix_ms as i64)]);
+            constr(0, vec![finite, constr(0, vec![])]) // Open (False)
         }
         None => {
             let pos_inf = constr(2, vec![]);
@@ -519,13 +533,31 @@ fn encode_validity_range(start: Option<u64>, ttl: Option<u64>) -> PlutusData {
 }
 
 /// Encode the redeemers map: Map<ScriptPurpose, Redeemer>
+/// Redeemers must be sorted by tag (Spend=0, Mint=1, Cert=2, Reward=3, Vote=4, Propose=5)
+/// then by index, matching the Cardano node's canonical ordering.
 fn encode_redeemers_map(
     redeemers: &[(RedeemersKey, PlutusData)],
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
 ) -> PlutusData {
-    let mut pairs: Vec<(PlutusData, PlutusData)> = Vec::new();
+    let mut sorted: Vec<_> = redeemers.to_vec();
+    sorted.sort_by(|(a, _), (b, _)| {
+        fn tag_order(tag: &RedeemerTag) -> usize {
+            match tag {
+                RedeemerTag::Spend => 0,
+                RedeemerTag::Mint => 1,
+                RedeemerTag::Cert => 2,
+                RedeemerTag::Reward => 3,
+                RedeemerTag::Vote => 4,
+                RedeemerTag::Propose => 5,
+            }
+        }
+        tag_order(&a.tag)
+            .cmp(&tag_order(&b.tag))
+            .then(a.index.cmp(&b.index))
+    });
 
-    for (key, data) in redeemers {
+    let mut pairs: Vec<(PlutusData, PlutusData)> = Vec::new();
+    for (key, data) in &sorted {
         let purpose = encode_redeemer_purpose(key, tx_body);
         pairs.push((purpose, data.clone()));
     }

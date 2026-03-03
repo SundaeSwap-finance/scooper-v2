@@ -14,10 +14,35 @@ use crate::sundaev3::Ident;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::*;
 
+/// Fixed ADA amount returned to the user in fulfillment outputs.
+/// For ADA buy orders, the remaining order ADA (minus this and tx fee) goes to the pool.
+pub const FULFILLMENT_BASE_ADA: u64 = 2_000_000;
+
 /// A resolved swap with precomputed math.
 #[derive(Clone)]
 pub struct ResolvedSwap {
     pub order: Arc<SundaeV4Order>,
+    pub input_idx: usize,
+    pub output_idx: usize,
+    pub dx: BigInt,
+    pub dy: BigInt,
+    /// For routed orders: the actual output asset and amount (from final hop).
+    /// When None, fulfillment uses this swap's output_idx/dy directly.
+    pub fulfillment_override: Option<FulfillmentOverride>,
+}
+
+/// Override for the fulfillment output of a routed order.
+#[derive(Clone)]
+pub struct FulfillmentOverride {
+    pub output_asset: AssetClass,
+    pub amount: BigInt,
+}
+
+/// Continuation swap from a routed order passing through this pool.
+/// Generates a transcript entry but doesn't consume an order input.
+#[derive(Clone)]
+pub struct ContinuationSwap {
+    pub originating_order: Arc<SundaeV4Order>,
     pub input_idx: usize,
     pub output_idx: usize,
     pub dx: BigInt,
@@ -30,6 +55,7 @@ pub struct Batch {
     pub pool: Arc<SundaeV4Pool>,
     pub pool_ident: Ident,
     pub swaps: Vec<ResolvedSwap>,
+    pub continuations: Vec<ContinuationSwap>,
     pub final_assets: Vec<(AssetClass, BigInt)>,
     pub final_total_lp: BigInt,
 }
@@ -98,16 +124,30 @@ pub fn find_pool_for_simple_order(
             vec![]
         };
 
+    // Determine if the order's offer is a non-ADA token.
+    // Order UTxOs always carry ~5M ADA as min-UTxO, so ADA > 2M alone doesn't
+    // mean the order is offering ADA. If the order has ANY non-ADA token with
+    // positive balance, the offer is that token, not ADA.
+    let order_has_non_ada_tokens = order.value.0.iter().any(|(policy, tokens)| {
+        !policy.is_empty() && tokens.values().any(|qty| qty.is_positive())
+    });
+
     for (ident, pool) in pools {
-        // Check if order's offer token is in pool's assets
-        let has_offer = pool.pool_datum.assets.iter().any(|(asset, _)| {
-            if asset.policy.is_empty() && asset.token.is_empty() {
-                // ADA: order must have > 2M ADA to count as selling ADA
-                order.value.get(asset) > BigInt::from(2_000_000i64)
-            } else {
-                order.value.get(asset).is_positive()
-            }
-        });
+        // Check if order's actual offer token is in pool's assets
+        let has_offer = if order_has_non_ada_tokens {
+            // Offer is a non-ADA token — only match pools containing that token
+            pool.pool_datum.assets.iter().any(|(asset, _)| {
+                !(asset.policy.is_empty() && asset.token.is_empty())
+                    && order.value.get(asset).is_positive()
+            })
+        } else {
+            // No non-ADA tokens → offering ADA (must have > 2M)
+            let ada = AssetClass { policy: vec![], token: vec![] };
+            order.value.get(&ada) > BigInt::from(2_000_000i64)
+                && pool.pool_datum.assets.iter().any(|(a, _)| {
+                    a.policy.is_empty() && a.token.is_empty()
+                })
+        };
 
         // Check if order's ask token is in pool's assets
         let has_ask = min_received_assets.is_empty()
@@ -211,6 +251,7 @@ pub fn assemble_batch(
         pool: pool.clone(),
         pool_ident: pool.pool_datum.identifier.clone(),
         swaps: selected,
+        continuations: Vec::new(),
         final_assets: running_assets,
         final_total_lp,
     })
@@ -235,9 +276,14 @@ pub fn try_execute_order(
     let reserve_out = &running_assets[output_idx].1;
 
     let offered_asset = &running_assets[input_idx].0;
-    let dx = order.value.get(offered_asset);
+    let raw_value = order.value.get(offered_asset);
+    // For ADA buy orders, dx = order ADA minus the fulfillment base (which stays with the user).
+    let dx = if offered_asset.policy.is_empty() && offered_asset.token.is_empty() {
+        raw_value - BigInt::from(FULFILLMENT_BASE_ADA as i64)
+    } else {
+        raw_value
+    };
     if !dx.is_positive() {
-
         return None;
     }
 
@@ -248,7 +294,6 @@ pub fn try_execute_order(
 
     // Check min_received constraint
     if !satisfies_min_received(order, &running_assets[output_idx].0, &dy) {
-
         return None;
     }
 
@@ -258,6 +303,7 @@ pub fn try_execute_order(
         output_idx,
         dx,
         dy,
+        fulfillment_override: None,
     })
 }
 
@@ -278,7 +324,12 @@ pub fn check_order_executability(
     let reserve_out = &pool_assets[output_idx].1;
 
     let offered_asset = &pool_assets[input_idx].0;
-    let dx = order.value.get(offered_asset);
+    let raw_value = order.value.get(offered_asset);
+    let dx = if offered_asset.policy.is_empty() && offered_asset.token.is_empty() {
+        raw_value - BigInt::from(FULFILLMENT_BASE_ADA as i64)
+    } else {
+        raw_value
+    };
     if !dx.is_positive() {
         return Err("offered amount not positive".to_string());
     }
@@ -313,6 +364,7 @@ pub fn check_order_executability(
         output_idx,
         dx,
         dy,
+        fulfillment_override: None,
     })
 }
 
