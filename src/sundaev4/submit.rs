@@ -78,11 +78,12 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
     }
 }
 
-/// Evaluate a transaction via Ogmios `evaluateTransaction` before submission.
+/// Evaluate a transaction via Ogmios `evaluateTransaction`.
 ///
 /// Returns Ok with the evaluation result JSON on success, or Err with details
-/// on failure. This uses the node's own script evaluation, so a pass here
-/// should guarantee on-chain acceptance.
+/// on failure. Note: Ogmios cannot see unconfirmed (mempool) UTxOs, so this
+/// will fail for chained transactions consuming predicted outputs.
+#[allow(dead_code)]
 pub async fn evaluate_tx_ogmios(url: &str, cbor: &[u8]) -> Result<serde_json::Value> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({

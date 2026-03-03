@@ -671,44 +671,9 @@ impl Scooper {
             }
         };
 
-        // Re-evaluate final tx with uplc-turbo to compare with first-pass budgets
-        let final_eval = crate::sundaev4::evaluator::evaluate_scoop_tx(
-            &final_tx.tx_body,
-            &final_tx.redeemers,
-            &final_tx.resolved_inputs,
-            &final_tx.resolved_ref_inputs,
-            script_store,
-            &exec.plutus_v3_cost_model,
-            final_tx.tx_hash,
-            &exec.slot_config,
-        );
-        match &final_eval {
-            Ok(r) => {
-                for (key, eu) in &r.budgets {
-                    // Find matching first-pass budget
-                    if let Some((_, first_eu)) = eval_result.budgets.iter().find(|(k, _)| k.tag == key.tag && k.index == key.index) {
-                        if eu.steps != first_eu.steps || eu.mem != first_eu.mem {
-                            warn!(
-                                tag = ?key.tag, index = key.index,
-                                first_cpu = first_eu.steps, final_cpu = eu.steps,
-                                first_mem = first_eu.mem, final_mem = eu.mem,
-                                "uplc-turbo budget CHANGED between first-pass and final tx"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "uplc-turbo re-eval of final tx FAILED");
-            }
-        }
-
         let n_orders = accum.order_count();
         let n_pools = accum.pools.len();
         let pool_idents: Vec<_> = accum.pools.keys().cloned().collect();
-
-        // Dump tx CBOR for offline analysis
-        warn!(tx_cbor = %hex::encode(&final_tx.cbor), "tx CBOR hex dump");
 
         info!(
             tx_hash = %final_tx.tx_hash_hex,
@@ -717,51 +682,6 @@ impl Scooper {
             pools = ?pool_idents.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
             "multi-pool scoop tx built, submitting"
         );
-
-        // Pre-flight: evaluate via Ogmios to get node-side script results
-        match crate::sundaev4::submit::evaluate_tx_ogmios(&exec.submit_url, &final_tx.cbor).await {
-            Ok(result) => {
-                info!(tx_hash = %final_tx.tx_hash_hex, "ogmios evaluate succeeded");
-                // Compare: first-pass uplc-turbo vs final-tx uplc-turbo vs Ogmios
-                if let Some(arr) = result.as_array() {
-                    let final_budgets = final_eval.as_ref().ok().map(|r| &r.budgets);
-                    for entry in arr {
-                        let purpose = entry.get("validator").and_then(|v| v.get("purpose")).and_then(|p| p.as_str()).unwrap_or("?");
-                        let index = entry.get("validator").and_then(|v| v.get("index")).and_then(|i| i.as_u64()).unwrap_or(0);
-                        let ogmios_cpu = entry.get("budget").and_then(|b| b.get("cpu")).and_then(|c| c.as_u64()).unwrap_or(0);
-                        let ogmios_mem = entry.get("budget").and_then(|b| b.get("memory")).and_then(|m| m.as_u64()).unwrap_or(0);
-                        let tag = match purpose {
-                            "spend" => pallas_primitives::conway::RedeemerTag::Spend,
-                            "withdraw" => pallas_primitives::conway::RedeemerTag::Reward,
-                            _ => continue,
-                        };
-                        let first_pass_eu = eval_result.budgets.iter()
-                            .find(|(k, _)| k.tag == tag && k.index as u64 == index)
-                            .map(|(_, eu)| eu);
-                        let final_uplc_eu = final_budgets.and_then(|b| b.iter()
-                            .find(|(k, _)| k.tag == tag && k.index as u64 == index)
-                            .map(|(_, eu)| eu));
-                        // Log any discrepancy
-                        let first_cpu = first_pass_eu.map(|eu| eu.steps).unwrap_or(0);
-                        let first_mem = first_pass_eu.map(|eu| eu.mem).unwrap_or(0);
-                        let final_cpu = final_uplc_eu.map(|eu| eu.steps).unwrap_or(0);
-                        let final_mem = final_uplc_eu.map(|eu| eu.mem).unwrap_or(0);
-                        if first_cpu != final_cpu || final_cpu != ogmios_cpu {
-                            warn!(
-                                purpose, index,
-                                first_cpu, final_cpu, ogmios_cpu,
-                                first_mem, final_mem, ogmios_mem,
-                                "budget discrepancy across evaluators"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(tx_hash = %final_tx.tx_hash_hex, error = %e, "ogmios evaluate FAILED — skipping submit");
-                return false;
-            }
-        }
 
         match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
             Ok(submitted_hash) => {

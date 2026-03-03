@@ -429,12 +429,28 @@
       '<span class="copy-btn" data-copy="' + escaped + '">' + copySvg + '</span></span>';
   }
 
+  function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    // Fallback for non-HTTPS contexts
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Promise.resolve();
+  }
+
   document.addEventListener('click', function(e) {
     var btn = e.target.closest('.copy-btn');
     if (!btn) return;
     var text = btn.getAttribute('data-copy');
     if (!text) return;
-    navigator.clipboard.writeText(text).then(function() {
+    copyToClipboard(text).then(function() {
       btn.classList.add('copied');
       setTimeout(function() { btn.classList.remove('copied'); }, 1000);
     });
