@@ -30,7 +30,7 @@ const EX_MEM: u64 = 14_000_000 / 10;
 const EX_STEPS: u64 = 10_000_000_000 / 10;
 pub const TX_FEE: u64 = 3_000_000;
 const POOL_MIN_ADA: u64 = 2_000_000;
-const VALIDITY_RANGE: u64 = 60;
+const VALIDITY_RANGE: u64 = 180;
 
 use crate::sundaev3::Ident;
 
@@ -157,41 +157,26 @@ pub fn build_multi_pool_scoop_tx(
         let mut total_fee_budget = BigInt::from(0);
         let mut transcript_entries: Vec<TranscriptEntry> = Vec::new();
 
-        // Process swaps first, then continuations (matching transcript order)
-        for swap in &batch.swaps {
+        // Process operations in the interleaved order they were accumulated.
+        // This is critical: replaying swaps-then-continuations would produce
+        // wrong intermediate reserves when routed orders interleave.
+        for op in &batch.ops_order {
+            let (input_idx, output_idx, dx, dy) = match op {
+                crate::sundaev4::batch::BatchOp::Swap(i) => {
+                    let s = &batch.swaps[*i];
+                    (s.input_idx, s.output_idx, &s.dx, &s.dy)
+                }
+                crate::sundaev4::batch::BatchOp::Continuation(i) => {
+                    let c = &batch.continuations[*i];
+                    (c.input_idx, c.output_idx, &c.dx, &c.dy)
+                }
+            };
+
             let prev_a = running_assets[0].1.clone();
             let prev_b = running_assets[1].1.clone();
 
-            running_assets[swap.input_idx].1 = &running_assets[swap.input_idx].1 + &swap.dx;
-            running_assets[swap.output_idx].1 = &running_assets[swap.output_idx].1 - &swap.dy;
-
-            let fee_budget = swap_math::cp_fee_budget(
-                &prev_a, &prev_b,
-                &running_assets[0].1, &running_assets[1].1,
-                &initial_total_lp,
-            );
-            total_fee_budget = &total_fee_budget + &fee_budget;
-
-            transcript_entries.push(TranscriptEntry {
-                state_after: VaultState {
-                    assets: running_assets.clone(),
-                    total_lp: initial_total_lp.clone(),
-                    circulating_lp: pool.pool_datum.circulating_lp.clone(),
-                    preminted_lp: pool.pool_datum.preminted_lp.clone(),
-                },
-                fee_budget,
-                operation_tag: BigInt::from(100),
-                operation_data: void_vault_state.clone().to_plutus(),
-            });
-        }
-
-        // Continuation swaps (routed orders passing through this pool)
-        for cont in &batch.continuations {
-            let prev_a = running_assets[0].1.clone();
-            let prev_b = running_assets[1].1.clone();
-
-            running_assets[cont.input_idx].1 = &running_assets[cont.input_idx].1 + &cont.dx;
-            running_assets[cont.output_idx].1 = &running_assets[cont.output_idx].1 - &cont.dy;
+            running_assets[input_idx].1 = &running_assets[input_idx].1 + dx;
+            running_assets[output_idx].1 = &running_assets[output_idx].1 - dy;
 
             let fee_budget = swap_math::cp_fee_budget(
                 &prev_a, &prev_b,
@@ -600,7 +585,8 @@ pub fn build_multi_pool_scoop_tx(
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
         // For ADA buy orders, the swap ADA (dx) goes to the pool. The fulfillment
         // only gets the base ADA (FULFILLMENT_BASE_ADA) minus the tx fee share.
-        let offered_is_ada = swap.fulfillment_override.is_none() && {
+        // This applies equally to routed ADA buy orders (which have fulfillment_override).
+        let offered_is_ada = {
             let inp = &batch.pool.pool_datum.assets[swap.input_idx].0;
             inp.policy.is_empty() && inp.token.is_empty()
         };

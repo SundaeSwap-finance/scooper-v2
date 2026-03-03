@@ -48,6 +48,13 @@ pub struct ContinuationSwap {
     pub dy: BigInt,
 }
 
+/// Identifies an operation in the batch's interleaved order.
+#[derive(Clone, Debug)]
+pub enum BatchOp {
+    Swap(usize),
+    Continuation(usize),
+}
+
 /// A complete batch for one pool, ready for the tx builder.
 #[derive(Clone)]
 pub struct Batch {
@@ -55,6 +62,10 @@ pub struct Batch {
     pub pool_ident: Ident,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
+    /// The interleaved order of swaps and continuations as they were
+    /// accumulated. Used by the tx_builder to build transcript entries
+    /// with correct intermediate reserve states.
+    pub ops_order: Vec<BatchOp>,
     pub final_assets: Vec<(AssetClass, BigInt)>,
     #[allow(dead_code)]
     pub final_total_lp: BigInt,
@@ -248,11 +259,13 @@ pub fn assemble_batch(
     );
     let final_total_lp = &initial_total_lp + &total_protocol_lp;
 
+    let ops_order: Vec<BatchOp> = (0..selected.len()).map(BatchOp::Swap).collect();
     Some(Batch {
         pool: pool.clone(),
         pool_ident: pool.pool_datum.identifier.clone(),
         swaps: selected,
         continuations: Vec::new(),
+        ops_order,
         final_assets: running_assets,
         final_total_lp,
     })
@@ -383,11 +396,15 @@ pub fn detect_swap_direction_from_assets(
             return Some((idx, output_idx));
         }
     }
-    // Fallback: offering ADA (asset 0) if it has more than min UTxO
+    // Fallback: offering ADA if it has more than min UTxO.
+    // Find the actual ADA index rather than assuming it's at position 0.
     let ada = AssetClass { policy: vec![], token: vec![] };
     let ada_amount = order.value.get(&ada);
     if ada_amount > BigInt::from(2_000_000i64) {
-        return Some((0, 1));
+        if let Some(ada_idx) = assets.iter().position(|(a, _)| a.policy.is_empty() && a.token.is_empty()) {
+            let out_idx = if ada_idx == 0 { 1 } else { 0 };
+            return Some((ada_idx, out_idx));
+        }
     }
     None
 }

@@ -1,5 +1,6 @@
 use crate::bigint::BigInt;
-use num_traits::{One, Signed};
+use num_traits::{One, Signed, Zero};
+use tracing::warn;
 
 /// Integer square root via Newton's method (floor).
 pub(crate) fn isqrt(n: &BigInt) -> BigInt {
@@ -44,7 +45,19 @@ pub fn cp_fee_budget(
     // isqrt(a1 * b1 * lp_before^2 / (a0 * b0)) - lp_before
     let numerator = a1 * b1 * lp_before * lp_before;
     let denominator = a0 * b0;
-    isqrt(&(&numerator / &denominator)) - lp_before
+    if denominator.is_zero() {
+        warn!(a0 = %a0, b0 = %b0, "cp_fee_budget: zero denominator (a0*b0=0)");
+        return BigInt::from(0);
+    }
+    let quotient = &numerator / &denominator;
+    if quotient.is_negative() {
+        warn!(
+            a0 = %a0, b0 = %b0, a1 = %a1, b1 = %b1, lp = %lp_before,
+            "cp_fee_budget: negative quotient — pool reserves may be invalid"
+        );
+        return BigInt::from(0);
+    }
+    isqrt(&quotient) - lp_before
 }
 
 /// Protocol LP = floor(fee_budget * ps_num / ps_den)

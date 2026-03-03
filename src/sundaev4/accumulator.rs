@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::Ident;
-use crate::sundaev4::batch::{self, Batch, ContinuationSwap, FulfillmentOverride, ResolvedSwap};
+use crate::sundaev4::batch::{self, Batch, BatchOp, ContinuationSwap, FulfillmentOverride, ResolvedSwap};
 use crate::sundaev4::router::RoutingPlan;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::SundaeV4Pool;
@@ -25,6 +25,11 @@ pub struct PoolAccum {
     pub initial_total_lp: BigInt,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
+    /// Fee budget accumulated incrementally as operations are applied.
+    /// Computed inline so we don't need to replay in the wrong order.
+    total_fee_budget: BigInt,
+    /// Interleaved order of swaps and continuations.
+    ops_order: Vec<BatchOp>,
 }
 
 /// Incrementally-built multi-pool transaction state.
@@ -63,6 +68,8 @@ impl Accumulator {
                 initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
                 swaps: Vec::new(),
                 continuations: Vec::new(),
+                total_fee_budget: BigInt::from(0),
+                ops_order: Vec::new(),
             }
         });
 
@@ -75,13 +82,29 @@ impl Accumulator {
         )
         .ok_or_else(|| "order cannot execute against running pool state".to_string())?;
 
+        // Capture reserves before update for fee budget computation
+        let prev_a = accum.running_assets[0].1.clone();
+        let prev_b = accum.running_assets[1].1.clone();
+
         // Update running reserves
         accum.running_assets[swap.input_idx].1 =
             &accum.running_assets[swap.input_idx].1 + &swap.dx;
         accum.running_assets[swap.output_idx].1 =
             &accum.running_assets[swap.output_idx].1 - &swap.dy;
 
+        // Accumulate fee budget with correct intermediate reserves
+        let fb = swap_math::cp_fee_budget(
+            &prev_a,
+            &prev_b,
+            &accum.running_assets[0].1,
+            &accum.running_assets[1].1,
+            &accum.initial_total_lp,
+        );
+        accum.total_fee_budget = &accum.total_fee_budget + &fb;
+
+        let swap_idx = accum.swaps.len();
         accum.swaps.push(swap);
+        accum.ops_order.push(BatchOp::Swap(swap_idx));
         Ok(())
     }
 
@@ -121,6 +144,13 @@ impl Accumulator {
             let is_entry_hop = hop_idx == 0;
             let mut this_hop_output = BigInt::from(0);
 
+            // For multi-split non-entry hops, track allocated dx so the last
+            // split absorbs the integer-division remainder.
+            let mut allocated_dx = BigInt::from(0);
+            let hop_total: BigInt = hop.splits.iter()
+                .map(|s| s.input_amount.clone())
+                .fold(BigInt::from(0), |a, b| &a + &b);
+
             for (split_idx, split) in hop.splits.iter().enumerate() {
                 let pool_ident = &split.pool.ident;
 
@@ -142,6 +172,8 @@ impl Accumulator {
                         initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
                         swaps: Vec::new(),
                         continuations: Vec::new(),
+                        total_fee_budget: BigInt::from(0),
+                        ops_order: Vec::new(),
                     }
                 });
 
@@ -159,17 +191,19 @@ impl Accumulator {
                     split.input_amount.clone()
                 } else if hop.splits.len() == 1 {
                     prev_hop_output.clone()
+                } else if split_idx == hop.splits.len() - 1 {
+                    // Last split absorbs the remainder to avoid integer-division
+                    // rounding loss that would break value conservation.
+                    &prev_hop_output - &allocated_dx
                 } else {
-                    // Multi-split on a non-entry hop: scale by the router's
-                    // proportion of this split vs. the hop total
-                    let hop_total: BigInt = hop.splits.iter()
-                        .map(|s| s.input_amount.clone())
-                        .fold(BigInt::from(0), |a, b| &a + &b);
-                    if hop_total.is_positive() {
+                    // Proportional split, tracking allocated amount
+                    let proportional = if hop_total.is_positive() {
                         &prev_hop_output * &split.input_amount / &hop_total
                     } else {
                         split.input_amount.clone()
-                    }
+                    };
+                    allocated_dx = &allocated_dx + &proportional;
+                    proportional
                 };
 
                 let dy = swap_math::cp_swap_result(
@@ -183,11 +217,25 @@ impl Accumulator {
                     return Err(format!("zero output from pool {}", pool_ident));
                 }
 
+                // Capture reserves before update for fee budget computation
+                let prev_a = accum.running_assets[0].1.clone();
+                let prev_b = accum.running_assets[1].1.clone();
+
                 // Update running reserves
                 accum.running_assets[input_idx].1 =
                     &accum.running_assets[input_idx].1 + &dx;
                 accum.running_assets[output_idx].1 =
                     &accum.running_assets[output_idx].1 - &dy;
+
+                // Accumulate fee budget with correct intermediate reserves
+                let fb = swap_math::cp_fee_budget(
+                    &prev_a,
+                    &prev_b,
+                    &accum.running_assets[0].1,
+                    &accum.running_assets[1].1,
+                    &accum.initial_total_lp,
+                );
+                accum.total_fee_budget = &accum.total_fee_budget + &fb;
 
                 this_hop_output = &this_hop_output + &dy;
 
@@ -201,8 +249,9 @@ impl Accumulator {
                     primary_pool_ident = Some(pool_ident.clone());
                 }
 
-                // Push to trial accum
+                // Push to trial accum with ops_order tracking
                 if is_entry_hop && split_idx == 0 {
+                    let idx = accum.swaps.len();
                     accum.swaps.push(ResolvedSwap {
                         order: order.clone(),
                         input_idx,
@@ -211,13 +260,16 @@ impl Accumulator {
                         dy: dy.clone(),
                         fulfillment_override: None,
                     });
+                    accum.ops_order.push(BatchOp::Swap(idx));
                 } else {
+                    let idx = accum.continuations.len();
                     accum.continuations.push(ContinuationSwap {
                         input_idx,
                         output_idx,
                         dx: dx.clone(),
                         dy: dy.clone(),
                     });
+                    accum.ops_order.push(BatchOp::Continuation(idx));
                 }
             }
 
@@ -292,9 +344,8 @@ impl Accumulator {
 
     /// Convert accumulated state into `Vec<Batch>` for the tx builder.
     ///
-    /// For each pool, replays the fee_budget computation (matching
-    /// `assemble_batch`) to produce `final_total_lp`. Includes both
-    /// swaps and continuations in the replay.
+    /// Uses the fee budget that was accumulated incrementally during
+    /// `try_add_order` / `try_add_routed_order` to compute `final_total_lp`.
     pub fn into_batches(self) -> Vec<Batch> {
         let mut batches = Vec::new();
 
@@ -303,47 +354,12 @@ impl Accumulator {
                 continue;
             }
 
-            // Replay fee budget computation to get final_total_lp.
-            // Process swaps first, then continuations (matching transcript order).
-            let mut total_fee_budget = BigInt::from(0);
-            let mut replay_assets = accum.pool.pool_datum.assets.clone();
-
-            for swap in &accum.swaps {
-                let prev_a = replay_assets[0].1.clone();
-                let prev_b = replay_assets[1].1.clone();
-                replay_assets[swap.input_idx].1 =
-                    &replay_assets[swap.input_idx].1 + &swap.dx;
-                replay_assets[swap.output_idx].1 =
-                    &replay_assets[swap.output_idx].1 - &swap.dy;
-                let fb = swap_math::cp_fee_budget(
-                    &prev_a,
-                    &prev_b,
-                    &replay_assets[0].1,
-                    &replay_assets[1].1,
-                    &accum.initial_total_lp,
-                );
-                total_fee_budget = &total_fee_budget + &fb;
-            }
-
-            for cont in &accum.continuations {
-                let prev_a = replay_assets[0].1.clone();
-                let prev_b = replay_assets[1].1.clone();
-                replay_assets[cont.input_idx].1 =
-                    &replay_assets[cont.input_idx].1 + &cont.dx;
-                replay_assets[cont.output_idx].1 =
-                    &replay_assets[cont.output_idx].1 - &cont.dy;
-                let fb = swap_math::cp_fee_budget(
-                    &prev_a,
-                    &prev_b,
-                    &replay_assets[0].1,
-                    &replay_assets[1].1,
-                    &accum.initial_total_lp,
-                );
-                total_fee_budget = &total_fee_budget + &fb;
-            }
-
+            // Fee budget was accumulated incrementally during try_add_order /
+            // try_add_routed_order, so we use it directly instead of replaying
+            // (replay in a different order than accumulation would produce wrong
+            // intermediate reserves when continuations are interleaved with swaps).
             let total_protocol_lp = swap_math::compute_protocol_lp(
-                &total_fee_budget,
+                &accum.total_fee_budget,
                 self.protocol_share.0,
                 self.protocol_share.1,
             );
@@ -354,6 +370,7 @@ impl Accumulator {
                 pool_ident: accum.ident,
                 swaps: accum.swaps,
                 continuations: accum.continuations,
+                ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,
             });
