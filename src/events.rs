@@ -35,10 +35,12 @@ pub enum IndexEvent {
         tx_id: String,
     },
     V3SettingsUpdated {
+        #[allow(dead_code)]
         settings: Arc<SundaeV3Settings>,
     },
     V4PoolCreated {
         id: Ident,
+        #[allow(dead_code)]
         pool: Arc<SundaeV4Pool>,
     },
     V4PoolUpdated {
@@ -64,6 +66,7 @@ pub enum IndexEvent {
         tx_id: String,
     },
     V4SettingsUpdated {
+        #[allow(dead_code)]
         settings: Arc<SundaeV4Settings>,
     },
     /// Emitted for every block (including empty ones) with current tip info.

@@ -57,6 +57,7 @@ impl ScriptStore {
     /// For each validator with `compiled_code`, hex-decodes the script CBOR,
     /// computes the PlutusV3 hash, and CBOR-unwraps to FLAT bytes.
     /// This bypasses the need to index reference UTxOs from the chain.
+    #[allow(dead_code)]
     pub fn from_blueprint(blueprint: &crate::blueprint::Blueprint) -> Result<Self> {
         let mut store = BTreeMap::new();
         for validator in &blueprint.validators {

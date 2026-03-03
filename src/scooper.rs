@@ -29,6 +29,15 @@ use crate::{
     },
 };
 
+/// How close (in slots) we need to be to the network tip to consider ourselves synced.
+const SYNC_TOLERANCE_SLOTS: u64 = 10;
+
+/// Log sync progress every N event batches to avoid log spam.
+const SYNC_LOG_INTERVAL: u64 = 500;
+
+/// Minimum ADA on the collateral return output (lovelace).
+const MIN_COLLATERAL_RETURN: u64 = 1_500_000;
+
 pub struct Scooper {
     event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
     v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
@@ -90,7 +99,7 @@ impl Scooper {
             }
 
             sync_log_counter += 1;
-            if sync_log_counter % 500 == 1 {
+            if sync_log_counter % SYNC_LOG_INTERVAL == 1 {
                 if let Some(s) = &self.v4_state {
                     let state = s.lock().await;
                     let latest = state.latest();
@@ -210,7 +219,7 @@ impl Scooper {
                 let latest = state.latest();
                 match latest.network_tip_slot {
                     Some(network_tip) => {
-                        let at_tip = latest.tip_slot + 10 >= network_tip;
+                        let at_tip = latest.tip_slot + SYNC_TOLERANCE_SLOTS >= network_tip;
                         Some(at_tip)
                     }
                     None => None,
@@ -391,13 +400,13 @@ impl Scooper {
         // Select collateral — needs enough ADA for total_collateral (TX_FEE * 1.5)
         // plus min UTxO on the collateral return output.
         let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
-        let min_collateral_ada = crate::sundaev4::tx_builder::TX_FEE * 3 / 2 + 1_500_000;
+        let min_collateral_ada = crate::sundaev4::tx_builder::TX_FEE * 3 / 2 + MIN_COLLATERAL_RETURN;
         let collateral = v4_state
             .wallet_utxos
             .iter()
             .find(|(_, v)| {
                 use num_traits::ToPrimitive;
-                v.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
+                v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
             });
         let (collateral_input, collateral_value) = match collateral {
             Some((input, value)) => (input.clone(), value.clone()),
@@ -681,15 +690,10 @@ impl Scooper {
 
                 let in_flight = InFlightTx {
                     tx_hash: final_tx.tx_hash,
-                    tx_hash_hex: final_tx.tx_hash_hex,
                     pool_idents: pool_idents.clone(),
                     consumed_orders,
                     predicted_pools,
                     ttl: final_tx.ttl,
-                    chain_index: pool_idents.iter()
-                        .map(|i| self.v4_chain_tracker.next_chain_index(i))
-                        .max()
-                        .unwrap_or(0),
                 };
                 self.v4_chain_tracker.record_submission(in_flight);
                 true

@@ -35,7 +35,6 @@ pub struct PredictedPoolUtxo {
 #[derive(Clone, Debug)]
 pub struct InFlightTx {
     pub tx_hash: Hash<32>,
-    pub tx_hash_hex: String,
     /// Pool identifiers touched by this transaction.
     pub pool_idents: Vec<Ident>,
     pub consumed_orders: Vec<Arc<SundaeV4Order>>,
@@ -43,8 +42,6 @@ pub struct InFlightTx {
     pub predicted_pools: Vec<(Ident, PredictedPoolUtxo)>,
     /// Transaction validity upper bound (slot)
     pub ttl: u64,
-    /// Position in chain (0 = first)
-    pub chain_index: usize,
 }
 
 impl InFlightTx {
@@ -91,6 +88,7 @@ impl ChainTracker {
     }
 
     /// Next chain index for a pool (0 if no chain exists).
+    #[allow(dead_code)]
     pub fn next_chain_index(&self, pool_ident: &Ident) -> usize {
         self.chains
             .get(pool_ident)
@@ -235,11 +233,13 @@ impl ChainTracker {
     }
 
     /// Check if we have any in-flight chains.
+    #[allow(dead_code)]
     pub fn has_in_flight(&self) -> bool {
         !self.chains.is_empty()
     }
 
     /// Get the pool identifiers that have in-flight chains.
+    #[allow(dead_code)]
     pub fn in_flight_pools(&self) -> Vec<Ident> {
         self.chains.keys().cloned().collect()
     }
@@ -269,13 +269,12 @@ mod tests {
         })
     }
 
-    fn make_in_flight(ident_byte: u8, hash_byte: u8, ttl: u64, chain_index: usize) -> InFlightTx {
+    fn make_in_flight(ident_byte: u8, hash_byte: u8, ttl: u64, _chain_index: usize) -> InFlightTx {
         let tx_hash: Hash<32> = [hash_byte; 32].into();
         let pool = make_pool(ident_byte);
         let ident = Ident::new(&[ident_byte]);
         InFlightTx {
             tx_hash,
-            tx_hash_hex: hex::encode(tx_hash),
             pool_idents: vec![ident.clone()],
             consumed_orders: vec![],
             predicted_pools: vec![(ident, PredictedPoolUtxo {
@@ -283,7 +282,6 @@ mod tests {
                 pool,
             })],
             ttl,
-            chain_index,
         }
     }
 
@@ -291,7 +289,7 @@ mod tests {
         ident_bytes: &[u8],
         hash_byte: u8,
         ttl: u64,
-        chain_index: usize,
+        _chain_index: usize,
     ) -> InFlightTx {
         let tx_hash: Hash<32> = [hash_byte; 32].into();
         let pool_idents: Vec<Ident> = ident_bytes.iter().map(|&b| Ident::new(&[b])).collect();
@@ -304,12 +302,10 @@ mod tests {
         }).collect();
         InFlightTx {
             tx_hash,
-            tx_hash_hex: hex::encode(tx_hash),
             pool_idents,
             consumed_orders: vec![],
             predicted_pools,
             ttl,
-            chain_index,
         }
     }
 

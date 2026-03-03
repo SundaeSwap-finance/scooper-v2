@@ -105,17 +105,9 @@ impl Accumulator {
         // Clone pool accums for trial execution
         let mut trial_pools = self.pools.clone();
 
-        // We'll collect the swaps/continuations to commit if successful
-        struct PendingSwap {
-            pool_ident: Ident,
-            swap: ResolvedSwap,
-        }
-        struct PendingContinuation {
-            pool_ident: Ident,
-            cont: ContinuationSwap,
-        }
-        let mut pending_swaps: Vec<PendingSwap> = Vec::new();
-        let mut pending_continuations: Vec<PendingContinuation> = Vec::new();
+        // Track the primary pool ident (first split of first hop) for
+        // fulfillment override lookup after all hops complete.
+        let mut primary_pool_ident: Option<Ident> = None;
 
         let mut final_output_asset: Option<AssetClass> = None;
         let mut final_output_amount = BigInt::from(0);
@@ -206,30 +198,7 @@ impl Accumulator {
                 }
 
                 if is_entry_hop && split_idx == 0 {
-                    // Primary entry swap — creates a ResolvedSwap
-                    pending_swaps.push(PendingSwap {
-                        pool_ident: pool_ident.clone(),
-                        swap: ResolvedSwap {
-                            order: order.clone(),
-                            input_idx,
-                            output_idx,
-                            dx: dx.clone(),
-                            dy: dy.clone(),
-                            fulfillment_override: None, // set below after all hops
-                        },
-                    });
-                } else {
-                    // All other splits/hops — continuation swaps
-                    pending_continuations.push(PendingContinuation {
-                        pool_ident: pool_ident.clone(),
-                        cont: ContinuationSwap {
-                            originating_order: order.clone(),
-                            input_idx,
-                            output_idx,
-                            dx: dx.clone(),
-                            dy: dy.clone(),
-                        },
-                    });
+                    primary_pool_ident = Some(pool_ident.clone());
                 }
 
                 // Push to trial accum
@@ -244,7 +213,6 @@ impl Accumulator {
                     });
                 } else {
                     accum.continuations.push(ContinuationSwap {
-                        originating_order: order.clone(),
                         input_idx,
                         output_idx,
                         dx: dx.clone(),
@@ -271,8 +239,8 @@ impl Accumulator {
         // Set fulfillment override on the primary swap if multi-hop or multi-split.
         // Must update the swap in trial_pools directly since that's what gets committed.
         if route.hops.len() > 1 || route.hops.iter().any(|h| h.splits.len() > 1) {
-            if let (Some(ps), Some(out_asset)) = (pending_swaps.first(), &final_output_asset) {
-                if let Some(accum) = trial_pools.get_mut(&ps.pool_ident) {
+            if let (Some(pi), Some(out_asset)) = (&primary_pool_ident, &final_output_asset) {
+                if let Some(accum) = trial_pools.get_mut(pi) {
                     // The primary swap was the last one pushed to this pool's accum
                     if let Some(swap) = accum.swaps.last_mut() {
                         swap.fulfillment_override = Some(FulfillmentOverride {
@@ -320,11 +288,6 @@ impl Accumulator {
 
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty() || self.order_count() == 0
-    }
-
-    /// Total number of orders across all pools (including continuations).
-    pub fn total_transcript_entries(&self) -> usize {
-        self.pools.values().map(|a| a.swaps.len() + a.continuations.len()).sum()
     }
 
     /// Convert accumulated state into `Vec<Batch>` for the tx builder.

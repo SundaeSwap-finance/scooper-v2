@@ -35,6 +35,7 @@ const VALIDITY_RANGE: u64 = 60;
 use crate::sundaev3::Ident;
 
 /// Result of building a batch scoop transaction, with predicted pool UTxO for chaining.
+#[allow(dead_code)]
 pub struct BatchBuildResult {
     pub cbor: Vec<u8>,
     pub tx_hash: Hash<32>,
@@ -67,6 +68,7 @@ pub struct MultiPoolBuildResult {
 /// Build a signed scoop transaction for 1 pool + N orders (a Batch).
 ///
 /// Thin wrapper around `build_multi_pool_scoop_tx` for backward compatibility.
+#[allow(dead_code)]
 pub fn build_batch_scoop_tx(
     batch: &Batch,
     settings: &SundaeV4Settings,

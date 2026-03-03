@@ -42,7 +42,6 @@ pub struct FulfillmentOverride {
 /// Generates a transcript entry but doesn't consume an order input.
 #[derive(Clone)]
 pub struct ContinuationSwap {
-    pub originating_order: Arc<SundaeV4Order>,
     pub input_idx: usize,
     pub output_idx: usize,
     pub dx: BigInt,
@@ -57,6 +56,7 @@ pub struct Batch {
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub final_assets: Vec<(AssetClass, BigInt)>,
+    #[allow(dead_code)]
     pub final_total_lp: BigInt,
 }
 
@@ -172,6 +172,7 @@ pub fn find_pool_for_simple_order(
 /// include it and restart from the beginning (a sell might enable an earlier buy).
 ///
 /// Returns `None` if no orders can be executed.
+#[allow(dead_code)]
 pub fn assemble_batch(
     pool: &Arc<SundaeV4Pool>,
     candidates: &[Arc<SundaeV4Order>],

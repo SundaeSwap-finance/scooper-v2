@@ -44,11 +44,13 @@ pub struct TxIn {
 
 impl Blueprint {
     /// Find a validator by title substring (e.g. "vault" matches "vault.pool_vault.spend").
+    #[allow(dead_code)]
     pub fn find_validator(&self, title: &str) -> Option<&Validator> {
         self.validators.iter().find(|v| v.title.contains(title))
     }
 
     /// Find a reference by key.
+    #[allow(dead_code)]
     pub fn find_reference(&self, key: &str) -> Option<&Reference> {
         self.references.iter().find(|r| r.key == key)
     }
@@ -57,6 +59,7 @@ impl Blueprint {
     ///
     /// Looks up the validator by `validator_title` (substring match) and the
     /// reference by `ref_key` (exact match), then constructs a `ScriptRefInfo`.
+    #[allow(dead_code)]
     pub fn script_ref_info(&self, validator_title: &str, ref_key: &str) -> Result<ScriptRefInfo> {
         let validator = self
             .find_validator(validator_title)
@@ -93,6 +96,7 @@ impl Blueprint {
     /// title → field mapping.
     ///
     /// Returns `Err` if any required validator or reference is missing.
+    #[allow(dead_code)]
     pub fn to_v4_module_scripts(&self) -> Result<crate::sundaev4::ModuleScripts> {
         use crate::sundaev4::ModuleScripts;
 
@@ -174,6 +178,7 @@ impl Validator {
     ///
     /// PlutusV3 hash = blake2b_224(0x03 || script_cbor)
     /// where script_cbor is the hex-decoded `compiled_code`.
+    #[allow(dead_code)]
     pub fn compute_hash(&self) -> Result<Hash<28>> {
         let code = self
             .compiled_code

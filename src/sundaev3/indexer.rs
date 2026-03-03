@@ -46,7 +46,6 @@ pub type SundaeV3HistoricalState = HistoricalState<SundaeV3State>;
 pub struct SundaeV3Update {
     pub slot: u64,
     pub tip_slot: Option<u64>,
-    pub state: SundaeV3State,
 }
 impl SundaeV3Update {
     #[allow(unused)]
@@ -236,7 +235,6 @@ impl SundaeV3Indexer {
         self.broadcaster.send_replace(SundaeV3Update {
             slot,
             tip_slot: None,
-            state,
         });
         Ok(())
     }
@@ -692,7 +690,6 @@ impl ChainIndex for SundaeV3Indexer {
             self.broadcaster.send_replace(SundaeV3Update {
                 slot,
                 tip_slot: info.tip_slot,
-                state: state.clone(),
             });
         }
 
@@ -740,7 +737,6 @@ impl ChainIndex for SundaeV3Indexer {
         self.broadcaster.send_replace(SundaeV3Update {
             slot: to_slot,
             tip_slot: None,
-            state: self.state.lock().await.latest().into_owned(),
         });
         let _ = self
             .event_tx

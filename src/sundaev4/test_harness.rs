@@ -11,7 +11,7 @@ pub(crate) mod test_harness {
     use pallas_codec::utils::MaybeIndefArray;
     use pallas_crypto::hash::Hasher;
     use pallas_crypto::key::ed25519::SecretKey;
-    use pallas_primitives::{ExUnits, Hash, TransactionInput};
+    use pallas_primitives::{Hash, TransactionInput};
     use plutus_parser::AsPlutus;
 
     use crate::bigint::BigInt;
@@ -19,7 +19,7 @@ pub(crate) mod test_harness {
     use crate::cardano_types::{AssetClass, Value};
     use crate::multisig::Multisig;
     use crate::sundaev3::Ident;
-    use crate::sundaev4::batch::{Batch, BatchLimits, ResolvedSwap, assemble_batch};
+    use crate::sundaev4::batch::Batch;
     use crate::sundaev4::evaluator::{EvalResult, ScriptStore, evaluate_scoop_tx};
     use crate::sundaev4::submit::encode_language_views;
     use crate::sundaev4::tx_builder::{MultiPoolBuildResult, build_multi_pool_scoop_tx};
@@ -395,7 +395,7 @@ pub(crate) mod test_harness {
     ///
     /// The settings value includes the settings NFT (settingsMint policy, empty token name)
     /// so that the fairness validator can find it in reference inputs.
-    pub fn make_settings(env: &TestEnv, scooper_keyhash: &[u8]) -> SundaeV4Settings {
+    pub fn make_settings(_env: &TestEnv, scooper_keyhash: &[u8]) -> SundaeV4Settings {
         // The settings NFT is minted by the settingsMint script.
         // We extract its policy from the settings ScriptRefInfo hash in module_scripts.
         // Actually, the settings NFT policy is separate from the settings validator hash.

@@ -74,6 +74,7 @@ pub struct VaultState {
 }
 
 impl VaultState {
+    #[allow(dead_code)]
     pub fn from_pool(datum: &PoolDatum) -> Self {
         VaultState {
             assets: datum.assets.clone(),
@@ -203,18 +204,6 @@ pub struct SettingsDatum {
     pub treasury_address: Vec<u8>,
     #[serde(serialize_with = "hex_ser::opt_vec_bytes")]
     pub authorized_scoopers: Option<Vec<Vec<u8>>>,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SettingsNode {
-    pub key: Vec<u8>,
-    pub config: PoolConfig,
-    pub next: Option<Vec<u8>>,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct PoolConfig {
-    pub actions: Vec<ActionEntry>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -396,6 +385,7 @@ pub struct ScriptRefInfo {
     pub ref_utxo: crate::cardano_types::TransactionInput,
     /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
     #[serde(default)]
+    #[allow(dead_code)]
     pub script_cbor: Option<String>,
 }
 
@@ -450,6 +440,7 @@ pub struct SundaeV4Protocol {
     pub starting_point: Point,
     pub execution: Option<ScooperExecution>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub blueprint: Option<crate::blueprint::Blueprint>,
 }
 

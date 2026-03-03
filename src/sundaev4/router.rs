@@ -40,7 +40,6 @@ pub struct HopResult {
     pub input_token: AssetClass,
     pub output_token: AssetClass,
     pub splits: Vec<SplitEntry>,
-    pub total_input: BigInt,
     pub total_output: BigInt,
 }
 
@@ -48,9 +47,12 @@ pub struct HopResult {
 #[derive(Clone, Debug)]
 pub struct RoutingPlan {
     pub hops: Vec<HopResult>,
+    #[allow(dead_code)]
     pub total_input: BigInt,
+    #[allow(dead_code)]
     pub total_output: BigInt,
     /// Output from just using the single best direct pool (for comparison).
+    #[allow(dead_code)]
     pub naive_output: BigInt,
 }
 
@@ -213,7 +215,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
             let max_idx = scaled
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, v)| v.clone())
+                .max_by(|a, b| a.1.cmp(b.1))
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             scaled[max_idx] = &scaled[max_idx] + &(total_input - &new_sum);
@@ -381,7 +383,6 @@ fn evaluate_path(path: &[PathHop], input_amount: &BigInt) -> Vec<HopResult> {
             input_token: hop.token_in.clone(),
             output_token: hop.token_out.clone(),
             splits,
-            total_input: current_amount.clone(),
             total_output: total_out.clone(),
         });
 
