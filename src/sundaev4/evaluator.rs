@@ -156,6 +156,17 @@ pub fn evaluate_scoop_tx(
             slot_config,
         );
 
+        // Dump script context for withdrawal scripts (for debugging evaluator discrepancy)
+        if key.tag == RedeemerTag::Reward {
+            warn!(
+                purpose = "withdraw",
+                index = key.index,
+                script = %hex::encode(script_hash),
+                context_cbor = %hex::encode(&context_cbor),
+                "script context CBOR for withdrawal"
+            );
+        }
+
         // Evaluate in a fresh arena (16MB stack not needed for single-threaded)
         let arena = Arena::new();
 
