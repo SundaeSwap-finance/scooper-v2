@@ -379,12 +379,12 @@ pub(crate) mod test_harness {
         Arc::new(SundaeV4Order {
             input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
             value,
-            datum: OrderDatum {
+            datum: SimpleOrderDatum {
                 owner: Multisig::Signature(vec![0xAA; 28]),
                 destination: Destination::SelfDestination,
-                constraints: OrderConstraints::Simple {
-                    min_received: vec![(want_tok, BigInt::from(min_want))],
-                },
+                offer: (offer_tok, BigInt::from(offer_amount)),
+                min_received: (want_tok, BigInt::from(min_want)),
+                max_protocol_fee: BigInt::from(1_500_000i64),
                 extension: unit_pd(),
             },
             slot,

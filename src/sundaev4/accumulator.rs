@@ -277,15 +277,12 @@ impl Accumulator {
         }
 
         // Check min_received against the final routed output
-        if let crate::sundaev4::OrderConstraints::Simple { min_received } = &order.datum.constraints {
-            for (asset, min_qty) in min_received {
-                if final_output_asset.as_ref() == Some(asset) && &final_output_amount < min_qty {
-                    return Err(format!(
-                        "routed output {} below min_received {}",
-                        final_output_amount, min_qty
-                    ));
-                }
-            }
+        let (ask_asset, min_qty) = &order.datum.min_received;
+        if final_output_asset.as_ref() == Some(ask_asset) && &final_output_amount < min_qty {
+            return Err(format!(
+                "routed output {} below min_received {}",
+                final_output_amount, min_qty
+            ));
         }
 
         // Set fulfillment override on the primary swap if multi-hop or multi-split.
@@ -385,7 +382,7 @@ mod tests {
     use super::*;
     use crate::cardano_types::{TransactionInput, Value};
     use crate::multisig::Multisig;
-    use crate::sundaev4::types::{Destination, OrderConstraints, OrderDatum, PoolDatum, SundaeV4Order};
+    use crate::sundaev4::types::{Destination, SimpleOrderDatum, PoolDatum, SundaeV4Order};
     use pallas_codec::utils::MaybeIndefArray;
 
     fn ada() -> AssetClass {
@@ -433,18 +430,19 @@ mod tests {
     }
 
     fn make_buy_order(ada_amount: i64, min_token: AssetClass, min_qty: i64, slot: u64) -> Arc<SundaeV4Order> {
+        let offer_amount = ada_amount - 2_000_000; // subtract min UTxO
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(ada_amount));
 
         Arc::new(SundaeV4Order {
             input: TransactionInput::new([slot as u8; 32].into(), 0),
             value,
-            datum: OrderDatum {
+            datum: SimpleOrderDatum {
                 owner: Multisig::Signature(vec![0xaa; 28]),
                 destination: Destination::SelfDestination,
-                constraints: OrderConstraints::Simple {
-                    min_received: vec![(min_token, BigInt::from(min_qty))],
-                },
+                offer: (ada(), BigInt::from(offer_amount)),
+                min_received: (min_token, BigInt::from(min_qty)),
+                max_protocol_fee: BigInt::from(1_500_000i64),
                 extension: unit_pd(),
             },
             slot,

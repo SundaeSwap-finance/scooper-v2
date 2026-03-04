@@ -142,47 +142,13 @@ impl serde::Serialize for Destination {
 }
 
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OrderDatum {
+pub struct SimpleOrderDatum {
     pub owner: Multisig,
     pub destination: Destination,
-    pub constraints: OrderConstraints,
+    pub offer: (AssetClass, BigInt),
+    pub min_received: (AssetClass, BigInt),
+    pub max_protocol_fee: BigInt,
     pub extension: PlutusData,
-}
-
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
-pub enum OrderConstraints {
-    Simple {
-        min_received: Vec<(AssetClass, BigInt)>,
-    },
-    Structured {
-        steps: Vec<IntentStep>,
-    },
-}
-
-impl serde::Serialize for OrderConstraints {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            OrderConstraints::Simple { min_received } => {
-                let mut s = serializer.serialize_struct("OrderConstraints", 1)?;
-                s.serialize_field("min_received", min_received)?;
-                s.end()
-            }
-            OrderConstraints::Structured { steps } => {
-                let mut s = serializer.serialize_struct("OrderConstraints", 1)?;
-                s.serialize_field("steps", steps)?;
-                s.end()
-            }
-        }
-    }
-}
-
-#[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct IntentStep {
-    pub operation_tag: BigInt,
-    pub pool_ident: Ident,
 }
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
@@ -411,7 +377,7 @@ impl PartialOrd for SundaeV4Pool {
 pub struct SundaeV4Order {
     pub input: TransactionInput,
     pub value: Value,
-    pub datum: OrderDatum,
+    pub datum: SimpleOrderDatum,
     pub slot: u64,
 }
 
@@ -511,65 +477,37 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_v4_order_datum_simple() {
-        // OrderDatum with Simple constraints
-        // owner: Signature(28 bytes = 56 hex chars)
-        let bytes = hex::decode(concat!(
-            "d8799f",                                           // Constr 0 (OrderDatum)
-            "d8799f581c",                                       // owner: Signature(28 bytes)
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff",
-            "d87a80",                                           // destination: Self
-            "d8799f",                                           // constraints: Simple
-            "9f9f9f4040ff1a000f4240ffff",                       // min_received: [(ADA, 1_000_000)]
-            "ff",
-            "d87980",                                           // extension: unit
-            "ff"
-        ))
-        .unwrap();
-        let pd: PlutusData = minicbor::decode(&bytes).unwrap();
-        let order: OrderDatum = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(
-            order.owner,
-            Multisig::Signature(vec![0xaa; 28])
-        );
-        assert_eq!(order.destination, Destination::SelfDestination);
-        match &order.constraints {
-            OrderConstraints::Simple { min_received } => {
-                assert_eq!(min_received.len(), 1);
-                assert_eq!(min_received[0].1, BigInt::from(1_000_000));
-            }
-            _ => panic!("expected Simple constraints"),
-        }
-    }
+    fn test_decode_v4_simple_order_datum() {
+        // SimpleOrderDatum: owner=Sig(0xaa..28), dest=Self,
+        // offer=(ADA, 5_000_000), min_received=(token, 1_000_000),
+        // max_protocol_fee=500_000, extension=unit
+        let datum = SimpleOrderDatum {
+            owner: Multisig::Signature(vec![0xaa; 28]),
+            destination: Destination::SelfDestination,
+            offer: (
+                AssetClass { policy: vec![], token: vec![] },
+                BigInt::from(5_000_000),
+            ),
+            min_received: (
+                AssetClass { policy: vec![0x01, 0x02, 0x03, 0x04], token: vec![0x05, 0x06, 0x07, 0x08] },
+                BigInt::from(1_000_000),
+            ),
+            max_protocol_fee: BigInt::from(500_000),
+            extension: PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+            }),
+        };
 
-    #[test]
-    fn test_decode_v4_order_datum_structured() {
-        // OrderDatum with Structured constraints
-        let bytes = hex::decode(concat!(
-            "d8799f",                                           // Constr 0 (OrderDatum)
-            "d8799f581c",                                       // owner: Signature
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbff",
-            "d87a80",                                           // destination: Self
-            "d87a9f",                                           // constraints: Structured
-            "9f",                                               // steps list
-            "d8799f1864",                                       // IntentStep { tag: 100,
-            "44deadbeef",                                       // pool_ident: 0xdeadbeef }
-            "ffff",
-            "ff",
-            "d87980",                                           // extension: unit
-            "ff"
-        ))
-        .unwrap();
-        let pd: PlutusData = minicbor::decode(&bytes).unwrap();
-        let order: OrderDatum = AsPlutus::from_plutus(pd).unwrap();
-        match &order.constraints {
-            OrderConstraints::Structured { steps } => {
-                assert_eq!(steps.len(), 1);
-                assert_eq!(steps[0].operation_tag, BigInt::from(100));
-                assert_eq!(steps[0].pool_ident, Ident::new(&[0xde, 0xad, 0xbe, 0xef]));
-            }
-            _ => panic!("expected Structured constraints"),
-        }
+        // Round-trip: encode then decode
+        let pd = datum.to_plutus();
+        let decoded: SimpleOrderDatum = AsPlutus::from_plutus(pd).unwrap();
+        assert_eq!(decoded.owner, Multisig::Signature(vec![0xaa; 28]));
+        assert_eq!(decoded.destination, Destination::SelfDestination);
+        assert_eq!(decoded.offer.1, BigInt::from(5_000_000));
+        assert_eq!(decoded.min_received.1, BigInt::from(1_000_000));
+        assert_eq!(decoded.max_protocol_fee, BigInt::from(500_000));
     }
 
     #[test]

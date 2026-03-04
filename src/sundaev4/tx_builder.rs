@@ -578,24 +578,24 @@ pub fn build_multi_pool_scoop_tx(
             (&batch.pool.pool_datum.assets[swap.output_idx].0, &swap.dy)
         };
 
-        let order_ada = {
-            use num_traits::ToPrimitive;
-            swap.order.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0)
-        };
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
-        // For ADA buy orders, the swap ADA (dx) goes to the pool. The fulfillment
-        // only gets the base ADA (FULFILLMENT_BASE_ADA) minus the tx fee share.
-        // This applies equally to routed ADA buy orders (which have fulfillment_override).
-        let offered_is_ada = {
-            let inp = &batch.pool.pool_datum.assets[swap.input_idx].0;
-            inp.policy.is_empty() && inp.token.is_empty()
+
+        // Compute fulfillment from first principles:
+        // fulfillment = order_value - offer - fee + swap_result
+        let (offer_asset, offer_amount) = &swap.order.datum.offer;
+        let actual_fee = {
+            use num_traits::ToPrimitive;
+            let max_fee = swap.order.datum.max_protocol_fee.clone().unwrap().to_u64().unwrap_or(fee);
+            fee.min(max_fee)
         };
-        let fulfillment_ada = if offered_is_ada {
-            crate::sundaev4::batch::FULFILLMENT_BASE_ADA.saturating_sub(fee)
-        } else {
-            order_ada.saturating_sub(fee)
-        };
-        let fulfillment_value = build_fulfillment_value(output_asset, dy, fulfillment_ada)?;
+        let fulfillment_value = build_fulfillment_value_from_order(
+            &swap.order.value,
+            offer_asset,
+            offer_amount,
+            output_asset,
+            dy,
+            actual_fee,
+        )?;
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
@@ -972,34 +972,88 @@ fn build_pool_output_value(
     ))
 }
 
-/// Build fulfillment output value: ADA + dy of the output asset.
-fn build_fulfillment_value(output_asset: &AssetClass, dy: &BigInt, ada: u64) -> Result<ConwayValue> {
+/// Build fulfillment output value from first principles:
+/// fulfillment = order_value - offer - fee + swap_result
+fn build_fulfillment_value_from_order(
+    order_value: &crate::cardano_types::Value,
+    offer_asset: &AssetClass,
+    offer_amount: &BigInt,
+    output_asset: &AssetClass,
+    dy: &BigInt,
+    fee: u64,
+) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
 
-    let dy_u64 = dy
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+
+    // Start with the order's input value as a working copy
+    let mut result = order_value.clone();
+
+    // Subtract the offered asset
+    let cur_offer = result.get(offer_asset);
+    result.insert(offer_asset, &cur_offer - offer_amount);
+
+    // Subtract the protocol fee (always ADA)
+    let cur_ada = result.get(&ada_asset);
+    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
+
+    // Add the swap result
+    let cur_out = result.get(output_asset);
+    result.insert(output_asset, &cur_out + dy);
+
+    // Convert to ConwayValue
+    let lovelace = result.get(&ada_asset)
         .clone()
         .unwrap()
         .to_u64()
-        .context("dy doesn't fit in u64")?;
+        .context("fulfillment ADA doesn't fit in u64")?;
 
-    if output_asset.policy.is_empty() && output_asset.token.is_empty() {
-        // Output is ADA — add dy to the fulfillment ADA
-        return Ok(ConwayValue::Coin(ada + dy_u64));
+    // Collect native tokens (skip ADA and any with zero/negative quantity)
+    let mut policy_map: std::collections::BTreeMap<
+        Vec<u8>,
+        std::collections::BTreeMap<Vec<u8>, u64>,
+    > = std::collections::BTreeMap::new();
+
+    for (policy, tokens) in &result.0 {
+        if policy.is_empty() {
+            continue; // ADA handled above
+        }
+        for (token_name, qty) in tokens {
+            let qty_u64 = qty.clone().unwrap().to_u64().unwrap_or(0);
+            if qty_u64 > 0 {
+                policy_map
+                    .entry(policy.clone())
+                    .or_default()
+                    .insert(token_name.clone(), qty_u64);
+            }
+        }
     }
 
-    let policy_hash: Hash<28> = Hash::from(output_asset.policy.as_slice());
-    let positive_dy = PositiveCoin::try_from(dy_u64)
-        .map_err(|_| anyhow::anyhow!("dy is zero"))?;
+    if policy_map.is_empty() {
+        return Ok(ConwayValue::Coin(lovelace));
+    }
 
-    let token_pairs = NonEmptyKeyValuePairs::Def(vec![(
-        PallasBytes::from(output_asset.token.clone()),
-        positive_dy,
-    )]);
+    let multiasset_pairs: Vec<_> = policy_map
+        .into_iter()
+        .map(|(policy, tokens)| {
+            let policy_hash: Hash<28> = Hash::from(policy.as_slice());
+            let token_pairs: Vec<_> = tokens
+                .into_iter()
+                .map(|(name, qty)| {
+                    (
+                        PallasBytes::from(name),
+                        PositiveCoin::try_from(qty).unwrap(),
+                    )
+                })
+                .collect();
+            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+        })
+        .collect();
 
     Ok(ConwayValue::Multiasset(
-        ada,
-        NonEmptyKeyValuePairs::Def(vec![(policy_hash, token_pairs)]),
+        lovelace,
+        NonEmptyKeyValuePairs::Def(multiasset_pairs),
     ))
 }
 

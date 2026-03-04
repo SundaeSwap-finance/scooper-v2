@@ -456,15 +456,8 @@ impl Scooper {
                 break;
             }
 
-            // Match order to pool (direct match first)
-            let pool_ident = match &order.datum.constraints {
-                crate::sundaev4::OrderConstraints::Structured { steps } => {
-                    steps.first().map(|s| s.pool_ident.clone())
-                }
-                crate::sundaev4::OrderConstraints::Simple { .. } => {
-                    batch::find_pool_for_simple_order(order, &v4_state.pools)
-                }
-            };
+            // Match order to pool
+            let pool_ident = batch::find_pool_for_simple_order(order, &v4_state.pools);
 
             // Clone + try add (direct or routed)
             let mut candidate = accum.clone();
@@ -486,27 +479,23 @@ impl Scooper {
                 false
             };
 
-            // If direct matching failed, try routing (Simple orders only)
+            // If direct matching failed, try routing
             if !added {
-                if let crate::sundaev4::OrderConstraints::Simple { min_received } = &order.datum.constraints {
-                    if let Some((input_token, output_token, amount)) =
-                        detect_order_tokens(order, &v4_state.pools, min_received)
-                    {
-                        if let Some(route) = router::find_optimal_route(
-                            &v4_state.pools,
-                            exec.fee,
-                            &input_token,
-                            &output_token,
-                            &amount,
-                        ) {
-                            if router::is_routed(&route) {
-                                candidate = accum.clone();
-                                if candidate.try_add_routed_order(
-                                    order, &route, &v4_state.pools,
-                                ).is_err() {
-                                    continue;
-                                }
-                            } else {
+                let (offer_asset, offer_amount) = &order.datum.offer;
+                let (ask_asset, _) = &order.datum.min_received;
+                if offer_asset != ask_asset {
+                    if let Some(route) = router::find_optimal_route(
+                        &v4_state.pools,
+                        exec.fee,
+                        offer_asset,
+                        ask_asset,
+                        offer_amount,
+                    ) {
+                        if router::is_routed(&route) {
+                            candidate = accum.clone();
+                            if candidate.try_add_routed_order(
+                                order, &route, &v4_state.pools,
+                            ).is_err() {
                                 continue;
                             }
                         } else {
@@ -869,64 +858,3 @@ enum OrderInvalidReason {
     PoolErrors(BTreeMap<Ident, PoolError>),
 }
 
-/// Detect the input token, output token, and input amount for a Simple order
-/// by inspecting the order's value and min_received constraints.
-///
-/// Returns `(input_token, output_token, input_amount)` or `None` if we can't
-/// determine both tokens.
-fn detect_order_tokens(
-    order: &crate::sundaev4::SundaeV4Order,
-    _pools: &BTreeMap<Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
-    min_received: &[(crate::cardano_types::AssetClass, BigInt)],
-) -> Option<(crate::cardano_types::AssetClass, crate::cardano_types::AssetClass, BigInt)> {
-    use num_traits::Signed;
-
-    // Collect all unique assets from pool pairs to know what's tradeable
-    let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
-
-    // Determine input token: find a non-ADA token with positive amount in order value,
-    // or ADA if the order has > 2M ADA
-    let mut input_token = None;
-    let mut input_amount = BigInt::from(0i64);
-
-    // Check non-ADA tokens first
-    for (policy, tokens) in &order.value.0 {
-        if policy.is_empty() {
-            continue;
-        }
-        for (token_name, qty) in tokens {
-            if qty.is_positive() {
-                input_token = Some(crate::cardano_types::AssetClass {
-                    policy: policy.clone(),
-                    token: token_name.clone(),
-                });
-                input_amount = qty.clone();
-                break;
-            }
-        }
-        if input_token.is_some() { break; }
-    }
-
-    // Fallback: ADA (if > 2M lovelace).
-    // Subtract FULFILLMENT_BASE_ADA — the fulfillment output retains that;
-    // only the remainder is the actual swap amount flowing into the pool.
-    if input_token.is_none() {
-        let ada_qty = order.value.get(&ada_asset);
-        if ada_qty > BigInt::from(2_000_000i64) {
-            input_token = Some(ada_asset.clone());
-            input_amount = ada_qty - BigInt::from(crate::sundaev4::batch::FULFILLMENT_BASE_ADA as i64);
-        }
-    }
-
-    let input_token = input_token?;
-
-    // Determine output token from min_received
-    let output_token = min_received.first().map(|(a, _)| a.clone())?;
-
-    // Don't route if input == output
-    if input_token == output_token {
-        return None;
-    }
-
-    Some((input_token, output_token, input_amount))
-}

@@ -933,7 +933,7 @@ async fn bootstrap_v4(
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
                 .and_then(|data| {
-                    sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+                    sundaev4::SimpleOrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
                 }) {
                 Ok(datum) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {

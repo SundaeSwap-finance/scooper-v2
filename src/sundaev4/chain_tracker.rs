@@ -399,10 +399,12 @@ mod tests {
         let order = Arc::new(crate::sundaev4::SundaeV4Order {
             input: order_input.clone(),
             value: Value::default(),
-            datum: crate::sundaev4::OrderDatum {
+            datum: crate::sundaev4::SimpleOrderDatum {
                 owner: crate::multisig::Multisig::Signature(vec![0xaa; 28]),
                 destination: crate::sundaev4::Destination::SelfDestination,
-                constraints: crate::sundaev4::OrderConstraints::Simple { min_received: vec![] },
+                offer: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
+                min_received: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
+                max_protocol_fee: crate::bigint::BigInt::from(0i64),
                 extension: pallas_primitives::PlutusData::Constr(
                     pallas_primitives::Constr { tag: 121, any_constructor: None, fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]) }
                 ),
@@ -462,10 +464,12 @@ mod tests {
         let order = Arc::new(crate::sundaev4::SundaeV4Order {
             input: order_input.clone(),
             value: Value::default(),
-            datum: crate::sundaev4::OrderDatum {
+            datum: crate::sundaev4::SimpleOrderDatum {
                 owner: crate::multisig::Multisig::Signature(vec![0xaa; 28]),
                 destination: crate::sundaev4::Destination::SelfDestination,
-                constraints: crate::sundaev4::OrderConstraints::Simple { min_received: vec![] },
+                offer: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
+                min_received: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
+                max_protocol_fee: crate::bigint::BigInt::from(0i64),
                 extension: pallas_primitives::PlutusData::Constr(
                     pallas_primitives::Constr { tag: 121, any_constructor: None, fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]) }
                 ),
