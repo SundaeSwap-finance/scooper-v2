@@ -614,7 +614,7 @@ impl AdminServer {
         let Some(v4) = &self.v4_state else {
             return "v4 indexer not configured".into();
         };
-        let Some(fee) = self.v4_fee else {
+        let Some(_fee) = self.v4_fee else {
             return "v4 execution not configured (no fee)".into();
         };
         let state = v4.lock().await.latest().into_owned();
@@ -634,17 +634,12 @@ impl AdminServer {
         let mut executable = Vec::new();
         let mut non_executable = Vec::new();
 
-        // protocol_share is not in the fee config — use (0,1) as neutral default
-        // since check_order_executability ignores it (it only affects LP math, not swap result)
-        let protocol_share = (0u64, 1u64);
-
         for order in &candidates {
             match batch::check_order_executability(
                 order,
                 &pool.pool_datum.assets,
                 &pool.pool_datum.total_lp,
-                fee,
-                protocol_share,
+                &pool.pool_type,
             ) {
                 Ok(swap) => {
                     executable.push(serde_json::json!({

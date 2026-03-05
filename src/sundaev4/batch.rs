@@ -129,7 +129,7 @@ pub fn find_pool_for_simple_order(
 pub fn assemble_batch(
     pool: &Arc<SundaeV4Pool>,
     candidates: &[Arc<SundaeV4Order>],
-    fee: (u64, u64),
+    _fee: (u64, u64),
     protocol_share: (u64, u64),
     limits: &BatchLimits,
 ) -> Option<Batch> {
@@ -155,8 +155,7 @@ pub fn assemble_batch(
                 order,
                 &running_assets,
                 &initial_total_lp,
-                fee,
-                protocol_share,
+                &pool.pool_type,
             ) {
                 // Update running reserves
                 let in_idx = swap.input_idx;
@@ -185,13 +184,13 @@ pub fn assemble_batch(
     let mut total_fee_budget = BigInt::from(0);
     let mut replay_assets = pool.pool_datum.assets.clone();
     for swap in &selected {
-        let prev_a = replay_assets[0].1.clone();
-        let prev_b = replay_assets[1].1.clone();
+        let prev_assets = replay_assets.clone();
         replay_assets[swap.input_idx].1 = &replay_assets[swap.input_idx].1 + &swap.dx;
         replay_assets[swap.output_idx].1 = &replay_assets[swap.output_idx].1 - &swap.dy;
-        let fb = swap_math::cp_fee_budget(
-            &prev_a, &prev_b,
-            &replay_assets[0].1, &replay_assets[1].1,
+        let fb = swap_math::compute_fee_budget(
+            &pool.pool_type,
+            &prev_assets,
+            &replay_assets,
             &initial_total_lp,
         );
         total_fee_budget = &total_fee_budget + &fb;
@@ -220,15 +219,11 @@ pub fn try_execute_order(
     order: &Arc<SundaeV4Order>,
     running_assets: &[(AssetClass, BigInt)],
     _running_total_lp: &BigInt,
-    fee: (u64, u64),
-    _protocol_share: (u64, u64),
+    pool_type: &PoolType,
 ) -> Option<ResolvedSwap> {
     let Some((input_idx, output_idx)) = detect_swap_direction(order, running_assets) else {
         return None;
     };
-
-    let reserve_in = &running_assets[input_idx].1;
-    let reserve_out = &running_assets[output_idx].1;
 
     // dx comes directly from the datum's offer amount
     let dx = order.datum.offer.1.clone();
@@ -236,7 +231,7 @@ pub fn try_execute_order(
         return None;
     }
 
-    let dy = swap_math::cp_swap_result(reserve_in, reserve_out, &dx, fee.0, fee.1);
+    let dy = compute_swap_result(pool_type, running_assets, input_idx, output_idx, &dx);
     if !dy.is_positive() {
         return None;
     }
@@ -256,6 +251,33 @@ pub fn try_execute_order(
     })
 }
 
+/// Dispatch swap result computation based on pool type.
+pub fn compute_swap_result(
+    pool_type: &PoolType,
+    assets: &[(AssetClass, BigInt)],
+    input_idx: usize,
+    output_idx: usize,
+    dx: &BigInt,
+) -> BigInt {
+    match pool_type {
+        PoolType::ConstantProduct { fee } => {
+            use num_traits::ToPrimitive;
+            let fee_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
+            let fee_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
+            swap_math::cp_swap_result(
+                &assets[input_idx].1,
+                &assets[output_idx].1,
+                dx,
+                fee_num,
+                fee_den,
+            )
+        }
+        PoolType::ConstantSum { prices, fee } => {
+            swap_math::cs_swap_result(dx, prices, input_idx, output_idx, &fee.num, &fee.den)
+        }
+    }
+}
+
 /// Check whether an order can execute against the given pool state.
 /// Returns a `ResolvedSwap` on success, or a descriptive error string explaining
 /// why the order cannot execute.
@@ -263,14 +285,10 @@ pub fn check_order_executability(
     order: &Arc<SundaeV4Order>,
     pool_assets: &[(AssetClass, BigInt)],
     _total_lp: &BigInt,
-    fee: (u64, u64),
-    _protocol_share: (u64, u64),
+    pool_type: &PoolType,
 ) -> Result<ResolvedSwap, String> {
     let (input_idx, output_idx) = detect_swap_direction(order, pool_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
-
-    let reserve_in = &pool_assets[input_idx].1;
-    let reserve_out = &pool_assets[output_idx].1;
 
     // dx comes directly from the datum's offer amount
     let dx = order.datum.offer.1.clone();
@@ -278,7 +296,7 @@ pub fn check_order_executability(
         return Err("offered amount not positive".to_string());
     }
 
-    let dy = swap_math::cp_swap_result(reserve_in, reserve_out, &dx, fee.0, fee.1);
+    let dy = compute_swap_result(pool_type, pool_assets, input_idx, output_idx, &dx);
     if !dy.is_positive() {
         return Err("swap output not positive".to_string());
     }
@@ -303,14 +321,21 @@ pub fn check_order_executability(
     })
 }
 
-/// Detect swap direction from the order's explicit offer asset.
+/// Detect swap direction from the order's explicit offer and min_received assets.
+///
+/// Works for N-asset pools: looks up both offer and min_received in the pool's
+/// asset list, returning their indices.
 pub fn detect_swap_direction(
     order: &SundaeV4Order,
     assets: &[(AssetClass, BigInt)],
 ) -> Option<(usize, usize)> {
     let offer_asset = &order.datum.offer.0;
+    let ask_asset = &order.datum.min_received.0;
     let input_idx = assets.iter().position(|(a, _)| a == offer_asset)?;
-    let output_idx = if input_idx == 0 { 1 } else { 0 };
+    let output_idx = assets.iter().position(|(a, _)| a == ask_asset)?;
+    if input_idx == output_idx {
+        return None;
+    }
     Some((input_idx, output_idx))
 }
 

@@ -36,15 +36,13 @@ pub struct PoolAccum {
 #[derive(Clone)]
 pub struct Accumulator {
     pub pools: BTreeMap<Ident, PoolAccum>,
-    fee: (u64, u64),
     protocol_share: (u64, u64),
 }
 
 impl Accumulator {
-    pub fn new(fee: (u64, u64), protocol_share: (u64, u64)) -> Self {
+    pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
             pools: BTreeMap::new(),
-            fee,
             protocol_share,
         }
     }
@@ -77,14 +75,12 @@ impl Accumulator {
             order,
             &accum.running_assets,
             &accum.initial_total_lp,
-            self.fee,
-            self.protocol_share,
+            &effective_pool.pool_type,
         )
         .ok_or_else(|| "order cannot execute against running pool state".to_string())?;
 
         // Capture reserves before update for fee budget computation
-        let prev_a = accum.running_assets[0].1.clone();
-        let prev_b = accum.running_assets[1].1.clone();
+        let prev_assets = accum.running_assets.clone();
 
         // Update running reserves
         accum.running_assets[swap.input_idx].1 =
@@ -93,11 +89,10 @@ impl Accumulator {
             &accum.running_assets[swap.output_idx].1 - &swap.dy;
 
         // Accumulate fee budget with correct intermediate reserves
-        let fb = swap_math::cp_fee_budget(
-            &prev_a,
-            &prev_b,
-            &accum.running_assets[0].1,
-            &accum.running_assets[1].1,
+        let fb = swap_math::compute_fee_budget(
+            &effective_pool.pool_type,
+            &prev_assets,
+            &accum.running_assets,
             &accum.initial_total_lp,
         );
         accum.total_fee_budget = &accum.total_fee_budget + &fb;
@@ -206,20 +201,19 @@ impl Accumulator {
                     proportional
                 };
 
-                let dy = swap_math::cp_swap_result(
-                    &accum.running_assets[input_idx].1,
-                    &accum.running_assets[output_idx].1,
+                let dy = batch::compute_swap_result(
+                    &effective_pool.pool_type,
+                    &accum.running_assets,
+                    input_idx,
+                    output_idx,
                     &dx,
-                    self.fee.0,
-                    self.fee.1,
                 );
                 if !dy.is_positive() {
                     return Err(format!("zero output from pool {}", pool_ident));
                 }
 
                 // Capture reserves before update for fee budget computation
-                let prev_a = accum.running_assets[0].1.clone();
-                let prev_b = accum.running_assets[1].1.clone();
+                let prev_assets = accum.running_assets.clone();
 
                 // Update running reserves
                 accum.running_assets[input_idx].1 =
@@ -228,11 +222,10 @@ impl Accumulator {
                     &accum.running_assets[output_idx].1 - &dy;
 
                 // Accumulate fee budget with correct intermediate reserves
-                let fb = swap_math::cp_fee_budget(
-                    &prev_a,
-                    &prev_b,
-                    &accum.running_assets[0].1,
-                    &accum.running_assets[1].1,
+                let fb = swap_math::compute_fee_budget(
+                    &effective_pool.pool_type,
+                    &prev_assets,
+                    &accum.running_assets,
                     &accum.initial_total_lp,
                 );
                 accum.total_fee_budget = &accum.total_fee_budget + &fb;
@@ -458,7 +451,7 @@ mod tests {
         let ident = pool.pool_datum.identifier.clone();
         let order = make_buy_order(10_000_000, token_a(), 1, 1);
 
-        let mut accum = Accumulator::new((3, 1000), (1, 2));
+        let mut accum = Accumulator::new((1, 2));
         assert!(accum.is_empty());
 
         accum.try_add_order(&order, &ident, &pool).unwrap();
@@ -476,7 +469,7 @@ mod tests {
         let pool = make_pool(0xAA, 1_000_000_000, token_a(), 1_000_000_000);
         let ident = pool.pool_datum.identifier.clone();
 
-        let mut accum = Accumulator::new((3, 1000), (1, 2));
+        let mut accum = Accumulator::new((1, 2));
         for slot in 1..=3u64 {
             let order = make_buy_order(10_000_000, token_a(), 1, slot);
             accum.try_add_order(&order, &ident, &pool).unwrap();
@@ -495,7 +488,7 @@ mod tests {
         let ident_a = pool_a.pool_datum.identifier.clone();
         let ident_b = pool_b.pool_datum.identifier.clone();
 
-        let mut accum = Accumulator::new((3, 1000), (1, 2));
+        let mut accum = Accumulator::new((1, 2));
 
         let order1 = make_buy_order(10_000_000, token_a(), 1, 1);
         accum.try_add_order(&order1, &ident_a, &pool_a).unwrap();
@@ -518,7 +511,7 @@ mod tests {
         // Order that wants more tokens than the swap would produce
         let bad_order = make_buy_order(10_000_000, token_a(), 999_999_999, 1);
 
-        let mut accum = Accumulator::new((3, 1000), (1, 2));
+        let mut accum = Accumulator::new((1, 2));
         assert!(accum.try_add_order(&bad_order, &ident, &pool).is_err());
         assert!(accum.is_empty());
     }
@@ -544,7 +537,7 @@ mod tests {
         ).unwrap();
 
         // Build via accumulator (same order)
-        let mut accum = Accumulator::new(fee, protocol_share);
+        let mut accum = Accumulator::new(protocol_share);
         for order in &orders {
             accum.try_add_order(order, &ident, &pool).unwrap();
         }

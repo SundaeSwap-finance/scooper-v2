@@ -448,7 +448,7 @@ impl Scooper {
         // Save checkpoints after each successful add so we can binary search
         // for the largest batch within execution limits.
 
-        let mut accum = Accumulator::new(exec.fee, exec.protocol_share);
+        let mut accum = Accumulator::new(exec.protocol_share);
         let mut checkpoints: Vec<Accumulator> = Vec::new();
 
         for order in &candidates {
