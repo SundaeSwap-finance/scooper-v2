@@ -329,50 +329,44 @@
         ],
         "slot-config": {
           "zero-slot": 0,
-          "zero-time": 1772675477000,
+          "zero-time": 1772750859000,
           "slot-length": 1000
         },
         "module-scripts": {
           "constant-product": {
             "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
-            "ref-utxo": "64b512e3f48aefec4390ebaa91fd1014b0b564eb854ac8b10154b95f9ef6a449#0"
+            "ref-utxo": "78279aa525ff75ca970840bec708e8c2628c8fcd425892185ac531647709768c#0"
           },
           "fee-split": {
             "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
-            "ref-utxo": "90b1e3e745b5332323e6142227fd0ce76cf9e67daea4fc565aac31828b716cfc#0"
+            "ref-utxo": "333daeff993e78c7471723f4c1c2fbdb6b84b336491dbe910c78f7dfc1de6d00#0"
           },
           "fairness": {
             "hash": "1632f4650f19647d3bb2a71f2182f1f6068dc8bb04ee223134a17f58",
-            "ref-utxo": "48b3148e01ce90d15eff376c9526ccb36cf8d7ece2acc0aa403bff873c077ab0#0"
+            "ref-utxo": "f656f5ef0e0262284f7b80816af13d50f04a50a3031b5eeb8c69e3a9afd23a09#0"
           },
           "vault": {
             "hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
-            "ref-utxo": "81629292da510f69c5fb5ee4aba4ce1de3dd702b3876ff55dc6c3a2251044cd3#0"
+            "ref-utxo": "e836dd72ff443f2e994d5c7e85de22758996c910c658209d944ac3ac2319e22c#0"
           },
           "order": {
             "hash": "805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f",
-            "ref-utxo": "bfd635cce4d0432024542f8137eac4e6b8eeedbabe480a0adb363af5bcca32dd#0"
+            "ref-utxo": "a449c14df85d9c728d0a4cb9be3bf066c8e063b438273022218400d9eb5691d8#0"
           },
           "pool-mint": {
             "hash": "5b8ae2b3b3fce7bc870981d31c1267d870e310fde3e052251065f87e",
-            "ref-utxo": "a7fce71767a9bd15b00330624b61ac2f7ade55fc53cc2eca6eb9a573d34fa27b#0"
+            "ref-utxo": "6260f1c0034aae7030da2c71976b4c16a13e9550bb3a4d87ba7aad7230085146#0"
           },
           "settings": {
             "hash": "86856b8c0c8492cafe295ec9e3e9c6b407b7fa16878a7336966a462f",
-            "ref-utxo": "96c68f3a90febf486dc2b3fb4dd514e6f7205342282c64fa46bf361defb27af5#0"
+            "ref-utxo": "776afef3b55e33332bc695525eaab22d93d6701607fb23c91844ed675a383633#0"
           },
           "constant-sum": {
             "hash": "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da",
-            "ref-utxo": "96ea47b12037f48d39ff8861586ba453891875eb4111b0da4cd493c0008dc744#0"
+            "ref-utxo": "135af4abfc89d32187c83ecda78fdf6a7c12fd18a51df0460454287e3eedfbc1#0"
           }
         },
-        "pool-configs": {
-          "26f4f8682143b9110bd6e58396635f6f07434d9aed25fc27280f70e7": {
-            "type": "constant-sum",
-            "prices": [1, 1],
-            "fee": [3, 1000]
-          }
-        }
+        "pool-configs": {}
       }
     }
   },
