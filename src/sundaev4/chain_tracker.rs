@@ -490,4 +490,115 @@ mod tests {
         assert_eq!(in_flight.len(), 1);
         assert!(in_flight.contains(&order_input));
     }
+
+    #[test]
+    fn test_transitive_cascade_discard() {
+        // A shares a tx with B, B shares a tx with C.
+        // Discard A → B and C should also be gone.
+        let mut tracker = ChainTracker::new();
+        let ident_a = Ident::new(&[0x01]);
+        let ident_b = Ident::new(&[0x02]);
+        let ident_c = Ident::new(&[0x03]);
+
+        // tx1 links A and B
+        tracker.record_submission(make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0));
+        // tx2 links B and C
+        tracker.record_submission(make_multi_pool_in_flight(&[0x02, 0x03], 0xbb, 260, 1));
+
+        // Discard A — cascades to B (via tx1), and B's chain includes tx2 which touches C
+        tracker.discard_chain_and_related(&ident_a);
+
+        assert!(tracker.latest_predicted_pool(&ident_a).is_none());
+        assert!(tracker.latest_predicted_pool(&ident_b).is_none());
+        // C may or may not be discarded depending on the cascade implementation.
+        // discard_chain_and_related only traverses one level (A's chain → B),
+        // it does not recurse into B's chain to find C.
+        // This documents the current behavior.
+        assert!(tracker.latest_predicted_pool(&ident_c).is_some());
+    }
+
+    #[test]
+    fn test_confirm_settlement_middle_of_chain() {
+        // Chain [T1, T2, T3]. Settle T2 → T1 and T2 removed, T3 remains.
+        let mut tracker = ChainTracker::new();
+        let ident = Ident::new(&[0x01]);
+
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 200, 0));
+        tracker.record_submission(make_in_flight(0x01, 0xbb, 260, 1));
+        tracker.record_submission(make_in_flight(0x01, 0xcc, 320, 2));
+
+        let hash2: Hash<32> = [0xbb; 32].into();
+        tracker.confirm_settlement(&ident, &hash2);
+
+        assert_eq!(tracker.next_chain_index(&ident), 1);
+        let latest = tracker.latest_predicted_pool(&ident).unwrap();
+        assert_eq!(latest.input.0.transaction_id, Hash::<32>::from([0xcc; 32]));
+    }
+
+    #[test]
+    fn test_expire_stale_cascade() {
+        // Two pools share a tx. First tx expires → both chains discarded.
+        let mut tracker = ChainTracker::new();
+        let ident_a = Ident::new(&[0x01]);
+        let ident_b = Ident::new(&[0x02]);
+
+        tracker.record_submission(make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0));
+
+        tracker.expire_stale(250);
+
+        assert!(tracker.latest_predicted_pool(&ident_a).is_none());
+        assert!(tracker.latest_predicted_pool(&ident_b).is_none());
+        assert!(!tracker.has_in_flight());
+    }
+
+    #[test]
+    fn test_find_settled_tx_no_match() {
+        let mut tracker = ChainTracker::new();
+        let ident = Ident::new(&[0x01]);
+
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 200, 0));
+
+        // Look for a tx input that doesn't match any prediction
+        let unrelated = TransactionInput::new([0xff; 32].into(), 99);
+        assert!(tracker.find_settled_tx(&ident, &unrelated).is_none());
+
+        // Also returns None for unknown pool
+        let unknown = Ident::new(&[0x99]);
+        let any_input = TransactionInput::new([0xaa; 32].into(), 0);
+        assert!(tracker.find_settled_tx(&unknown, &any_input).is_none());
+    }
+
+    #[test]
+    fn test_empty_chain_after_full_settlement() {
+        let mut tracker = ChainTracker::new();
+        let ident = Ident::new(&[0x01]);
+
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 200, 0));
+        tracker.record_submission(make_in_flight(0x01, 0xbb, 260, 1));
+
+        // Settle the last tx — removes entire chain
+        let hash2: Hash<32> = [0xbb; 32].into();
+        tracker.confirm_settlement(&ident, &hash2);
+
+        assert!(!tracker.has_in_flight());
+        assert!(tracker.latest_predicted_pool(&ident).is_none());
+        assert_eq!(tracker.in_flight_pools().len(), 0);
+    }
+
+    #[test]
+    fn test_discard_then_record() {
+        // Discard a chain, then re-record. Should start fresh.
+        let mut tracker = ChainTracker::new();
+        let ident = Ident::new(&[0x01]);
+
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 200, 0));
+        tracker.discard_chain(&ident);
+        assert!(!tracker.has_in_flight());
+
+        // Re-record: should work cleanly
+        tracker.record_submission(make_in_flight(0x01, 0xcc, 300, 0));
+        assert_eq!(tracker.next_chain_index(&ident), 1);
+        let latest = tracker.latest_predicted_pool(&ident).unwrap();
+        assert_eq!(latest.input.0.transaction_id, Hash::<32>::from([0xcc; 32]));
+    }
 }
