@@ -908,24 +908,32 @@
   }
 
   function formatSpentReason(reason) {
-    if (reason === 'Cancelled') return { text: 'Cancelled', poolId: '', badge: 'badge-red' };
+    if (reason === 'Cancelled') return { text: 'Cancelled', poolId: '', poolIds: [], badge: 'badge-red' };
     if (reason && reason.Scooped) {
-      var pids = (reason.Scooped.pool_ids || []).join(', ');
-      return { text: 'Scooped', poolId: pids, badge: 'badge-green' };
+      var ids = reason.Scooped.pool_ids || [];
+      var pids = ids.join(', ');
+      return { text: 'Scooped', poolId: pids, poolIds: ids, badge: 'badge-green' };
     }
-    return { text: 'Unknown', poolId: '', badge: 'badge-yellow' };
+    return { text: 'Unknown', poolId: '', poolIds: [], badge: 'badge-yellow' };
   }
 
-  function spentOrderRows(data) {
+  function spentOrderRows(data, poolTypes) {
     var sorted = data.slice().sort(function(a, b) { return (b.slot || 0) - (a.slot || 0); });
     return sorted.map(function(entry) {
       var row = document.createElement('tr');
       var r = formatSpentReason(entry.reason);
       var ref = spentOrderRefFull(entry.order);
       var txId = entry.tx_id || '';
+      var typeBadges = '';
+      if (poolTypes && r.poolIds) {
+        typeBadges = r.poolIds.map(function(pid) {
+          var pt = poolTypes[pid];
+          return pt ? ' ' + formatPoolType(pt) : '';
+        }).join('');
+      }
       row.innerHTML = '<td>' + copyable(truncate(ref, 24), ref) + '</td>' +
         '<td>' + copyable(truncate(r.poolId, 16), r.poolId) + '</td>' +
-        '<td><span class="badge ' + r.badge + '">' + r.text + '</span></td>' +
+        '<td><span class="badge ' + r.badge + '">' + r.text + '</span>' + typeBadges + '</td>' +
         '<td>' + copyable(truncate(txId, 16), txId) + '</td>' +
         '<td>' + (entry.slot || '') + '</td>';
       return row;
@@ -942,9 +950,16 @@
 
   async function loadV4SpentOrders() {
     try {
-      const res = await fetch('/v4/spent-orders');
-      const data = await res.json();
-      renderLimited('v4-spent-orders-body', spentOrderRows(data));
+      var [spentRes, poolsRes] = await Promise.all([fetch('/v4/spent-orders'), fetch('/v4/pools')]);
+      var data = await spentRes.json();
+      var poolTypes = {};
+      try {
+        var pools = await poolsRes.json();
+        for (var pid in pools) {
+          if (pools[pid].pool_type) poolTypes[pid] = pools[pid].pool_type;
+        }
+      } catch (e) { /* ignore */ }
+      renderLimited('v4-spent-orders-body', spentOrderRows(data, poolTypes));
     } catch (e) { /* ignore */ }
   }
 
