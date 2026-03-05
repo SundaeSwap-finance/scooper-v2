@@ -190,8 +190,6 @@ pub fn evaluate_scoop_tx(
                 // Log any trace output
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
-                    // Also eprintln for tests where tracing subscriber isn't set up
-                    eprintln!("[script {}] trace: {log}", hex::encode(script_hash));
                 }
                 bail!(
                     "script {} ({:?}[{}]) evaluation failed: {e:?}",

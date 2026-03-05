@@ -17,7 +17,7 @@ use std::process;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 mod bigint;
 mod blueprint;
@@ -53,7 +53,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
     instrumentation::init(&config.log)?;
-    info!("Started scooper");
+    info!(
+        v3_enabled = config.protocol.v3.is_some(),
+        v4_enabled = config.protocol.v4.is_some(),
+        server_address = %config.server.address,
+        "configuration loaded"
+    );
 
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<(u64, Vec<IndexEvent>)>(256);
@@ -318,11 +323,11 @@ async fn manager_loop(
                 }
             }
             Err(err) => {
-                warn!("could not start acropolis process: {err:#}");
+                error!("could not start acropolis process: {err:#}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         };
 
-        warn!("Restarting Scooper indexer");
+        warn!("restarting indexer — resync requested or connection lost");
     }
 }

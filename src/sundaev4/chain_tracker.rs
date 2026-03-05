@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use pallas_primitives::Hash;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cardano_types::TransactionInput;
 use crate::sundaev3::Ident;
@@ -145,7 +145,7 @@ impl ChainTracker {
     /// scooped the pool, or our tx failed).
     pub fn discard_chain(&mut self, pool_ident: &Ident) {
         if let Some(chain) = self.chains.remove(pool_ident) {
-            warn!(
+            info!(
                 pool = %pool_ident,
                 chain_len = chain.len(),
                 "discarding in-flight chain"
@@ -173,7 +173,7 @@ impl ChainTracker {
         }
 
         if related_idents.len() > 1 {
-            warn!(
+            info!(
                 pool = %pool_ident,
                 related_pools = related_idents.len(),
                 "cascade-discarding related multi-pool chains"
@@ -189,7 +189,7 @@ impl ChainTracker {
     pub fn discard_all(&mut self) {
         let count: usize = self.chains.values().map(|c| c.len()).sum();
         if count > 0 {
-            warn!(total_txs = count, "discarding all in-flight chains");
+            info!(total_txs = count, "discarding all in-flight chains");
             self.chains.clear();
         }
     }
@@ -213,7 +213,7 @@ impl ChainTracker {
             .collect();
 
         for ident in stale_pools {
-            warn!(pool = %ident, current_slot, "expiring stale in-flight chain");
+            info!(pool = %ident, current_slot, "expiring stale in-flight chain");
             self.discard_chain_and_related(&ident);
         }
     }

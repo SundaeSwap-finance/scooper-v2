@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::Serialize;
 use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     bigint::BigInt,
@@ -94,7 +94,14 @@ impl Scooper {
             self.drain_events().await;
 
             if let Some(true) = self.is_at_network_tip().await {
-                info!("scooper synced with chain tip, batch processing enabled");
+                let (n_pools, n_orders) = if let Some(s) = &self.v4_state {
+                    let state = s.lock().await;
+                    let latest = state.latest();
+                    (latest.pools.len(), latest.orders.len())
+                } else {
+                    (0, 0)
+                };
+                info!(n_pools, n_orders, "scooper synced with chain tip, batch processing enabled");
                 break;
             }
 
@@ -121,7 +128,11 @@ impl Scooper {
                             self.process_events(slot, events).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("scooper lagged behind by {n} event batches");
+                            if n < 50 {
+                                debug!("scooper lagged behind by {n} event batches");
+                            } else {
+                                warn!(n, "scooper lagged behind by {n} event batches — possible processing bottleneck");
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return;
@@ -168,7 +179,11 @@ impl Scooper {
                         match res {
                             Ok(batch) => batch,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!("scooper lagged behind by {n} event batches");
+                                if n < 50 {
+                                    debug!("scooper lagged behind by {n} event batches");
+                                } else {
+                                    warn!(n, "scooper lagged behind by {n} event batches — possible processing bottleneck");
+                                }
                                 continue;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -195,7 +210,11 @@ impl Scooper {
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                    warn!("scooper lagged behind by {n} event batches during drain");
+                    if n < 50 {
+                        debug!("scooper lagged behind by {n} event batches during drain");
+                    } else {
+                        warn!(n, "scooper lagged behind by {n} event batches during drain — possible processing bottleneck");
+                    }
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             }
@@ -371,7 +390,7 @@ impl Scooper {
         // Ensure language views are computed
         if self.v4_language_views.is_none() {
             let lv = crate::sundaev4::submit::encode_language_views(&exec.plutus_v3_cost_model);
-            info!(
+            debug!(
                 "computed PlutusV3 language views ({} bytes) from config cost model ({} params)",
                 lv.len(),
                 exec.plutus_v3_cost_model.len()
@@ -447,7 +466,7 @@ impl Scooper {
                     self.v4_script_store = Some(s);
                 }
                 Err(e) => {
-                    warn!(error = %e, "failed to build script store from ref UTxOs");
+                    error!(error = %e, "failed to build script store from ref UTxOs");
                     return false;
                 }
             }
@@ -537,7 +556,7 @@ impl Scooper {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(error = %e, n_orders = accum.order_count(), "tx build failed");
+                    debug!(error = %e, n_orders = accum.order_count(), "tx build failed");
                     return false;
                 },
             };
@@ -554,7 +573,7 @@ impl Scooper {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(error = %e, n_orders = accum.order_count(), "tx eval failed");
+                    debug!(error = %e, n_orders = accum.order_count(), "tx eval failed");
                     return false;
                 },
             };
@@ -598,15 +617,17 @@ impl Scooper {
         let had_successful_build = best.is_some();
         let accum = match best {
             Some(idx) => {
+                let pools: Vec<_> = checkpoints[idx].pools.keys().map(|i| i.to_string()).collect();
                 info!(
                     n_orders = checkpoints[idx].order_count(),
                     n_candidates = checkpoints.len(),
+                    pools = ?pools,
                     "batch size determined"
                 );
                 checkpoints.into_iter().nth(idx).unwrap()
             }
             None => {
-                warn!("no valid batch size found within limits");
+                debug!(n_candidates = checkpoints.len(), "no valid batch size found within limits");
                 return false;
             }
         };
@@ -729,7 +750,7 @@ impl Scooper {
                         "lost scoop race — pool or order UTxO already spent by another scooper"
                     );
                 } else {
-                    warn!(error = %msg, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
+                    error!(error = %msg, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);

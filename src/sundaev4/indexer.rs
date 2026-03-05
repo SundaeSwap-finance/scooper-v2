@@ -367,7 +367,7 @@ impl SundaeV4Indexer {
                 }
 
                 // No config found — use default prices (1:1) and global fee
-                eprintln!("[WARN] CS pool {} has no pool-config entry, using defaults", ident_hex);
+                warn!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
                 return PoolType::ConstantSum {
                     prices: vec![BigInt::from(1); pool_datum.assets.len()],
                     fee: Rational {

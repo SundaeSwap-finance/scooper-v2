@@ -7,7 +7,7 @@ use pallas_addresses::{Address, Network, ScriptHash, ShelleyAddress, ShelleyDele
 use plutus_parser::{AsPlutus, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     bigint::BigInt,
@@ -470,7 +470,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 .context("blockfrost: parse UTxOs")?;
 
             let batch_len = utxos.len();
-            info!("blockfrost: fetched page {page} ({batch_len} UTxOs, {} total so far)", all_utxos.len() + batch_len);
+            debug!("blockfrost: fetched page {page} ({batch_len} UTxOs, {} total so far)", all_utxos.len() + batch_len);
             for utxo in utxos {
                 let tx_bytes =
                     hex::decode(&utxo.tx_hash).context("blockfrost: invalid tx hash hex")?;
@@ -782,7 +782,11 @@ async fn bootstrap_v3(
         info!("bootstrap: processing {n_utxos} V3 order UTxOs...");
         for (i, utxo) in order_utxos.iter().enumerate() {
             if (i + 1) % 100 == 0 || i + 1 == n_utxos {
-                info!("bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                if i + 1 == n_utxos {
+                    info!("bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                } else {
+                    debug!("bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                }
             }
             let Some(ref cbor) = utxo.datum_cbor else {
                 continue;
@@ -932,7 +936,11 @@ async fn bootstrap_v4(
         info!("bootstrap: processing {n_utxos} V4 order UTxOs...");
         for (i, utxo) in order_utxos.iter().enumerate() {
             if (i + 1) % 100 == 0 || i + 1 == n_utxos {
-                info!("bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                if i + 1 == n_utxos {
+                    info!("bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                } else {
+                    debug!("bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                }
             }
             let Some(ref cbor) = utxo.datum_cbor else {
                 continue;
