@@ -246,6 +246,49 @@ pub(crate) mod test_harness {
                 self.exec.module_scripts.fairness.hash.to_vec(),
             ]
         }
+
+        /// Compute `module_state` entries for a CS pool.
+        ///
+        /// Same structure as CP module_state but uses CS module hash and config.
+        pub fn cs_module_state(&self, prices: &[BigInt], fee: &Rational) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let cs_script = self.exec.module_scripts.constant_sum.as_ref()
+                .expect("blueprint must include constantSum validator for CS tests");
+
+            let cs_config = ConstantSumConfig {
+                prices: prices.to_vec(),
+                fee: fee.clone(),
+            };
+            let cs_cbor = minicbor::to_vec(&cs_config.to_plutus()).unwrap();
+            let cs_hash = Hasher::<256>::hash(&cs_cbor).to_vec();
+
+            let fs_config = FeeSplitConfig {
+                protocol_share: Rational {
+                    num: BigInt::from(self.exec.protocol_share.0),
+                    den: BigInt::from(self.exec.protocol_share.1),
+                },
+            };
+            let fs_cbor = minicbor::to_vec(&fs_config.to_plutus()).unwrap();
+            let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
+
+            let fairness_hash = Hasher::<256>::hash(&[0x80]).to_vec();
+
+            vec![
+                (cs_script.hash.to_vec(), cs_hash),
+                (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+                (self.exec.module_scripts.fairness.hash.to_vec(), fairness_hash),
+            ]
+        }
+
+        /// The action entry modules list for CS pools: [cs_hash, fs_hash, fairness_hash].
+        pub fn cs_action_modules(&self) -> Vec<Vec<u8>> {
+            let cs_script = self.exec.module_scripts.constant_sum.as_ref()
+                .expect("blueprint must include constantSum validator for CS tests");
+            vec![
+                cs_script.hash.to_vec(),
+                self.exec.module_scripts.fee_split.hash.to_vec(),
+                self.exec.module_scripts.fairness.hash.to_vec(),
+            ]
+        }
     }
 
     // ─── Shared test helpers ──────────────────────────────────────────────────
@@ -356,6 +399,80 @@ pub(crate) mod test_harness {
                     num: BigInt::from(env.exec.fee.0),
                     den: BigInt::from(env.exec.fee.1),
                 },
+            },
+            slot: 100,
+        })
+    }
+
+    /// Create a constant-sum pool with the proper module pipeline (CS + FS + fairness).
+    ///
+    /// Similar to `make_pool` but uses CS module scripts and PoolType::ConstantSum.
+    pub fn make_cs_pool(
+        env: &TestEnv,
+        ident_byte: u8,
+        assets: Vec<(AssetClass, i64)>,
+        prices: Vec<BigInt>,
+        fee: Rational,
+    ) -> Arc<SundaeV4Pool> {
+        let ident_bytes = vec![ident_byte; 28];
+
+        let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+        nft_name.extend_from_slice(&ident_bytes);
+        let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+        lp_name.extend_from_slice(&ident_bytes);
+
+        let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+
+        let nft_asset = AssetClass {
+            policy: pool_mint_policy.clone(),
+            token: nft_name,
+        };
+        let lp_asset = AssetClass {
+            policy: pool_mint_policy,
+            token: lp_name,
+        };
+
+        let total_lp = 1_000_000_000i64;
+        let circulating_lp = 0i64;
+        let preminted_lp = total_lp;
+
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(50_000_000i64));
+        for (asset, reserve) in &assets {
+            value.insert(asset, BigInt::from(*reserve));
+        }
+        value.insert(&nft_asset, BigInt::from(1i64));
+        value.insert(&lp_asset, BigInt::from(preminted_lp));
+
+        let mut tx_hash = [0u8; 32];
+        tx_hash[0] = ident_byte;
+
+        let datum_assets: Vec<(AssetClass, BigInt)> = assets
+            .iter()
+            .map(|(a, r)| (a.clone(), BigInt::from(*r)))
+            .collect();
+
+        Arc::new(SundaeV4Pool {
+            input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: datum_assets,
+                total_lp: BigInt::from(total_lp),
+                circulating_lp: BigInt::from(circulating_lp),
+                preminted_lp: BigInt::from(preminted_lp),
+                identifier: Ident::new(&ident_bytes),
+                actions: vec![
+                    ActionEntry {
+                        tag: BigInt::from(100),
+                        enabled: true,
+                        modules: env.cs_action_modules(),
+                    },
+                ],
+                module_state: env.cs_module_state(&prices, &fee),
+            },
+            pool_type: PoolType::ConstantSum {
+                prices,
+                fee,
             },
             slot: 100,
         })

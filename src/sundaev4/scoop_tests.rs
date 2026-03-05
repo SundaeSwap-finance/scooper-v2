@@ -219,6 +219,130 @@ mod tests {
         assert!(batch.is_none(), "impossible min_received should prevent batch assembly");
     }
 
+    // ─── Constant-sum pool tests ────────────────────────────────────────────
+
+    #[test]
+    fn cs_single_order() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], // 1:1 price
+            fee.clone(),
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("CS batch assembly should succeed");
+
+        assert_eq!(batch.swaps.len(), 1);
+        // CS swap: dy = dx * price_in * (1 - fee) / price_out
+        // = 10_000_000 * 1_000_000 * 997 / (1_000_000 * 1000) = 9_970_000
+        assert_eq!(batch.swaps[0].dy, BigInt::from(9_970_000));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("CS build_and_eval should succeed");
+
+        assert!(!eval.budgets.is_empty(), "should have evaluated at least one script");
+    }
+
+    #[test]
+    fn cs_multiple_orders() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            fee.clone(),
+        );
+        let orders = vec![
+            make_order(token_a(), 10_000_000, token_b(), 1, 1),
+            make_order(token_a(), 20_000_000, token_b(), 1, 2),
+            make_order(token_a(), 5_000_000, token_b(), 1, 3),
+        ];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("CS batch assembly should succeed");
+
+        assert_eq!(batch.swaps.len(), 3);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("CS build_and_eval should succeed");
+
+        assert!(!eval.budgets.is_empty());
+    }
+
+    #[test]
+    fn cs_opposing_orders() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            fee.clone(),
+        );
+        let orders = vec![
+            make_order(token_a(), 10_000_000, token_b(), 1, 1),
+            make_order(token_b(), 5_000_000, token_a(), 1, 2),
+        ];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("CS batch assembly should succeed");
+
+        assert_eq!(batch.swaps.len(), 2);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("CS build_and_eval should succeed");
+
+        assert!(!eval.budgets.is_empty());
+    }
+
+    #[test]
+    fn mixed_cp_cs_tx() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let tok_c = token(0x05, 0x06);
+        let tok_d = token(0x07, 0x08);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+
+        // CP pool
+        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        // CS pool
+        let cs_pool = make_cs_pool(
+            &env, 0xCC,
+            vec![(tok_c.clone(), 1_000_000_000), (tok_d.clone(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+
+        let cp_orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let cs_orders = vec![make_order(tok_c.clone(), 10_000_000, tok_d.clone(), 1, 2)];
+
+        let cp_batch = assemble_batch(&cp_pool, &cp_orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let cs_batch = assemble_batch(&cs_pool, &cs_orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env.build_and_eval(&[cp_batch, cs_batch], &settings, 1000)
+            .expect("mixed CP+CS build_and_eval should succeed");
+
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 2, "should predict 2 pool outputs");
+    }
+
     // ─── Assertion helpers ────────────────────────────────────────────────────
 
     fn assert_k_nondecreasing(a0: &BigInt, b0: &BigInt, a1: &BigInt, b1: &BigInt) {
