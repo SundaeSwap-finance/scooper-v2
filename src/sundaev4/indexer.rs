@@ -87,7 +87,7 @@ impl SundaeV4Indexer {
             .as_ref()
             .map(|exec| {
                 let scripts = &exec.module_scripts;
-                [
+                let mut set = [
                     &scripts.vault,
                     &scripts.order,
                     &scripts.constant_product,
@@ -98,7 +98,11 @@ impl SundaeV4Indexer {
                 ]
                 .iter()
                 .map(|s| s.ref_utxo.clone())
-                .collect::<BTreeSet<_>>()
+                .collect::<BTreeSet<_>>();
+                if let Some(cs) = &scripts.constant_sum {
+                    set.insert(cs.ref_utxo.clone());
+                }
+                set
             })
             .unwrap_or_default();
         Self {

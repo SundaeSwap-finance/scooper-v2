@@ -329,7 +329,7 @@
         ],
         "slot-config": {
           "zero-slot": 0,
-          "zero-time": 1772656464000,
+          "zero-time": 1772675477000,
           "slot-length": 1000
         },
         "module-scripts": {
@@ -360,6 +360,17 @@
           "settings": {
             "hash": "86856b8c0c8492cafe295ec9e3e9c6b407b7fa16878a7336966a462f",
             "ref-utxo": "96c68f3a90febf486dc2b3fb4dd514e6f7205342282c64fa46bf361defb27af5#0"
+          },
+          "constant-sum": {
+            "hash": "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da",
+            "ref-utxo": "96ea47b12037f48d39ff8861586ba453891875eb4111b0da4cd493c0008dc744#0"
+          }
+        },
+        "pool-configs": {
+          "26f4f8682143b9110bd6e58396635f6f07434d9aed25fc27280f70e7": {
+            "type": "constant-sum",
+            "prices": [1, 1],
+            "fee": [3, 1000]
           }
         }
       }

@@ -353,7 +353,7 @@
     <div class="section-title">Pools</div>
     <div class="search-bar"><input type="text" data-filter="v4-pools-body" placeholder="Filter pools..."></div>
     <table id="v4-pools-table">
-      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th><th>Protocol Equity</th></tr></thead>
+      <thead><tr><th>Pool ID</th><th>Type</th><th>Assets</th><th>LP</th><th>Protocol Equity</th></tr></thead>
       <tbody id="v4-pools-body"></tbody>
     </table>
     <div class="section-title">Orders</div>
@@ -773,7 +773,9 @@
         var id = e[0], pool = e[1];
         var row = document.createElement('tr');
         var pd = pool.pool_datum || {};
+        var pt = formatPoolType(pool.pool_type);
         row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + '</td>' +
+          '<td>' + pt + '</td>' +
           '<td>' + formatV4PoolAssets(pd) + '</td>' +
           '<td>' + formatBigint(pd.total_lp) + '</td>' +
           '<td>' + formatProtocolEquity(pd) + '</td>';
@@ -849,6 +851,14 @@
     const a = datum.coin_a || datum.asset_a;
     const b = datum.coin_b || datum.asset_b;
     return formatAssetClass(a) + ' / ' + formatAssetClass(b);
+  }
+
+  function formatPoolType(pt) {
+    if (!pt) return '<span class="badge badge-yellow">?</span>';
+    if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
+    if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
+    var keys = Object.keys(pt);
+    return '<span class="badge badge-yellow">' + (keys[0] || '?') + '</span>';
   }
 
   function formatV4PoolAssets(pd) {

@@ -525,7 +525,10 @@ impl Scooper {
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             ) {
                 Ok(r) => r,
-                Err(_) => return false,
+                Err(e) => {
+                    warn!(error = %e, n_orders = accum.order_count(), "tx build failed");
+                    return false;
+                },
             };
 
             let eval = match crate::sundaev4::evaluator::evaluate_scoop_tx(
@@ -539,7 +542,10 @@ impl Scooper {
                 &exec.slot_config,
             ) {
                 Ok(r) => r,
-                Err(_) => return false,
+                Err(e) => {
+                    warn!(error = %e, n_orders = accum.order_count(), "tx eval failed");
+                    return false;
+                },
             };
 
             let total_mem: u64 = eval.budgets.iter().map(|(_, eu)| eu.mem).sum();
