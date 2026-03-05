@@ -351,11 +351,6 @@ impl Scooper {
         }
     }
 
-    /// Protocol-level limits for transaction building.
-    const MAX_TX_EX_MEM: u64 = 14_000_000;
-    const MAX_TX_EX_STEPS: u64 = 10_000_000_000;
-    const MAX_TX_SIZE: usize = 16_384;
-
     /// Run one cycle of incremental accumulation → build → evaluate → submit.
     ///
     /// Iterates candidate orders one at a time. For each: clone accumulator,
@@ -568,12 +563,13 @@ impl Scooper {
             let total_steps: u64 = eval.budgets.iter().map(|(_, eu)| eu.steps).sum();
             let tx_size = build.cbor.len();
 
-            let padded_mem = total_mem * 6 / 5;
-            let padded_steps = total_steps * 6 / 5;
+            let (pad_num, pad_den) = exec.budget_padding;
+            let padded_mem = total_mem * pad_num / pad_den;
+            let padded_steps = total_steps * pad_num / pad_den;
 
-            padded_mem <= Self::MAX_TX_EX_MEM
-                && padded_steps <= Self::MAX_TX_EX_STEPS
-                && tx_size <= Self::MAX_TX_SIZE
+            padded_mem <= exec.max_tx_ex_mem
+                && padded_steps <= exec.max_tx_ex_steps
+                && tx_size <= exec.max_tx_size
         };
 
         // Binary search: find the largest checkpoint index that's within limits.

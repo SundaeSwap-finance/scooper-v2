@@ -138,6 +138,10 @@ pub(crate) mod test_harness {
                     slot_length: 1000,
                 },
                 pool_configs: std::collections::BTreeMap::new(),
+                max_tx_ex_mem: 14_000_000,
+                max_tx_ex_steps: 10_000_000_000,
+                max_tx_size: 16_384,
+                budget_padding: (6, 5),
             };
 
             // Collateral: deterministic UTxO with enough ADA

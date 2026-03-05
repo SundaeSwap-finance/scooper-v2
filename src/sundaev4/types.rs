@@ -349,7 +349,25 @@ pub struct ScooperExecution {
     /// Keyed by pool ident (hex string).
     #[serde(default)]
     pub pool_configs: std::collections::BTreeMap<String, PoolConfig>,
+    /// Maximum transaction execution memory units. Default: 14_000_000.
+    #[serde(default = "default_max_tx_ex_mem")]
+    pub max_tx_ex_mem: u64,
+    /// Maximum transaction execution CPU steps. Default: 10_000_000_000.
+    #[serde(default = "default_max_tx_ex_steps")]
+    pub max_tx_ex_steps: u64,
+    /// Maximum transaction size in bytes. Default: 16_384.
+    #[serde(default = "default_max_tx_size")]
+    pub max_tx_size: usize,
+    /// Budget padding as (numerator, denominator). Padded = raw * num / den.
+    /// Default: (6, 5) i.e. 20% padding.
+    #[serde(default = "default_budget_padding")]
+    pub budget_padding: (u64, u64),
 }
+
+fn default_max_tx_ex_mem() -> u64 { 14_000_000 }
+fn default_max_tx_ex_steps() -> u64 { 10_000_000_000 }
+fn default_max_tx_size() -> usize { 16_384 }
+fn default_budget_padding() -> (u64, u64) { (6, 5) }
 
 impl ScooperExecution {
     /// If `scooper_secret_key_file` is set, read the file and populate

@@ -25,9 +25,6 @@ type ConwayValue = conway::Value;
 use std::collections::BTreeMap;
 use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 
-/// Per-redeemer ExUnits budget (tx max / 10 so 6 redeemers fit comfortably).
-const EX_MEM: u64 = 14_000_000 / 10;
-const EX_STEPS: u64 = 10_000_000_000 / 10;
 pub const TX_FEE: u64 = 3_000_000;
 const POOL_MIN_ADA: u64 = 2_000_000;
 const VALIDITY_RANGE: u64 = 180;
@@ -229,7 +226,7 @@ pub fn build_multi_pool_scoop_tx(
     let lookup_eu = |key: &RedeemersKey| -> ExUnits {
         ex_units
             .and_then(|eus| eus.iter().find(|(k, _)| k == key).map(|(_, eu)| eu.clone()))
-            .unwrap_or(ExUnits { mem: EX_MEM, steps: EX_STEPS })
+            .unwrap_or(ExUnits { mem: exec.max_tx_ex_mem / 10, steps: exec.max_tx_ex_steps / 10 })
     };
 
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
