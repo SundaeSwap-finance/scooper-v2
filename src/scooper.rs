@@ -486,7 +486,6 @@ impl Scooper {
                 if offer_asset != ask_asset {
                     if let Some(route) = router::find_optimal_route(
                         &v4_state.pools,
-                        exec.fee,
                         offer_asset,
                         ask_asset,
                         offer_amount,

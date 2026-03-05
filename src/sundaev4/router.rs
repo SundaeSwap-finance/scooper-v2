@@ -1,7 +1,8 @@
 //! Auto-router: finds optimal multi-hop and split routes through the pool graph.
 //!
-//! Port of `sundae-v4/test/emulator/src/router.ts`, CP pools only.
-//! Pure module (no IO) — all functions work on immutable data.
+//! Port of `sundae-v4/test/emulator/src/router.ts`.
+//! Supports CP and CS pools. Pure module (no IO) — all functions work on
+//! immutable data.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -16,6 +17,18 @@ use crate::sundaev4::types::SundaeV4Pool;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+/// Pool-type-specific parameters for the router.
+#[derive(Clone, Debug)]
+pub enum PoolViewType {
+    ConstantProduct,
+    ConstantSum {
+        /// Price of the input asset in this direction.
+        price_in: BigInt,
+        /// Price of the output asset in this direction.
+        price_out: BigInt,
+    },
+}
+
 /// Lightweight pool view for the router (direction-aware).
 #[derive(Clone, Debug)]
 pub struct PoolView {
@@ -24,6 +37,7 @@ pub struct PoolView {
     pub reserve_out: BigInt,
     pub fee_num: u64,
     pub fee_den: u64,
+    pub view_type: PoolViewType,
 }
 
 /// A single pool's contribution to a split.
@@ -58,9 +72,18 @@ pub struct RoutingPlan {
 
 // ─── Swap Output ─────────────────────────────────────────────────────────────
 
-/// CP swap output: dy = B * dx_eff / (A + dx_eff)
-fn cp_output(pool: &PoolView, dx: &BigInt) -> BigInt {
-    swap_math::cp_swap_result(&pool.reserve_in, &pool.reserve_out, dx, pool.fee_num, pool.fee_den)
+/// Compute swap output for any pool type.
+fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
+    match &pool.view_type {
+        PoolViewType::ConstantProduct => {
+            swap_math::cp_swap_result(&pool.reserve_in, &pool.reserve_out, dx, pool.fee_num, pool.fee_den)
+        }
+        PoolViewType::ConstantSum { price_in, price_out } => {
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            swap_math::cs_swap_result(dx, &[price_in.clone(), price_out.clone()], 0, 1, &fee_num, &fee_den)
+        }
+    }
 }
 
 // ─── Marginal Price Functions ────────────────────────────────────────────────
@@ -74,24 +97,40 @@ fn scale() -> BigInt {
     s
 }
 
-/// CP marginal at effective allocation x (raw input):
-/// marginal_raw = (feeDen - feeNum)/feeDen * A * B * SCALE / (A + xEff)^2
-fn cp_marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
+/// Marginal price at a given raw allocation for any pool type (scaled by SCALE).
+///
+/// CP: decreasing marginal — `fee_mult/fee_den * A * B * SCALE / (A + xEff)^2`
+/// CS: constant marginal — `fee_mult * price_out * SCALE / (price_in * fee_den)`
+fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
     let fee_num = BigInt::from(pool.fee_num);
     let fee_den = BigInt::from(pool.fee_den);
-    let x_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
-    let denom = &pool.reserve_in + &x_eff;
-    if !denom.is_positive() {
-        return BigInt::from(0);
-    }
     let fee_mult = &fee_den - &fee_num;
-    &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
-        / &(&fee_den * &denom * &denom)
+
+    match &pool.view_type {
+        PoolViewType::ConstantProduct => {
+            let x_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
+            let denom = &pool.reserve_in + &x_eff;
+            if !denom.is_positive() {
+                return BigInt::from(0);
+            }
+            &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
+                / &(&fee_den * &denom * &denom)
+        }
+        PoolViewType::ConstantSum { price_in, price_out } => {
+            // CS marginal is constant (doesn't depend on allocation)
+            let _ = raw_allocated;
+            &fee_mult * price_out * &scale() / &(price_in * &fee_den)
+        }
+    }
 }
 
 // ─── Optimal Split via Bisection ─────────────────────────────────────────────
 
-/// For a target marginal λ, compute how much raw input each CP pool absorbs.
+/// For a target marginal λ, compute how much raw input each pool absorbs.
+///
+/// CP pools: solve for the allocation that gives marginal = λ.
+/// CS pools: constant marginal — absorb up to reserve limit if λ <= marginal,
+/// otherwise 0.
 fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
     if !lambda.is_positive() {
         return pools.iter().map(|_| BigInt::from(0)).collect();
@@ -105,15 +144,31 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
             let fee_den = BigInt::from(pool.fee_den);
             let fee_mult = &fee_den - &fee_num;
 
-            // x_eff = isqrt(fee_mult * A * B * SCALE / (fee_den * lambda)) - A
-            let numerator = &fee_mult * &pool.reserve_in * &pool.reserve_out * &sc;
-            let denominator = &fee_den * lambda;
-            let x_eff = swap_math::isqrt(&(&numerator / &denominator)) - &pool.reserve_in;
-            if !x_eff.is_positive() {
-                return BigInt::from(0);
+            match &pool.view_type {
+                PoolViewType::ConstantProduct => {
+                    // x_eff = isqrt(fee_mult * A * B * SCALE / (fee_den * lambda)) - A
+                    let numerator = &fee_mult * &pool.reserve_in * &pool.reserve_out * &sc;
+                    let denominator = &fee_den * lambda;
+                    let x_eff = swap_math::isqrt(&(&numerator / &denominator)) - &pool.reserve_in;
+                    if !x_eff.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    // Convert effective back to raw: raw = x_eff * fee_den / fee_mult
+                    &x_eff * &fee_den / &fee_mult
+                }
+                PoolViewType::ConstantSum { price_in, price_out } => {
+                    // CS marginal is constant. If lambda <= marginal, absorb
+                    // everything up to what the reserve allows. Otherwise 0.
+                    let cs_marginal = &fee_mult * price_out * &sc / &(price_in * &fee_den);
+                    if lambda <= &cs_marginal {
+                        // Can absorb up to the full output reserve
+                        // max_raw = reserve_out * price_out * fee_den / (price_in * fee_mult)
+                        &pool.reserve_out * price_out * &fee_den / &(price_in * &fee_mult)
+                    } else {
+                        BigInt::from(0)
+                    }
+                }
             }
-            // Convert effective back to raw: raw = x_eff * fee_den / fee_mult
-            &x_eff * &fee_den / &fee_mult
         })
         .collect()
 }
@@ -126,7 +181,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         return vec![];
     }
     if pools.len() == 1 {
-        let out = cp_output(&pools[0], total_input);
+        let out = pool_output(&pools[0], total_input);
         return vec![SplitEntry {
             pool: pools[0].clone(),
             input_amount: total_input.clone(),
@@ -137,7 +192,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     // Determine lambda search range
     let mut lambda_hi = BigInt::from(0);
     for pool in pools {
-        let m = cp_marginal_at_allocation(pool, &BigInt::from(0));
+        let m = marginal_at_allocation(pool, &BigInt::from(0));
         if m > lambda_hi {
             lambda_hi = m;
         }
@@ -149,7 +204,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     let mut best_output = BigInt::from(0);
 
     for (i, pool) in pools.iter().enumerate() {
-        let out = cp_output(pool, total_input);
+        let out = pool_output(pool, total_input);
         if out > best_output {
             best_output = out.clone();
             best_allocs = vec![BigInt::from(0); pools.len()];
@@ -182,7 +237,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         let mut candidate_output = BigInt::from(0);
         for (i, pool) in pools.iter().enumerate() {
             if allocs[i].is_positive() {
-                candidate_output = &candidate_output + &cp_output(pool, &allocs[i]);
+                candidate_output = &candidate_output + &pool_output(pool, &allocs[i]);
             }
         }
 
@@ -227,7 +282,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     let mut results = Vec::new();
     for (i, pool) in pools.iter().enumerate() {
         if best_allocs[i].is_positive() {
-            let out = cp_output(pool, &best_allocs[i]);
+            let out = pool_output(pool, &best_allocs[i]);
             results.push(SplitEntry {
                 pool: pool.clone(),
                 input_amount: best_allocs[i].clone(),
@@ -243,47 +298,59 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
 type PoolGraph = BTreeMap<AssetClass, BTreeMap<AssetClass, Vec<PoolView>>>;
 
 /// Build a directed pool graph from on-chain pool state.
-/// For each pool with assets [A, B], creates edges A→B and B→A.
+///
+/// For CP pools with assets [A, B]: creates edges A→B and B→A.
+/// For CS pools with N assets: creates edges for all (i, j) pairs.
 fn build_graph(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
-    fee: (u64, u64),
 ) -> PoolGraph {
+    use crate::sundaev4::types::PoolType;
+    use num_traits::ToPrimitive;
+
     let mut graph: PoolGraph = BTreeMap::new();
 
     for (ident, pool) in pools {
-        if pool.pool_datum.assets.len() != 2 {
-            continue;
+        let assets = &pool.pool_datum.assets;
+
+        let (fee_num, fee_den, view_type_fn): (u64, u64, Box<dyn Fn(usize, usize) -> PoolViewType>) = match &pool.pool_type {
+            PoolType::ConstantProduct { fee } => {
+                let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
+                let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
+                (fn_num, fn_den, Box::new(|_, _| PoolViewType::ConstantProduct))
+            }
+            PoolType::ConstantSum { prices, fee } => {
+                let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
+                let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
+                let prices = prices.clone();
+                (fn_num, fn_den, Box::new(move |i, j| PoolViewType::ConstantSum {
+                    price_in: prices[i].clone(),
+                    price_out: prices[j].clone(),
+                }))
+            }
+        };
+
+        // Create edges for all (i, j) pairs
+        for i in 0..assets.len() {
+            for j in 0..assets.len() {
+                if i == j { continue; }
+                let (ref token_in, ref reserve_in) = assets[i];
+                let (ref token_out, ref reserve_out) = assets[j];
+
+                graph
+                    .entry(token_in.clone())
+                    .or_default()
+                    .entry(token_out.clone())
+                    .or_default()
+                    .push(PoolView {
+                        ident: ident.clone(),
+                        reserve_in: reserve_in.clone(),
+                        reserve_out: reserve_out.clone(),
+                        fee_num,
+                        fee_den,
+                        view_type: view_type_fn(i, j),
+                    });
+            }
         }
-        let (ref token_a, ref reserve_a) = pool.pool_datum.assets[0];
-        let (ref token_b, ref reserve_b) = pool.pool_datum.assets[1];
-
-        // A→B direction
-        graph
-            .entry(token_a.clone())
-            .or_default()
-            .entry(token_b.clone())
-            .or_default()
-            .push(PoolView {
-                ident: ident.clone(),
-                reserve_in: reserve_a.clone(),
-                reserve_out: reserve_b.clone(),
-                fee_num: fee.0,
-                fee_den: fee.1,
-            });
-
-        // B→A direction
-        graph
-            .entry(token_b.clone())
-            .or_default()
-            .entry(token_a.clone())
-            .or_default()
-            .push(PoolView {
-                ident: ident.clone(),
-                reserve_in: reserve_b.clone(),
-                reserve_out: reserve_a.clone(),
-                fee_num: fee.0,
-                fee_den: fee.1,
-            });
     }
 
     graph
@@ -367,7 +434,7 @@ fn evaluate_path(path: &[PathHop], input_amount: &BigInt) -> Vec<HopResult> {
 
     for hop in path {
         let splits = if hop.pools.len() == 1 {
-            let out = cp_output(&hop.pools[0], &current_amount);
+            let out = pool_output(&hop.pools[0], &current_amount);
             vec![SplitEntry {
                 pool: hop.pools[0].clone(),
                 input_amount: current_amount.clone(),
@@ -401,12 +468,11 @@ fn evaluate_path(path: &[PathHop], input_amount: &BigInt) -> Vec<HopResult> {
 /// direct pool, no multi-hop, no split).
 pub fn find_optimal_route(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
-    fee: (u64, u64),
     input_token: &AssetClass,
     output_token: &AssetClass,
     amount: &BigInt,
 ) -> Option<RoutingPlan> {
-    let graph = build_graph(pools, fee);
+    let graph = build_graph(pools);
     let paths = find_paths(&graph, input_token, output_token, 4);
 
     if paths.is_empty() {
@@ -440,7 +506,7 @@ pub fn find_optimal_route(
     if let Some(edges) = graph.get(input_token) {
         if let Some(direct_pools) = edges.get(output_token) {
             for pool in direct_pools {
-                let out = cp_output(pool, amount);
+                let out = pool_output(pool, amount);
                 if out > plan.naive_output {
                     plan.naive_output = out;
                 }
@@ -526,7 +592,6 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
@@ -549,7 +614,6 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1_000_000),
@@ -574,7 +638,6 @@ mod tests {
         // Swap TOKENA → TOKENB (no direct pool, must go via ADA)
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
@@ -597,7 +660,6 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &ada(),
             &token(0xAA),
             &BigInt::from(10_000_000),
@@ -620,7 +682,6 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(5_000_000),
@@ -646,7 +707,6 @@ mod tests {
         // A → D through 3 hops
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xAA),
             &token(0xDD),
             &BigInt::from(1000),
@@ -671,7 +731,6 @@ mod tests {
         // Try to route between two tokens with no path
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &token(0xBB),
             &token(0xCC),
             &BigInt::from(1000),
@@ -685,7 +744,6 @@ mod tests {
         let pools = BTreeMap::new();
         let route = find_optimal_route(
             &pools,
-            (3, 1000),
             &ada(),
             &token(0xAA),
             &BigInt::from(1000),
