@@ -485,6 +485,11 @@ impl Scooper {
         let mut accum = Accumulator::new(exec.protocol_share);
         let mut checkpoints: Vec<Accumulator> = Vec::new();
 
+        let mut skip_no_pool = 0u32;
+        let mut skip_add_failed = 0u32;
+        let mut skip_no_route = 0u32;
+        let mut skip_route_failed = 0u32;
+
         for order in &candidates {
             if accum.order_count() >= self.v4_batch_limits.max_orders {
                 break;
@@ -503,13 +508,23 @@ impl Scooper {
                         Some(predicted) => predicted.pool.clone(),
                         None => match v4_state.pools.get(pool_ident) {
                             Some(p) => p.clone(),
-                            None => { continue; },
+                            None => { skip_no_pool += 1; continue; },
                         },
                     }
                 };
 
-                candidate.try_add_order(order, pool_ident, &effective_pool).is_ok()
+                match candidate.try_add_order(order, pool_ident, &effective_pool) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        skip_add_failed += 1;
+                        if skip_add_failed <= 3 {
+                            debug!(error = %e, order = %order.input, "try_add_order failed");
+                        }
+                        false
+                    }
+                }
             } else {
+                skip_no_pool += 1;
                 false
             };
 
@@ -529,12 +544,15 @@ impl Scooper {
                             if candidate.try_add_routed_order(
                                 order, &route, &v4_state.pools,
                             ).is_err() {
+                                skip_route_failed += 1;
                                 continue;
                             }
                         } else {
+                            skip_no_route += 1;
                             continue;
                         }
                     } else {
+                        skip_no_route += 1;
                         continue;
                     }
                 } else {
@@ -547,6 +565,14 @@ impl Scooper {
         }
 
         if checkpoints.is_empty() {
+            warn!(
+                n_candidates = candidates.len(),
+                skip_no_pool,
+                skip_add_failed,
+                skip_no_route,
+                skip_route_failed,
+                "no orders could be added to batch"
+            );
             return false;
         }
 

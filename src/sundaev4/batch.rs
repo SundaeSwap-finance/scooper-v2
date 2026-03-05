@@ -516,6 +516,164 @@ mod tests {
         assert!(batch.is_none());
     }
 
+    fn token_b() -> AssetClass {
+        AssetClass { policy: vec![0x03], token: vec![0x04] }
+    }
+
+    fn token_c() -> AssetClass {
+        AssetClass { policy: vec![0x05], token: vec![0x06] }
+    }
+
+    fn make_pool_3asset(
+        ada_reserve: i64,
+        token_a_reserve: i64,
+        token_b_reserve: i64,
+    ) -> Arc<SundaeV4Pool> {
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(ada_reserve));
+        value.insert(&token_a(), BigInt::from(token_a_reserve));
+        value.insert(&token_b(), BigInt::from(token_b_reserve));
+
+        Arc::new(SundaeV4Pool {
+            input: TransactionInput::new([0xbb; 32].into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: vec![
+                    (ada(), BigInt::from(ada_reserve)),
+                    (token_a(), BigInt::from(token_a_reserve)),
+                    (token_b(), BigInt::from(token_b_reserve)),
+                ],
+                total_lp: BigInt::from(1_000_000),
+                circulating_lp: BigInt::from(500_000),
+                preminted_lp: BigInt::from(500_000),
+                identifier: Ident::new(&[0xbe, 0xef]),
+                actions: vec![],
+                module_state: vec![],
+            },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            },
+            slot: 100,
+        })
+    }
+
+    fn make_pool_4asset(
+        r0: i64, r1: i64, r2: i64, r3: i64,
+    ) -> Arc<SundaeV4Pool> {
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(r0));
+        value.insert(&token_a(), BigInt::from(r1));
+        value.insert(&token_b(), BigInt::from(r2));
+        value.insert(&token_c(), BigInt::from(r3));
+
+        Arc::new(SundaeV4Pool {
+            input: TransactionInput::new([0xcc; 32].into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: vec![
+                    (ada(), BigInt::from(r0)),
+                    (token_a(), BigInt::from(r1)),
+                    (token_b(), BigInt::from(r2)),
+                    (token_c(), BigInt::from(r3)),
+                ],
+                total_lp: BigInt::from(1_000_000),
+                circulating_lp: BigInt::from(500_000),
+                preminted_lp: BigInt::from(500_000),
+                identifier: Ident::new(&[0xca, 0xfe]),
+                actions: vec![],
+                module_state: vec![],
+            },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            },
+            slot: 100,
+        })
+    }
+
+    /// Make an order swapping between arbitrary assets
+    fn make_order(
+        offer_asset: AssetClass,
+        offer_amount: i64,
+        ask_asset: AssetClass,
+        min_ask: i64,
+        slot: u64,
+    ) -> Arc<SundaeV4Order> {
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(2_000_000i64));
+        value.insert(&offer_asset, BigInt::from(offer_amount));
+
+        Arc::new(SundaeV4Order {
+            input: TransactionInput::new([slot as u8; 32].into(), 0),
+            value,
+            datum: SimpleOrderDatum {
+                owner: Multisig::Signature(vec![0xaa; 28]),
+                destination: Destination::SelfDestination,
+                offer: (offer_asset, BigInt::from(offer_amount)),
+                min_received: (ask_asset, BigInt::from(min_ask)),
+                max_protocol_fee: BigInt::from(1_500_000i64),
+                extension: unit_pd(),
+            },
+            slot,
+        })
+    }
+
+    #[test]
+    fn test_detect_swap_direction_3asset() {
+        let pool = make_pool_3asset(1_000_000, 1_000_000, 1_000_000);
+        // ADA→token_b: input_idx=0, output_idx=2
+        let order = make_order(ada(), 10_000, token_b(), 1, 1);
+        let dir = detect_swap_direction(&order, &pool.pool_datum.assets);
+        assert_eq!(dir, Some((0, 2)));
+
+        // token_a→token_b: input_idx=1, output_idx=2
+        let order2 = make_order(token_a(), 5_000, token_b(), 1, 2);
+        let dir2 = detect_swap_direction(&order2, &pool.pool_datum.assets);
+        assert_eq!(dir2, Some((1, 2)));
+    }
+
+    #[test]
+    fn test_detect_swap_direction_4asset() {
+        let pool = make_pool_4asset(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        // token_b→token_c: input_idx=2, output_idx=3
+        let order = make_order(token_b(), 5_000, token_c(), 1, 1);
+        let dir = detect_swap_direction(&order, &pool.pool_datum.assets);
+        assert_eq!(dir, Some((2, 3)));
+    }
+
+    #[test]
+    fn test_batch_assembly_3asset_cp() {
+        let pool = make_pool_3asset(1_000_000_000, 1_000_000_000, 1_000_000_000);
+        // Swap ADA→token_b (indices 0→2, skipping asset 1)
+        let orders = vec![make_order(ada(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(&pool, &orders, (3, 1000), (1, 2), &BatchLimits::default());
+        assert!(batch.is_some());
+        let batch = batch.unwrap();
+        assert_eq!(batch.swaps.len(), 1);
+        assert_eq!(batch.swaps[0].input_idx, 0);
+        assert_eq!(batch.swaps[0].output_idx, 2);
+        assert!(batch.swaps[0].dy.is_positive());
+        // Final assets: asset[1] unchanged
+        assert_eq!(batch.final_assets[1].1, BigInt::from(1_000_000_000i64));
+    }
+
+    #[test]
+    fn test_batch_assembly_4asset_cp_mixed() {
+        let pool = make_pool_4asset(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000);
+        // Two orders using different pairs within the same 4-asset pool
+        let orders = vec![
+            make_order(ada(), 5_000_000, token_a(), 1, 1),     // 0→1
+            make_order(token_b(), 5_000_000, token_c(), 1, 2), // 2→3
+        ];
+        let batch = assemble_batch(&pool, &orders, (3, 1000), (1, 2), &BatchLimits::default());
+        assert!(batch.is_some());
+        let batch = batch.unwrap();
+        assert_eq!(batch.swaps.len(), 2);
+        assert_eq!(batch.swaps[0].input_idx, 0);
+        assert_eq!(batch.swaps[0].output_idx, 1);
+        assert_eq!(batch.swaps[1].input_idx, 2);
+        assert_eq!(batch.swaps[1].output_idx, 3);
+    }
+
     #[test]
     fn test_group_orders_by_pool() {
         let pool = make_pool(1_000_000_000, 1_000_000_000);

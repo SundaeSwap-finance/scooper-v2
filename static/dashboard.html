@@ -846,7 +846,7 @@
   function formatPoolAssets(datum) {
     if (!datum) return '?';
     if (Array.isArray(datum.assets) && datum.assets.length >= 2) {
-      return formatAssetClass(datum.assets[0]) + ' / ' + formatAssetClass(datum.assets[1]);
+      return datum.assets.map(function(a) { return formatAssetClass(a); }).join(' / ');
     }
     const a = datum.coin_a || datum.asset_a;
     const b = datum.coin_b || datum.asset_b;
@@ -865,8 +865,10 @@
     if (!pd || !pd.assets) return '?';
     const assets = pd.assets;
     if (Array.isArray(assets) && assets.length >= 2) {
-      return formatAssetClass(assets[0][0]) + ': ' + formatBigint(assets[0][1]) +
-        ' / ' + formatAssetClass(assets[1][0]) + ': ' + formatBigint(assets[1][1]);
+      return assets.map(function(pair) {
+        if (!Array.isArray(pair)) return '?';
+        return formatAssetClass(pair[0]) + ': ' + formatBigint(pair[1]);
+      }).join(' / ');
     }
     return JSON.stringify(assets).slice(0, 60);
   }

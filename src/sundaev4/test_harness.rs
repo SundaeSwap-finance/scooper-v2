@@ -318,6 +318,14 @@ pub(crate) mod test_harness {
         token(0x03, 0x04)
     }
 
+    pub fn token_e() -> AssetClass {
+        token(0x09, 0x0A)
+    }
+
+    pub fn token_f() -> AssetClass {
+        token(0x0B, 0x0C)
+    }
+
     pub fn unit_pd() -> pallas_primitives::PlutusData {
         pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
             tag: 121,

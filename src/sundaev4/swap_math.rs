@@ -60,7 +60,14 @@ pub fn cp_fee_budget(
     isqrt(&quotient) - lp_before
 }
 
-/// Constant-sum swap: dy = floor((dx * prices[input_idx] * (fee_den - fee_num)) / (prices[output_idx] * fee_den))
+/// Constant-sum swap: dy such that v_increase = floor(input_value * fee_num / fee_den).
+///
+/// The on-chain CS validator checks that the pool value increase (v_increase)
+/// is exactly floor(input_value * fee_num / fee_den). Working backwards:
+///   v_increase = dx * prices[input] - dy * prices[output]
+///   dy = (dx * prices[input] - v_increase) / prices[output]
+///
+/// Returns 0 if dy is not integer (swap impossible for this dx).
 pub fn cs_swap_result(
     dx: &BigInt,
     prices: &[BigInt],
@@ -70,8 +77,14 @@ pub fn cs_swap_result(
     fee_den: &BigInt,
 ) -> BigInt {
     let input_value = dx * &prices[input_idx];
-    let fee_mult = fee_den - fee_num;
-    &input_value * &fee_mult / &(&prices[output_idx] * fee_den)
+    let v_increase = &input_value * fee_num / fee_den;
+    let numerator = &input_value - &v_increase;
+    let price_out = &prices[output_idx];
+    let rem = &numerator % price_out;
+    if !rem.is_zero() {
+        return BigInt::from(0); // swap impossible: dy not integer
+    }
+    &numerator / price_out
 }
 
 /// Fee budget for constant-sum pools:
@@ -107,10 +120,15 @@ pub fn compute_fee_budget(
 ) -> BigInt {
     match pool_type {
         super::types::PoolType::ConstantProduct { .. } => {
-            // CP uses pairwise reserves (always 2 assets)
+            // CP pairwise: find which 2 assets changed (works for N-asset pools)
+            let changed: Vec<usize> = (0..assets_before.len())
+                .filter(|&i| assets_before[i].1 != assets_after[i].1)
+                .collect();
+            assert!(changed.len() == 2, "CP swap must change exactly 2 assets, got {}", changed.len());
+            let (i, j) = (changed[0], changed[1]);
             cp_fee_budget(
-                &assets_before[0].1, &assets_before[1].1,
-                &assets_after[0].1, &assets_after[1].1,
+                &assets_before[i].1, &assets_before[j].1,
+                &assets_after[i].1, &assets_after[j].1,
                 lp_before,
             )
         }
@@ -215,6 +233,103 @@ mod tests {
             &BigInt::from(1),
         );
         assert_eq!(dy, BigInt::from(200));
+    }
+
+    #[test]
+    fn test_cp_fee_budget_3asset_swap_0_2() {
+        // 3-asset pool: swap assets [0] and [2], asset [1] unchanged
+        // CP swap: reserve_in=1M, reserve_out=2M, dx=10000, fee=3/1000
+        //   fee=30, dx_eff=9970, dy=2M*9970/(1M+9970)=19742
+        // After: [1_010_000, 500_000, 1_980_258]  (k1 > k0 due to fee)
+        use crate::cardano_types::AssetClass;
+        let assets_before = vec![
+            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(500_000)),
+            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(2_000_000)),
+        ];
+        let assets_after = vec![
+            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_010_000)),
+            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(500_000)),
+            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_980_258)),
+        ];
+        let lp = BigInt::from(1_000_000);
+        let pool_type = super::super::types::PoolType::ConstantProduct {
+            fee: super::super::types::Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+        };
+        let fb = super::compute_fee_budget(&pool_type, &assets_before, &assets_after, &lp);
+        // Same as direct cp_fee_budget on just the changed pair
+        let fb_direct = cp_fee_budget(
+            &BigInt::from(1_000_000), &BigInt::from(2_000_000),
+            &BigInt::from(1_010_000), &BigInt::from(1_980_258),
+            &lp,
+        );
+        assert_eq!(fb, fb_direct);
+        assert!(fb > BigInt::zero());
+    }
+
+    #[test]
+    fn test_cp_fee_budget_4asset_swap_1_3() {
+        // 4-asset pool: swap assets [1] and [3], assets [0] and [2] unchanged
+        use crate::cardano_types::AssetClass;
+        let assets_before = vec![
+            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![3], token: vec![3] }, BigInt::from(1_000_000)),
+        ];
+        let assets_after = vec![
+            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(1_010_000)),
+            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_000_000)),
+            (AssetClass { policy: vec![3], token: vec![3] }, BigInt::from(990_129)),
+        ];
+        let lp = BigInt::from(1_000_000);
+        let pool_type = super::super::types::PoolType::ConstantProduct {
+            fee: super::super::types::Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+        };
+        let fb = super::compute_fee_budget(&pool_type, &assets_before, &assets_after, &lp);
+        // Should match direct call on just the [1],[3] pair
+        let fb_direct = cp_fee_budget(
+            &BigInt::from(1_000_000), &BigInt::from(1_000_000),
+            &BigInt::from(1_010_000), &BigInt::from(990_129),
+            &lp,
+        );
+        assert_eq!(fb, fb_direct);
+        assert!(fb > BigInt::zero());
+    }
+
+    #[test]
+    fn test_cs_swap_result_3asset() {
+        // 3-asset CS pool: prices [1, 2, 3], fee 3/1000
+        // Swap 300 of asset 0 → asset 2
+        // input_value = 300 * 1 = 300
+        // v_increase = floor(300 * 3 / 1000) = 0
+        // numerator = 300 - 0 = 300
+        // dy = 300 / 3 = 100
+        let dy = cs_swap_result(
+            &BigInt::from(300),
+            &[BigInt::from(1), BigInt::from(2), BigInt::from(3)],
+            0,
+            2,
+            &BigInt::from(3),
+            &BigInt::from(1000),
+        );
+        assert_eq!(dy, BigInt::from(100));
+    }
+
+    #[test]
+    fn test_cs_fee_budget_3asset() {
+        // 3-asset CS pool: prices [1, 1, 1], lp 1M
+        // Before: [1M, 1M, 1M], After: [1.01M, 1M, 990030]
+        // v0 = 3M, v1 = 1_010_000 + 1_000_000 + 990_030 = 3_000_030
+        // fee_budget = floor(3_000_030 * 1M / 3M) - 1M = 1_000_010 - 1_000_000 = 10
+        let fb = cs_fee_budget(
+            &[BigInt::from(1_000_000), BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            &[BigInt::from(1_010_000), BigInt::from(1_000_000), BigInt::from(990_030)],
+            &BigInt::from(1_000_000),
+            &[BigInt::from(1), BigInt::from(1), BigInt::from(1)],
+        );
+        assert_eq!(fb, BigInt::from(10));
     }
 
     #[test]

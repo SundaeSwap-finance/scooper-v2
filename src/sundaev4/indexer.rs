@@ -366,8 +366,11 @@ impl SundaeV4Indexer {
                     };
                 }
 
-                // No config found — use default prices (1:1) and global fee
-                warn!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
+                // TODO: Extract CS config (prices, fee) from the Create redeemer
+                // when the pool is first seen on-chain, rather than relying on
+                // pool-configs or defaults. Anyone can create a pool with arbitrary
+                // prices, so manual config doesn't scale.
+                debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
                 return PoolType::ConstantSum {
                     prices: vec![BigInt::from(1); pool_datum.assets.len()],
                     fee: Rational {
