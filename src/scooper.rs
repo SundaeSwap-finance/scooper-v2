@@ -16,6 +16,7 @@ use crate::{
     bigint::BigInt,
     cardano_types::TransactionInput,
     events::IndexEvent,
+    metrics::Metrics,
     sundaev3::{
         Ident, PoolError, SingletonValue, SundaeV3HistoricalState, SundaeV3Order, SundaeV3Pool,
         ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value,
@@ -49,6 +50,7 @@ pub struct Scooper {
     v4_batch_limits: BatchLimits,
     trace_directory: Option<PathBuf>,
     paused: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
     /// Set to the tip slot when we lose a scoop race; skip batch cycles
     /// until the tip advances past this slot, giving the indexer time to
     /// process the competitor's block and remove spent UTxOs.
@@ -63,6 +65,7 @@ impl Scooper {
         v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
         v4_execution: Option<ScooperExecution>,
         paused: Arc<AtomicBool>,
+        metrics: Arc<Metrics>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -78,6 +81,7 @@ impl Scooper {
             v4_batch_limits: BatchLimits::default(),
             trace_directory,
             paused,
+            metrics,
             backoff_until_after_slot: None,
         })
     }
@@ -715,6 +719,8 @@ impl Scooper {
         match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
             Ok(submitted_hash) => {
                 info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
+                self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
+                self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 
                 // Collect consumed orders from all batches
                 let consumed_orders: Vec<_> = final_batches.iter()
@@ -738,11 +744,14 @@ impl Scooper {
                     ttl: final_tx.ttl,
                 };
                 self.v4_chain_tracker.record_submission(in_flight);
+                self.metrics.in_flight_txs.store(self.v4_chain_tracker.in_flight_tx_count() as u64, Ordering::Relaxed);
                 true
             }
             Err(e) => {
+                self.metrics.batches_failed.fetch_add(1, Ordering::Relaxed);
                 let msg = e.to_string();
                 if msg.contains("BadInputsUTxO") {
+                    self.metrics.races_lost.fetch_add(1, Ordering::Relaxed);
                     let pool_strs: Vec<String> = pool_idents.iter().map(|i| i.to_string()).collect();
                     info!(
                         tx_hash = %final_tx.tx_hash_hex,
@@ -755,6 +764,7 @@ impl Scooper {
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
                 }
+                self.metrics.in_flight_txs.store(self.v4_chain_tracker.in_flight_tx_count() as u64, Ordering::Relaxed);
                 if let Some(tip) = self.current_tip_slot().await {
                     self.backoff_until_after_slot = Some(tip);
                 }

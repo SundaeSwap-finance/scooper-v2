@@ -194,6 +194,17 @@ impl ChainTracker {
         }
     }
 
+    /// Count unique in-flight transactions across all chains.
+    pub fn in_flight_tx_count(&self) -> usize {
+        let mut seen = BTreeSet::new();
+        for chain in self.chains.values() {
+            for tx in chain {
+                seen.insert(tx.tx_hash);
+            }
+        }
+        seen.len()
+    }
+
     /// Discard chains whose first (oldest) tx TTL has passed.
     /// If the first tx expired, the entire chain is invalid.
     /// Uses cascade discard for multi-pool awareness.

@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use crate::{
     cardano_types::TransactionInput,
     events::IndexEvent,
+    metrics::Metrics,
     sundaev3::{Ident, PoolError, SundaeV3HistoricalState, ValidationError, validate_order},
     sundaev4::{SundaeV4HistoricalState, batch},
 };
@@ -131,6 +132,7 @@ pub async fn admin_server(
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
     let v4_module_preimages = Arc::new(v4_module_preimages);
@@ -163,6 +165,7 @@ pub async fn admin_server(
         let v4_state = v4_state.clone();
         let v4_module_preimages = v4_module_preimages.clone();
         let paused = paused.clone();
+        let metrics = metrics.clone();
         let tls_acceptor = tls_acceptor.clone();
 
         let child = shutdown.child_token();
@@ -177,12 +180,12 @@ pub async fn admin_server(
                 };
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
+                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics) => {}
                 }
             } else {
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused) => {}
+                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics) => {}
                 }
             }
         });
@@ -198,6 +201,7 @@ async fn handle_request(
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
 ) {
     let io = TokioIo::new(stream);
 
@@ -209,6 +213,7 @@ async fn handle_request(
         resync_tx,
         event_tx,
         paused,
+        metrics,
     };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
@@ -227,6 +232,7 @@ struct AdminServer {
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
+    metrics: Arc<Metrics>,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -287,6 +293,7 @@ impl AdminServer {
                 Self::text_response("resync")
             }
             "/health" => Self::json_response(self.serve_health_stats().await),
+            "/metrics" => self.serve_metrics().await,
             "/pause" => {
                 let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
                 let now_paused = !was_paused;
@@ -385,6 +392,20 @@ impl AdminServer {
             "scooper_totals": stats.scooper_totals,
             "recent_scoops": stats.recent_scoops,
         })).unwrap()
+    }
+
+    async fn serve_metrics(&self) -> Response<ResponseBody> {
+        let body = crate::metrics::render_metrics(
+            &self.v3_state,
+            &self.v4_state,
+            &self.paused,
+            &self.metrics,
+        ).await;
+        Response::builder()
+            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Either::Left(Full::new(Bytes::from(body))))
+            .unwrap()
     }
 
     fn serve_sse(&self) -> Response<ResponseBody> {

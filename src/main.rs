@@ -28,6 +28,7 @@ mod datum_lookup;
 mod events;
 mod historical_state;
 mod instrumentation;
+mod metrics;
 mod multisig;
 mod persistence;
 mod scooper;
@@ -108,6 +109,7 @@ async fn main() -> Result<()> {
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
         .unwrap_or_default();
     let paused = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(metrics::Metrics::new());
     let scooper_handle = tokio::spawn(
         Scooper::new(
             config.log.trace_directory.clone(),
@@ -116,6 +118,7 @@ async fn main() -> Result<()> {
             v4_state.clone(),
             v4_execution,
             paused.clone(),
+            metrics.clone(),
         )?
         .run(shutdown.child_token()),
     );
@@ -128,6 +131,7 @@ async fn main() -> Result<()> {
         resync_tx,
         event_tx.clone(),
         paused.clone(),
+        metrics.clone(),
         shutdown.child_token(),
     ));
 
