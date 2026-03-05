@@ -317,6 +317,20 @@ impl SlotConfig {
 // Execution configuration
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Per-pool config for pools that require operator-provided parameters.
+///
+/// CS pools carry `{ prices, fee }` in their on-chain module config hash,
+/// but the hash is derived from the config — the full config is not on-chain.
+/// The operator must provide it here, keyed by pool ident (hex).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum PoolConfig {
+    ConstantSum {
+        prices: Vec<i64>,
+        fee: (u64, u64),
+    },
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ScooperExecution {
@@ -330,6 +344,10 @@ pub struct ScooperExecution {
     pub module_scripts: ModuleScripts,
     pub plutus_v3_cost_model: Vec<i64>,
     pub slot_config: SlotConfig,
+    /// Per-pool configs for pools requiring operator-provided parameters.
+    /// Keyed by pool ident (hex string).
+    #[serde(default)]
+    pub pool_configs: std::collections::BTreeMap<String, PoolConfig>,
 }
 
 impl ScooperExecution {

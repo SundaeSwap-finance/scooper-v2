@@ -349,8 +349,22 @@ impl SundaeV4Indexer {
         // Check if the first module matches the constant_sum script hash
         if let (Some(module_hash), Some(cs_script)) = (first_module, &exec.module_scripts.constant_sum) {
             if module_hash.as_slice() == cs_script.hash.as_ref() {
-                // CS pool — look up config from pool_configs (future: from on-chain)
-                // For now, return a placeholder that will be overridden by config lookup
+                // CS pool — look up config from pool_configs
+                let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
+                if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
+                    exec.pool_configs.get(&ident_hex)
+                {
+                    return PoolType::ConstantSum {
+                        prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
+                        fee: Rational {
+                            num: BigInt::from(fee.0),
+                            den: BigInt::from(fee.1),
+                        },
+                    };
+                }
+
+                // No config found — use default prices (1:1) and global fee
+                eprintln!("[WARN] CS pool {} has no pool-config entry, using defaults", ident_hex);
                 return PoolType::ConstantSum {
                     prices: vec![BigInt::from(1); pool_datum.assets.len()],
                     fee: Rational {
