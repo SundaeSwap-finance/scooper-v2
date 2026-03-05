@@ -197,6 +197,36 @@ async fn manager_loop(
             v4_index_and_config = Some((v4_index, v4_config));
         }
 
+        // Warn if DB has data but starting-point is origin (common after devnet reset)
+        if let Some((_, v4_config)) = &v4_index_and_config {
+            if matches!(v4_config.starting_point, acropolis_common::Point::Origin) {
+                if let Some(ref s) = v4_state {
+                    let slot = s.lock().await.latest().tip_slot;
+                    if slot > 0 {
+                        warn!(
+                            slot,
+                            "DB contains v4 data at slot {slot} but starting-point is 'origin' \
+                             — if the devnet was reset, delete the database file and restart"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some((_, v3_config)) = &v3_index_and_config {
+            if matches!(v3_config.starting_point, acropolis_common::Point::Origin) {
+                if let Some(ref s) = v3_state {
+                    let n_pools = s.lock().await.latest().pools.len();
+                    if n_pools > 0 {
+                        warn!(
+                            n_pools,
+                            "DB contains v3 data ({n_pools} pools) but starting-point is 'origin' \
+                             — if the devnet was reset, delete the database file and restart"
+                        );
+                    }
+                }
+            }
+        }
+
         // Bootstrap from Kupo/Blockfrost if configured and DB is empty.
         let mut bootstrap_point: Option<acropolis_common::Point> = None;
         if let Some(ref bootstrap_config) = protocol.bootstrap {
