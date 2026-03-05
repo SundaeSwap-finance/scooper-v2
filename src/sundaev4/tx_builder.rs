@@ -172,15 +172,15 @@ pub fn build_multi_pool_scoop_tx(
                 }
             };
 
-            let prev_a = running_assets[0].1.clone();
-            let prev_b = running_assets[1].1.clone();
+            let prev_assets = running_assets.clone();
 
             running_assets[input_idx].1 = &running_assets[input_idx].1 + dx;
             running_assets[output_idx].1 = &running_assets[output_idx].1 - dy;
 
-            let fee_budget = swap_math::cp_fee_budget(
-                &prev_a, &prev_b,
-                &running_assets[0].1, &running_assets[1].1,
+            let fee_budget = swap_math::compute_fee_budget(
+                &batch.pool.pool_type,
+                &prev_assets,
+                &running_assets,
                 &initial_total_lp,
             );
             total_fee_budget = &total_fee_budget + &fee_budget;
@@ -288,6 +288,7 @@ pub fn build_multi_pool_scoop_tx(
     };
 
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
+    let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -311,15 +312,25 @@ pub fn build_multi_pool_scoop_tx(
             output_index: pool_oref.index,
         };
 
-        cp_entries.push(CPOperateEntry {
-            vault_oref: pool_oref_plutus.clone(),
-            config: ConstantProductConfig {
-                fee: Rational {
-                    num: BigInt::from(exec.fee.0),
-                    den: BigInt::from(exec.fee.1),
-                },
-            },
-        });
+        match &batch.pool.pool_type {
+            PoolType::ConstantProduct { fee } => {
+                cp_entries.push(CPOperateEntry {
+                    vault_oref: pool_oref_plutus.clone(),
+                    config: ConstantProductConfig {
+                        fee: fee.clone(),
+                    },
+                });
+            }
+            PoolType::ConstantSum { prices, fee } => {
+                cs_entries.push(CSOperateEntry {
+                    vault_oref: pool_oref_plutus.clone(),
+                    config: ConstantSumConfig {
+                        prices: prices.clone(),
+                        fee: fee.clone(),
+                    },
+                });
+            }
+        }
 
         fs_entries.push(FSOperateEntry {
             vault_oref: pool_oref_plutus,
@@ -375,26 +386,30 @@ pub fn build_multi_pool_scoop_tx(
         entries: order_validator_entries,
     };
 
-    let cp_redeemer = ConstantProductRedeemer::Operate { entries: cp_entries };
+    let has_cp = !cp_entries.is_empty();
+    let has_cs = !cs_entries.is_empty();
+
     let fs_redeemer = FeeSplitRedeemer::Operate { entries: fs_entries };
     let fairness_redeemer = FairnessRedeemer::Operate { entries: fairness_entries };
 
     // ── Step 6: Reference inputs ───────────────────────────────────────────
 
-    let ref_inputs: Vec<TransactionInput> = [
-        &exec.module_scripts.vault,
-        &exec.module_scripts.order,
-        &exec.module_scripts.constant_product,
-        &exec.module_scripts.fee_split,
-        &exec.module_scripts.fairness,
-        &exec.module_scripts.pool_mint,
-        &exec.module_scripts.settings,
-    ]
-    .iter()
-    .map(|s| s.ref_utxo.0.clone())
-    .collect();
-
-    let mut all_ref_inputs = ref_inputs;
+    let mut all_ref_inputs: Vec<TransactionInput> = vec![
+        exec.module_scripts.vault.ref_utxo.0.clone(),
+        exec.module_scripts.order.ref_utxo.0.clone(),
+        exec.module_scripts.fee_split.ref_utxo.0.clone(),
+        exec.module_scripts.fairness.ref_utxo.0.clone(),
+        exec.module_scripts.pool_mint.ref_utxo.0.clone(),
+        exec.module_scripts.settings.ref_utxo.0.clone(),
+    ];
+    if has_cp {
+        all_ref_inputs.push(exec.module_scripts.constant_product.ref_utxo.0.clone());
+    }
+    if has_cs {
+        if let Some(cs) = &exec.module_scripts.constant_sum {
+            all_ref_inputs.push(cs.ref_utxo.0.clone());
+        }
+    }
     all_ref_inputs.push(settings.input.0.clone());
 
     // ── Step 7: Build withdrawal map ───────────────────────────────────────
@@ -405,14 +420,11 @@ pub fn build_multi_pool_scoop_tx(
         PallasBytes::from(account)
     }
 
-    let withdrawals = vec![
+    // Always present: order, fee_split, fairness
+    let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![
         (
             reward_account(&exec.module_scripts.order.hash),
             order_validator_redeemer.to_plutus(),
-        ),
-        (
-            reward_account(&exec.module_scripts.constant_product.hash),
-            cp_redeemer.to_plutus(),
         ),
         (
             reward_account(&exec.module_scripts.fee_split.hash),
@@ -424,36 +436,33 @@ pub fn build_multi_pool_scoop_tx(
         ),
     ];
 
-    let mut sorted_withdrawals = withdrawals;
-    sorted_withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    // Withdrawal redeemers
-    let sorted_withdrawal_accounts: Vec<PallasBytes> =
-        sorted_withdrawals.iter().map(|(a, _)| a.clone()).collect();
-
-    fn withdrawal_index(accounts: &[PallasBytes], account: &PallasBytes) -> u32 {
-        accounts.iter().position(|a| a == account).unwrap() as u32
+    // Conditionally add CP withdrawal
+    if has_cp {
+        let cp_redeemer = ConstantProductRedeemer::Operate { entries: cp_entries };
+        withdrawals.push((
+            reward_account(&exec.module_scripts.constant_product.hash),
+            cp_redeemer.to_plutus(),
+        ));
     }
 
-    let order_wd_account = reward_account(&exec.module_scripts.order.hash);
-    let cp_wd_account = reward_account(&exec.module_scripts.constant_product.hash);
-    let fs_wd_account = reward_account(&exec.module_scripts.fee_split.hash);
-    let fair_wd_account = reward_account(&exec.module_scripts.fairness.hash);
+    // Conditionally add CS withdrawal
+    if has_cs {
+        if let Some(cs_script) = &exec.module_scripts.constant_sum {
+            let cs_redeemer = ConstantSumRedeemer::Operate { entries: cs_entries };
+            withdrawals.push((
+                reward_account(&cs_script.hash),
+                cs_redeemer.to_plutus(),
+            ));
+        }
+    }
 
-    let order_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &order_wd_account) };
-    let cp_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &cp_wd_account) };
-    let fs_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fs_wd_account) };
-    let fair_wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: withdrawal_index(&sorted_withdrawal_accounts, &fair_wd_account) };
+    withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-    let order_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == order_wd_account).unwrap().1.clone();
-    let cp_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == cp_wd_account).unwrap().1.clone();
-    let fs_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fs_wd_account).unwrap().1.clone();
-    let fair_wd_data = sorted_withdrawals.iter().find(|(a, _)| *a == fair_wd_account).unwrap().1.clone();
-
-    redeemer_info.push((order_wd_key.clone(), order_wd_data, lookup_eu(&order_wd_key)));
-    redeemer_info.push((cp_wd_key.clone(), cp_wd_data, lookup_eu(&cp_wd_key)));
-    redeemer_info.push((fs_wd_key.clone(), fs_wd_data, lookup_eu(&fs_wd_key)));
-    redeemer_info.push((fair_wd_key.clone(), fair_wd_data, lookup_eu(&fair_wd_key)));
+    // Withdrawal redeemers — one per withdrawal entry
+    for (idx, (_, data)) in withdrawals.iter().enumerate() {
+        let wd_key = RedeemersKey { tag: RedeemerTag::Reward, index: idx as u32 };
+        redeemer_info.push((wd_key.clone(), data.clone(), lookup_eu(&wd_key)));
+    }
 
     // ── Step 8: Build outputs ──────────────────────────────────────────────
 
@@ -635,7 +644,7 @@ pub fn build_multi_pool_scoop_tx(
         ttl: Some(ttl),
         certificates: None,
         withdrawals: Some(pallas_primitives::NonEmptyKeyValuePairs::Def(
-            sorted_withdrawals
+            withdrawals
                 .into_iter()
                 .map(|(account, _)| (account, 0u64))
                 .collect(),
