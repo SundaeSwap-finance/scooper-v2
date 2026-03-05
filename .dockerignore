@@ -1,0 +1,9 @@
+target/
+.git/
+logs/
+downloads/
+*.db
+logs.txt
+proptest-regressions/
+.mcp.json
+.claude/
