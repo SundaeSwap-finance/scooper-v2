@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::Serialize;
 use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     bigint::BigInt,
@@ -367,7 +367,10 @@ impl Scooper {
     async fn run_v4_batch_cycle(&mut self) -> bool {
         let exec = match &self.v4_execution {
             Some(e) => e.clone(),
-            None => return false,
+            None => {
+                trace!("v4 execution not configured, skipping batch cycle");
+                return false;
+            }
         };
 
         // Ensure language views are computed
@@ -385,12 +388,18 @@ impl Scooper {
         // Snapshot state
         let v4_state = match &self.v4_state {
             Some(s) => s.lock().await.latest().into_owned(),
-            None => return false,
+            None => {
+                trace!("v4 state not available, skipping batch cycle");
+                return false;
+            }
         };
 
         let settings = match &v4_state.settings {
             Some(s) => s.clone(),
-            None => return false,
+            None => {
+                debug!("v4 settings not yet loaded, skipping batch cycle");
+                return false;
+            }
         };
 
         // Use the network tip slot (actual chain tip) for the validity interval,
@@ -410,7 +419,14 @@ impl Scooper {
             });
         let (collateral_input, collateral_value) = match collateral {
             Some((input, value)) => (input.clone(), value.clone()),
-            None => return false,
+            None => {
+                warn!(
+                    min_ada = min_collateral_ada,
+                    wallet_utxos = v4_state.wallet_utxos.len(),
+                    "no wallet UTxO with sufficient ADA for collateral"
+                );
+                return false;
+            }
         };
 
         // Filter orders: exclude in-flight ones, sort oldest first
@@ -602,10 +618,12 @@ impl Scooper {
         // ── Submit the accumulated tx ──────────────────────────────────────
 
         if accum.is_empty() {
+            debug!("accumulator empty after binary search");
             return false;
         }
 
         if !had_successful_build {
+            debug!("no successful build during binary search");
             return false;
         }
 
