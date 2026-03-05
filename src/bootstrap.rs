@@ -17,7 +17,7 @@ use crate::{
     sundaev4::{self, SundaeV4HistoricalState, SundaeV4Protocol},
 };
 
-const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+use crate::cardano_types::CIP_67_ASSET_LABEL_222;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Configuration

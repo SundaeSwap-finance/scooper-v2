@@ -64,6 +64,7 @@ pub struct Batch {
     /// with correct intermediate reserve states.
     pub ops_order: Vec<BatchOp>,
     pub final_assets: Vec<(AssetClass, BigInt)>,
+    /// Total LP after applying protocol share. Used in accumulator comparison tests.
     #[allow(dead_code)]
     pub final_total_lp: BigInt,
 }
@@ -125,7 +126,8 @@ pub fn find_pool_for_simple_order(
 /// include it and restart from the beginning (a sell might enable an earlier buy).
 ///
 /// Returns `None` if no orders can be executed.
-#[allow(dead_code)]
+/// Used by scoop_tests and accumulator comparison tests.
+#[cfg(test)]
 pub fn assemble_batch(
     pool: &Arc<SundaeV4Pool>,
     candidates: &[Arc<SundaeV4Order>],

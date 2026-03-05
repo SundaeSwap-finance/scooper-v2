@@ -54,8 +54,7 @@ impl SundaeV3Update {
     }
 }
 
-const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
-const METADATA_DATUM_KEY: u64 = 103251;
+use crate::cardano_types::{CIP_67_ASSET_LABEL_222, METADATA_DATUM_KEY};
 
 pub struct SundaeV3Indexer {
     state: Arc<Mutex<SundaeV3HistoricalState>>,

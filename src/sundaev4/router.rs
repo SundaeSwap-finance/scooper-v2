@@ -61,11 +61,13 @@ pub struct HopResult {
 #[derive(Clone, Debug)]
 pub struct RoutingPlan {
     pub hops: Vec<HopResult>,
+    /// Total input amount. Asserted in router tests.
     #[allow(dead_code)]
     pub total_input: BigInt,
+    /// Total output across all hops. Asserted in router tests.
     #[allow(dead_code)]
     pub total_output: BigInt,
-    /// Output from just using the single best direct pool (for comparison).
+    /// Output from just using the single best direct pool (for comparison). Asserted in router tests.
     #[allow(dead_code)]
     pub naive_output: BigInt,
 }

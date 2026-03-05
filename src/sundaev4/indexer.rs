@@ -29,8 +29,7 @@ use crate::{
     },
 };
 
-const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
-const METADATA_DATUM_KEY: u64 = 103251;
+use crate::cardano_types::{CIP_67_ASSET_LABEL_222, METADATA_DATUM_KEY};
 
 #[derive(Debug, Clone, Default)]
 pub struct SundaeV4State {

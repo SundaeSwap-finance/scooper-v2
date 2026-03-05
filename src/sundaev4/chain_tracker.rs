@@ -87,8 +87,8 @@ impl ChainTracker {
             .and_then(|tx| tx.predicted_pool_for(pool_ident))
     }
 
-    /// Next chain index for a pool (0 if no chain exists).
-    #[allow(dead_code)]
+    /// Next chain index for a pool (0 if no chain exists). Used in tests.
+    #[cfg(test)]
     pub fn next_chain_index(&self, pool_ident: &Ident) -> usize {
         self.chains
             .get(pool_ident)
@@ -232,14 +232,14 @@ impl ChainTracker {
             .map(|tx| tx.tx_hash)
     }
 
-    /// Check if we have any in-flight chains.
-    #[allow(dead_code)]
+    /// Check if we have any in-flight chains. Used in tests.
+    #[cfg(test)]
     pub fn has_in_flight(&self) -> bool {
         !self.chains.is_empty()
     }
 
-    /// Get the pool identifiers that have in-flight chains.
-    #[allow(dead_code)]
+    /// Get the pool identifiers that have in-flight chains. Used in tests.
+    #[cfg(test)]
     pub fn in_flight_pools(&self) -> Vec<Ident> {
         self.chains.keys().cloned().collect()
     }

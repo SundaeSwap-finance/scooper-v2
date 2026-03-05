@@ -35,11 +35,13 @@ pub enum IndexEvent {
         tx_id: String,
     },
     V3SettingsUpdated {
+        /// Retained for SSE event data.
         #[allow(dead_code)]
         settings: Arc<SundaeV3Settings>,
     },
     V4PoolCreated {
         id: Ident,
+        /// Retained for SSE event data.
         #[allow(dead_code)]
         pool: Arc<SundaeV4Pool>,
     },
@@ -66,6 +68,7 @@ pub enum IndexEvent {
         tx_id: String,
     },
     V4SettingsUpdated {
+        /// Retained for SSE event data.
         #[allow(dead_code)]
         settings: Arc<SundaeV4Settings>,
     },

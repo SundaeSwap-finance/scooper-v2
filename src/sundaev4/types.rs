@@ -74,7 +74,8 @@ pub struct VaultState {
 }
 
 impl VaultState {
-    #[allow(dead_code)]
+    /// Construct from a pool datum. Used in tests.
+    #[cfg(test)]
     pub fn from_pool(datum: &PoolDatum) -> Self {
         VaultState {
             assets: datum.assets.clone(),
@@ -405,6 +406,7 @@ pub struct ScriptRefInfo {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub ref_utxo: crate::cardano_types::TransactionInput,
     /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
+    /// Hex-encoded script CBOR, populated from blueprint. Retained for serde round-trip.
     #[serde(default)]
     #[allow(dead_code)]
     pub script_cbor: Option<String>,
@@ -461,6 +463,7 @@ pub struct SundaeV4Protocol {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub starting_point: Point,
     pub execution: Option<ScooperExecution>,
+    /// Optional blueprint for deriving scripts. Retained for serde round-trip.
     #[serde(default)]
     #[allow(dead_code)]
     pub blueprint: Option<crate::blueprint::Blueprint>,

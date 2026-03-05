@@ -13,6 +13,12 @@ use std::str::FromStr;
 
 use plutus_parser::AsPlutus;
 
+/// CIP-67 asset label prefix for reference tokens (label 222).
+pub const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+
+/// Metadata key used for datum-in-metadata pattern.
+pub const METADATA_DATUM_KEY: u64 = 103251;
+
 use crate::bigint::BigInt;
 use crate::datum_lookup::ScopedDatumLookup;
 pub type Bytes = Vec<u8>;

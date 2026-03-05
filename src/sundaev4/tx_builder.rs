@@ -34,22 +34,6 @@ const VALIDITY_RANGE: u64 = 180;
 
 use crate::sundaev3::Ident;
 
-/// Result of building a batch scoop transaction, with predicted pool UTxO for chaining.
-#[allow(dead_code)]
-pub struct BatchBuildResult {
-    pub cbor: Vec<u8>,
-    pub tx_hash: Hash<32>,
-    pub tx_hash_hex: String,
-    pub tx_body: conway::PseudoTransactionBody<TransactionOutput>,
-    pub resolved_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
-    pub resolved_ref_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
-    pub redeemers: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)>,
-    /// Predicted pool UTxO after this tx settles: (input_ref, updated_pool)
-    pub predicted_pool: (crate::cardano_types::TransactionInput, SundaeV4Pool),
-    /// The TTL used for this transaction
-    pub ttl: u64,
-}
-
 /// Result of building a multi-pool scoop transaction.
 pub struct MultiPoolBuildResult {
     pub cbor: Vec<u8>,
@@ -63,45 +47,6 @@ pub struct MultiPoolBuildResult {
     pub predicted_pools: Vec<(Ident, crate::cardano_types::TransactionInput, SundaeV4Pool)>,
     /// The TTL used for this transaction
     pub ttl: u64,
-}
-
-/// Build a signed scoop transaction for 1 pool + N orders (a Batch).
-///
-/// Thin wrapper around `build_multi_pool_scoop_tx` for backward compatibility.
-#[allow(dead_code)]
-pub fn build_batch_scoop_tx(
-    batch: &Batch,
-    settings: &SundaeV4Settings,
-    exec: &ScooperExecution,
-    current_slot: u64,
-    language_views: &[u8],
-    collateral_utxo: &TransactionInput,
-    collateral_value: &crate::cardano_types::Value,
-    ex_units: Option<&[(RedeemersKey, ExUnits)]>,
-    ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
-) -> Result<BatchBuildResult> {
-    let multi = build_multi_pool_scoop_tx(
-        &[batch.clone()], settings, exec, current_slot, language_views,
-        collateral_utxo, collateral_value, ex_units, ref_utxo_outputs,
-    )?;
-
-    let (ident, predicted_input, predicted_pool) = multi.predicted_pools
-        .into_iter()
-        .next()
-        .context("multi-pool build returned no predicted pools")?;
-    let _ = ident;
-
-    Ok(BatchBuildResult {
-        cbor: multi.cbor,
-        tx_hash: multi.tx_hash,
-        tx_hash_hex: multi.tx_hash_hex,
-        tx_body: multi.tx_body,
-        resolved_inputs: multi.resolved_inputs,
-        resolved_ref_inputs: multi.resolved_ref_inputs,
-        redeemers: multi.redeemers,
-        predicted_pool: (predicted_input, predicted_pool),
-        ttl: multi.ttl,
-    })
 }
 
 /// Build a signed scoop transaction for M pools + N orders.

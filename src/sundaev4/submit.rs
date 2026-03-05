@@ -78,45 +78,6 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
     }
 }
 
-/// Evaluate a transaction via Ogmios `evaluateTransaction`.
-///
-/// Returns Ok with the evaluation result JSON on success, or Err with details
-/// on failure. Note: Ogmios cannot see unconfirmed (mempool) UTxOs, so this
-/// will fail for chained transactions consuming predicted outputs.
-#[allow(dead_code)]
-pub async fn evaluate_tx_ogmios(url: &str, cbor: &[u8]) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "evaluateTransaction",
-        "params": {
-            "transaction": { "cbor": hex::encode(cbor) }
-        },
-        "id": 1
-    });
-    let resp = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .context("ogmios evaluate request failed")?;
-
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios evaluate response not valid JSON")?;
-
-    if let Some(result) = json.get("result") {
-        Ok(result.clone())
-    } else {
-        let error = json
-            .get("error")
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        bail!("ogmios evaluate failed: {}", error);
-    }
-}
-
 /// Encode PlutusV3 cost model parameters as CBOR language views: `{2: [params...]}`.
 pub fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
     let mut buf = Vec::new();
