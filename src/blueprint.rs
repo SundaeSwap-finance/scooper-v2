@@ -161,6 +161,14 @@ impl Blueprint {
             })
         }
 
+        // Try to find constant_sum (optional — not all blueprints include it)
+        let constant_sum = make_info(
+            self,
+            &["constant_sum", "constant-sum", "constantSum"],
+            "constantSum",
+            "constant_sum",
+        ).ok();
+
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2)?,
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
@@ -169,6 +177,7 @@ impl Blueprint {
             order: make_info(self, mappings[4].0, mappings[4].1, mappings[4].2)?,
             pool_mint: make_info(self, mappings[5].0, mappings[5].1, mappings[5].2)?,
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
+            constant_sum,
         })
     }
 }

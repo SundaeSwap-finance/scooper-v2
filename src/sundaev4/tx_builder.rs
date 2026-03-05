@@ -780,6 +780,7 @@ pub fn build_multi_pool_scoop_tx(
             input: predicted_input.clone(),
             value: predicted_value,
             pool_datum: per_pool[out_idx].updated_datum.clone(),
+            pool_type: batch.pool.pool_type.clone(),
             slot: current_slot,
         };
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));

@@ -253,6 +253,7 @@ mod tests {
     use crate::sundaev4::types::PoolDatum;
 
     fn make_pool(ident_byte: u8) -> Arc<SundaeV4Pool> {
+        use crate::sundaev4::types::{PoolType, Rational};
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xaa; 32].into(), 0),
             value: Value::default(),
@@ -264,6 +265,9 @@ mod tests {
                 identifier: Ident::new(&[ident_byte]),
                 actions: vec![],
                 module_state: vec![],
+            },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
         })

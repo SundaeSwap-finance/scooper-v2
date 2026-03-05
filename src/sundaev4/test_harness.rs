@@ -351,6 +351,12 @@ pub(crate) mod test_harness {
                 ],
                 module_state: env.module_state(),
             },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational {
+                    num: BigInt::from(env.exec.fee.0),
+                    den: BigInt::from(env.exec.fee.1),
+                },
+            },
             slot: 100,
         })
     }

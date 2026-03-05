@@ -503,6 +503,12 @@ mod tests {
                 actions: vec![],
                 module_state: vec![],
             },
+            pool_type: crate::sundaev4::types::PoolType::ConstantProduct {
+                fee: crate::sundaev4::types::Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
+            },
             slot: 100,
         });
 

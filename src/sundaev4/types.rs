@@ -192,11 +192,32 @@ pub struct OutputRef {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Pool type enum
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Identifies a pool's swap module and carries its parameters.
+///
+/// Using an enum (not traits) gives exhaustive compile-time checks when adding
+/// new variants and avoids boxing/dynamic dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum PoolType {
+    ConstantProduct { fee: Rational },
+    ConstantSum { prices: Vec<BigInt>, fee: Rational },
+    // Future: ConcentratedLiquidity { ... }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Module config types
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantProductConfig {
+    pub fee: Rational,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConstantSumConfig {
+    pub prices: Vec<BigInt>,
     pub fee: Rational,
 }
 
@@ -225,6 +246,19 @@ pub enum ConstantProductRedeemer {
 pub struct CPOperateEntry {
     pub vault_oref: OutputRef,
     pub config: ConstantProductConfig,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum ConstantSumRedeemer {
+    Create { initial_state: PlutusData },
+    Operate { entries: Vec<CSOperateEntry> },
+    Destroy,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct CSOperateEntry {
+    pub vault_oref: OutputRef,
+    pub config: ConstantSumConfig,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -340,6 +374,9 @@ pub struct ModuleScripts {
     pub order: ScriptRefInfo,
     pub pool_mint: ScriptRefInfo,
     pub settings: ScriptRefInfo,
+    /// Optional: only required when scooping constant-sum pools.
+    #[serde(default)]
+    pub constant_sum: Option<ScriptRefInfo>,
 }
 
 #[serde_with::serde_as]
@@ -364,6 +401,7 @@ pub struct SundaeV4Pool {
     pub input: TransactionInput,
     pub value: Value,
     pub pool_datum: PoolDatum,
+    pub pool_type: PoolType,
     pub slot: u64,
 }
 

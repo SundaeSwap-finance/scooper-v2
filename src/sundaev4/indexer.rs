@@ -150,12 +150,14 @@ impl SundaeV4Indexer {
                     let Some(pool_datum) = self.parse_pool(&output, &datums) else {
                         bail!("invalid pool datum");
                     };
+                    let pool_type = self.detect_pool_type(&pool_datum);
                     state.pools.insert(
                         pool_datum.identifier.clone(),
                         Arc::new(SundaeV4Pool {
                             input: txo.txo_id,
                             value: output.value,
                             pool_datum,
+                            pool_type,
                             slot: txo.created_slot,
                         }),
                     );
@@ -253,12 +255,14 @@ impl SundaeV4Indexer {
                 }
                 "pool" => {
                     if let Some(pd) = self.parse_pool(&output, &datums) {
+                        let pool_type = self.detect_pool_type(&pd);
                         state.spent_pools.push(SpentPool {
                             id: pd.identifier.clone(),
                             old_pool: Arc::new(SundaeV4Pool {
                                 input: stxo.txo.txo_id,
                                 value: output.value,
                                 pool_datum: pd,
+                                pool_type,
                                 slot: stxo.txo.created_slot,
                             }),
                             new_pool: None,
@@ -308,6 +312,62 @@ impl SundaeV4Indexer {
             }
         }
         result
+    }
+
+    /// Detect the pool type from its datum's action modules.
+    ///
+    /// Matches the swap action's first module hash against known module script
+    /// hashes from config. Defaults to ConstantProduct if no execution config
+    /// is available or no match is found.
+    fn detect_pool_type(&self, pool_datum: &PoolDatum) -> crate::sundaev4::types::PoolType {
+        use crate::sundaev4::types::{PoolType, Rational};
+        use crate::bigint::BigInt;
+
+        let Some(exec) = &self.protocol.execution else {
+            // No execution config: default to CP with 0/1 fee (won't be used for scooping)
+            return PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            };
+        };
+
+        // Find the swap action (tag == 100, enabled)
+        let swap_action = pool_datum.actions.iter().find(|a| {
+            a.tag == BigInt::from(100) && a.enabled
+        });
+
+        let Some(action) = swap_action else {
+            return PoolType::ConstantProduct {
+                fee: Rational {
+                    num: BigInt::from(exec.fee.0),
+                    den: BigInt::from(exec.fee.1),
+                },
+            };
+        };
+
+        let first_module = action.modules.first();
+
+        // Check if the first module matches the constant_sum script hash
+        if let (Some(module_hash), Some(cs_script)) = (first_module, &exec.module_scripts.constant_sum) {
+            if module_hash.as_slice() == cs_script.hash.as_ref() {
+                // CS pool — look up config from pool_configs (future: from on-chain)
+                // For now, return a placeholder that will be overridden by config lookup
+                return PoolType::ConstantSum {
+                    prices: vec![BigInt::from(1); pool_datum.assets.len()],
+                    fee: Rational {
+                        num: BigInt::from(exec.fee.0),
+                        den: BigInt::from(exec.fee.1),
+                    },
+                };
+            }
+        }
+
+        // Default: constant product
+        PoolType::ConstantProduct {
+            fee: Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            },
+        }
     }
 
     fn parse_pool(
@@ -457,10 +517,12 @@ impl ChainIndex for SundaeV4Indexer {
                     });
 
                     let pool_id = pd.identifier.clone();
+                    let pool_type = self.detect_pool_type(&pd);
                     let pool_record = SundaeV4Pool {
                         input: this_input,
                         value: tx_out.value,
                         pool_datum: pd,
+                        pool_type,
                         slot,
                     };
                     updated_pools.insert(pool_id, Arc::new(pool_record));

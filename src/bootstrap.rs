@@ -901,12 +901,20 @@ async fn bootstrap_v4(
             continue;
         }
         let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+        // Default pool type — proper detection occurs via the indexer
+        let pool_type = sundaev4::PoolType::ConstantProduct {
+            fee: sundaev4::Rational {
+                num: crate::bigint::BigInt::from(0),
+                den: crate::bigint::BigInt::from(1),
+            },
+        };
         pools.insert(
             pool_datum.identifier.clone(),
             Arc::new(sundaev4::SundaeV4Pool {
                 input,
                 value: utxo.value.clone(),
                 pool_datum,
+                pool_type,
                 slot: utxo.slot,
             }),
         );

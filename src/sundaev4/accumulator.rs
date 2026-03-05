@@ -382,7 +382,7 @@ mod tests {
     use super::*;
     use crate::cardano_types::{TransactionInput, Value};
     use crate::multisig::Multisig;
-    use crate::sundaev4::types::{Destination, SimpleOrderDatum, PoolDatum, SundaeV4Order};
+    use crate::sundaev4::types::{Destination, SimpleOrderDatum, PoolDatum, PoolType, Rational, SundaeV4Order};
     use pallas_codec::utils::MaybeIndefArray;
 
     fn ada() -> AssetClass {
@@ -424,6 +424,9 @@ mod tests {
                 identifier: Ident::new(&[ident_byte]),
                 actions: vec![],
                 module_state: vec![],
+            },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
         })

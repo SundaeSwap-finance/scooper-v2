@@ -370,6 +370,9 @@ mod tests {
                 actions: vec![],
                 module_state: vec![],
             },
+            pool_type: PoolType::ConstantProduct {
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            },
             slot: 100,
         })
     }
