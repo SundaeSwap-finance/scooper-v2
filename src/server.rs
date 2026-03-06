@@ -325,6 +325,8 @@ impl AdminServer {
             serde_json::json!({ "configured": false })
         };
 
+        let in_flight = self.metrics.in_flight_snapshot();
+
         let v4_info = if let Some(v4) = &self.v4_state {
             let state = v4.lock().await.latest().into_owned();
             let sync_pct = match state.network_tip_slot {
@@ -338,6 +340,8 @@ impl AdminServer {
                 "tip_slot": state.tip_slot,
                 "network_tip_slot": state.network_tip_slot,
                 "sync_pct": sync_pct,
+                "in_flight_pools": in_flight.pool_ids,
+                "in_flight_orders": in_flight.order_refs,
             })
         } else {
             serde_json::json!({ "configured": false })

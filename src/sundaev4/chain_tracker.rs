@@ -249,8 +249,7 @@ impl ChainTracker {
         !self.chains.is_empty()
     }
 
-    /// Get the pool identifiers that have in-flight chains. Used in tests.
-    #[cfg(test)]
+    /// Get the pool identifiers that have in-flight chains.
     pub fn in_flight_pools(&self) -> Vec<Ident> {
         self.chains.keys().cloned().collect()
     }

@@ -150,10 +150,11 @@ impl Scooper {
             // 1. Non-blocking drain of all pending events
             self.drain_events().await;
 
-            // 2. Expire stale in-flight chains
+            // 2. Expire stale in-flight chains & sync metrics
             if let Some(tip_slot) = self.current_tip_slot().await {
                 self.v4_chain_tracker.expire_stale(tip_slot);
             }
+            self.sync_in_flight_metrics();
 
             // 3. Attempt batch cycle (skip if paused or backing off after lost race)
             let did_work = if self.paused.load(Ordering::Relaxed) {
@@ -379,6 +380,14 @@ impl Scooper {
     /// Iterates candidate orders one at a time. For each: clone accumulator,
     /// try adding the order, build+evaluate, check limits. If within limits,
     /// accept the candidate; if over limits, submit the previous state.
+    /// Sync the metrics in-flight snapshot from the chain tracker.
+    fn sync_in_flight_metrics(&self) {
+        let pools = self.v4_chain_tracker.in_flight_pools();
+        let orders = self.v4_chain_tracker.in_flight_order_inputs();
+        let tx_count = self.v4_chain_tracker.in_flight_tx_count();
+        self.metrics.update_in_flight(&pools, &orders, tx_count);
+    }
+
     ///
     /// This naturally supports multi-pool transactions when orders target
     /// different pools.
@@ -449,6 +458,8 @@ impl Scooper {
 
         // Filter orders: exclude in-flight ones, sort oldest first
         let in_flight_inputs = self.v4_chain_tracker.in_flight_order_inputs();
+        let in_flight_pools = self.v4_chain_tracker.in_flight_pools();
+        let n_in_flight_orders = in_flight_inputs.len();
         let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
@@ -458,6 +469,14 @@ impl Scooper {
         candidates.sort_by_key(|o| o.slot);
 
         if candidates.is_empty() {
+            if n_in_flight_orders > 0 {
+                debug!(
+                    n_in_flight_orders,
+                    in_flight_pools = ?in_flight_pools.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                    total_orders = v4_state.orders.len(),
+                    "\u{23f3} all orders in-flight, waiting for settlement"
+                );
+            }
             return false;
         }
 
@@ -657,7 +676,37 @@ impl Scooper {
                 checkpoints.into_iter().nth(idx).unwrap()
             }
             None => {
-                debug!(n_candidates = checkpoints.len(), "no valid batch size found within limits");
+                // Re-run smallest batch (1 order) to capture the error at warn level
+                let diag = checkpoints.first().unwrap();
+                let diag_batches = diag.clone().into_batches();
+                let reason = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+                    &diag_batches, &settings, &exec, current_slot, language_views,
+                    &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+                ) {
+                    Err(e) => format!("build: {e}"),
+                    Ok(build) => match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                        &build.tx_body, &build.redeemers, &build.resolved_inputs,
+                        &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
+                        build.tx_hash, &exec.slot_config,
+                    ) {
+                        Err(e) => format!("eval: {e}"),
+                        Ok(r) => {
+                            let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
+                            let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
+                            let (pad_num, pad_den) = exec.budget_padding;
+                            format!(
+                                "over limits: mem={}/{}, steps={}/{}, size=n/a",
+                                total_mem * pad_num / pad_den, exec.max_tx_ex_mem,
+                                total_steps * pad_num / pad_den, exec.max_tx_ex_steps,
+                            )
+                        }
+                    },
+                };
+                warn!(
+                    n_candidates = checkpoints.len(),
+                    reason,
+                    "no valid batch size found within limits"
+                );
                 return false;
             }
         };
@@ -770,7 +819,7 @@ impl Scooper {
                     ttl: final_tx.ttl,
                 };
                 self.v4_chain_tracker.record_submission(in_flight);
-                self.metrics.in_flight_txs.store(self.v4_chain_tracker.in_flight_tx_count() as u64, Ordering::Relaxed);
+                self.sync_in_flight_metrics();
                 true
             }
             Err(e) => {
@@ -790,7 +839,7 @@ impl Scooper {
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
                 }
-                self.metrics.in_flight_txs.store(self.v4_chain_tracker.in_flight_tx_count() as u64, Ordering::Relaxed);
+                self.sync_in_flight_metrics();
                 if let Some(tip) = self.current_tip_slot().await {
                     self.backoff_until_after_slot = Some(tip);
                 }

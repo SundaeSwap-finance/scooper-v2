@@ -1,11 +1,19 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
-use crate::sundaev3::SundaeV3HistoricalState;
+use crate::sundaev3::{Ident, SundaeV3HistoricalState};
 use crate::sundaev4::SundaeV4HistoricalState;
+
+/// Snapshot of in-flight transaction state, shared with the server for dashboard display.
+#[derive(Clone, Default)]
+pub struct InFlightSnapshot {
+    pub pool_ids: Vec<String>,
+    pub order_refs: Vec<String>,
+}
 
 /// Scooper-originated counters shared between the scooper task and the server.
 pub struct Metrics {
@@ -14,6 +22,7 @@ pub struct Metrics {
     pub races_lost: AtomicU64,
     pub orders_scooped: AtomicU64,
     pub in_flight_txs: AtomicU64,
+    in_flight_snapshot: std::sync::Mutex<InFlightSnapshot>,
 }
 
 impl Metrics {
@@ -24,7 +33,22 @@ impl Metrics {
             races_lost: AtomicU64::new(0),
             orders_scooped: AtomicU64::new(0),
             in_flight_txs: AtomicU64::new(0),
+            in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
         }
+    }
+
+    /// Update the in-flight snapshot from current chain tracker state.
+    pub fn update_in_flight(&self, pools: &[Ident], order_inputs: &BTreeSet<crate::cardano_types::TransactionInput>, tx_count: usize) {
+        let snapshot = InFlightSnapshot {
+            pool_ids: pools.iter().map(|id| hex::encode(id.to_bytes())).collect(),
+            order_refs: order_inputs.iter().map(|i| i.to_string()).collect(),
+        };
+        self.in_flight_txs.store(tx_count as u64, Ordering::Relaxed);
+        *self.in_flight_snapshot.lock().unwrap() = snapshot;
+    }
+
+    pub fn in_flight_snapshot(&self) -> InFlightSnapshot {
+        self.in_flight_snapshot.lock().unwrap().clone()
     }
 }
 
