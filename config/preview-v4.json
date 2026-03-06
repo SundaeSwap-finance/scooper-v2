@@ -17,14 +17,14 @@
       "starting-point": "48460699.7bfb6a677df577d2f0371236ecf63554b54b35b663d3ad9159695a609306e629"
     },
     "v4": {
-      "vault-script-hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
-      "order-script-hashes": ["fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"],
-      "settings-script-hash": "c767266215eb375961303a1e30808ec59d25cfb7cbce85872848cbfa",
-      "settings-nft": "9e0b61ad4207b1e0dee7c291b327ba626e3172ffe236e15992a32424.",
-      "pool-nft-policy": "532d1e9ee1209fb4006f8e2689b5c9be010faa43e76fc00fc6f99b3b",
+      "vault-script-hash": "0632d8180185baf02d43283e6879ca699aba64e8151c9f994904b80c",
+      "order-script-hashes": ["805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f"],
+      "settings-script-hash": "737217410c5b3577653b1aee02178d0ea44c82dbd48c5947c66d8e1a",
+      "settings-nft": "984eeb17f04a9ea4e4838144886603a2610540e4c6b835eb004956f5.",
+      "pool-nft-policy": "9a30124e1071263f8f1b5da9f39436c3e80fab3a7bf7260af7682ad1",
       "starting-point": "origin",
       "execution": {
-        "scooper-secret-key-file": "/home/ec2-user/scooper-v1/foo.skey",
+        "scooper-secret-key-file": "/home/ec2-user/scooper-v2/v4.skey",
         "submit-url": "http://localhost:1337",
         "fee": [3, 1000],
         "protocol-share": [1, 2],
@@ -60,31 +60,35 @@
         "module-scripts": {
           "constant-product": {
             "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
-            "ref-utxo": "7e623ada3840d0d3b03ea85157bd514d84e2f72a03f7ceea2cc4a4b963e140b0#0"
+            "ref-utxo": "874885c5571241800298a2eada9586305b773e765482c81d1d68a67fb73151fd#0"
+          },
+          "constant-sum": {
+            "hash": "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da",
+            "ref-utxo": "72654a7130426d7965567dea3a08ea85cb135dd2befe24e900fde3d0baab6332#0"
           },
           "fee-split": {
             "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
-            "ref-utxo": "46655fc76eab8cf76695ce4a23e286bc62443eca72e0849ebaa244f8c53dbff6#0"
+            "ref-utxo": "0a366753d0b7f996047c00a671c5c57d75547df4060b2f2202ed1fdb042422e2#0"
           },
           "fairness": {
-            "hash": "e9f9367f6ca2298c73e2458cb20193850bbc9983de382fa4fcfeb32d",
-            "ref-utxo": "8fcf7283d215a93a32c4472972ff02797c495a57f85b5d5569832809f30c678f#0"
+            "hash": "bdf86f36a0f118b5e67e26c48aa54130c3e59ef9c2427f0594f4a63c",
+            "ref-utxo": "95834dda8ce154f01f41bb990e52754dc32614263c8a0ded7849b3de00795d0c#0"
           },
           "vault": {
-            "hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
-            "ref-utxo": "90bea82a3d9eb6f446859bc5cda6667e76122b48d670b737687a40b6d9119696#0"
+            "hash": "0632d8180185baf02d43283e6879ca699aba64e8151c9f994904b80c",
+            "ref-utxo": "5edf26fa6211e6aefc93d828ebe15199b03912cbf00630afc3667b61cd253102#0"
           },
           "order": {
-            "hash": "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39",
-            "ref-utxo": "03a4d77ca29662f3b9bead48cf62f280755d69a5518f50a921f48f7a13d467eb#0"
+            "hash": "805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f",
+            "ref-utxo": "ccdaffcf00102549177e2b5833ab904a10ef5fc2d1417a5cf910c15a345d6665#0"
           },
           "pool-mint": {
-            "hash": "532d1e9ee1209fb4006f8e2689b5c9be010faa43e76fc00fc6f99b3b",
-            "ref-utxo": "201ee1ec27dd88918b02c271e0d605ca7d35d13c119a66f6a805b635c4ab3e24#0"
+            "hash": "9a30124e1071263f8f1b5da9f39436c3e80fab3a7bf7260af7682ad1",
+            "ref-utxo": "3f0c78f0aa7f51afb137bf91deff20d8150441558a01f07e5ba28b52fe604a3a#0"
           },
           "settings": {
-            "hash": "c767266215eb375961303a1e30808ec59d25cfb7cbce85872848cbfa",
-            "ref-utxo": "6a811147541aa3946c40500a127f559d5b6f5ba47c0204ff12f925c466259c15#0"
+            "hash": "737217410c5b3577653b1aee02178d0ea44c82dbd48c5947c66d8e1a",
+            "ref-utxo": "1d9d2f22048acb400a3bad31f60514968410185610a003a6df02474edf65ba51#0"
           }
         }
       }
@@ -99,7 +103,7 @@
     "module": {
       "peer-network-interface": {
         "node-addresses": [
-          "localhost:41981"
+          "localhost:3001"
         ]
       },
       "mithril-snapshot-fetcher": {
