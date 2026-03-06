@@ -256,11 +256,10 @@ pub fn build_multi_pool_scoop_tx(
 
         match &batch.pool.pool_type {
             PoolType::ConstantProduct { fee } => {
+                let config = ConstantProductConfig { fee: fee.clone() };
                 cp_entries.push(CPOperateEntry {
                     vault_oref: pool_oref_plutus.clone(),
-                    config: ConstantProductConfig {
-                        fee: fee.clone(),
-                    },
+                    config,
                 });
             }
             PoolType::ConstantSum { prices, fee } => {
@@ -274,14 +273,16 @@ pub fn build_multi_pool_scoop_tx(
             }
         }
 
+        let fs_config = FeeSplitConfig {
+            protocol_share: Rational {
+                num: BigInt::from(exec.protocol_share.0),
+                den: BigInt::from(exec.protocol_share.1),
+            },
+        };
+
         fs_entries.push(FSOperateEntry {
             vault_oref: pool_oref_plutus,
-            config: FeeSplitConfig {
-                protocol_share: Rational {
-                    num: BigInt::from(exec.protocol_share.0),
-                    den: BigInt::from(exec.protocol_share.1),
-                },
-            },
+            config: fs_config,
         });
 
         fairness_entries.push(FairnessOperateEntry {
