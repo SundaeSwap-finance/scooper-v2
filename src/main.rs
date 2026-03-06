@@ -236,24 +236,28 @@ async fn manager_loop(
             }
         }
 
-        // Bootstrap from Kupo/Blockfrost if configured and DB is empty.
+        // Bootstrap from Kupo/Blockfrost if configured and DB has no data.
+        // We check tip_slot == 0 (no blocks indexed yet) rather than pools.is_empty(),
+        // because a protocol can legitimately have 0 pools while still having
+        // indexed blocks, settings, orders, etc.
         let mut bootstrap_point: Option<acropolis_common::Point> = None;
         if let Some(ref bootstrap_config) = protocol.bootstrap {
-            let v3_empty = match &v3_state {
+            let v3_needs_bootstrap = match &v3_state {
                 Some(s) => s.lock().await.latest().pools.is_empty(),
                 None => false,
             };
-            let v4_empty = match &v4_state {
-                Some(s) => s.lock().await.latest().pools.is_empty(),
+            let v4_needs_bootstrap = match &v4_state {
+                Some(s) => s.lock().await.latest().tip_slot == 0,
                 None => false,
             };
-            if v3_empty || v4_empty {
+            if v3_needs_bootstrap || v4_needs_bootstrap {
                 match bootstrap::run_bootstrap(
                     bootstrap_config,
-                    protocol.v3.as_ref(),
-                    protocol.v4.as_ref(),
+                    if v3_needs_bootstrap { protocol.v3.as_ref() } else { None },
+                    if v4_needs_bootstrap { protocol.v4.as_ref() } else { None },
                     &v3_state,
                     &v4_state,
+                    &persistence,
                 )
                 .await
                 {

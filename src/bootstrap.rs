@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use num_traits::Signed;
 use pallas_addresses::{Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+use pallas_codec::utils::CborWrap;
+use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
+use pallas_primitives::conway;
 use plutus_parser::{AsPlutus, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -13,6 +16,7 @@ use crate::{
     bigint::BigInt,
     cardano_types::{AssetClass, TransactionInput, Value},
     events::InvalidOrder,
+    persistence::{IndexerDao, PersistedTxo, TxChanges},
     sundaev3::{self, SundaeV3HistoricalState, SundaeV3Protocol},
     sundaev4::{self, SundaeV4HistoricalState, SundaeV4Protocol},
 };
@@ -49,6 +53,70 @@ struct FetchedUtxo {
 pub struct BootstrapResult {
     pub tip_slot: u64,
     pub tip_hash: String,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Encoding helpers for bootstrap persistence
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Convert internal `Value` to pallas Conway-era value for encoding bootstrap UTxOs.
+fn value_to_conway(value: &Value) -> conway::Value {
+    use num_traits::ToPrimitive;
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let lovelace = value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
+
+    let mut policy_map: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, u64>> =
+        std::collections::BTreeMap::new();
+    for (policy_bytes, tokens) in &value.0 {
+        if policy_bytes.is_empty() { continue; }
+        for (token_bytes, qty) in tokens {
+            let amt = qty.clone().unwrap().to_u64().unwrap_or(0);
+            if amt > 0 {
+                policy_map.entry(policy_bytes.clone()).or_default().insert(token_bytes.clone(), amt);
+            }
+        }
+    }
+
+    if policy_map.is_empty() {
+        return conway::Value::Coin(lovelace);
+    }
+
+    let multiasset_pairs: Vec<_> = policy_map.into_iter().filter_map(|(policy, tokens)| {
+        let policy_hash: Hash<28> = Hash::from(policy.as_slice());
+        let token_pairs: Vec<_> = tokens.into_iter()
+            .filter_map(|(name, qty)| PositiveCoin::try_from(qty).ok().map(|pc| (PallasBytes::from(name), pc)))
+            .collect();
+        if token_pairs.is_empty() { None }
+        else { Some((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))) }
+    }).collect();
+
+    if multiasset_pairs.is_empty() {
+        conway::Value::Coin(lovelace)
+    } else {
+        conway::Value::Multiasset(lovelace, NonEmptyKeyValuePairs::Def(multiasset_pairs))
+    }
+}
+
+/// Encode a bootstrap UTxO as Conway-era PostAlonzoTransactionOutput bytes for DB persistence.
+fn encode_bootstrap_utxo(
+    address_bytes: &[u8],
+    value: &Value,
+    datum_cbor: Option<&[u8]>,
+) -> Vec<u8> {
+    let pallas_value = value_to_conway(value);
+    let datum_option = datum_cbor.map(|cbor| {
+        let pd: conway::PlutusData = minicbor::decode(cbor).expect("invalid datum CBOR in bootstrap");
+        conway::PseudoDatumOption::Data(CborWrap(pd))
+    });
+    let txo = conway::TransactionOutput::PostAlonzo(
+        pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            address: PallasBytes::from(address_bytes.to_vec()),
+            value: pallas_value,
+            datum_option,
+            script_ref: None,
+        },
+    );
+    minicbor::to_vec(&txo).expect("infallible encoding")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -695,6 +763,7 @@ pub async fn run_bootstrap(
     v4_protocol: Option<&SundaeV4Protocol>,
     v3_state: &Option<Arc<Mutex<SundaeV3HistoricalState>>>,
     v4_state: &Option<Arc<Mutex<SundaeV4HistoricalState>>>,
+    persistence: &Arc<dyn crate::persistence::Persistence>,
 ) -> Result<BootstrapResult> {
     let provider: Box<dyn BootstrapProvider + Send + Sync> = match config {
         BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
@@ -711,7 +780,8 @@ pub async fn run_bootstrap(
     }
 
     if let (Some(proto), Some(state)) = (v4_protocol, v4_state) {
-        bootstrap_v4(&*provider, proto, state, tip_slot).await?;
+        let dao = persistence.indexer_dao("sundae_v4");
+        bootstrap_v4(&*provider, proto, state, tip_slot, &*dao).await?;
     }
 
     Ok(BootstrapResult { tip_slot, tip_hash })
@@ -868,6 +938,7 @@ async fn bootstrap_v4(
     protocol: &SundaeV4Protocol,
     state: &Arc<Mutex<SundaeV4HistoricalState>>,
     tip_slot: u64,
+    dao: &dyn IndexerDao,
 ) -> Result<()> {
     info!("bootstrap: fetching V4 pools...");
     let pool_utxos = provider
@@ -905,13 +976,10 @@ async fn bootstrap_v4(
             continue;
         }
         let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-        // Default pool type — proper detection occurs via the indexer
-        let pool_type = sundaev4::PoolType::ConstantProduct {
-            fee: sundaev4::Rational {
-                num: crate::bigint::BigInt::from(0),
-                den: crate::bigint::BigInt::from(1),
-            },
-        };
+        let pool_type = crate::sundaev4::detect_pool_type(
+            &pool_datum,
+            protocol.execution.as_ref(),
+        );
         pools.insert(
             pool_datum.identifier.clone(),
             Arc::new(sundaev4::SundaeV4Pool {
@@ -1002,12 +1070,14 @@ async fn bootstrap_v4(
 
     // Fetch wallet UTxOs if execution is configured
     let mut wallet_utxos = std::collections::BTreeMap::new();
+    let mut scooper_addr_bytes: Vec<u8> = Vec::new();
     if let Some(ref exec) = protocol.execution {
         match sundaev4::derive_scooper_pallas_address(&exec.scooper_secret_key) {
             Err(e) => {
                 warn!("bootstrap v4: could not derive scooper address: {e:#}");
             }
             Ok(addr) => {
+                scooper_addr_bytes = addr.to_vec();
                 let addr_bech32 = addr.to_bech32().unwrap_or_default();
                 info!("bootstrap: fetching V4 wallet UTxOs at {addr_bech32}...");
                 match provider.fetch_address_utxos(&addr_bech32).await {
@@ -1032,7 +1102,7 @@ async fn bootstrap_v4(
     if let Some(ref exec) = protocol.execution {
         info!("bootstrap: fetching V4 reference script UTxOs...");
         let scripts = &exec.module_scripts;
-        let all_refs = [
+        let mut all_refs: Vec<&crate::sundaev4::ScriptRefInfo> = vec![
             &scripts.constant_product,
             &scripts.fee_split,
             &scripts.fairness,
@@ -1041,6 +1111,9 @@ async fn bootstrap_v4(
             &scripts.pool_mint,
             &scripts.settings,
         ];
+        if let Some(ref cs) = scripts.constant_sum {
+            all_refs.push(cs);
+        }
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {
@@ -1081,7 +1154,124 @@ async fn bootstrap_v4(
     let n_wallet = wallet_utxos.len();
     let n_refs = ref_utxo_outputs.len();
 
-    // Populate state
+    // Persist bootstrap state to DB so subsequent restarts skip bootstrap.
+    {
+        let mut persisted_txos: Vec<PersistedTxo> = Vec::new();
+
+        let vault_addr = ShelleyAddress::new(
+            Network::Testnet,
+            ShelleyPaymentPart::Script(protocol.vault_script_hash),
+            ShelleyDelegationPart::Null,
+        ).to_vec();
+        for (_, pool) in &pools {
+            let datum_bytes = pool.pool_datum.clone().to_plutus_bytes();
+            persisted_txos.push(PersistedTxo {
+                txo_id: pool.input.clone(),
+                txo_type: "pool".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&vault_addr, &pool.value, Some(&datum_bytes)),
+                address: vault_addr.clone(),
+                datum: None,
+            });
+        }
+
+        let order_addr = protocol.order_script_hashes.first().map(|h| {
+            ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(*h),
+                ShelleyDelegationPart::Null,
+            ).to_vec()
+        }).unwrap_or_default();
+        for order in &orders {
+            let datum_bytes = order.datum.clone().to_plutus_bytes();
+            persisted_txos.push(PersistedTxo {
+                txo_id: order.input.clone(),
+                txo_type: "order".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&order_addr, &order.value, Some(&datum_bytes)),
+                address: order_addr.clone(),
+                datum: None,
+            });
+        }
+
+        if let Some(ref s) = settings {
+            let settings_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(protocol.settings_script_hash),
+                ShelleyDelegationPart::Null,
+            ).to_vec();
+            let datum_bytes = s.datum.clone().to_plutus_bytes();
+            persisted_txos.push(PersistedTxo {
+                txo_id: s.input.clone(),
+                txo_type: "settings".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&settings_addr, &s.value, Some(&datum_bytes)),
+                address: settings_addr,
+                datum: None,
+            });
+        }
+
+        for (input, value) in &wallet_utxos {
+            persisted_txos.push(PersistedTxo {
+                txo_id: input.clone(),
+                txo_type: "wallet".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&scooper_addr_bytes, value, None),
+                address: scooper_addr_bytes.clone(),
+                datum: None,
+            });
+        }
+
+        let dummy_addr = ShelleyAddress::new(
+            Network::Testnet,
+            ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
+            ShelleyDelegationPart::Null,
+        ).to_vec();
+        for (input, output) in &ref_utxo_outputs {
+            let txo_bytes = match &output.script_ref {
+                Some(crate::cardano_types::ScriptRef::PlutusV3(script)) => {
+                    let txo = conway::TransactionOutput::PostAlonzo(
+                        pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+                            address: PallasBytes::from(dummy_addr.clone()),
+                            value: conway::Value::Coin(2_000_000),
+                            datum_option: None,
+                            script_ref: Some(CborWrap(conway::PseudoScript::PlutusV3Script(script.clone()))),
+                        },
+                    );
+                    minicbor::to_vec(&txo).expect("infallible encoding")
+                }
+                _ => encode_bootstrap_utxo(&dummy_addr, &output.value, None),
+            };
+            persisted_txos.push(PersistedTxo {
+                txo_id: input.clone(),
+                txo_type: "ref".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: txo_bytes,
+                address: dummy_addr.clone(),
+                datum: None,
+            });
+        }
+
+        if !persisted_txos.is_empty() {
+            let n = persisted_txos.len();
+            dao.apply_tx_changes(TxChanges {
+                slot: tip_slot,
+                height: 0,
+                created_txos: persisted_txos,
+                spent_txos: vec![],
+                metadata_datums: vec![],
+                scoop_records: vec![],
+            }).await?;
+            info!(txos = n, "bootstrap: persisted V4 state to DB");
+        }
+    }
+
+    // Populate in-memory state
     {
         let mut locked = state.lock().await;
         let s = locked.update_slot(tip_slot)?;

@@ -14,7 +14,7 @@ use pallas_primitives::conway::RedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
 use plutus_parser::{AsPlutus, PlutusData};
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
@@ -75,6 +75,11 @@ impl SundaeV4Indexer {
         rollback_limit: u64,
         dao: Box<dyn IndexerDao>,
     ) -> Self {
+        info!(
+            has_execution = protocol.execution.is_some(),
+            fee = ?protocol.execution.as_ref().map(|e| e.fee),
+            "V4 indexer created"
+        );
         let scooper_address = protocol.execution.as_ref().and_then(|exec| {
             derive_scooper_pallas_address(&exec.scooper_secret_key).ok()
         });
@@ -318,76 +323,8 @@ impl SundaeV4Indexer {
     }
 
     /// Detect the pool type from its datum's action modules.
-    ///
-    /// Matches the swap action's first module hash against known module script
-    /// hashes from config. Defaults to ConstantProduct if no execution config
-    /// is available or no match is found.
     fn detect_pool_type(&self, pool_datum: &PoolDatum) -> crate::sundaev4::types::PoolType {
-        use crate::sundaev4::types::{PoolType, Rational};
-        use crate::bigint::BigInt;
-
-        let Some(exec) = &self.protocol.execution else {
-            // No execution config: default to CP with 0/1 fee (won't be used for scooping)
-            return PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-            };
-        };
-
-        // Find the swap action (tag == 100, enabled)
-        let swap_action = pool_datum.actions.iter().find(|a| {
-            a.tag == BigInt::from(100) && a.enabled
-        });
-
-        let Some(action) = swap_action else {
-            return PoolType::ConstantProduct {
-                fee: Rational {
-                    num: BigInt::from(exec.fee.0),
-                    den: BigInt::from(exec.fee.1),
-                },
-            };
-        };
-
-        let first_module = action.modules.first();
-
-        // Check if the first module matches the constant_sum script hash
-        if let (Some(module_hash), Some(cs_script)) = (first_module, &exec.module_scripts.constant_sum) {
-            if module_hash.as_slice() == cs_script.hash.as_ref() {
-                // CS pool — look up config from pool_configs
-                let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-                if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
-                    exec.pool_configs.get(&ident_hex)
-                {
-                    return PoolType::ConstantSum {
-                        prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
-                        fee: Rational {
-                            num: BigInt::from(fee.0),
-                            den: BigInt::from(fee.1),
-                        },
-                    };
-                }
-
-                // TODO: Extract CS config (prices, fee) from the Create redeemer
-                // when the pool is first seen on-chain, rather than relying on
-                // pool-configs or defaults. Anyone can create a pool with arbitrary
-                // prices, so manual config doesn't scale.
-                debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
-                return PoolType::ConstantSum {
-                    prices: vec![BigInt::from(1); pool_datum.assets.len()],
-                    fee: Rational {
-                        num: BigInt::from(exec.fee.0),
-                        den: BigInt::from(exec.fee.1),
-                    },
-                };
-            }
-        }
-
-        // Default: constant product
-        PoolType::ConstantProduct {
-            fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
-            },
-        }
+        detect_pool_type(pool_datum, self.protocol.execution.as_ref())
     }
 
     fn parse_pool(
@@ -1044,5 +981,74 @@ fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {
         s_addr.payment().as_hash() == hash
     } else {
         false
+    }
+}
+
+/// Detect the pool type from a pool datum's action modules.
+///
+/// Matches the swap action's first module hash against known module script
+/// hashes from config. Defaults to ConstantProduct if no execution config
+/// is available or no match is found.
+///
+/// Used by both the indexer (during chain sync) and bootstrap (during initial load).
+pub fn detect_pool_type(
+    pool_datum: &PoolDatum,
+    execution: Option<&crate::sundaev4::types::ScooperExecution>,
+) -> crate::sundaev4::types::PoolType {
+    use crate::sundaev4::types::{PoolType, Rational};
+    use crate::bigint::BigInt;
+
+    let Some(exec) = execution else {
+        return PoolType::ConstantProduct {
+            fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+        };
+    };
+
+    let swap_action = pool_datum.actions.iter().find(|a| {
+        a.tag == BigInt::from(100) && a.enabled
+    });
+
+    let Some(action) = swap_action else {
+        return PoolType::ConstantProduct {
+            fee: Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            },
+        };
+    };
+
+    let first_module = action.modules.first();
+
+    if let (Some(module_hash), Some(cs_script)) = (first_module, &exec.module_scripts.constant_sum) {
+        if module_hash.as_slice() == cs_script.hash.as_ref() {
+            let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
+            if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
+                exec.pool_configs.get(&ident_hex)
+            {
+                return PoolType::ConstantSum {
+                    prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
+                    fee: Rational {
+                        num: BigInt::from(fee.0),
+                        den: BigInt::from(fee.1),
+                    },
+                };
+            }
+
+            debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
+            return PoolType::ConstantSum {
+                prices: vec![BigInt::from(1); pool_datum.assets.len()],
+                fee: Rational {
+                    num: BigInt::from(exec.fee.0),
+                    den: BigInt::from(exec.fee.1),
+                },
+            };
+        }
+    }
+
+    PoolType::ConstantProduct {
+        fee: Rational {
+            num: BigInt::from(exec.fee.0),
+            den: BigInt::from(exec.fee.1),
+        },
     }
 }

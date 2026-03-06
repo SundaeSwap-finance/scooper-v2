@@ -554,6 +554,21 @@ mod tests {
     }
 
     #[test]
+    fn test_cp_config_hash_matches_ts() {
+        use pallas_crypto::hash::Hasher;
+        let config = ConstantProductConfig {
+            fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+        };
+        let cbor = minicbor::to_vec(&config.to_plutus()).unwrap();
+        let hash = hex::encode(Hasher::<256>::hash(&cbor));
+        eprintln!("CP CBOR: {}", hex::encode(&cbor));
+        eprintln!("CP hash: {}", hash);
+        // TS produces: d8799fd8799f031903e8ffff → hash 191f6d4b...
+        assert_eq!(hex::encode(&cbor), "d8799fd8799f031903e8ffff");
+        assert_eq!(hash, "191f6d4b97693d5268090e9d918bfad9e171e5699b155bdc9bd944e005891a5a");
+    }
+
+    #[test]
     fn test_decode_v4_simple_order_datum() {
         // SimpleOrderDatum: owner=Sig(0xaa..28), dest=Self,
         // offer=(ADA, 5_000_000), min_received=(token, 1_000_000),
