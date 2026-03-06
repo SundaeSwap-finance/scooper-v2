@@ -328,6 +328,14 @@ impl Accumulator {
         self.pools.values().map(|a| a.swaps.len()).sum()
     }
 
+    /// Collect all order inputs across all accumulated pools.
+    pub fn order_inputs(&self) -> Vec<&crate::cardano_types::TransactionInput> {
+        self.pools
+            .values()
+            .flat_map(|p| p.swaps.iter().map(|s| &s.order.input))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty() || self.order_count() == 0
     }

@@ -209,6 +209,7 @@
   .badge-blue { background: rgba(116,185,255,0.15); color: var(--blue); }
   .badge-accent { background: rgba(108,92,231,0.15); color: var(--accent); }
   .badge-in-flight { background: rgba(253,203,110,0.10); color: var(--yellow); font-size: 13px; }
+  .badge-quarantine { background: rgba(225,112,85,0.10); color: var(--red); font-size: 13px; }
   tr.our-row td { background: rgba(108,92,231,0.06); }
 
   .event-log {
@@ -516,6 +517,8 @@
   // --- In-flight tracking ---
   var inFlightPools = new Set();
   var inFlightOrders = new Set();
+  // --- Quarantine tracking ---
+  var quarantinedOrders = new Set();
 
   // --- Status / sync bar ---
   let status = {};
@@ -528,6 +531,10 @@
       var v4 = status.v4 || {};
       inFlightPools = new Set(v4.in_flight_pools || []);
       inFlightOrders = new Set(v4.in_flight_orders || []);
+      // Update quarantine set
+      var q = v4.quarantine || {};
+      var qOrders = (q.permanent || []).concat(q.temporary || []).map(function(e) { return e.order; });
+      quarantinedOrders = new Set(qOrders);
       updateSyncBar();
       updateStats();
       updatePauseBtn(status.paused);
@@ -604,8 +611,10 @@
     }
     if (v4.configured) {
       var inFlightCount = (v4.in_flight_orders || []).length;
+      var quarantineCount = quarantinedOrders.size;
       v4s.innerHTML = statCard('Pools', v4.pool_count) + statCard('Orders', v4.order_count)
         + (inFlightCount > 0 ? statCard('\u23f3 In-Flight', inFlightCount) : '')
+        + (quarantineCount > 0 ? statCard('\u26d4 Quarantined', quarantineCount) : '')
         + statCard('Tip Slot', (v4.tip_slot || 0).toLocaleString());
     } else {
       v4s.innerHTML = '<div class="not-configured">V4 indexer not configured</div>';
@@ -834,11 +843,15 @@
         var row = document.createElement('tr');
         var orderRef = typeof e.order.input === 'string' ? e.order.input : '';
         var isInFlight = inFlightOrders.has(orderRef);
+        var isQuarantined = quarantinedOrders.has(orderRef);
         var info = execInfo[orderRef];
         var statusBadge, detail;
         if (isInFlight) {
           statusBadge = '<span class="badge badge-in-flight" title="Transaction in mempool">\u23f3 in-flight</span>';
           detail = 'awaiting settlement';
+        } else if (isQuarantined) {
+          statusBadge = '<span class="badge badge-quarantine" title="Order quarantined">\u26d4 quarantined</span>';
+          detail = 'skipped — see quarantine';
         } else if (!info) {
           statusBadge = '<span class="badge badge-yellow">unknown</span>';
           detail = '';

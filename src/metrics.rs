@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
+use crate::scooper::QuarantineSnapshot;
 use crate::sundaev3::{Ident, SundaeV3HistoricalState};
 use crate::sundaev4::SundaeV4HistoricalState;
 
@@ -23,6 +24,7 @@ pub struct Metrics {
     pub orders_scooped: AtomicU64,
     pub in_flight_txs: AtomicU64,
     in_flight_snapshot: std::sync::Mutex<InFlightSnapshot>,
+    quarantine_snapshot: std::sync::Mutex<QuarantineSnapshot>,
 }
 
 impl Metrics {
@@ -34,6 +36,7 @@ impl Metrics {
             orders_scooped: AtomicU64::new(0),
             in_flight_txs: AtomicU64::new(0),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
+            quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
         }
     }
 
@@ -49,6 +52,15 @@ impl Metrics {
 
     pub fn in_flight_snapshot(&self) -> InFlightSnapshot {
         self.in_flight_snapshot.lock().unwrap().clone()
+    }
+
+    /// Update the quarantine snapshot from the scooper's current state.
+    pub fn update_quarantine(&self, snapshot: QuarantineSnapshot) {
+        *self.quarantine_snapshot.lock().unwrap() = snapshot;
+    }
+
+    pub fn quarantine_snapshot(&self) -> QuarantineSnapshot {
+        self.quarantine_snapshot.lock().unwrap().clone()
     }
 }
 
@@ -142,6 +154,10 @@ pub async fn render_metrics(
     write_counter(&mut out, "scooper_races_lost_total", "Total scoop races lost (BadInputsUTxO)", metrics.races_lost.load(Ordering::Relaxed));
     write_counter(&mut out, "scooper_orders_scooped_total", "Total orders successfully scooped", metrics.orders_scooped.load(Ordering::Relaxed));
     write_gauge(&mut out, "scooper_in_flight_txs", "Number of in-flight transactions in chain tracker", metrics.in_flight_txs.load(Ordering::Relaxed));
+
+    let q = metrics.quarantine_snapshot();
+    write_gauge(&mut out, "scooper_quarantined_permanent", "Number of permanently quarantined orders", q.permanent.len());
+    write_gauge(&mut out, "scooper_quarantined_temporary", "Number of temporarily quarantined orders", q.temporary.len());
 
     out
 }

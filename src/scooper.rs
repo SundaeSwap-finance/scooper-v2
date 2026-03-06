@@ -39,6 +39,17 @@ const SYNC_LOG_INTERVAL: u64 = 500;
 /// Minimum ADA on the collateral return output (lovelace).
 const MIN_COLLATERAL_RETURN: u64 = 1_500_000;
 
+/// How many slots to temporarily quarantine orders after a BadInputsUTxO failure (~2 minutes).
+const TEMP_QUARANTINE_SLOTS: u64 = 120;
+
+/// Why an order is quarantined.
+pub enum Quarantine {
+    /// Structurally broken — single-order batch failed build/eval. Never retry.
+    Permanent { reason: String },
+    /// Likely already spent — retry after indexer catches up.
+    Temporary { reason: String, until_slot: u64 },
+}
+
 pub struct Scooper {
     event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
     v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
@@ -55,6 +66,8 @@ pub struct Scooper {
     /// until the tip advances past this slot, giving the indexer time to
     /// process the competitor's block and remove spent UTxOs.
     backoff_until_after_slot: Option<u64>,
+    /// Orders quarantined due to structural failure or suspected spent inputs.
+    quarantine: BTreeMap<TransactionInput, Quarantine>,
 }
 
 impl Scooper {
@@ -83,6 +96,7 @@ impl Scooper {
             paused,
             metrics,
             backoff_until_after_slot: None,
+            quarantine: BTreeMap::new(),
         })
     }
 
@@ -150,11 +164,13 @@ impl Scooper {
             // 1. Non-blocking drain of all pending events
             self.drain_events().await;
 
-            // 2. Expire stale in-flight chains & sync metrics
+            // 2. Expire stale in-flight chains, prune quarantine & sync metrics
             if let Some(tip_slot) = self.current_tip_slot().await {
                 self.v4_chain_tracker.expire_stale(tip_slot);
+                self.prune_expired_quarantine(tip_slot);
             }
             self.sync_in_flight_metrics();
+            self.sync_quarantine_metrics();
 
             // 3. Attempt batch cycle (skip if paused or backing off after lost race)
             let did_work = if self.paused.load(Ordering::Relaxed) {
@@ -232,6 +248,46 @@ impl Scooper {
             Some(s) => Some(s.lock().await.latest().tip_slot),
             None => None,
         }
+    }
+
+    /// Check whether an order is currently quarantined.
+    fn is_quarantined(&self, input: &TransactionInput, current_slot: u64) -> bool {
+        match self.quarantine.get(input) {
+            Some(Quarantine::Permanent { .. }) => true,
+            Some(Quarantine::Temporary { until_slot, .. }) => current_slot <= *until_slot,
+            None => false,
+        }
+    }
+
+    /// Remove expired temporary quarantine entries.
+    fn prune_expired_quarantine(&mut self, current_slot: u64) {
+        self.quarantine.retain(|_, q| match q {
+            Quarantine::Permanent { .. } => true,
+            Quarantine::Temporary { until_slot, .. } => current_slot <= *until_slot,
+        });
+    }
+
+    /// Snapshot of quarantined order inputs for the metrics/API layer.
+    pub fn quarantine_snapshot(&self) -> QuarantineSnapshot {
+        let mut permanent = Vec::new();
+        let mut temporary = Vec::new();
+        for (input, q) in &self.quarantine {
+            match q {
+                Quarantine::Permanent { reason } => {
+                    permanent.push(QuarantineEntry {
+                        order: input.to_string(),
+                        reason: reason.clone(),
+                    });
+                }
+                Quarantine::Temporary { reason, until_slot } => {
+                    temporary.push(QuarantineEntry {
+                        order: input.to_string(),
+                        reason: format!("{} (until slot {})", reason, until_slot),
+                    });
+                }
+            }
+        }
+        QuarantineSnapshot { permanent, temporary }
     }
 
     /// Check if we've caught up with the network tip.
@@ -350,9 +406,11 @@ impl Scooper {
                 }
                 IndexEvent::V4OrderScooped { order, pool_ids, .. } => {
                     trace!(slot, order = %order.input, pools = ?pool_ids, "v4 order scooped");
+                    self.quarantine.remove(&order.input);
                 }
                 IndexEvent::V4OrderCancelled { order, .. } => {
                     trace!(slot, order = %order.input, "v4 order cancelled");
+                    self.quarantine.remove(&order.input);
                 }
                 IndexEvent::V4SettingsUpdated { .. } => {
                     trace!(slot, "v4 settings updated");
@@ -386,6 +444,11 @@ impl Scooper {
         let orders = self.v4_chain_tracker.in_flight_order_inputs();
         let tx_count = self.v4_chain_tracker.in_flight_tx_count();
         self.metrics.update_in_flight(&pools, &orders, tx_count);
+    }
+
+    /// Sync quarantine snapshot to the metrics layer for API/dashboard.
+    fn sync_quarantine_metrics(&self) {
+        self.metrics.update_quarantine(self.quarantine_snapshot());
     }
 
     ///
@@ -456,25 +519,35 @@ impl Scooper {
             }
         };
 
-        // Filter orders: exclude in-flight ones, sort oldest first
+        // Filter orders: exclude in-flight and quarantined, sort oldest first
         let in_flight_inputs = self.v4_chain_tracker.in_flight_order_inputs();
         let in_flight_pools = self.v4_chain_tracker.in_flight_pools();
         let n_in_flight_orders = in_flight_inputs.len();
+        let mut n_quarantined = 0u32;
         let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
             .filter(|o| !in_flight_inputs.contains(&o.input))
+            .filter(|o| {
+                if self.is_quarantined(&o.input, current_slot) {
+                    n_quarantined += 1;
+                    false
+                } else {
+                    true
+                }
+            })
             .cloned()
             .collect();
         candidates.sort_by_key(|o| o.slot);
 
         if candidates.is_empty() {
-            if n_in_flight_orders > 0 {
+            if n_in_flight_orders > 0 || n_quarantined > 0 {
                 debug!(
                     n_in_flight_orders,
+                    n_quarantined,
                     in_flight_pools = ?in_flight_pools.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
                     total_orders = v4_state.orders.len(),
-                    "\u{23f3} all orders in-flight, waiting for settlement"
+                    "\u{23f3} all orders in-flight or quarantined, waiting"
                 );
             }
             return false;
@@ -702,6 +775,17 @@ impl Scooper {
                         }
                     },
                 };
+
+                // Permanently quarantine the first order — it's structurally broken
+                let bad_inputs = diag.order_inputs();
+                for input in bad_inputs {
+                    warn!(order = %input, %reason, "permanently quarantining order");
+                    self.quarantine.insert(input.clone(), Quarantine::Permanent {
+                        reason: reason.clone(),
+                    });
+                }
+                self.sync_quarantine_metrics();
+
                 warn!(
                     n_candidates = checkpoints.len(),
                     reason,
@@ -833,6 +917,34 @@ impl Scooper {
                         pools = ?pool_strs,
                         "lost scoop race — pool or order UTxO already spent by another scooper"
                     );
+                    // Parse bad inputs from the error and quarantine only those
+                    let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
+                    let bad_refs = parse_bad_inputs(&msg);
+                    let order_inputs = accum.order_inputs();
+                    if bad_refs.is_empty() {
+                        // Couldn't parse — quarantine all orders as fallback
+                        info!(n_orders = order_inputs.len(), until_slot, "temporarily quarantining all batch orders (unparseable error)");
+                        for input in &order_inputs {
+                            self.quarantine.insert((*input).clone(), Quarantine::Temporary {
+                                reason: "BadInputsUTxO (fallback)".into(),
+                                until_slot,
+                            });
+                        }
+                    } else {
+                        // Only quarantine orders whose input appears in the bad inputs list
+                        let mut n_quarantined = 0u32;
+                        for input in &order_inputs {
+                            if bad_refs.contains(&input.to_string()) {
+                                self.quarantine.insert((*input).clone(), Quarantine::Temporary {
+                                    reason: "BadInputsUTxO".into(),
+                                    until_slot,
+                                });
+                                n_quarantined += 1;
+                            }
+                        }
+                        info!(n_quarantined, n_bad_inputs = bad_refs.len(), until_slot, "temporarily quarantining spent orders");
+                    }
+                    self.sync_quarantine_metrics();
                 } else {
                     error!(error = %msg, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
                 }
@@ -868,6 +980,34 @@ impl Scooper {
             writeln!(&mut file)?;
         }
         Ok(())
+    }
+}
+
+/// Best-effort extraction of bad input refs from a BadInputsUTxO error message.
+///
+/// The error string from submit is `"ogmios submit failed (status): {json}"`.
+/// The JSON portion is the Ogmios error object with structure:
+///   `{"code":...,"data":{"badInputs":["txhash#idx",...]}}`
+fn parse_bad_inputs(msg: &str) -> std::collections::BTreeSet<String> {
+    /// Minimal typed representation of the Ogmios error envelope.
+    #[derive(serde::Deserialize)]
+    struct OgmiosError {
+        #[serde(default)]
+        data: Option<OgmiosErrorData>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OgmiosErrorData {
+        #[serde(default, alias = "badInputs")]
+        bad_inputs: Vec<String>,
+    }
+
+    let json_str = msg.find('{').map(|i| &msg[i..]).unwrap_or("");
+    match serde_json::from_str::<OgmiosError>(json_str) {
+        Ok(err) => err.data
+            .map(|d| d.bad_inputs.into_iter().collect())
+            .unwrap_or_default(),
+        Err(_) => std::collections::BTreeSet::new(),
     }
 }
 
@@ -974,6 +1114,19 @@ enum OrderAction {
 enum OrderValidity {
     Valid { pools: Vec<Ident> },
     Invalid { reason: OrderInvalidReason },
+}
+
+/// Snapshot of quarantined orders, shared with the server for API/dashboard display.
+#[derive(Clone, Default, Serialize)]
+pub struct QuarantineSnapshot {
+    pub permanent: Vec<QuarantineEntry>,
+    pub temporary: Vec<QuarantineEntry>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct QuarantineEntry {
+    pub order: String,
+    pub reason: String,
 }
 
 #[derive(Debug, PartialEq, Serialize)]

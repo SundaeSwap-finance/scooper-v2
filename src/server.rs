@@ -326,6 +326,7 @@ impl AdminServer {
         };
 
         let in_flight = self.metrics.in_flight_snapshot();
+        let quarantine = self.metrics.quarantine_snapshot();
 
         let v4_info = if let Some(v4) = &self.v4_state {
             let state = v4.lock().await.latest().into_owned();
@@ -342,6 +343,7 @@ impl AdminServer {
                 "sync_pct": sync_pct,
                 "in_flight_pools": in_flight.pool_ids,
                 "in_flight_orders": in_flight.order_refs,
+                "quarantine": quarantine,
             })
         } else {
             serde_json::json!({ "configured": false })
