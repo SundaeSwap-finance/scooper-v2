@@ -74,9 +74,9 @@ pub struct RoutingPlan {
 
 // ─── Swap Output ─────────────────────────────────────────────────────────────
 
-/// Compute swap output for any pool type.
+/// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
-    match &pool.view_type {
+    let raw = match &pool.view_type {
         PoolViewType::ConstantProduct => {
             swap_math::cp_swap_result(&pool.reserve_in, &pool.reserve_out, dx, pool.fee_num, pool.fee_den)
         }
@@ -85,6 +85,13 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
             let fee_den = BigInt::from(pool.fee_den);
             swap_math::cs_swap_result(dx, &[price_in.clone(), price_out.clone()], 0, 1, &fee_num, &fee_den)
         }
+    };
+    // Cap at reserve_out — can't withdraw more than the pool holds.
+    // (CP naturally stays below reserves; CS can exceed them.)
+    if raw > pool.reserve_out {
+        pool.reserve_out.clone()
+    } else {
+        raw
     }
 }
 
@@ -102,7 +109,7 @@ fn scale() -> BigInt {
 /// Marginal price at a given raw allocation for any pool type (scaled by SCALE).
 ///
 /// CP: decreasing marginal — `fee_mult/fee_den * A * B * SCALE / (A + xEff)^2`
-/// CS: constant marginal — `fee_mult * price_out * SCALE / (price_in * fee_den)`
+/// CS: constant marginal — `fee_mult * price_in * SCALE / (price_out * fee_den)`
 fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
     let fee_num = BigInt::from(pool.fee_num);
     let fee_den = BigInt::from(pool.fee_den);
@@ -119,9 +126,9 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
                 / &(&fee_den * &denom * &denom)
         }
         PoolViewType::ConstantSum { price_in, price_out } => {
-            // CS marginal is constant (doesn't depend on allocation)
+            // CS marginal is constant: dy/dx = price_in * fee_mult / (price_out * fee_den)
             let _ = raw_allocated;
-            &fee_mult * price_out * &scale() / &(price_in * &fee_den)
+            &fee_mult * price_in * &scale() / &(price_out * &fee_den)
         }
     }
 }
@@ -161,7 +168,7 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                 PoolViewType::ConstantSum { price_in, price_out } => {
                     // CS marginal is constant. If lambda <= marginal, absorb
                     // everything up to what the reserve allows. Otherwise 0.
-                    let cs_marginal = &fee_mult * price_out * &sc / &(price_in * &fee_den);
+                    let cs_marginal = &fee_mult * price_in * &sc / &(price_out * &fee_den);
                     if lambda <= &cs_marginal {
                         // Can absorb up to the full output reserve
                         // max_raw = reserve_out * price_out * fee_den / (price_in * fee_mult)
@@ -721,6 +728,219 @@ mod tests {
         // Verify positive output and 3 hops
         assert!(plan.total_output.is_positive());
         assert_eq!(plan.naive_output, BigInt::from(0)); // no direct pool
+    }
+
+    fn make_cs_pool(
+        ident_byte: u8,
+        assets: Vec<(AssetClass, i64)>,
+        prices: Vec<i64>,
+    ) -> (Ident, Arc<SundaeV4Pool>) {
+        let mut value = Value::default();
+        let mut datum_assets = Vec::new();
+        for (asset, reserve) in &assets {
+            value.insert(asset, BigInt::from(*reserve));
+            datum_assets.push((asset.clone(), BigInt::from(*reserve)));
+        }
+        let ident = Ident::new(&[ident_byte]);
+
+        let pool = Arc::new(SundaeV4Pool {
+            input: TransactionInput::new([ident_byte; 32].into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: datum_assets,
+                total_lp: BigInt::from(1_000_000),
+                circulating_lp: BigInt::from(500_000),
+                preminted_lp: BigInt::from(500_000),
+                identifier: ident.clone(),
+                actions: vec![],
+                module_state: vec![],
+            },
+            pool_type: crate::sundaev4::types::PoolType::ConstantSum {
+                prices: prices.iter().map(|&p| BigInt::from(p)).collect(),
+                fee: crate::sundaev4::types::Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
+            },
+            slot: 100,
+        });
+
+        (ident, pool)
+    }
+
+    /// Test 9: Direct CS pool swap
+    #[test]
+    fn test_cs_direct_swap() {
+        let mut pools = BTreeMap::new();
+        let (id, pool) = make_cs_pool(
+            0x01,
+            vec![(token(0xAA), 1_000_000), (token(0xBB), 1_000_000)],
+            vec![1, 1],
+        );
+        pools.insert(id, pool);
+
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xBB),
+            &BigInt::from(10_000),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        assert_eq!(plan.hops.len(), 1);
+        // CS 1:1 with 3/1000 fee: dy = (10000*1 - floor(10000*1*3/1000)) / 1
+        // = 10000 - 30 = 9970
+        assert_eq!(plan.total_output, BigInt::from(9970));
+    }
+
+    /// Test 10: CS pool with asymmetric prices
+    #[test]
+    fn test_cs_asymmetric_prices() {
+        let mut pools = BTreeMap::new();
+        let (id, pool) = make_cs_pool(
+            0x01,
+            vec![(token(0xAA), 1_000_000), (token(0xBB), 2_000_000)],
+            vec![2, 1],
+        );
+        pools.insert(id, pool);
+
+        // Swap A→B: price_in=2, price_out=1
+        // input_value = 1000 * 2 = 2000
+        // v_increase = floor(2000 * 3 / 1000) = 6
+        // dy = (2000 - 6) / 1 = 1994
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xBB),
+            &BigInt::from(1000),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        assert_eq!(plan.total_output, BigInt::from(1994));
+    }
+
+    /// Test 11: Split between CS and CP pools (same pair).
+    /// CS has a better rate (prices [3,1] → 3x output) but limited reserves,
+    /// so the router should use CS first and overflow to CP.
+    #[test]
+    fn test_split_cs_and_cp() {
+        let mut pools = BTreeMap::new();
+        // CS pool: prices [3,1] (3x rate), 100k reserve of token BB
+        let (id1, pool1) = make_cs_pool(
+            0x01,
+            vec![(token(0xAA), 1_000_000), (token(0xBB), 100_000)],
+            vec![3, 1],
+        );
+        // CP pool: large reserves (10M each)
+        let (id2, pool2) = make_pool(0x02, token(0xAA), 10_000_000, token(0xBB), 10_000_000);
+        pools.insert(id1, pool1);
+        pools.insert(id2, pool2);
+
+        // 100k input. CS marginal ≈ 2.991 >> CP marginal ≈ 0.997.
+        // CS should absorb ~33.4k (exhausting its 100k BB reserve at 3:1), rest to CP.
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xBB),
+            &BigInt::from(100_000),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        assert_eq!(plan.hops.len(), 1);
+        // The split should outperform CP-only.
+        let cp_only = swap_math::cp_swap_result(
+            &BigInt::from(10_000_000), &BigInt::from(10_000_000),
+            &BigInt::from(100_000), 3, 1000,
+        );
+        assert!(plan.total_output > cp_only, "split should beat CP-only: {} vs {}", plan.total_output, cp_only);
+        // Should actually split (use both pools)
+        assert!(is_routed(&plan), "should split across CS and CP");
+    }
+
+    /// Test 12: CS multi-asset pool (3 assets) in router graph
+    #[test]
+    fn test_cs_3asset_routing() {
+        let mut pools = BTreeMap::new();
+        // 3-asset CS pool: A, B, C with prices [1, 2, 3]
+        let (id, pool) = make_cs_pool(
+            0x01,
+            vec![(token(0xAA), 1_000_000), (token(0xBB), 1_000_000), (token(0xCC), 1_000_000)],
+            vec![1, 2, 3],
+        );
+        pools.insert(id, pool);
+
+        // Swap A→C: price_in=1, price_out=3
+        // input_value = 300 * 1 = 300
+        // v_increase = floor(300 * 3 / 1000) = 0
+        // dy = (300 - 0) / 3 = 100
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xCC),
+            &BigInt::from(300),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        assert_eq!(plan.total_output, BigInt::from(100));
+    }
+
+    /// Test 13: Multi-hop through CS pool
+    #[test]
+    fn test_multi_hop_via_cs() {
+        let mut pools = BTreeMap::new();
+        // CP: A→ADA
+        let (id1, pool1) = make_pool(0x01, ada(), 1_000_000, token(0xAA), 1_000_000);
+        // CS: ADA→B (1:1 stablecoin-like)
+        let (id2, pool2) = make_cs_pool(
+            0x02,
+            vec![(ada(), 1_000_000), (token(0xBB), 1_000_000)],
+            vec![1, 1],
+        );
+        pools.insert(id1, pool1);
+        pools.insert(id2, pool2);
+
+        // Swap A → B via ADA (CP then CS)
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xBB),
+            &BigInt::from(10_000),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        assert_eq!(plan.hops.len(), 2);
+        assert!(plan.total_output.is_positive());
+        assert!(is_routed(&plan));
+    }
+
+    /// Test 14: CS marginal correctly prioritizes high-rate CS over CP
+    #[test]
+    fn test_cs_marginal_prioritization() {
+        // CS pool with prices [2, 1]: marginal = 2 * 997/1000 ≈ 1.994
+        // CP pool 1:1 with same reserves: marginal at 0 = 997/1000 ≈ 0.997
+        // CS should be strongly preferred for small amounts.
+        let mut pools = BTreeMap::new();
+        let (id1, pool1) = make_cs_pool(
+            0x01,
+            vec![(token(0xAA), 1_000_000), (token(0xBB), 2_000_000)],
+            vec![2, 1],
+        );
+        let (id2, pool2) = make_pool(0x02, token(0xAA), 1_000_000, token(0xBB), 1_000_000);
+        pools.insert(id1, pool1);
+        pools.insert(id2, pool2);
+
+        let route = find_optimal_route(
+            &pools,
+            &token(0xAA),
+            &token(0xBB),
+            &BigInt::from(1000),
+        );
+        assert!(route.is_some());
+        let plan = route.unwrap();
+        // CS output: 1000*2 = 2000 input_value, v_increase=6, dy=1994
+        // CP output: 1M*997/(1M+997) = 996
+        // CS is much better, router should use CS
+        assert_eq!(plan.total_output, BigInt::from(1994));
     }
 
     /// Test 7: No route possible
