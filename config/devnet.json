@@ -366,7 +366,13 @@
             "ref-utxo": "135af4abfc89d32187c83ecda78fdf6a7c12fd18a51df0460454287e3eedfbc1#0"
           }
         },
-        "pool-configs": {}
+        "pool-configs": {
+          "ca888bf247bb0a887e4509e23432edaec574bf50ed66e4effc7babc6": {
+            "type": "constant-sum",
+            "prices": [1, 1, 1],
+            "fee": [3, 1000]
+          }
+        }
       }
     }
   },
