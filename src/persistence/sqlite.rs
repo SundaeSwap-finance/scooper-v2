@@ -13,8 +13,8 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedTxo, Persistence, ScoopRecord,
-        SpentPersistedTxo, TxChanges,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedPoolConfig, PersistedTxo, Persistence,
+        ScoopRecord, SpentPersistedTxo, TxChanges,
     },
 };
 
@@ -87,6 +87,10 @@ impl SqliteIndexerDao {
 
     fn scoop_records_table(&self) -> String {
         format!("{}_scoop_records", self.namespace)
+    }
+
+    fn pool_configs_table(&self) -> String {
+        format!("{}_pool_configs", self.namespace)
     }
 }
 
@@ -184,6 +188,32 @@ impl IndexerDao for SqliteIndexerDao {
             query.execute(&mut *tx).await?;
         }
 
+        if !changes.pool_configs.is_empty() {
+            let pool_configs_table = self.pool_configs_table();
+            // Upsert: keep the earliest created_slot we've seen.
+            let insert_pool_config_query = {
+                let column_names = "pool_id, config_cbor, created_slot";
+                let values_clauses =
+                    vec!["(?,?,?)".to_string(); changes.pool_configs.len()].join(",");
+                format!(
+                    "INSERT INTO {pool_configs_table} ({column_names}) VALUES {values_clauses} \
+                     ON CONFLICT(pool_id) DO UPDATE SET \
+                       config_cbor = excluded.config_cbor, \
+                       created_slot = MIN({pool_configs_table}.created_slot, excluded.created_slot);"
+                )
+            };
+            let mut query = sqlx::query(&insert_pool_config_query);
+
+            for cfg in changes.pool_configs {
+                query = query
+                    .bind(cfg.pool_id)
+                    .bind(cfg.config_cbor)
+                    .bind(cfg.created_slot as i64);
+            }
+
+            query.execute(&mut *tx).await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -215,6 +245,14 @@ impl IndexerDao for SqliteIndexerDao {
 
         sqlx::query(&format!(
             "DELETE FROM {scoop_records_table} WHERE slot > ?;"
+        ))
+        .bind(slot as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        let pool_configs_table = self.pool_configs_table();
+        sqlx::query(&format!(
+            "DELETE FROM {pool_configs_table} WHERE created_slot > ?;"
         ))
         .bind(slot as i64)
         .execute(&mut *tx)
@@ -255,6 +293,14 @@ impl IndexerDao for SqliteIndexerDao {
         let scoop_records_table = self.scoop_records_table();
         let query = format!(
             "SELECT tx_id, slot, pool_id, n_orders, scooper FROM {scoop_records_table} ORDER BY slot;"
+        );
+        Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
+    }
+
+    async fn load_pool_configs(&self) -> Result<Vec<PersistedPoolConfig>> {
+        let pool_configs_table = self.pool_configs_table();
+        let query = format!(
+            "SELECT pool_id, config_cbor, created_slot FROM {pool_configs_table} ORDER BY created_slot, pool_id;"
         );
         Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
@@ -322,6 +368,19 @@ impl FromRow<'_, SqliteRow> for ScoopRecord {
             pool_id,
             n_orders: n_orders as u32,
             scooper,
+        })
+    }
+}
+
+impl FromRow<'_, SqliteRow> for PersistedPoolConfig {
+    fn from_row(row: &'_ SqliteRow) -> Result<Self, sqlx::Error> {
+        let pool_id: Vec<u8> = row.try_get("pool_id")?;
+        let config_cbor: Vec<u8> = row.try_get("config_cbor")?;
+        let created_slot: i64 = row.try_get("created_slot")?;
+        Ok(Self {
+            pool_id,
+            config_cbor,
+            created_slot: created_slot as u64,
         })
     }
 }
@@ -527,6 +586,97 @@ mod tests {
         }
     }
 
+    fn cs_pool_config(slot: u64) -> PersistedPoolConfig {
+        PersistedPoolConfig {
+            pool_id: vec![0xde, 0xad, 0xbe, 0xef],
+            // Constr(0, [Constr(0, [[1, 2]]), Constr(0, [3, 1000])])
+            // — ConstantSumConfig { prices: [1, 2], fee: 3/1000 }
+            config_cbor: hex::decode("d8799f9f0102ffd8799f031903e8ffff").unwrap(),
+            created_slot: slot,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_pool_configs() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.indexer_dao("sundae_v4");
+
+        let cfg = cs_pool_config(100);
+        dao.apply_tx_changes(TxChanges {
+            slot: cfg.created_slot,
+            height: 1,
+            created_txos: vec![],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            pool_configs: vec![cfg.clone()],
+        })
+        .await?;
+
+        let loaded = dao.load_pool_configs().await?;
+        assert_eq!(loaded, vec![cfg]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pool_configs_upsert_keeps_earliest_slot() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.indexer_dao("sundae_v4");
+
+        let earlier = cs_pool_config(100);
+        let mut later = cs_pool_config(200);
+        // Same pool_id, different slot — second write must not bump created_slot.
+        later.config_cbor = hex::decode("d8799f9f0103ffd8799f031903e8ffff").unwrap();
+
+        dao.apply_tx_changes(TxChanges {
+            slot: earlier.created_slot,
+            height: 1,
+            created_txos: vec![],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            pool_configs: vec![earlier.clone()],
+        }).await?;
+
+        dao.apply_tx_changes(TxChanges {
+            slot: later.created_slot,
+            height: 2,
+            created_txos: vec![],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            pool_configs: vec![later.clone()],
+        }).await?;
+
+        let loaded = dao.load_pool_configs().await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].created_slot, earlier.created_slot);
+        // CBOR is overwritten (later write wins) but slot sticks to earlier.
+        assert_eq!(loaded[0].config_cbor, later.config_cbor);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_pool_configs_after_slot() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.indexer_dao("sundae_v4");
+
+        let cfg = cs_pool_config(500);
+        dao.apply_tx_changes(TxChanges {
+            slot: cfg.created_slot,
+            height: 1,
+            created_txos: vec![],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            pool_configs: vec![cfg.clone()],
+        }).await?;
+
+        dao.rollback(400).await?;
+        assert!(dao.load_pool_configs().await?.is_empty());
+        Ok(())
+    }
+
     fn preview_datum() -> PersistedDatum {
         PersistedDatum {
             hash: hex::decode("8ecfafddfa732227ba5b494183fd3150a4c8614656e6182f92c25ee2d1480019").unwrap(),
@@ -548,6 +698,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -558,6 +709,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -580,6 +732,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -601,6 +754,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -613,6 +767,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum2.clone()],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -634,6 +789,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -644,6 +800,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -656,6 +813,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -678,6 +836,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -688,6 +847,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -713,6 +873,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -723,6 +884,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -735,6 +897,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -761,6 +924,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -773,6 +937,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -785,6 +950,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 
@@ -797,6 +963,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         })
         .await?;
 

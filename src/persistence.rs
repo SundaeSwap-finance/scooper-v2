@@ -56,6 +56,7 @@ pub struct TxChanges {
     pub spent_txos: Vec<SpentTxo>,
     pub metadata_datums: Vec<PersistedDatum>,
     pub scoop_records: Vec<ScoopRecord>,
+    pub pool_configs: Vec<PersistedPoolConfig>,
 }
 impl TxChanges {
     pub fn new(slot: u64, height: u64) -> Self {
@@ -66,6 +67,7 @@ impl TxChanges {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
+            pool_configs: vec![],
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -73,6 +75,7 @@ impl TxChanges {
             && self.spent_txos.is_empty()
             && self.metadata_datums.is_empty()
             && self.scoop_records.is_empty()
+            && self.pool_configs.is_empty()
     }
 }
 
@@ -85,6 +88,7 @@ pub trait IndexerDao: Send + Sync + 'static {
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
     async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>>;
+    async fn load_pool_configs(&self) -> Result<Vec<PersistedPoolConfig>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +107,18 @@ pub struct SpentPersistedTxo {
     pub txo: PersistedTxo,
     pub spent_slot: u64,
     pub spent_tx_id: Option<Vec<u8>>,
+}
+
+/// CBOR-encoded pool module config keyed by pool identifier.
+///
+/// Used to persist CS pool configs (`prices`, `fee`) extracted from on-chain
+/// Create redeemers, so the resolved type survives restarts where the original
+/// Create tx is no longer in the indexer's stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedPoolConfig {
+    pub pool_id: Vec<u8>,
+    pub config_cbor: Vec<u8>,
+    pub created_slot: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

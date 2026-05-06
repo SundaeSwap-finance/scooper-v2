@@ -817,6 +817,9 @@ mod tests {
         async fn load_scoop_records(&self) -> Result<Vec<crate::persistence::ScoopRecord>> {
             Ok(vec![])
         }
+        async fn load_pool_configs(&self) -> Result<Vec<crate::persistence::PersistedPoolConfig>> {
+            Ok(vec![])
+        }
     }
 
     async fn handle_block(indexer: &mut SundaeV3Indexer, block: MultiEraBlock<'_>) -> Result<()> {
