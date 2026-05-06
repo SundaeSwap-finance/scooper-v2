@@ -667,6 +667,25 @@ mod tests {
     }
 
     #[test]
+    fn test_constant_sum_config_cbor_round_trip() {
+        // ConstantSumConfig { prices: [1, 2], fee: 3/1000 }
+        let cfg = ConstantSumConfig {
+            prices: vec![BigInt::from(1), BigInt::from(2)],
+            fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+        };
+        let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
+        // Persisted byte shape used by sqlite tests in persistence::sqlite.
+        // If this changes, update those test fixtures.
+        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffff");
+
+        let pd: PlutusData = minicbor::decode(&cbor).unwrap();
+        let decoded: ConstantSumConfig = AsPlutus::from_plutus(pd).unwrap();
+        assert_eq!(decoded.prices, cfg.prices);
+        assert_eq!(decoded.fee.num, cfg.fee.num);
+        assert_eq!(decoded.fee.den, cfg.fee.den);
+    }
+
+    #[test]
     fn test_decode_v4_constant_product_config() {
         // ConstantProductConfig { fee: Rational { num: 3, den: 1000 } }
         // Constr(0, [Constr(0, [3, 1000])]) — both struct and Rational are Constr-encoded
