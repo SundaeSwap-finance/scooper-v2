@@ -17,7 +17,7 @@ use crate::{
     cardano_types::{AssetClass, TransactionInput, Value},
     events::InvalidOrder,
     persistence::{IndexerDao, PersistedTxo, TxChanges},
-    sundaev3::{self, SundaeV3HistoricalState, SundaeV3Protocol},
+    sundaev3::{self, Ident, SundaeV3HistoricalState, SundaeV3Protocol},
     sundaev4::{self, SundaeV4HistoricalState, SundaeV4Protocol},
 };
 
@@ -145,6 +145,20 @@ trait BootstrapProvider {
     /// Fetch a PlutusV3 script's CBOR by its hash.
     /// Returns the raw script CBOR bytes (single-wrapped: CBOR bytestring containing FLAT UPLC).
     async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>>;
+
+    /// Fetch the CBOR of the transaction that first minted the given asset.
+    ///
+    /// Used to recover the original Create-redeemer payload for pools that were
+    /// created before the scooper started (e.g. CS pools whose `prices`/`fee`
+    /// only live in the Create withdrawal redeemer, not in the persistent datum).
+    /// `asset_unit` is the Blockfrost asset id: hex(policy) ++ hex(asset_name).
+    async fn fetch_first_mint_tx_cbor(&self, asset_unit: &str) -> Result<Vec<u8>> {
+        let _ = asset_unit;
+        anyhow::bail!(
+            "first-mint tx lookup is not supported by this bootstrap provider; \
+             use a Blockfrost source to bootstrap CS pools"
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -474,6 +488,17 @@ struct BlockfrostBlockForUtxo {
     slot: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct BlockfrostAssetHistory {
+    tx_hash: String,
+    action: String, // "minted" | "burned"
+}
+
+#[derive(Deserialize)]
+struct BlockfrostTxCbor {
+    cbor: String,
+}
+
 fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
     let mut value = Value::default();
     for a in amounts {
@@ -751,6 +776,50 @@ impl BootstrapProvider for BlockfrostProvider {
             .ok_or_else(|| anyhow::anyhow!("blockfrost: no cbor field for script {script_hash}"))?;
         hex::decode(cbor_hex).context("blockfrost: invalid script CBOR hex")
     }
+
+    async fn fetch_first_mint_tx_cbor(&self, asset_unit: &str) -> Result<Vec<u8>> {
+        // Page 1, ascending — the earliest history record for the asset is the mint tx.
+        let history_url = format!(
+            "{}/assets/{}/history?order=asc&page=1&count=1",
+            self.url, asset_unit
+        );
+        let history: Vec<BlockfrostAssetHistory> = self
+            .client
+            .get(&history_url)
+            .header("project_id", &self.project_id)
+            .send()
+            .await
+            .context("blockfrost: fetch asset history")?
+            .error_for_status()
+            .context("blockfrost: asset history status")?
+            .json()
+            .await
+            .context("blockfrost: parse asset history")?;
+        let first = history.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("blockfrost: no history for asset {asset_unit}")
+        })?;
+        if first.action != "minted" {
+            anyhow::bail!(
+                "blockfrost: first history entry for {asset_unit} is {}, not 'minted'",
+                first.action
+            );
+        }
+
+        let tx_url = format!("{}/txs/{}/cbor", self.url, first.tx_hash);
+        let resp: BlockfrostTxCbor = self
+            .client
+            .get(&tx_url)
+            .header("project_id", &self.project_id)
+            .send()
+            .await
+            .context("blockfrost: fetch tx cbor")?
+            .error_for_status()
+            .context("blockfrost: tx cbor status")?
+            .json()
+            .await
+            .context("blockfrost: parse tx cbor")?;
+        hex::decode(&resp.cbor).context("blockfrost: invalid tx CBOR hex")
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -933,6 +1002,82 @@ async fn bootstrap_v3(
     Ok(())
 }
 
+/// True iff this pool is constant-sum *and* we don't already know its config —
+/// neither from `pool-configs` in the operator file nor from `cs_configs`
+/// (preloaded persisted entries plus any we've recovered earlier in this pass).
+fn needs_cs_lookup(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    cs_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig>,
+) -> bool {
+    let Some(exec) = execution else {
+        return false;
+    };
+    let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() else {
+        return false;
+    };
+    let swap_action = pool_datum
+        .actions
+        .iter()
+        .find(|a| a.tag == BigInt::from(100) && a.enabled);
+    let Some(action) = swap_action else {
+        return false;
+    };
+    let Some(first_module) = action.modules.first() else {
+        return false;
+    };
+    if first_module.as_slice() != cs_script.hash.as_ref() {
+        return false;
+    }
+    // It's CS. Skip lookup if we already have an answer from any source.
+    let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
+    if exec.pool_configs.contains_key(&ident_hex) {
+        return false;
+    }
+    if cs_configs.contains_key(&pool_datum.identifier) {
+        return false;
+    }
+    true
+}
+
+/// Resolve a CS pool's config by fetching its mint tx and parsing the
+/// constant-sum module's `Create` withdrawal redeemer.
+async fn lookup_cs_config(
+    provider: &(dyn BootstrapProvider + Send + Sync),
+    protocol: &SundaeV4Protocol,
+    ident: &Ident,
+) -> Result<sundaev4::ConstantSumConfig> {
+    let exec = protocol
+        .execution
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no execution config for CS lookup"))?;
+    let cs_script = exec
+        .module_scripts
+        .constant_sum
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no constant_sum module configured"))?;
+
+    let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
+    asset_name.extend_from_slice(ident.to_bytes());
+    let asset_unit = format!(
+        "{}{}",
+        hex::encode(protocol.pool_nft_policy.as_ref()),
+        hex::encode(&asset_name)
+    );
+    debug!(asset = %asset_unit, "bootstrap v4: fetching CS pool Create tx");
+
+    let tx_cbor = provider.fetch_first_mint_tx_cbor(&asset_unit).await?;
+    let tx = pallas_traverse::MultiEraTx::decode(&tx_cbor)
+        .context("decode Create tx CBOR")?;
+
+    sundaev4::extract_cs_config_from_tx(&tx, &cs_script.hash).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Create tx for pool {} has no constant-sum withdrawal redeemer or unparseable initial_state",
+            ident
+        )
+    })
+}
+
 async fn bootstrap_v4(
     provider: &(dyn BootstrapProvider + Send + Sync),
     protocol: &SundaeV4Protocol,
@@ -945,6 +1090,29 @@ async fn bootstrap_v4(
         .fetch_pool_utxos_by_nft(&protocol.pool_nft_policy, &protocol.vault_script_hash)
         .await
         .context("bootstrap v4: fetch pool UTxOs")?;
+
+    // Pre-load any persisted CS configs so we don't re-fetch them via Blockfrost
+    // on every bootstrap. New entries discovered in this pass get appended below.
+    let persisted_configs = dao
+        .load_pool_configs()
+        .await
+        .context("bootstrap v4: load persisted pool configs")?;
+    let mut cs_configs: std::collections::BTreeMap<
+        Ident,
+        sundaev4::ConstantSumConfig,
+    > = std::collections::BTreeMap::new();
+    for cfg in persisted_configs {
+        let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
+            .context("bootstrap v4: persisted pool config CBOR malformed")?;
+        let parsed = sundaev4::ConstantSumConfig::from_plutus(pd)
+            .context("bootstrap v4: persisted pool config decode failed")?;
+        cs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+    }
+    let preloaded_cs = cs_configs.len();
+    if preloaded_cs > 0 {
+        info!(count = preloaded_cs, "bootstrap v4: hydrated CS pool configs from DB");
+    }
+    let mut new_persisted_configs: Vec<crate::persistence::PersistedPoolConfig> = Vec::new();
 
     let mut pools = std::collections::BTreeMap::new();
     for utxo in &pool_utxos {
@@ -976,9 +1144,44 @@ async fn bootstrap_v4(
             continue;
         }
         let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+
+        // For CS pools without a config-file override or persisted entry, fetch
+        // the original Create tx via Blockfrost and parse its withdrawal redeemer.
+        // Failure is a hard error: if a CS pool is on-chain but its Create tx is
+        // unreachable, our chain view is broken and bootstrap should not silently
+        // fall back to defaults.
+        if needs_cs_lookup(&pool_datum, protocol.execution.as_ref(), &cs_configs) {
+            let cs_cfg = lookup_cs_config(
+                provider,
+                protocol,
+                &pool_datum.identifier,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "bootstrap v4: failed to recover CS config for pool {}",
+                    hex::encode(pool_datum.identifier.to_bytes())
+                )
+            })?;
+            let cbor = minicbor::to_vec(&cs_cfg.clone().to_plutus())
+                .context("bootstrap v4: encode ConstantSumConfig CBOR")?;
+            new_persisted_configs.push(crate::persistence::PersistedPoolConfig {
+                pool_id: pool_datum.identifier.to_bytes().to_vec(),
+                config_cbor: cbor,
+                created_slot: utxo.slot,
+            });
+            cs_configs.insert(pool_datum.identifier.clone(), cs_cfg);
+            info!(
+                pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                "bootstrap v4: recovered CS pool config from on-chain Create tx"
+            );
+        }
+
+        let resolved_cs = cs_configs.get(&pool_datum.identifier);
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
             protocol.execution.as_ref(),
+            resolved_cs,
         );
         pools.insert(
             pool_datum.identifier.clone(),
@@ -1266,8 +1469,13 @@ async fn bootstrap_v4(
                 spent_txos: vec![],
                 metadata_datums: vec![],
                 scoop_records: vec![],
+                pool_configs: new_persisted_configs.clone(),
             }).await?;
-            info!(txos = n, "bootstrap: persisted V4 state to DB");
+            info!(
+                txos = n,
+                pool_configs = new_persisted_configs.len(),
+                "bootstrap: persisted V4 state to DB"
+            );
         }
     }
 
