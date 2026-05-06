@@ -1502,3 +1502,109 @@ async fn bootstrap_v4(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod live_smoke_tests {
+    //! Network-bound smoke tests against preview Blockfrost.
+    //!
+    //! Each test is `#[ignore]`'d so `cargo test` stays hermetic. Run with:
+    //!     cargo test --bin scooper-v2 live_smoke -- --ignored --nocapture
+    //!
+    //! These verify the bootstrap lookup endpoints return what our
+    //! deserializers expect, and that we can recover a CS pool's config
+    //! end-to-end. If preview state changes (e.g. the asset id below is
+    //! retired), update the constants — these are diagnostic, not regression
+    //! gates.
+    use super::*;
+    use pallas_traverse::MultiEraTx;
+
+    const PREVIEW_BLOCKFROST: &str = "https://cardano-preview.blockfrost.io/api/v0";
+    const PREVIEW_PROJECT_ID: &str = "previewUJJvqX2v9TOOAis8dZWiuyTPfJxJIKgH";
+    const PREVIEW_POOL_NFT_POLICY_HEX: &str =
+        "9a30124e1071263f8f1b5da9f39436c3e80fab3a7bf7260af7682ad1";
+    const PREVIEW_CS_MODULE_HASH_HEX: &str =
+        "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da";
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_blockfrost_endpoints_match_struct_shapes() -> Result<()> {
+        let provider = BlockfrostProvider::new(PREVIEW_BLOCKFROST, PREVIEW_PROJECT_ID);
+        // Pick any pool NFT under the preview policy and verify we can walk
+        // the asset-history -> tx-cbor pipeline without serde failures.
+        let policy_hash: ScriptHash = PREVIEW_POOL_NFT_POLICY_HEX.parse()?;
+        let pool_utxos = provider
+            .fetch_pool_utxos_by_nft(&policy_hash, &policy_hash)
+            .await?;
+        let utxo = pool_utxos
+            .iter()
+            .find(|u| u.datum_cbor.is_some())
+            .expect("preview must have at least one pool with a datum");
+        let pool_datum = sundaev4::PoolDatum::from_plutus(
+            PlutusData::from_plutus_bytes(utxo.datum_cbor.as_ref().unwrap())?,
+        )?;
+        let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
+        asset_name.extend_from_slice(pool_datum.identifier.to_bytes());
+        let asset_unit = format!(
+            "{}{}",
+            PREVIEW_POOL_NFT_POLICY_HEX,
+            hex::encode(&asset_name)
+        );
+
+        let tx_cbor = provider.fetch_first_mint_tx_cbor(&asset_unit).await?;
+        let _tx = MultiEraTx::decode(&tx_cbor)?;
+        eprintln!(
+            "decoded Create tx for pool {} ({} bytes)",
+            pool_datum.identifier,
+            tx_cbor.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_recover_cs_config_for_any_cs_pool() -> Result<()> {
+        let provider = BlockfrostProvider::new(PREVIEW_BLOCKFROST, PREVIEW_PROJECT_ID);
+        let policy_hash: ScriptHash = PREVIEW_POOL_NFT_POLICY_HEX.parse()?;
+        let cs_hash: ScriptHash = PREVIEW_CS_MODULE_HASH_HEX.parse()?;
+        let pool_utxos = provider
+            .fetch_pool_utxos_by_nft(&policy_hash, &policy_hash)
+            .await?;
+        let mut found_cs = false;
+        for utxo in &pool_utxos {
+            let Some(ref cbor) = utxo.datum_cbor else { continue; };
+            let Ok(pd) = PlutusData::from_plutus_bytes(cbor) else { continue; };
+            let Ok(pool_datum) = sundaev4::PoolDatum::from_plutus(pd) else { continue; };
+            // Detect "is this a CS pool" via the swap action's first module hash.
+            let is_cs = pool_datum
+                .actions
+                .iter()
+                .find(|a| a.tag == BigInt::from(100) && a.enabled)
+                .and_then(|a| a.modules.first())
+                .map(|h| h.as_slice() == cs_hash.as_ref())
+                .unwrap_or(false);
+            if !is_cs {
+                continue;
+            }
+            let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
+            asset_name.extend_from_slice(pool_datum.identifier.to_bytes());
+            let asset_unit = format!(
+                "{}{}",
+                PREVIEW_POOL_NFT_POLICY_HEX,
+                hex::encode(&asset_name)
+            );
+            let tx_cbor = provider.fetch_first_mint_tx_cbor(&asset_unit).await?;
+            let tx = MultiEraTx::decode(&tx_cbor)?;
+            let cfg = sundaev4::extract_cs_config_from_tx(&tx, &cs_hash)
+                .expect("Create redeemer should be parseable");
+            eprintln!(
+                "recovered CS config for {}: prices={:?} fee={}/{}",
+                pool_datum.identifier, cfg.prices, cfg.fee.num, cfg.fee.den
+            );
+            found_cs = true;
+        }
+        if !found_cs {
+            eprintln!("NOTE: no CS pools currently on preview — skipping deep verification");
+        }
+        Ok(())
+    }
+}
