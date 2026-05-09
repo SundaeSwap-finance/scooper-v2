@@ -2,7 +2,7 @@
   "persistence": { "sqlite": { "filename": "scooper-v2.db" } },
   "protocol": {
     "v4": {
-      "vault-script-hash": "a4ba144c65744e8fa8c58c026850fae87f3db9b22fc16ce0a657f9ed",
+      "pool-script-hash": "a4ba144c65744e8fa8c58c026850fae87f3db9b22fc16ce0a657f9ed",
       "order-script-hashes": ["fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"],
       "settings-script-hash": "a0929fe6428f6663b0165094b0e17b8664b15b530fe8fc90eb5adc99",
       "settings-nft": "601580a70de41c680949206c5570974a9bbb53cbc9dcfc4b7537581b.",
@@ -55,7 +55,7 @@
             "hash": "123c75209ffc6aec1e9282980a06e93d2b471306a94dcd8fbb101c50",
             "ref-utxo": "04da286aee665cb5ce55f74dc71b8fd58dd5cb2caf5ca686ab3bf3089bf7d413#0"
           },
-          "vault": {
+          "pool": {
             "hash": "a4ba144c65744e8fa8c58c026850fae87f3db9b22fc16ce0a657f9ed",
             "ref-utxo": "e98f8d3d4cbff86d4c4f99d730217c44b5ebd3c7478b0e6069efb7d31e886597#0"
           },

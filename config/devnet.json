@@ -9,7 +9,7 @@
   },
   "protocol": {
     "v4": {
-      "vault-script-hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
+      "pool-script-hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
       "order-script-hashes": [
         "805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f"
       ],
@@ -345,7 +345,7 @@
             "hash": "1632f4650f19647d3bb2a71f2182f1f6068dc8bb04ee223134a17f58",
             "ref-utxo": "f656f5ef0e0262284f7b80816af13d50f04a50a3031b5eeb8c69e3a9afd23a09#0"
           },
-          "vault": {
+          "pool": {
             "hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
             "ref-utxo": "e836dd72ff443f2e994d5c7e85de22758996c910c658209d944ac3ac2319e22c#0"
           },

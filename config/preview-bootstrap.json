@@ -17,7 +17,7 @@
       "starting-point": "48460699.7bfb6a677df577d2f0371236ecf63554b54b35b663d3ad9159695a609306e629"
     },
     "v4": {
-      "vault-script-hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
+      "pool-script-hash": "a4aa229dcad4ff33d5feccbbf18414cbf795855c32cf21d80bdb3ba6",
       "order-script-hashes": ["fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"],
       "settings-script-hash": "c767266215eb375961303a1e30808ec59d25cfb7cbce85872848cbfa",
       "settings-nft": "9e0b61ad4207b1e0dee7c291b327ba626e3172ffe236e15992a32424.",

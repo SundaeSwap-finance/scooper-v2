@@ -410,21 +410,17 @@ mod tests {
         let mut tracker = ChainTracker::new();
 
         let order_input = TransactionInput::new([0xff; 32].into(), 7);
-        let order = Arc::new(crate::sundaev4::SundaeV4Order {
-            input: order_input.clone(),
-            value: Value::default(),
-            datum: crate::sundaev4::SimpleOrderDatum {
-                owner: crate::multisig::Multisig::Signature(vec![0xaa; 28]),
-                destination: crate::sundaev4::Destination::SelfDestination,
-                offer: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
-                min_received: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
-                max_protocol_fee: crate::bigint::BigInt::from(0i64),
-                extension: pallas_primitives::PlutusData::Constr(
-                    pallas_primitives::Constr { tag: 121, any_constructor: None, fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]) }
-                ),
-            },
-            slot: 1,
-        });
+        let zero_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
+            order_input.clone(),
+            Value::default(),
+            crate::multisig::Multisig::Signature(vec![0xaa; 28]),
+            crate::sundaev4::Destination::SelfDestination,
+            (zero_asset.clone(), crate::bigint::BigInt::from(0i64)),
+            (zero_asset, crate::bigint::BigInt::from(0i64)),
+            crate::bigint::BigInt::from(0i64),
+            1,
+        ));
 
         let mut tx = make_in_flight(0x01, 0xaa, 200, 0);
         tx.consumed_orders = vec![order];
@@ -475,21 +471,17 @@ mod tests {
         let mut tracker = ChainTracker::new();
 
         let order_input = TransactionInput::new([0xff; 32].into(), 7);
-        let order = Arc::new(crate::sundaev4::SundaeV4Order {
-            input: order_input.clone(),
-            value: Value::default(),
-            datum: crate::sundaev4::SimpleOrderDatum {
-                owner: crate::multisig::Multisig::Signature(vec![0xaa; 28]),
-                destination: crate::sundaev4::Destination::SelfDestination,
-                offer: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
-                min_received: (crate::cardano_types::AssetClass { policy: vec![], token: vec![] }, crate::bigint::BigInt::from(0i64)),
-                max_protocol_fee: crate::bigint::BigInt::from(0i64),
-                extension: pallas_primitives::PlutusData::Constr(
-                    pallas_primitives::Constr { tag: 121, any_constructor: None, fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]) }
-                ),
-            },
-            slot: 1,
-        });
+        let zero_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
+            order_input.clone(),
+            Value::default(),
+            crate::multisig::Multisig::Signature(vec![0xaa; 28]),
+            crate::sundaev4::Destination::SelfDestination,
+            (zero_asset.clone(), crate::bigint::BigInt::from(0i64)),
+            (zero_asset, crate::bigint::BigInt::from(0i64)),
+            crate::bigint::BigInt::from(0i64),
+            1,
+        ));
 
         let mut tx = make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 200, 0);
         tx.consumed_orders = vec![order];

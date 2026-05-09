@@ -1087,7 +1087,7 @@ async fn bootstrap_v4(
 ) -> Result<()> {
     info!("bootstrap: fetching V4 pools...");
     let pool_utxos = provider
-        .fetch_pool_utxos_by_nft(&protocol.pool_nft_policy, &protocol.vault_script_hash)
+        .fetch_pool_utxos_by_nft(&protocol.pool_nft_policy, &protocol.pool_script_hash)
         .await
         .context("bootstrap v4: fetch pool UTxOs")?;
 
@@ -1220,13 +1220,19 @@ async fn bootstrap_v4(
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
                 .and_then(|data| {
-                    sundaev4::SimpleOrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+                    sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+                })
+                .and_then(|datum| {
+                    sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                        .map(|constraint| (datum, constraint))
+                        .map_err(|e| format!("{e}"))
                 }) {
-                Ok(datum) => {
+                Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
                         input,
                         value: utxo.value.clone(),
                         datum,
+                        constraint,
                         slot: utxo.slot,
                     }));
                 }
@@ -1309,7 +1315,7 @@ async fn bootstrap_v4(
             &scripts.constant_product,
             &scripts.fee_split,
             &scripts.fairness,
-            &scripts.vault,
+            &scripts.pool,
             &scripts.order,
             &scripts.pool_mint,
             &scripts.settings,
@@ -1361,9 +1367,9 @@ async fn bootstrap_v4(
     {
         let mut persisted_txos: Vec<PersistedTxo> = Vec::new();
 
-        let vault_addr = ShelleyAddress::new(
+        let pool_addr = ShelleyAddress::new(
             Network::Testnet,
-            ShelleyPaymentPart::Script(protocol.vault_script_hash),
+            ShelleyPaymentPart::Script(protocol.pool_script_hash),
             ShelleyDelegationPart::Null,
         ).to_vec();
         for (_, pool) in &pools {
@@ -1373,8 +1379,8 @@ async fn bootstrap_v4(
                 txo_type: "pool".to_string(),
                 created_slot: tip_slot,
                 era: 7,
-                txo: encode_bootstrap_utxo(&vault_addr, &pool.value, Some(&datum_bytes)),
-                address: vault_addr.clone(),
+                txo: encode_bootstrap_utxo(&pool_addr, &pool.value, Some(&datum_bytes)),
+                address: pool_addr.clone(),
                 datum: None,
             });
         }

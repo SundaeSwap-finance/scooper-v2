@@ -78,7 +78,7 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 1: Per-pool transcript + updated datums ───────────────────────
 
-    let void_vault_state = VaultState {
+    let void_pool_state = PoolState {
         assets: vec![],
         total_lp: BigInt::from(0),
         circulating_lp: BigInt::from(0),
@@ -128,7 +128,7 @@ pub fn build_multi_pool_scoop_tx(
             total_fee_budget = &total_fee_budget + &fee_budget;
 
             transcript_entries.push(TranscriptEntry {
-                state_after: VaultState {
+                state_after: PoolState {
                     assets: running_assets.clone(),
                     total_lp: initial_total_lp.clone(),
                     circulating_lp: pool.pool_datum.circulating_lp.clone(),
@@ -136,7 +136,7 @@ pub fn build_multi_pool_scoop_tx(
                 },
                 fee_budget,
                 operation_tag: BigInt::from(100),
-                operation_data: void_vault_state.clone().to_plutus(),
+                operation_data: void_pool_state.clone().to_plutus(),
             });
         }
 
@@ -239,15 +239,15 @@ pub fn build_multi_pool_scoop_tx(
         let pool_sorted_idx = pool_sorted_indices[batch_idx];
         let pool_output_idx = batch_to_pool_output[batch_idx];
 
-        let vault_redeemer = VaultRedeemer::Action {
+        let pool_redeemer = PoolRedeemer::Action {
             tag: BigInt::from(100),
             transcript: per_pool[batch_idx].transcript.clone(),
             pool_input_index: BigInt::from(pool_sorted_idx as u64),
             pool_output_index: BigInt::from(pool_output_idx as u64),
         };
 
-        let vault_key = RedeemersKey { tag: RedeemerTag::Spend, index: pool_sorted_idx as u32 };
-        redeemer_info.push((vault_key.clone(), vault_redeemer.to_plutus(), lookup_eu(&vault_key)));
+        let pool_key = RedeemersKey { tag: RedeemerTag::Spend, index: pool_sorted_idx as u32 };
+        redeemer_info.push((pool_key.clone(), pool_redeemer.to_plutus(), lookup_eu(&pool_key)));
 
         let pool_oref_plutus = OutputRef {
             transaction_id: pool_oref.transaction_id.to_vec(),
@@ -258,13 +258,13 @@ pub fn build_multi_pool_scoop_tx(
             PoolType::ConstantProduct { fee } => {
                 let config = ConstantProductConfig { fee: fee.clone() };
                 cp_entries.push(CPOperateEntry {
-                    vault_oref: pool_oref_plutus.clone(),
+                    pool_oref: pool_oref_plutus.clone(),
                     config,
                 });
             }
             PoolType::ConstantSum { prices, fee } => {
                 cs_entries.push(CSOperateEntry {
-                    vault_oref: pool_oref_plutus.clone(),
+                    pool_oref: pool_oref_plutus.clone(),
                     config: ConstantSumConfig {
                         prices: prices.clone(),
                         fee: fee.clone(),
@@ -281,7 +281,7 @@ pub fn build_multi_pool_scoop_tx(
         };
 
         fs_entries.push(FSOperateEntry {
-            vault_oref: pool_oref_plutus,
+            pool_oref: pool_oref_plutus,
             config: fs_config,
         });
 
@@ -311,7 +311,8 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // ── Step 5: Build order validator entries ───────────────────────────────
-    // Sorted by input_index, output at m_pools + out_pos
+    // Contract iterates filtered order inputs and entries in lock-step; each
+    // entry only carries output_index, which must be strictly increasing.
 
     let mut input_sorted_order: Vec<usize> = (0..n_orders).collect();
     input_sorted_order.sort_by_key(|&i| order_filtered_indices[i]);
@@ -319,8 +320,7 @@ pub fn build_multi_pool_scoop_tx(
     let order_validator_entries: Vec<OrderValidatorEntry> = input_sorted_order
         .iter()
         .enumerate()
-        .map(|(out_pos, &flat_idx)| OrderValidatorEntry {
-            input_index: order_filtered_indices[flat_idx],
+        .map(|(out_pos, _flat_idx)| OrderValidatorEntry {
             output_index: (m_pools + out_pos) as u64,
         })
         .collect();
@@ -338,7 +338,7 @@ pub fn build_multi_pool_scoop_tx(
     // ── Step 6: Reference inputs ───────────────────────────────────────────
 
     let mut all_ref_inputs: Vec<TransactionInput> = vec![
-        exec.module_scripts.vault.ref_utxo.0.clone(),
+        exec.module_scripts.pool.ref_utxo.0.clone(),
         exec.module_scripts.order.ref_utxo.0.clone(),
         exec.module_scripts.fee_split.ref_utxo.0.clone(),
         exec.module_scripts.fairness.ref_utxo.0.clone(),
@@ -352,6 +352,11 @@ pub fn build_multi_pool_scoop_tx(
         if let Some(cs) = &exec.module_scripts.constant_sum {
             all_ref_inputs.push(cs.ref_utxo.0.clone());
         }
+    }
+    // Order-side dispatcher reference. The order validator's withdraw requires
+    // the per-tag module's withdrawal; today every order is a Swap (tag 2).
+    if let Some(so) = &exec.module_scripts.swap_order {
+        all_ref_inputs.push(so.ref_utxo.0.clone());
     }
     all_ref_inputs.push(settings.input.0.clone());
 
@@ -399,6 +404,23 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
 
+    // Per-tag order-module withdrawal. The contract dispatches via
+    // `settings.order_modules[constraint_tag]` and requires the matching
+    // module's withdrawal to be present in the tx. Currently we only batch
+    // Swap-tagged orders, so emit a single swap_order withdrawal with unit
+    // redeemer (the module ignores its own redeemer).
+    let any_swap = batches.iter().any(|b| !b.swaps.is_empty());
+    if any_swap {
+        if let Some(so) = &exec.module_scripts.swap_order {
+            let unit = pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+            });
+            withdrawals.push((reward_account(&so.hash), unit));
+        }
+    }
+
     withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     // Withdrawal redeemers — one per withdrawal entry
@@ -410,12 +432,12 @@ pub fn build_multi_pool_scoop_tx(
     // ── Step 8: Build outputs ──────────────────────────────────────────────
 
     let pool_address = {
-        let vault_addr = ShelleyAddress::new(
+        let pool_addr = ShelleyAddress::new(
             Network::Testnet,
-            ShelleyPaymentPart::Script(exec.module_scripts.vault.hash),
+            ShelleyPaymentPart::Script(exec.module_scripts.pool.hash),
             ShelleyDelegationPart::Null,
         );
-        PallasBytes::from(vault_addr.to_vec())
+        PallasBytes::from(pool_addr.to_vec())
     };
 
     let mut outputs: Vec<TransactionOutput> = Vec::new();
@@ -534,11 +556,28 @@ pub fn build_multi_pool_scoop_tx(
 
         // Compute fulfillment from first principles:
         // fulfillment = order_value - offer - fee + swap_result
-        let (offer_asset, offer_amount) = &swap.order.datum.offer;
+        let (offer_asset, offer_amount) = swap.order.swap_offered();
         let actual_fee = {
             use num_traits::ToPrimitive;
-            let max_fee = swap.order.datum.max_protocol_fee.clone().unwrap().to_u64().unwrap_or(fee);
-            fee.min(max_fee)
+            // Mirror the contract's `compute_fee_allowance(budget, share_batcher, fee, n)`
+            // from `lib/order_lib.ak`:
+            //   fee_share = fee / n; surplus = budget - fee_share
+            //   allowance = fee_share + share_batcher * surplus / 10000
+            // The contract enforces `fee_taken <= allowance * offered_this_fill / original_offered`.
+            // For full-fill swaps offered_this_fill == original_offered so the bound is just `allowance`.
+            // We bill the maximum allowance — the scooper claims their share_batcher cut.
+            let budget = swap.order.datum.budget.clone().unwrap()
+                .to_u64().unwrap_or(0);
+            let share_bps = swap.order.datum.share_batcher.clone().unwrap()
+                .to_u64().unwrap_or(0);
+            let fee_share = TX_FEE / (n_orders as u64);
+            let surplus = budget.saturating_sub(fee_share);
+            let allowance = fee_share + share_bps.saturating_mul(surplus) / 10_000;
+            // `fee` here is the per-order share of TX_FEE (with last-order absorbing
+            // remainder). It must not exceed the contract's allowance bound.
+            // TODO(phase-B): if `budget * n < TX_FEE` the contract rejects the batch.
+            // Pre-filter such orders during batching to avoid wasted submissions.
+            fee.min(allowance)
         };
         let fulfillment_value = build_fulfillment_value_from_order(
             &swap.order.value,

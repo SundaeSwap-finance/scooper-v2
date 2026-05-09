@@ -622,8 +622,8 @@ impl Scooper {
 
             // If direct matching failed, try routing
             if !added {
-                let (offer_asset, offer_amount) = &order.datum.offer;
-                let (ask_asset, _) = &order.datum.min_received;
+                let (offer_asset, offer_amount) = order.swap_offered();
+                let (ask_asset, _) = order.swap_min_received();
                 if offer_asset != ask_asset {
                     if let Some(route) = router::find_optimal_route(
                         &v4_state.pools,

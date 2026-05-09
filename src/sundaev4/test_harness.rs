@@ -11,7 +11,7 @@ pub(crate) mod test_harness {
     use pallas_codec::utils::MaybeIndefArray;
     use pallas_crypto::hash::Hasher;
     use pallas_crypto::key::ed25519::SecretKey;
-    use pallas_primitives::{Hash, TransactionInput};
+    use pallas_primitives::{Hash, PlutusData, TransactionInput};
     use plutus_parser::AsPlutus;
 
     use crate::bigint::BigInt;
@@ -512,19 +512,16 @@ pub(crate) mod test_harness {
         tx_hash[0] = 0xD0;
         tx_hash[1..9].copy_from_slice(&slot.to_be_bytes());
 
-        Arc::new(SundaeV4Order {
-            input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        Arc::new(SundaeV4Order::test_swap_order(
+            crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
             value,
-            datum: SimpleOrderDatum {
-                owner: Multisig::Signature(vec![0xAA; 28]),
-                destination: Destination::SelfDestination,
-                offer: (offer_tok, BigInt::from(offer_amount)),
-                min_received: (want_tok, BigInt::from(min_want)),
-                max_protocol_fee: BigInt::from(1_500_000i64),
-                extension: unit_pd(),
-            },
+            Multisig::Signature(vec![0xAA; 28]),
+            Destination::SelfDestination,
+            (offer_tok, BigInt::from(offer_amount)),
+            (want_tok, BigInt::from(min_want)),
+            BigInt::from(1_500_000i64),
             slot,
-        })
+        ))
     }
 
     /// Build a settings UTxO from the test env's scooper keyhash.
@@ -562,6 +559,13 @@ pub(crate) mod test_harness {
                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
                 authorized_scoopers: Some(vec![scooper_keyhash.to_vec()]),
+                order_modules: vec![],
+                min_share_batcher: BigInt::from(0),
+                extension: PlutusData::Constr(pallas_primitives::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+                }),
             },
             slot: 1,
         }

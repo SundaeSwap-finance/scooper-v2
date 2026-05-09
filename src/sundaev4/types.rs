@@ -42,7 +42,7 @@ mod hex_ser {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Pool / Vault types
+// Pool types
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -66,18 +66,18 @@ pub struct ActionEntry {
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct VaultState {
+pub struct PoolState {
     pub assets: Vec<(AssetClass, BigInt)>,
     pub total_lp: BigInt,
     pub circulating_lp: BigInt,
     pub preminted_lp: BigInt,
 }
 
-impl VaultState {
+impl PoolState {
     /// Construct from a pool datum. Used in tests.
     #[cfg(test)]
     pub fn from_pool(datum: &PoolDatum) -> Self {
-        VaultState {
+        PoolState {
             assets: datum.assets.clone(),
             total_lp: datum.total_lp.clone(),
             circulating_lp: datum.circulating_lp.clone(),
@@ -92,14 +92,14 @@ impl VaultState {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TranscriptEntry {
-    pub state_after: VaultState,
+    pub state_after: PoolState,
     pub fee_budget: BigInt,
     pub operation_tag: BigInt,
     pub operation_data: PlutusData,
 }
 
 #[derive(AsPlutus, Debug, PartialEq, Eq)]
-pub enum VaultRedeemer {
+pub enum PoolRedeemer {
     EscapeHatch {
         redeemed_lp: BigInt,
     },
@@ -120,6 +120,10 @@ pub enum VaultRedeemer {
 // Order types
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Order destination. Matches Aiken's `Destination { Fixed { address, datum } | Self }`.
+/// `PlutusAddress` here is structurally identical to Aiken's `cardano/address.{Address}`
+/// (payment credential + optional referenced stake credential), so the on-wire Constr
+/// encoding round-trips with the contract's redesigned `Address` type unchanged.
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq)]
 pub enum Destination {
     Fixed(PlutusAddress, Option<PlutusData>),
@@ -142,14 +146,131 @@ impl serde::Serialize for Destination {
     }
 }
 
+/// Wire-format order datum, mirroring Aiken's `OrderDatum`.
+///
+/// `constraints` is opaque on-chain — its leading Constr tag dispatches to a
+/// constraint shape (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Decode with
+/// [`Constraint::from_plutus_constraint`] and store the result alongside the
+/// datum on [`SundaeV4Order`] so callers don't re-decode per-access.
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct SimpleOrderDatum {
+pub struct OrderDatum {
     pub owner: Multisig,
     pub destination: Destination,
-    pub offer: (AssetClass, BigInt),
-    pub min_received: (AssetClass, BigInt),
-    pub max_protocol_fee: BigInt,
+    /// Per-order tx-fee budget. Contract requires `budget * n_orders >= tx_fee`.
+    pub budget: BigInt,
+    /// Scooper share of `budget - fee_share` surplus, in basis points (0..=10000).
+    pub share_batcher: BigInt,
+    /// Opaque constraint payload — see [`Constraint`] for the decoded form.
+    pub constraints: PlutusData,
     pub extension: PlutusData,
+}
+
+/// Decoded form of `OrderDatum.constraints`. The constructor tag picks the variant.
+///
+/// Shapes match the contract's per-tag extractors (see `lib/constraints/`):
+/// - Basic (Deposit/Withdraw/Claim): `offered` and `min_received` are `List<(AssetClass, Int)>`.
+/// - Swap: `offered: AssetClass` (no quantity), `original_offered: Int`,
+///   `remaining_offered: Int`, `min_received: List<(AssetClass, Int)>`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum Constraint {
+    /// Tag 0
+    Deposit {
+        offered: Vec<(AssetClass, BigInt)>,
+        min_received: Vec<(AssetClass, BigInt)>,
+    },
+    /// Tag 1
+    Withdraw {
+        offered: Vec<(AssetClass, BigInt)>,
+        min_received: Vec<(AssetClass, BigInt)>,
+    },
+    /// Tag 2 — partial-fill capable. `original_offered` is the immutable quote
+    /// reference; `remaining_offered` shrinks as fills happen.
+    Swap {
+        offered: AssetClass,
+        original_offered: BigInt,
+        remaining_offered: BigInt,
+        min_received: Vec<(AssetClass, BigInt)>,
+    },
+    /// Tag 3
+    Claim {
+        offered: Vec<(AssetClass, BigInt)>,
+        min_received: Vec<(AssetClass, BigInt)>,
+    },
+}
+
+impl Constraint {
+    /// Decode a `Constr`-tagged constraint payload. Returns the unrecognised tag
+    /// in the error case so the caller can decide how to surface it.
+    pub fn from_plutus_constraint(pd: &PlutusData) -> anyhow::Result<Self> {
+        let PlutusData::Constr(c) = pd else {
+            anyhow::bail!("constraint must be a Constr");
+        };
+        // Pallas tags: Constr 0..6 → cbor 121..127, Constr 7+ → 1280+. Strip the offset.
+        let tag = if c.tag >= 121 && c.tag <= 127 {
+            (c.tag - 121) as u64
+        } else if c.tag >= 1280 {
+            (c.tag - 1280 + 7) as u64
+        } else {
+            c.tag as u64
+        };
+        let fields: Vec<PlutusData> = c.fields.clone().to_vec();
+        let f = |i: usize| -> anyhow::Result<&PlutusData> {
+            fields.get(i).ok_or_else(|| anyhow::anyhow!("constraint missing field {i}"))
+        };
+        let list_pair = |i: usize| -> anyhow::Result<Vec<(AssetClass, BigInt)>> {
+            <Vec<(AssetClass, BigInt)>>::from_plutus(f(i)?.clone())
+                .map_err(|e| anyhow::anyhow!("decode list pair: {e}"))
+        };
+        Ok(match tag {
+            0 => Constraint::Deposit { offered: list_pair(0)?, min_received: list_pair(1)? },
+            1 => Constraint::Withdraw { offered: list_pair(0)?, min_received: list_pair(1)? },
+            2 => Constraint::Swap {
+                offered: AssetClass::from_plutus(f(0)?.clone())
+                    .map_err(|e| anyhow::anyhow!("decode swap.offered: {e}"))?,
+                original_offered: BigInt::from_plutus(f(1)?.clone())
+                    .map_err(|e| anyhow::anyhow!("decode swap.original_offered: {e}"))?,
+                remaining_offered: BigInt::from_plutus(f(2)?.clone())
+                    .map_err(|e| anyhow::anyhow!("decode swap.remaining_offered: {e}"))?,
+                min_received: list_pair(3)?,
+            },
+            3 => Constraint::Claim { offered: list_pair(0)?, min_received: list_pair(1)? },
+            t => anyhow::bail!("unknown constraint tag {t}"),
+        })
+    }
+
+    /// Constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Matches the
+    /// `settings.order_modules` lookup key.
+    pub fn tag(&self) -> u64 {
+        match self {
+            Constraint::Deposit { .. } => 0,
+            Constraint::Withdraw { .. } => 1,
+            Constraint::Swap { .. } => 2,
+            Constraint::Claim { .. } => 3,
+        }
+    }
+
+    /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
+    /// the constraint. Returns `None` for non-Swap orders — the scooper's
+    /// batching path only handles swaps.
+    pub fn swap_offered(&self) -> Option<(&AssetClass, &BigInt)> {
+        match self {
+            Constraint::Swap { offered, remaining_offered, .. } => Some((offered, remaining_offered)),
+            _ => None,
+        }
+    }
+
+    /// First entry of a Swap's `min_received` list, borrowed. Today's batching
+    /// path treats orders as having a single counter-asset; multi-asset
+    /// `min_received` constraints are TODO.
+    pub fn swap_min_received(&self) -> Option<(&AssetClass, &BigInt)> {
+        match self {
+            Constraint::Swap { min_received, .. } => {
+                let (a, q) = min_received.first()?;
+                Some((a, q))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
@@ -171,6 +292,11 @@ pub struct SettingsDatum {
     pub treasury_address: Vec<u8>,
     #[serde(serialize_with = "hex_ser::opt_vec_bytes")]
     pub authorized_scoopers: Option<Vec<Vec<u8>>>,
+    /// Maps order constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim) → module script hash.
+    pub order_modules: Vec<(BigInt, Vec<u8>)>,
+    /// Minimum scooper share in basis points; orders with `share_batcher < min_share_batcher` are rejected.
+    pub min_share_batcher: BigInt,
+    pub extension: PlutusData,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -233,7 +359,6 @@ pub struct OrderValidatorRedeemer {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct OrderValidatorEntry {
-    pub input_index: u64,
     pub output_index: u64,
 }
 
@@ -245,7 +370,7 @@ pub enum ConstantProductRedeemer {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct CPOperateEntry {
-    pub vault_oref: OutputRef,
+    pub pool_oref: OutputRef,
     pub config: ConstantProductConfig,
 }
 
@@ -258,7 +383,7 @@ pub enum ConstantSumRedeemer {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct CSOperateEntry {
-    pub vault_oref: OutputRef,
+    pub pool_oref: OutputRef,
     pub config: ConstantSumConfig,
 }
 
@@ -275,7 +400,7 @@ pub enum FeeSplitRedeemer {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct FSOperateEntry {
-    pub vault_oref: OutputRef,
+    pub pool_oref: OutputRef,
     pub config: FeeSplitConfig,
 }
 
@@ -407,13 +532,19 @@ pub struct ModuleScripts {
     pub constant_product: ScriptRefInfo,
     pub fee_split: ScriptRefInfo,
     pub fairness: ScriptRefInfo,
-    pub vault: ScriptRefInfo,
+    pub pool: ScriptRefInfo,
     pub order: ScriptRefInfo,
     pub pool_mint: ScriptRefInfo,
     pub settings: ScriptRefInfo,
     /// Optional: only required when scooping constant-sum pools.
     #[serde(default)]
     pub constant_sum: Option<ScriptRefInfo>,
+    /// Per-tag order-side dispatcher modules. Keyed by constraint tag
+    /// (2 = Swap). Required for the modules referenced in
+    /// `settings.order_modules` — the order validator's withdraw handler
+    /// requires their withdrawals to be present.
+    #[serde(default)]
+    pub swap_order: Option<ScriptRefInfo>,
 }
 
 #[serde_with::serde_as]
@@ -453,8 +584,72 @@ impl PartialOrd for SundaeV4Pool {
 pub struct SundaeV4Order {
     pub input: TransactionInput,
     pub value: Value,
-    pub datum: SimpleOrderDatum,
+    pub datum: OrderDatum,
+    /// Decoded constraint, computed once at index time so consumers don't re-parse.
+    pub constraint: Constraint,
     pub slot: u64,
+}
+
+impl SundaeV4Order {
+    /// Convenience: `(offered_asset, remaining_offered_qty)` for Swap orders.
+    /// Panics on non-Swap; only call from paths that have already filtered to
+    /// swap-shaped orders.
+    pub fn swap_offered(&self) -> (&AssetClass, &BigInt) {
+        self.constraint.swap_offered()
+            .expect("SundaeV4Order::swap_offered called on non-Swap constraint")
+    }
+
+    /// First entry of the Swap's min_received list. See
+    /// [`Constraint::swap_min_received`].
+    pub fn swap_min_received(&self) -> (&AssetClass, &BigInt) {
+        self.constraint.swap_min_received()
+            .expect("SundaeV4Order::swap_min_received called on non-Swap constraint")
+    }
+
+    /// Test-only constructor for a Swap-shaped order. `offer` is `(asset, qty)`
+    /// where qty becomes both `original_offered` and `remaining_offered` (no
+    /// partial-fill state). `min_received` becomes a single-entry list. Uses
+    /// `unit` for `extension`; `budget` is the per-order tx-fee budget.
+    #[cfg(test)]
+    pub fn test_swap_order(
+        input: TransactionInput,
+        value: Value,
+        owner: Multisig,
+        destination: Destination,
+        offer: (AssetClass, BigInt),
+        min_received: (AssetClass, BigInt),
+        budget: BigInt,
+        slot: u64,
+    ) -> Self {
+        let (offer_asset, offer_qty) = offer;
+        let min_recv_list = vec![min_received];
+        let constraints = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 121 + 2, // Swap
+            any_constructor: None,
+            fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
+                offer_asset.to_plutus(),
+                offer_qty.clone().to_plutus(),       // original_offered
+                offer_qty.to_plutus(),               // remaining_offered
+                min_recv_list.to_plutus(),
+            ]),
+        });
+        let unit = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 121,
+            any_constructor: None,
+            fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+        });
+        let datum = OrderDatum {
+            owner,
+            destination,
+            budget,
+            share_batcher: BigInt::from(0),
+            constraints: constraints.clone(),
+            extension: unit,
+        };
+        let constraint = Constraint::from_plutus_constraint(&constraints)
+            .expect("test_swap_order: constraint should decode");
+        SundaeV4Order { input, value, datum, constraint, slot }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -473,7 +668,7 @@ pub struct SundaeV4Settings {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SundaeV4Protocol {
-    pub vault_script_hash: ScriptHash,
+    pub pool_script_hash: ScriptHash,
     pub order_script_hashes: Vec<ScriptHash>,
     pub settings_script_hash: ScriptHash,
     pub settings_nft: AssetClass,
@@ -534,8 +729,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_v4_vault_state() {
-        // VaultState with 2 assets, total_lp=1000, circ_lp=500, preminted=500
+    fn test_decode_v4_pool_state() {
+        // PoolState with 2 assets, total_lp=1000, circ_lp=500, preminted=500
         let bytes = hex::decode(concat!(
             "d8799f",
             "9f9f9f4040ff1a00989680ff9f9f44010203044405060708ff1a004c4b40ffff",
@@ -546,7 +741,7 @@ mod tests {
         ))
         .unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
-        let vs: VaultState = AsPlutus::from_plutus(pd).unwrap();
+        let vs: PoolState = AsPlutus::from_plutus(pd).unwrap();
         assert_eq!(vs.total_lp, BigInt::from(1000));
         assert_eq!(vs.circulating_lp, BigInt::from(500));
         assert_eq!(vs.preminted_lp, BigInt::from(500));
@@ -569,37 +764,61 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_v4_simple_order_datum() {
-        // SimpleOrderDatum: owner=Sig(0xaa..28), dest=Self,
-        // offer=(ADA, 5_000_000), min_received=(token, 1_000_000),
-        // max_protocol_fee=500_000, extension=unit
-        let datum = SimpleOrderDatum {
+    fn test_decode_v4_order_datum_swap() {
+        // OrderDatum with a Swap constraint (tag=2):
+        //   offered = ADA (asset only)
+        //   original_offered = remaining_offered = 5_000_000
+        //   min_received = [(token, 1_000_000)]
+        let ada = AssetClass { policy: vec![], token: vec![] };
+        let token = AssetClass {
+            policy: vec![0x01, 0x02, 0x03, 0x04],
+            token: vec![0x05, 0x06, 0x07, 0x08],
+        };
+        let unit = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 121,
+            any_constructor: None,
+            fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+        });
+        let min_recv: Vec<(AssetClass, BigInt)> =
+            vec![(token.clone(), BigInt::from(1_000_000))];
+        let constraints = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 121 + 2, // Swap
+            any_constructor: None,
+            fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
+                ada.clone().to_plutus(),               // offered: AssetClass
+                BigInt::from(5_000_000).to_plutus(),   // original_offered: Int
+                BigInt::from(5_000_000).to_plutus(),   // remaining_offered: Int
+                min_recv.to_plutus(),                  // min_received: List<(AssetClass, Int)>
+            ]),
+        });
+        let datum = OrderDatum {
             owner: Multisig::Signature(vec![0xaa; 28]),
             destination: Destination::SelfDestination,
-            offer: (
-                AssetClass { policy: vec![], token: vec![] },
-                BigInt::from(5_000_000),
-            ),
-            min_received: (
-                AssetClass { policy: vec![0x01, 0x02, 0x03, 0x04], token: vec![0x05, 0x06, 0x07, 0x08] },
-                BigInt::from(1_000_000),
-            ),
-            max_protocol_fee: BigInt::from(500_000),
-            extension: PlutusData::Constr(pallas_primitives::Constr {
-                tag: 121,
-                any_constructor: None,
-                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
-            }),
+            budget: BigInt::from(1_000_000),
+            share_batcher: BigInt::from(50),
+            constraints: constraints.clone(),
+            extension: unit,
         };
 
-        // Round-trip: encode then decode
-        let pd = datum.to_plutus();
-        let decoded: SimpleOrderDatum = AsPlutus::from_plutus(pd).unwrap();
+        let pd = datum.clone().to_plutus();
+        let decoded: OrderDatum = AsPlutus::from_plutus(pd).unwrap();
         assert_eq!(decoded.owner, Multisig::Signature(vec![0xaa; 28]));
         assert_eq!(decoded.destination, Destination::SelfDestination);
-        assert_eq!(decoded.offer.1, BigInt::from(5_000_000));
-        assert_eq!(decoded.min_received.1, BigInt::from(1_000_000));
-        assert_eq!(decoded.max_protocol_fee, BigInt::from(500_000));
+        assert_eq!(decoded.budget, BigInt::from(1_000_000));
+        assert_eq!(decoded.share_batcher, BigInt::from(50));
+
+        let parsed = Constraint::from_plutus_constraint(&decoded.constraints).unwrap();
+        match parsed {
+            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+                assert_eq!(offered, ada);
+                assert_eq!(original_offered, BigInt::from(5_000_000));
+                assert_eq!(remaining_offered, BigInt::from(5_000_000));
+                assert_eq!(min_received.len(), 1);
+                assert_eq!(min_received[0].0, token);
+                assert_eq!(min_received[0].1, BigInt::from(1_000_000));
+            }
+            other => panic!("expected Swap, got {other:?}"),
+        }
     }
 
     #[test]
@@ -621,14 +840,14 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_v4_vault_redeemer_action() {
-        // VaultRedeemer::Action { tag: 100, transcript: [], pool_input_index: 0, pool_output_index: 0 }
+    fn test_decode_v4_pool_redeemer_action() {
+        // PoolRedeemer::Action { tag: 100, transcript: [], pool_input_index: 0, pool_output_index: 0 }
         // = Constr 3 [100, [], 0, 0]
         let bytes = hex::decode("d87c9f18649fff0000ff").unwrap();
         let pd: PlutusData = minicbor::decode(&bytes).unwrap();
-        let redeemer: VaultRedeemer = AsPlutus::from_plutus(pd).unwrap();
+        let redeemer: PoolRedeemer = AsPlutus::from_plutus(pd).unwrap();
         match redeemer {
-            VaultRedeemer::Action {
+            PoolRedeemer::Action {
                 tag,
                 transcript,
                 pool_input_index,
@@ -645,25 +864,29 @@ mod tests {
 
     #[test]
     fn test_decode_v4_settings_datum() {
-        // SettingsDatum { admin: Sig(0xaa..28), treasury_admin: Sig(0xbb..28),
-        //   treasury_address: 0xcccc, authorized_scoopers: Some([0xdd..28]) }
-        let bytes = hex::decode(concat!(
-            "d8799f",
-            "d8799f581c",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff",
-            "d8799f581c",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbff",
-            "42cccc",
-            "d8799f9f581c",
-            "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddffff",
-            "ff"
-        ))
-        .unwrap();
-        let pd: PlutusData = minicbor::decode(&bytes).unwrap();
-        let settings: SettingsDatum = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(settings.treasury_address, vec![0xcc, 0xcc]);
-        assert!(settings.authorized_scoopers.is_some());
-        assert_eq!(settings.authorized_scoopers.as_ref().unwrap().len(), 1);
+        // Round-trip: build a SettingsDatum with all 7 fields, encode, decode, compare.
+        let datum = SettingsDatum {
+            settings_admin: Multisig::Signature(vec![0xaa; 28]),
+            treasury_admin: Multisig::Signature(vec![0xbb; 28]),
+            treasury_address: vec![0xcc, 0xcc],
+            authorized_scoopers: Some(vec![vec![0xdd; 28]]),
+            order_modules: vec![
+                (BigInt::from(2), vec![0xee; 28]), // tag 2 = Swap
+            ],
+            min_share_batcher: BigInt::from(50),
+            extension: PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+            }),
+        };
+        let pd = datum.clone().to_plutus();
+        let decoded: SettingsDatum = AsPlutus::from_plutus(pd).unwrap();
+        assert_eq!(decoded.treasury_address, vec![0xcc, 0xcc]);
+        assert_eq!(decoded.authorized_scoopers.as_ref().unwrap().len(), 1);
+        assert_eq!(decoded.order_modules.len(), 1);
+        assert_eq!(decoded.order_modules[0].0, BigInt::from(2));
+        assert_eq!(decoded.min_share_batcher, BigInt::from(50));
     }
 
     #[test]
@@ -697,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_state_from_pool() {
+    fn test_pool_state_from_pool() {
         let pool = PoolDatum {
             assets: vec![
                 (AssetClass { policy: vec![], token: vec![] }, BigInt::from(100)),
@@ -710,7 +933,7 @@ mod tests {
             actions: vec![],
             module_state: vec![],
         };
-        let state = VaultState::from_pool(&pool);
+        let state = PoolState::from_pool(&pool);
         assert_eq!(state.assets, pool.assets);
         assert_eq!(state.total_lp, pool.total_lp);
         assert_eq!(state.circulating_lp, pool.circulating_lp);
@@ -718,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn test_vault_redeemer_encoding() {
+    fn test_pool_redeemer_encoding() {
         use crate::cardano_types::AssetClass;
 
-        // Build a minimal VaultRedeemer::Action and check its CBOR hex
-        let state = VaultState {
+        // Build a minimal PoolRedeemer::Action and check its CBOR hex
+        let state = PoolState {
             assets: vec![
                 (AssetClass { policy: vec![0xaa], token: vec![0xbb] }, BigInt::from(100)),
             ],
@@ -734,14 +957,14 @@ mod tests {
             state_after: state.clone(),
             fee_budget: BigInt::from(1),
             operation_tag: BigInt::from(100),
-            operation_data: VaultState {
+            operation_data: PoolState {
                 assets: vec![],
                 total_lp: BigInt::from(0),
                 circulating_lp: BigInt::from(0),
                 preminted_lp: BigInt::from(0),
             }.to_plutus(),
         };
-        let redeemer = VaultRedeemer::Action {
+        let redeemer = PoolRedeemer::Action {
             tag: BigInt::from(100),
             transcript: vec![entry],
             pool_input_index: BigInt::from(0u64),
@@ -750,7 +973,7 @@ mod tests {
         let pd = redeemer.to_plutus();
         let cbor = minicbor::to_vec(&pd).unwrap();
         let hex = hex::encode(&cbor);
-        eprintln!("VaultRedeemer CBOR hex: {hex}");
+        eprintln!("PoolRedeemer CBOR hex: {hex}");
 
         // Verify structure: should be Constr(3, [tag, transcript, pool_input_idx, pool_output_idx])
         if let PlutusData::Constr(c) = &pd {

@@ -270,7 +270,7 @@ impl Accumulator {
         }
 
         // Check min_received against the final routed output
-        let (ask_asset, min_qty) = &order.datum.min_received;
+        let (ask_asset, min_qty) = order.swap_min_received();
         if final_output_asset.as_ref() == Some(ask_asset) && &final_output_amount < min_qty {
             return Err(format!(
                 "routed output {} below min_received {}",
@@ -383,7 +383,7 @@ mod tests {
     use super::*;
     use crate::cardano_types::{TransactionInput, Value};
     use crate::multisig::Multisig;
-    use crate::sundaev4::types::{Destination, SimpleOrderDatum, PoolDatum, PoolType, Rational, SundaeV4Order};
+    use crate::sundaev4::types::{Destination, PoolDatum, PoolType, Rational, SundaeV4Order};
     use pallas_codec::utils::MaybeIndefArray;
 
     fn ada() -> AssetClass {
@@ -438,19 +438,16 @@ mod tests {
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(ada_amount));
 
-        Arc::new(SundaeV4Order {
-            input: TransactionInput::new([slot as u8; 32].into(), 0),
+        Arc::new(SundaeV4Order::test_swap_order(
+            TransactionInput::new([slot as u8; 32].into(), 0),
             value,
-            datum: SimpleOrderDatum {
-                owner: Multisig::Signature(vec![0xaa; 28]),
-                destination: Destination::SelfDestination,
-                offer: (ada(), BigInt::from(offer_amount)),
-                min_received: (min_token, BigInt::from(min_qty)),
-                max_protocol_fee: BigInt::from(1_500_000i64),
-                extension: unit_pd(),
-            },
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (ada(), BigInt::from(offer_amount)),
+            (min_token, BigInt::from(min_qty)),
+            BigInt::from(1_500_000i64),
             slot,
-        })
+        ))
     }
 
     #[test]

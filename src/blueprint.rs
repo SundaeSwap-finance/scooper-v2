@@ -100,15 +100,19 @@ impl Blueprint {
     pub fn to_v4_module_scripts(&self) -> Result<crate::sundaev4::ModuleScripts> {
         use crate::sundaev4::ModuleScripts;
 
-        // (validator title pattern, reference key, field name for error messages)
+        // (validator title pattern, reference key, field name for error messages).
+        // Patterns are substring-matched against the plutus.json validator title,
+        // so use the most specific suffix (e.g. `_module`, `_validator`) to avoid
+        // collisions: `pool` would match `pool_mint` and `pool_validator`; `order`
+        // would match `order_validator`, `basic_order_module`, and `swap_order_module`.
         let mappings: &[(&[&str], &str, &str)] = &[
-            (&["constant_product", "constant-product", "constantProduct"], "constantProduct", "constant_product"),
-            (&["fee_split", "fee-split", "feeSplit"], "feeSplit", "fee_split"),
-            (&["fairness"], "fairness", "fairness"),
-            (&["vault"], "vault", "vault"),
-            (&["order"], "order", "order"),
-            (&["pool_mint", "pool-mint", "poolMint"], "poolMint", "pool_mint"),
-            (&["settings_mint", "settings-mint", "settings", "settingsMint"], "settings", "settings"),
+            (&["constant_product_module", "constant_product", "constantProduct"], "constantProduct", "constant_product"),
+            (&["fee_split_module", "fee_split", "feeSplit"], "feeSplit", "fee_split"),
+            (&["fairness_module", "fairness"], "fairness", "fairness"),
+            (&["pool_validator", "pool"], "pool", "pool"),
+            (&["order_validator"], "order", "order"),
+            (&["pool_mint"], "poolMint", "pool_mint"),
+            (&["settings_validator"], "settings", "settings"),
         ];
 
         fn find_by_patterns<'a>(bp: &'a Blueprint, patterns: &[&str]) -> Option<&'a Validator> {
@@ -164,20 +168,29 @@ impl Blueprint {
         // Try to find constant_sum (optional — not all blueprints include it)
         let constant_sum = make_info(
             self,
-            &["constant_sum", "constant-sum", "constantSum"],
+            &["constant_sum_module", "constant_sum", "constantSum"],
             "constantSum",
             "constant_sum",
+        ).ok();
+
+        // Try to find swap_order (optional — pre-redesign blueprints lack it)
+        let swap_order = make_info(
+            self,
+            &["swap_order_module", "swap_order", "swapOrder"],
+            "swapOrder",
+            "swap_order",
         ).ok();
 
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2)?,
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
             fairness: make_info(self, mappings[2].0, mappings[2].1, mappings[2].2)?,
-            vault: make_info(self, mappings[3].0, mappings[3].1, mappings[3].2)?,
+            pool: make_info(self, mappings[3].0, mappings[3].1, mappings[3].2)?,
             order: make_info(self, mappings[4].0, mappings[4].1, mappings[4].2)?,
             pool_mint: make_info(self, mappings[5].0, mappings[5].1, mappings[5].2)?,
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
             constant_sum,
+            swap_order,
         })
     }
 }
@@ -239,6 +252,82 @@ mod tests {
         let info = bp.script_ref_info("vault", "vault").unwrap();
         assert_eq!(hex::encode(info.hash), "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd");
         assert_eq!(info.ref_utxo.0.index, 0);
+    }
+
+    /// Smoke test against the deployed preview blueprint. Verifies that the
+    /// title-pattern mappings in `to_v4_module_scripts` resolve every required
+    /// validator + ref-UTxO from the post-redesign contract titles
+    /// (`pool.pool_validator.spend`, `modules/constant_product.constant_product_module.withdraw`,
+    /// `constraints/swap_order.swap_order_module.withdraw`, etc.). Skipped if
+    /// the file is missing so CI on a fresh checkout doesn't fail.
+    #[test]
+    fn test_load_preview_blueprint() {
+        let path = "/home/pi/proj/sundae/sundae-v4/preview-blueprint.json";
+        let Ok(data) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present");
+            return;
+        };
+        let bp: Blueprint = serde_json::from_str(&data)
+            .expect("preview blueprint should parse");
+        let modules = bp.to_v4_module_scripts()
+            .expect("to_v4_module_scripts should resolve every required validator");
+        // Pool validator hash should be 28 bytes.
+        assert_eq!(modules.pool.hash.as_slice().len(), 28);
+        assert_eq!(modules.order.hash.as_slice().len(), 28);
+        assert_eq!(modules.settings.hash.as_slice().len(), 28);
+        assert_eq!(modules.pool_mint.hash.as_slice().len(), 28);
+        assert!(modules.constant_product.script_cbor.is_some());
+        assert!(modules.constant_sum.is_some(), "constant_sum optional but present in preview");
+        assert!(modules.swap_order.is_some(), "swap_order required for new order dispatch");
+    }
+
+    /// Verifies that `config/preview-v4.json` deserializes into the scooper's
+    /// `SundaeV4Protocol` end-to-end and that the hashes in it agree with the
+    /// blueprint at `~/proj/sundae/sundae-v4/preview-blueprint.json`. Catches
+    /// drift between the two without running any chain ops.
+    #[test]
+    fn test_preview_v4_config_matches_blueprint() {
+        // Skip if blueprint is absent (fresh checkout / non-deploy machine).
+        let bp_path = "/home/pi/proj/sundae/sundae-v4/preview-blueprint.json";
+        let Ok(bp_data) = std::fs::read_to_string(bp_path) else {
+            eprintln!("skipping: {bp_path} not present");
+            return;
+        };
+        let bp: Blueprint = serde_json::from_str(&bp_data).expect("blueprint should parse");
+
+        // Parse the config file via the scooper's full config layer, then pull
+        // out the v4 protocol section.
+        let cfg_text = std::fs::read_to_string("config/preview-v4.json")
+            .expect("config/preview-v4.json should exist");
+        let cfg_value: serde_json::Value =
+            serde_json::from_str(&cfg_text).expect("config should parse as JSON");
+        let v4_value = &cfg_value["protocol"]["v4"];
+        let v4: crate::sundaev4::SundaeV4Protocol =
+            serde_json::from_value(v4_value.clone()).expect("v4 protocol should deserialize");
+
+        // pool/order/settings/pool_nft script hashes must match the blueprint.
+        let bp_modules = bp.to_v4_module_scripts().expect("blueprint modules");
+        assert_eq!(
+            v4.pool_script_hash, bp_modules.pool.hash,
+            "pool script hash drift",
+        );
+        assert_eq!(
+            v4.order_script_hashes[0], bp_modules.order.hash,
+            "order script hash drift",
+        );
+        assert_eq!(
+            v4.settings_script_hash, bp_modules.settings.hash,
+            "settings script hash drift",
+        );
+        assert_eq!(
+            v4.pool_nft_policy, bp_modules.pool_mint.hash,
+            "pool_nft_policy must equal pool_mint validator hash",
+        );
+
+        // settings_nft policy must equal the settings_mint validator hash.
+        let settings_mint_hash =
+            bp.find_validator("settings_mint").expect("settings_mint validator").hash.clone();
+        assert_eq!(hex::encode(v4.settings_nft.policy), settings_mint_hash);
     }
 
     #[test]

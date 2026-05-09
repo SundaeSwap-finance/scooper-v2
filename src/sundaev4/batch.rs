@@ -103,12 +103,21 @@ pub fn group_orders_by_pool(
 }
 
 /// Find a pool whose assets match the order's offer AND min_received tokens.
+///
+/// Phase B stance: scooper executes Swap orders as **full-consume** only. The
+/// `remaining_offered` quantity from the order's Swap constraint is taken as
+/// `dx`; one fulfillment output is produced at the order's destination
+/// (matching the contract's `output.address != input.address` branch in
+/// `validate_swap_order`). Partial fills — re-outputting to the same script
+/// with a reduced `remaining_offered` and an unchanged `original_offered` /
+/// `min_received` — are not yet supported. TODO(phase-B+): add a partial-fill
+/// path so large limit-style orders can stream across multiple scoops.
 pub fn find_pool_for_simple_order(
     order: &SundaeV4Order,
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
-    let offer_asset = &order.datum.offer.0;
-    let ask_asset = &order.datum.min_received.0;
+    let offer_asset = order.swap_offered().0;
+    let ask_asset = order.swap_min_received().0;
 
     for (ident, pool) in pools {
         let has_offer = pool.pool_datum.assets.iter().any(|(a, _)| a == offer_asset);
@@ -227,8 +236,8 @@ pub fn try_execute_order(
         return None;
     };
 
-    // dx comes directly from the datum's offer amount
-    let dx = order.datum.offer.1.clone();
+    // dx comes from the order's remaining_offered amount (partial fills not yet supported).
+    let dx = order.swap_offered().1.clone();
     if !dx.is_positive() {
         return None;
     }
@@ -292,8 +301,8 @@ pub fn check_order_executability(
     let (input_idx, output_idx) = detect_swap_direction(order, pool_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
-    // dx comes directly from the datum's offer amount
-    let dx = order.datum.offer.1.clone();
+    // dx comes from the order's remaining_offered amount.
+    let dx = order.swap_offered().1.clone();
     if !dx.is_positive() {
         return Err("offered amount not positive".to_string());
     }
@@ -305,7 +314,7 @@ pub fn check_order_executability(
 
     // Check min_received
     let output_asset = &pool_assets[output_idx].0;
-    let (ask_asset, min_qty) = &order.datum.min_received;
+    let (ask_asset, min_qty) = order.swap_min_received();
     if ask_asset != output_asset {
         return Err("pool output asset doesn't match min_received token".to_string());
     }
@@ -331,8 +340,8 @@ pub fn detect_swap_direction(
     order: &SundaeV4Order,
     assets: &[(AssetClass, BigInt)],
 ) -> Option<(usize, usize)> {
-    let offer_asset = &order.datum.offer.0;
-    let ask_asset = &order.datum.min_received.0;
+    let offer_asset = order.swap_offered().0;
+    let ask_asset = order.swap_min_received().0;
     let input_idx = assets.iter().position(|(a, _)| a == offer_asset)?;
     let output_idx = assets.iter().position(|(a, _)| a == ask_asset)?;
     if input_idx == output_idx {
@@ -347,7 +356,7 @@ fn satisfies_min_received(
     output_asset: &AssetClass,
     dy: &BigInt,
 ) -> bool {
-    let (ask_asset, min_qty) = &order.datum.min_received;
+    let (ask_asset, min_qty) = order.swap_min_received();
     if ask_asset != output_asset {
         return false;
     }
@@ -410,19 +419,16 @@ mod tests {
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(ada_amount));
 
-        Arc::new(SundaeV4Order {
-            input: TransactionInput::new([slot as u8; 32].into(), 0),
+        Arc::new(SundaeV4Order::test_swap_order(
+            TransactionInput::new([slot as u8; 32].into(), 0),
             value,
-            datum: SimpleOrderDatum {
-                owner: Multisig::Signature(vec![0xaa; 28]),
-                destination: Destination::SelfDestination,
-                offer: (ada(), BigInt::from(offer_amount)),
-                min_received: (token_a(), BigInt::from(min_token)),
-                max_protocol_fee: BigInt::from(1_500_000i64),
-                extension: unit_pd(),
-            },
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (ada(), BigInt::from(offer_amount)),
+            (token_a(), BigInt::from(min_token)),
+            BigInt::from(1_500_000i64),
             slot,
-        })
+        ))
     }
 
     fn make_sell_order(token_amount: i64, min_ada: i64, slot: u64) -> Arc<SundaeV4Order> {
@@ -430,19 +436,16 @@ mod tests {
         value.insert(&ada(), BigInt::from(2_000_000i64)); // min UTxO
         value.insert(&token_a(), BigInt::from(token_amount));
 
-        Arc::new(SundaeV4Order {
-            input: TransactionInput::new([slot as u8; 32].into(), 0),
+        Arc::new(SundaeV4Order::test_swap_order(
+            TransactionInput::new([slot as u8; 32].into(), 0),
             value,
-            datum: SimpleOrderDatum {
-                owner: Multisig::Signature(vec![0xaa; 28]),
-                destination: Destination::SelfDestination,
-                offer: (token_a(), BigInt::from(token_amount)),
-                min_received: (ada(), BigInt::from(min_ada)),
-                max_protocol_fee: BigInt::from(1_500_000i64),
-                extension: unit_pd(),
-            },
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (token_a(), BigInt::from(token_amount)),
+            (ada(), BigInt::from(min_ada)),
+            BigInt::from(1_500_000i64),
             slot,
-        })
+        ))
     }
 
     #[test]
@@ -602,19 +605,16 @@ mod tests {
         value.insert(&ada(), BigInt::from(2_000_000i64));
         value.insert(&offer_asset, BigInt::from(offer_amount));
 
-        Arc::new(SundaeV4Order {
-            input: TransactionInput::new([slot as u8; 32].into(), 0),
+        Arc::new(SundaeV4Order::test_swap_order(
+            TransactionInput::new([slot as u8; 32].into(), 0),
             value,
-            datum: SimpleOrderDatum {
-                owner: Multisig::Signature(vec![0xaa; 28]),
-                destination: Destination::SelfDestination,
-                offer: (offer_asset, BigInt::from(offer_amount)),
-                min_received: (ask_asset, BigInt::from(min_ask)),
-                max_protocol_fee: BigInt::from(1_500_000i64),
-                extension: unit_pd(),
-            },
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (offer_asset, BigInt::from(offer_amount)),
+            (ask_asset, BigInt::from(min_ask)),
+            BigInt::from(1_500_000i64),
             slot,
-        })
+        ))
     }
 
     #[test]

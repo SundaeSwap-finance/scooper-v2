@@ -24,8 +24,8 @@ use crate::{
     persistence::{IndexerDao, PersistedDatum, PersistedPoolConfig, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
     sundaev3::Ident,
     sundaev4::{
-        OrderRedeemer, PoolDatum, SettingsDatum, SundaeV4Order, SundaeV4Pool,
-        SundaeV4Protocol, SundaeV4Settings, VaultRedeemer,
+        OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV4Order, SundaeV4Pool,
+        SundaeV4Protocol, SundaeV4Settings,
     },
 };
 
@@ -97,7 +97,7 @@ impl SundaeV4Indexer {
             .map(|exec| {
                 let scripts = &exec.module_scripts;
                 let mut set = [
-                    &scripts.vault,
+                    &scripts.pool,
                     &scripts.order,
                     &scripts.constant_product,
                     &scripts.fee_split,
@@ -110,6 +110,9 @@ impl SundaeV4Indexer {
                 .collect::<BTreeSet<_>>();
                 if let Some(cs) = &scripts.constant_sum {
                     set.insert(cs.ref_utxo.clone());
+                }
+                if let Some(so) = &scripts.swap_order {
+                    set.insert(so.ref_utxo.clone());
                 }
                 set
             })
@@ -195,11 +198,18 @@ impl SundaeV4Indexer {
                     );
                 }
                 "order" => {
-                    match output.datum.try_parse(&datums) {
-                        Ok(datum) => {
+                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
+                        .and_then(|datum| {
+                            crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                                .map(|c| (datum, c))
+                                .map_err(|e| format!("constraint decode: {e}"))
+                        })
+                    {
+                        Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
                                 datum,
+                                constraint,
                                 value: output.value,
                                 slot: txo.created_slot,
                             }));
@@ -215,11 +225,18 @@ impl SundaeV4Indexer {
                     }
                 }
                 "invalid_order" => {
-                    match output.datum.try_parse(&datums) {
-                        Ok(datum) => {
+                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
+                        .and_then(|datum| {
+                            crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                                .map(|c| (datum, c))
+                                .map_err(|e| format!("constraint decode: {e}"))
+                        })
+                    {
+                        Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
                                 datum,
+                                constraint,
                                 value: output.value,
                                 slot: txo.created_slot,
                             }));
@@ -271,18 +288,23 @@ impl SundaeV4Indexer {
             let tx_id = stxo.spent_tx_id.map(hex::encode).unwrap_or_default();
             match stxo.txo.txo_type.as_str() {
                 "order" => {
-                    if let Some(od) = output.datum.parse(&datums) {
-                        state.spent_orders.push(SpentOrder {
-                            order: Arc::new(SundaeV4Order {
-                                input: stxo.txo.txo_id,
-                                datum: od,
-                                value: output.value,
-                                slot: stxo.txo.created_slot,
-                            }),
-                            reason: SpentOrderReason::Unknown,
-                            tx_id,
-                            slot: stxo.spent_slot,
-                        });
+                    if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums) {
+                        if let Ok(constraint) =
+                            crate::sundaev4::Constraint::from_plutus_constraint(&od.constraints)
+                        {
+                            state.spent_orders.push(SpentOrder {
+                                order: Arc::new(SundaeV4Order {
+                                    input: stxo.txo.txo_id,
+                                    datum: od,
+                                    constraint,
+                                    value: output.value,
+                                    slot: stxo.txo.created_slot,
+                                }),
+                                reason: SpentOrderReason::Unknown,
+                                tx_id,
+                                slot: stxo.spent_slot,
+                            });
+                        }
                     }
                 }
                 "pool" => {
@@ -535,7 +557,7 @@ impl ChainIndex for SundaeV4Indexer {
         // Scan outputs for vault/order/settings script hashes
         for (ix, output) in tx.outputs().iter().enumerate() {
             let address = output.address()?;
-            if payment_hash_equals(&address, &self.protocol.vault_script_hash) {
+            if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_txo(output);
                 if let Some(pd) = self.parse_pool(&tx_out, &datums) {
@@ -602,8 +624,13 @@ impl ChainIndex for SundaeV4Indexer {
             {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_txo(output);
-                match tx_out.datum.try_parse(&datums) {
-                    Ok(od) => {
+                match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
+                    .and_then(|datum| {
+                        crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                            .map(|c| (datum, c))
+                            .map_err(|e| format!("constraint decode: {e}"))
+                    }) {
+                    Ok((od, constraint)) => {
                         changes.created_txos.push(PersistedTxo {
                             txo_id: this_input.clone(),
                             txo_type: "order".to_string(),
@@ -618,6 +645,7 @@ impl ChainIndex for SundaeV4Indexer {
                             input: this_input,
                             value: tx_out.value,
                             datum: od,
+                            constraint,
                             slot,
                         };
                         new_orders.push(Arc::new(order));
@@ -748,15 +776,15 @@ impl ChainIndex for SundaeV4Indexer {
                 tx_id: tx_id_hex.clone(),
                 slot,
             });
-            match self.parse_redeemer::<VaultRedeemer>(&tx, spend_index) {
-                Some(VaultRedeemer::Action { .. }) => {
+            match self.parse_redeemer::<PoolRedeemer>(&tx, spend_index) {
+                Some(PoolRedeemer::Action { .. }) => {
                     // Pool was scooped — collect all scooped pool idents
                     scoop_pool_ids.push(ident.clone());
                 }
-                Some(VaultRedeemer::EscapeHatch { .. })
-                | Some(VaultRedeemer::Upgrade)
-                | Some(VaultRedeemer::EmergencyDisable { .. }) => {
-                    // Non-scoop vault operation
+                Some(PoolRedeemer::EscapeHatch { .. })
+                | Some(PoolRedeemer::Upgrade)
+                | Some(PoolRedeemer::EmergencyDisable { .. }) => {
+                    // Non-scoop pool operation
                 }
                 None => {
                     warn!(slot, %ident, "v4: pool spent without a valid redeemer!");

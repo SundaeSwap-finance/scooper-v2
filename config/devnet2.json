@@ -4,7 +4,7 @@
   "server": { "address": "0.0.0.0:9998" },
   "protocol": {
     "v4": {
-      "vault-script-hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
+      "pool-script-hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
       "order-script-hashes": [
         "fae1ad2e521629bb91ad1df301f552c5ca13801dc312475722fccc39"
       ],
@@ -59,7 +59,7 @@
             "hash": "9346d056441dd9c58ddd91c1128c0fd71c4653e226555883d0112192",
             "ref-utxo": "9ceae06802ce1b1686e0e6e315a750c4ba3d18a7c2a8a91ac99c1b8194dee0c3#0"
           },
-          "vault": {
+          "pool": {
             "hash": "cecb62ab6cca3c6f4460062e52e52c25a032a96a2a5f1dcdbc12f95d",
             "ref-utxo": "2b5e811df944d4ef6365e1a1115494d58e91d38015ae7f287989e85500638c17#0"
           },

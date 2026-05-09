@@ -379,7 +379,7 @@ mod tests {
         let order = make_order(token_e(), 10_000_000, token_b(), 1, 1);
 
         let route = router::find_optimal_route(
-            &pool_map, &token_e(), &token_b(), &order.datum.offer.1,
+            &pool_map, &token_e(), &token_b(), &order.swap_offered().1,
         ).expect("router should find E→A→B path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
         assert!(router::is_routed(&route));
@@ -434,7 +434,7 @@ mod tests {
         let order = make_order(token_a(), 10_000_000, token_f(), 1, 1);
 
         let route = router::find_optimal_route(
-            &pool_map, &token_a(), &token_f(), &order.datum.offer.1,
+            &pool_map, &token_a(), &token_f(), &order.swap_offered().1,
         ).expect("router should find A→E→F path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
 
@@ -501,7 +501,7 @@ mod tests {
         // CS→CP direction ensures CS first hop gets a clean multiple-of-1000 input.
         let order_eb = make_order(token_e(), 5_000_000, token_b(), 1, 3);
         let route = router::find_optimal_route(
-            &pool_map, &token_e(), &token_b(), &order_eb.datum.offer.1,
+            &pool_map, &token_e(), &token_b(), &order_eb.swap_offered().1,
         ).expect("router should find E→B path");
         assert_eq!(route.hops.len(), 2);
 
