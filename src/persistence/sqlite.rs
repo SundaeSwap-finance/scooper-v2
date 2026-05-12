@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedPoolConfig, PersistedTxo, Persistence,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo, Persistence,
         ScoopRecord, SpentPersistedTxo, TxChanges,
     },
 };
@@ -89,8 +89,8 @@ impl SqliteIndexerDao {
         format!("{}_scoop_records", self.namespace)
     }
 
-    fn pool_configs_table(&self) -> String {
-        format!("{}_pool_configs", self.namespace)
+    fn module_configs_table(&self) -> String {
+        format!("{}_module_configs", self.namespace)
     }
 }
 
@@ -188,25 +188,26 @@ impl IndexerDao for SqliteIndexerDao {
             query.execute(&mut *tx).await?;
         }
 
-        if !changes.pool_configs.is_empty() {
-            let pool_configs_table = self.pool_configs_table();
+        if !changes.module_configs.is_empty() {
+            let module_configs_table = self.module_configs_table();
             // Upsert: keep the earliest created_slot we've seen.
-            let insert_pool_config_query = {
-                let column_names = "pool_id, config_cbor, created_slot";
+            let insert_module_config_query = {
+                let column_names = "pool_id, module_hash, config_cbor, created_slot";
                 let values_clauses =
-                    vec!["(?,?,?)".to_string(); changes.pool_configs.len()].join(",");
+                    vec!["(?,?,?,?)".to_string(); changes.module_configs.len()].join(",");
                 format!(
-                    "INSERT INTO {pool_configs_table} ({column_names}) VALUES {values_clauses} \
-                     ON CONFLICT(pool_id) DO UPDATE SET \
+                    "INSERT INTO {module_configs_table} ({column_names}) VALUES {values_clauses} \
+                     ON CONFLICT(pool_id, module_hash) DO UPDATE SET \
                        config_cbor = excluded.config_cbor, \
-                       created_slot = MIN({pool_configs_table}.created_slot, excluded.created_slot);"
+                       created_slot = MIN({module_configs_table}.created_slot, excluded.created_slot);"
                 )
             };
-            let mut query = sqlx::query(&insert_pool_config_query);
+            let mut query = sqlx::query(&insert_module_config_query);
 
-            for cfg in changes.pool_configs {
+            for cfg in changes.module_configs {
                 query = query
                     .bind(cfg.pool_id)
+                    .bind(cfg.module_hash)
                     .bind(cfg.config_cbor)
                     .bind(cfg.created_slot as i64);
             }
@@ -250,9 +251,9 @@ impl IndexerDao for SqliteIndexerDao {
         .execute(&mut *tx)
         .await?;
 
-        let pool_configs_table = self.pool_configs_table();
+        let module_configs_table = self.module_configs_table();
         sqlx::query(&format!(
-            "DELETE FROM {pool_configs_table} WHERE created_slot > ?;"
+            "DELETE FROM {module_configs_table} WHERE created_slot > ?;"
         ))
         .bind(slot as i64)
         .execute(&mut *tx)
@@ -297,10 +298,10 @@ impl IndexerDao for SqliteIndexerDao {
         Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
 
-    async fn load_pool_configs(&self) -> Result<Vec<PersistedPoolConfig>> {
-        let pool_configs_table = self.pool_configs_table();
+    async fn load_module_configs(&self) -> Result<Vec<PersistedModuleConfig>> {
+        let module_configs_table = self.module_configs_table();
         let query = format!(
-            "SELECT pool_id, config_cbor, created_slot FROM {pool_configs_table} ORDER BY created_slot, pool_id;"
+            "SELECT pool_id, module_hash, config_cbor, created_slot FROM {module_configs_table} ORDER BY created_slot, pool_id, module_hash;"
         );
         Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
@@ -372,13 +373,15 @@ impl FromRow<'_, SqliteRow> for ScoopRecord {
     }
 }
 
-impl FromRow<'_, SqliteRow> for PersistedPoolConfig {
+impl FromRow<'_, SqliteRow> for PersistedModuleConfig {
     fn from_row(row: &'_ SqliteRow) -> Result<Self, sqlx::Error> {
         let pool_id: Vec<u8> = row.try_get("pool_id")?;
+        let module_hash: Vec<u8> = row.try_get("module_hash")?;
         let config_cbor: Vec<u8> = row.try_get("config_cbor")?;
         let created_slot: i64 = row.try_get("created_slot")?;
         Ok(Self {
             pool_id,
+            module_hash,
             config_cbor,
             created_slot: created_slot as u64,
         })
@@ -586,22 +589,23 @@ mod tests {
         }
     }
 
-    fn cs_pool_config(slot: u64) -> PersistedPoolConfig {
-        PersistedPoolConfig {
+    fn cs_module_config(slot: u64) -> PersistedModuleConfig {
+        PersistedModuleConfig {
             pool_id: vec![0xde, 0xad, 0xbe, 0xef],
-            // Constr(0, [Constr(0, [[1, 2]]), Constr(0, [3, 1000])])
-            // — ConstantSumConfig { prices: [1, 2], fee: 3/1000 }
-            config_cbor: hex::decode("d8799f9f0102ffd8799f031903e8ffff").unwrap(),
+            module_hash: vec![0xaa; 28],
+            // Constr(0, [[1, 2], Constr(0, [3, 1000]), Constr(0, [0, 1])])
+            // — ConstantSumConfig { prices: [1, 2], fee: 3/1000, bounty_k: 0/1 }
+            config_cbor: hex::decode("d8799f9f0102ffd8799f031903e8ffd8799f0001ffff").unwrap(),
             created_slot: slot,
         }
     }
 
     #[tokio::test]
-    async fn should_round_trip_pool_configs() -> Result<()> {
+    async fn should_round_trip_module_configs() -> Result<()> {
         let db = new_db().await?;
         let dao = db.indexer_dao("sundae_v4");
 
-        let cfg = cs_pool_config(100);
+        let cfg = cs_module_config(100);
         dao.apply_tx_changes(TxChanges {
             slot: cfg.created_slot,
             height: 1,
@@ -609,23 +613,23 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![cfg.clone()],
+            module_configs: vec![cfg.clone()],
         })
         .await?;
 
-        let loaded = dao.load_pool_configs().await?;
+        let loaded = dao.load_module_configs().await?;
         assert_eq!(loaded, vec![cfg]);
         Ok(())
     }
 
     #[tokio::test]
-    async fn pool_configs_upsert_keeps_earliest_slot() -> Result<()> {
+    async fn module_configs_upsert_keeps_earliest_slot() -> Result<()> {
         let db = new_db().await?;
         let dao = db.indexer_dao("sundae_v4");
 
-        let earlier = cs_pool_config(100);
-        let mut later = cs_pool_config(200);
-        // Same pool_id, different slot — second write must not bump created_slot.
+        let earlier = cs_module_config(100);
+        let mut later = cs_module_config(200);
+        // Same (pool_id, module_hash), different slot — second write must not bump created_slot.
         later.config_cbor = hex::decode("d8799f9f0103ffd8799f031903e8ffff").unwrap();
 
         dao.apply_tx_changes(TxChanges {
@@ -635,7 +639,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![earlier.clone()],
+            module_configs: vec![earlier.clone()],
         }).await?;
 
         dao.apply_tx_changes(TxChanges {
@@ -645,10 +649,10 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![later.clone()],
+            module_configs: vec![later.clone()],
         }).await?;
 
-        let loaded = dao.load_pool_configs().await?;
+        let loaded = dao.load_module_configs().await?;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].created_slot, earlier.created_slot);
         // CBOR is overwritten (later write wins) but slot sticks to earlier.
@@ -657,11 +661,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_removes_pool_configs_after_slot() -> Result<()> {
+    async fn rollback_removes_module_configs_after_slot() -> Result<()> {
         let db = new_db().await?;
         let dao = db.indexer_dao("sundae_v4");
 
-        let cfg = cs_pool_config(500);
+        let cfg = cs_module_config(500);
         dao.apply_tx_changes(TxChanges {
             slot: cfg.created_slot,
             height: 1,
@@ -669,11 +673,11 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![cfg.clone()],
+            module_configs: vec![cfg.clone()],
         }).await?;
 
         dao.rollback(400).await?;
-        assert!(dao.load_pool_configs().await?.is_empty());
+        assert!(dao.load_module_configs().await?.is_empty());
         Ok(())
     }
 
@@ -698,7 +702,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -709,7 +713,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -732,7 +736,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -754,7 +758,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum.clone()],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -767,7 +771,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![datum2.clone()],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -789,7 +793,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -800,7 +804,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -813,7 +817,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -836,7 +840,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -847,7 +851,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -873,7 +877,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
         let order = preview_order();
@@ -884,7 +888,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -897,7 +901,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -924,7 +928,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -937,7 +941,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -950,7 +954,7 @@ mod tests {
             spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
@@ -963,7 +967,7 @@ mod tests {
             spent_txos: vec![],
             metadata_datums: vec![],
             scoop_records: vec![],
-            pool_configs: vec![],
+            module_configs: vec![],
         })
         .await?;
 
