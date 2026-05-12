@@ -21,7 +21,7 @@ use crate::{
     datum_lookup::{DatumLookup, ScopedDatumLookup},
     events::{IndexEvent, InvalidOrder, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder, SpentOrderReason, SpentPool},
     historical_state::HistoricalState,
-    persistence::{IndexerDao, PersistedDatum, PersistedPoolConfig, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
+    persistence::{IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
     sundaev3::Ident,
     sundaev4::{
         OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV4Order, SundaeV4Pool,
@@ -65,11 +65,21 @@ pub struct SundaeV4Indexer {
     /// slot are skipped in handle_block/handle_onchain_tx_bytes to avoid the
     /// "cannot update slot" error when the cursor lags behind the DB state.
     loaded_slot: u64,
-    /// Resolved CS pool configs keyed by pool ident, populated from the
-    /// `pool_configs` DB table on load and from on-chain Create redeemers
-    /// during sync. Survives restarts so that a CS pool created before the
-    /// scooper started can still be typed correctly.
-    pool_configs: Mutex<BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>>,
+    /// Resolved per-module configs keyed by pool ident.
+    ///
+    /// Each pool's `module_state` stores `(module_script_hash, config_hash)`
+    /// pairs; the scooper must re-send the actual config in every Operate
+    /// redeemer. We hydrate from the `module_configs` DB table on load and
+    /// from on-chain Create redeemers during sync.
+    module_configs: Mutex<PoolModuleConfigCache>,
+}
+
+/// In-memory per-pool config cache, one map per module. Add a new field +
+/// hydration arm in `load()` to support a new module.
+#[derive(Default)]
+pub struct PoolModuleConfigCache {
+    pub cs: BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>,
+    pub fee_split: BTreeMap<Ident, crate::sundaev4::types::FeeSplitConfig>,
 }
 
 impl SundaeV4Indexer {
@@ -86,7 +96,11 @@ impl SundaeV4Indexer {
             "V4 indexer created"
         );
         let scooper_address = protocol.execution.as_ref().and_then(|exec| {
-            derive_scooper_pallas_address(&exec.scooper_secret_key).ok()
+            derive_scooper_pallas_address_with_stake(
+                &exec.scooper_secret_key,
+                exec.scooper_stake_keyhash.as_deref(),
+            )
+            .ok()
         });
         let scooper_keyhash = protocol.execution.as_ref().and_then(|exec| {
             derive_scooper_keyhash(&exec.scooper_secret_key).ok()
@@ -128,7 +142,7 @@ impl SundaeV4Indexer {
             ref_utxo_inputs,
             tip_event_counter: 0,
             loaded_slot: 0,
-            pool_configs: Mutex::new(BTreeMap::new()),
+            module_configs: Mutex::new(PoolModuleConfigCache::default()),
         }
     }
 
@@ -139,7 +153,7 @@ impl SundaeV4Indexer {
     pub async fn load(&mut self) -> Result<()> {
         let txos = self.dao.load_txos().await?;
         let datums = self.dao.load_datums().await?;
-        let persisted_configs = self.dao.load_pool_configs().await?;
+        let persisted_configs = self.dao.load_module_configs().await?;
         let mut slot = 0;
         let mut state = SundaeV4State::default();
         for datum in datums {
@@ -150,23 +164,45 @@ impl SundaeV4Indexer {
                 .add_metadata_datum((datum.datum.to_vec(), data));
         }
 
-        // Hydrate pool_configs cache from DB so detect_pool_type calls below
-        // resolve CS pools correctly even though the original Create tx is
-        // long out of the indexer's stream.
+        // Hydrate the per-module config cache from DB so detect_pool_type
+        // calls below resolve correctly even though the original Create tx
+        // is long out of the indexer's stream. Dispatch by module hash:
+        // entries whose module_hash matches a known module land in that
+        // module's map; unknown entries are ignored.
+        let cs_module_hash: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.constant_sum.as_ref())
+            .map(|cs| cs.hash.as_ref().to_vec());
+        let fs_module_hash: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
         {
-            use crate::sundaev4::types::ConstantSumConfig;
-            let mut cache = self.pool_configs.lock().await;
+            use crate::sundaev4::types::{ConstantSumConfig, FeeSplitConfig};
+            let mut cache = self.module_configs.lock().await;
             for cfg in persisted_configs {
                 let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
-                    .context("could not parse persisted pool config CBOR")?;
-                let parsed = ConstantSumConfig::from_plutus(pd)
-                    .context("could not parse persisted ConstantSumConfig")?;
-                cache.insert(Ident::new(&cfg.pool_id), parsed);
+                    .context("could not parse persisted module config CBOR")?;
+                if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
+                    let parsed = ConstantSumConfig::from_plutus(pd)
+                        .context("could not parse persisted ConstantSumConfig")?;
+                    cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
+                } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
+                    let parsed = FeeSplitConfig::from_plutus(pd)
+                        .context("could not parse persisted FeeSplitConfig")?;
+                    cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
+                }
             }
-            info!(count = cache.len(), "v4: hydrated CS pool configs from DB");
+            info!(
+                cs = cache.cs.len(),
+                fs = cache.fee_split.len(),
+                "v4: hydrated per-module pool configs from DB",
+            );
         }
 
-        let cs_cache = self.pool_configs.lock().await;
+        let cache = self.module_configs.lock().await;
+        let cs_cache = &cache.cs;
         for txo in txos {
             let era = Era::try_from(txo.era)?;
             let parsed = MultiEraOutput::decode(era, &txo.txo)?;
@@ -186,6 +222,7 @@ impl SundaeV4Indexer {
                         bail!("invalid pool datum");
                     };
                     let pool_type = self.detect_pool_type_with_cache(&pool_datum, &cs_cache);
+                    let fs_cfg = cache.fee_split.get(&pool_datum.identifier).cloned();
                     state.pools.insert(
                         pool_datum.identifier.clone(),
                         Arc::new(SundaeV4Pool {
@@ -194,6 +231,7 @@ impl SundaeV4Indexer {
                             pool_datum,
                             pool_type,
                             slot: txo.created_slot,
+                            fee_split_config: fs_cfg,
                         }),
                     );
                 }
@@ -310,6 +348,7 @@ impl SundaeV4Indexer {
                 "pool" => {
                     if let Some(pd) = self.parse_pool(&output, &datums) {
                         let pool_type = self.detect_pool_type_with_cache(&pd, &cs_cache);
+                        let fs_cfg = cache.fee_split.get(&pd.identifier).cloned();
                         state.spent_pools.push(SpentPool {
                             id: pd.identifier.clone(),
                             old_pool: Arc::new(SundaeV4Pool {
@@ -318,6 +357,7 @@ impl SundaeV4Indexer {
                                 pool_datum: pd,
                                 pool_type,
                                 slot: stxo.txo.created_slot,
+                                fee_split_config: fs_cfg,
                             }),
                             new_pool: None,
                             tx_id,
@@ -459,6 +499,65 @@ pub fn extract_cs_config_from_tx(
     }
 }
 
+/// Try to extract a `FeeSplitConfig` from a tx's fee_split module withdrawal
+/// redeemer. The redeemer is `Create { config }` in the pool's mint tx and
+/// `Operate { entries }` in every subsequent scoop. For Operate we accept the
+/// first entry's config (all entries share the same protocol_share per pool;
+/// the per-entry config is just re-asserted for each pool in the batch).
+pub fn extract_fee_split_config_from_tx(
+    tx: &MultiEraTx,
+    fs_script_hash: &ScriptHash,
+) -> Option<crate::sundaev4::types::FeeSplitConfig> {
+    use crate::sundaev4::types::FeeSplitRedeemer;
+
+    let mut account = vec![0xf0u8];
+    account.extend_from_slice(fs_script_hash.as_ref());
+    let sorted = tx.withdrawals_sorted_set();
+    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let redeemers = tx.redeemers();
+    let redeemer = redeemers
+        .iter()
+        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
+    match parsed {
+        FeeSplitRedeemer::Create { config } => Some(config),
+        // Operate carries one entry per pool in the batch; for the bootstrap
+        // case (extracting per-pool config) the caller should prefer a Create
+        // tx, but Operate is acceptable when only `Operate` is available. We
+        // return the first entry's config; callers that need per-pool routing
+        // should match by `pool_oref` instead.
+        FeeSplitRedeemer::Operate { entries } => entries.into_iter().next().map(|e| e.config),
+    }
+}
+
+/// Like `extract_fee_split_config_from_tx`, but for an Operate redeemer with
+/// multiple pools: returns the entry matching `pool_oref`.
+#[allow(dead_code)]
+pub fn extract_fee_split_config_for_pool_from_tx(
+    tx: &MultiEraTx,
+    fs_script_hash: &ScriptHash,
+    pool_oref: &crate::sundaev4::types::OutputRef,
+) -> Option<crate::sundaev4::types::FeeSplitConfig> {
+    use crate::sundaev4::types::FeeSplitRedeemer;
+
+    let mut account = vec![0xf0u8];
+    account.extend_from_slice(fs_script_hash.as_ref());
+    let sorted = tx.withdrawals_sorted_set();
+    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let redeemers = tx.redeemers();
+    let redeemer = redeemers
+        .iter()
+        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
+    match parsed {
+        FeeSplitRedeemer::Create { config } => Some(config),
+        FeeSplitRedeemer::Operate { entries } => entries
+            .into_iter()
+            .find(|e| &e.pool_oref == pool_oref)
+            .map(|e| e.config),
+    }
+}
+
 #[async_trait]
 impl ChainIndex for SundaeV4Indexer {
     fn name(&self) -> String {
@@ -546,13 +645,29 @@ impl ChainIndex for SundaeV4Indexer {
 
         let datums = state.datums.for_tx(&tx);
 
-        // Try to extract CS config from this tx's Create redeemer (if any).
-        // For scoop txs (Operate redeemer), this returns None — harmless.
+        // Try to extract per-module configs from this tx's Create/Operate
+        // redeemers (if any). For scoop txs without a Create redeemer for a
+        // given module, these return None — harmless. We use the result to
+        // populate per-pool config caches.
         let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
+        let fs_config_from_tx = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash));
+        let cs_module_hash_bytes: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.constant_sum.as_ref())
+            .map(|cs| cs.hash.as_ref().to_vec());
+        let fs_module_hash_bytes: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
 
         // Lock the persisted-config cache for the duration of output scanning:
-        // CS pool outputs read from it, and a fresh Create writes a new entry.
-        let mut cs_cache = self.pool_configs.lock().await;
+        // pool outputs read from it, and Create writes a new entry.
+        let mut module_cache = self.module_configs.lock().await;
 
         // Scan outputs for vault/order/settings script hashes
         for (ix, output) in tx.outputs().iter().enumerate() {
@@ -579,7 +694,7 @@ impl ChainIndex for SundaeV4Indexer {
                     //   4. defaults
                     let resolved_cs = cs_config_from_tx
                         .as_ref()
-                        .or_else(|| cs_cache.get(&pool_id));
+                        .or_else(|| module_cache.cs.get(&pool_id));
                     let pool_type = detect_pool_type(
                         &pd,
                         self.protocol.execution.as_ref(),
@@ -591,15 +706,17 @@ impl ChainIndex for SundaeV4Indexer {
                     if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantSum { .. }) =
                         (cs_config_from_tx.as_ref(), &pool_type)
                     {
-                        if !cs_cache.contains_key(&pool_id) {
+                        if !module_cache.cs.contains_key(&pool_id) {
                             let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
                                 .context("encode ConstantSumConfig CBOR")?;
-                            changes.pool_configs.push(PersistedPoolConfig {
+                            changes.module_configs.push(PersistedModuleConfig {
                                 pool_id: pool_id.to_bytes().to_vec(),
+                                module_hash: cs_module_hash_bytes.clone()
+                                    .expect("cs_module_hash present when CS pool detected"),
                                 config_cbor: cbor,
                                 created_slot: slot,
                             });
-                            cs_cache.insert(pool_id.clone(), cfg.clone());
+                            module_cache.cs.insert(pool_id.clone(), cfg.clone());
                             info!(
                                 pool = %hex::encode(pool_id.to_bytes()),
                                 "v4: persisted CS pool config from Create redeemer"
@@ -607,12 +724,38 @@ impl ChainIndex for SundaeV4Indexer {
                         }
                     }
 
+                    // Same for fee_split: every pool has fee_split config in
+                    // the mint tx (Create) and in every later scoop (Operate).
+                    // Either form is usable; the first time we see it we
+                    // persist and cache for future scoops.
+                    if let (Some(cfg), Some(fs_hash)) =
+                        (fs_config_from_tx.as_ref(), fs_module_hash_bytes.as_ref())
+                    {
+                        if !module_cache.fee_split.contains_key(&pool_id) {
+                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
+                                .context("encode FeeSplitConfig CBOR")?;
+                            changes.module_configs.push(PersistedModuleConfig {
+                                pool_id: pool_id.to_bytes().to_vec(),
+                                module_hash: fs_hash.clone(),
+                                config_cbor: cbor,
+                                created_slot: slot,
+                            });
+                            module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
+                            info!(
+                                pool = %hex::encode(pool_id.to_bytes()),
+                                "v4: persisted fee_split config from redeemer"
+                            );
+                        }
+                    }
+
+                    let fs_cfg = module_cache.fee_split.get(&pool_id).cloned();
                     let pool_record = SundaeV4Pool {
                         input: this_input,
                         value: tx_out.value,
                         pool_datum: pd,
                         pool_type,
                         slot,
+                        fee_split_config: fs_cfg,
                     };
                     updated_pools.insert(pool_id, Arc::new(pool_record));
                 }
@@ -690,9 +833,13 @@ impl ChainIndex for SundaeV4Indexer {
                 }
             }
 
-            // Track wallet UTxOs (scooper's own address)
-            if let Some(scooper_addr) = &self.scooper_address {
-                if address_equals(&address, scooper_addr) {
+            // Track wallet UTxOs by payment credential — CIP-1852 wallets use
+            // base addresses (payment + stake) but the scooper might be
+            // configured with an enterprise address. Matching by payment
+            // credential alone accepts any address form (enterprise, base,
+            // pointer) whose payment key we hold.
+            if let Some(scooper_kh) = &self.scooper_keyhash {
+                if payment_hash_equals(&address, scooper_kh) {
                     let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                     let tx_out = cardano_types::convert_txo(output);
                     trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
@@ -1017,14 +1164,23 @@ impl ChainIndex for SundaeV4Indexer {
 
 fn derive_scooper_keyhash(secret_key_hex: &str) -> Result<pallas_primitives::Hash<28>> {
     use pallas_crypto::hash::Hasher;
-    use pallas_crypto::key::ed25519::SecretKey;
 
     let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
-    let sk = SecretKey::from(arr);
-    let pk = sk.public_key();
+    let pk = match bytes.len() {
+        32 => {
+            use pallas_crypto::key::ed25519::SecretKey;
+            let arr: [u8; 32] = bytes.try_into().unwrap();
+            SecretKey::from(arr).public_key()
+        }
+        64 => {
+            use pallas_crypto::key::ed25519::SecretKeyExtended;
+            let arr: [u8; 64] = bytes.try_into().unwrap();
+            SecretKeyExtended::from_bytes(arr)
+                .map_err(|e| anyhow::anyhow!("invalid extended ed25519 key: {e}"))?
+                .public_key()
+        }
+        n => anyhow::bail!("secret key must be 32 or 64 bytes, got {n}"),
+    };
     let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
     Ok(Hasher::<224>::hash(&pk_bytes))
 }
@@ -1088,24 +1244,34 @@ fn build_scoop_stats(
 }
 
 pub(crate) fn derive_scooper_pallas_address(secret_key_hex: &str) -> Result<Address> {
+    derive_scooper_pallas_address_with_stake(secret_key_hex, None)
+}
+
+/// Build the scooper's Shelley address. If `stake_keyhash_hex` is `Some`, a
+/// base address (payment + staking) is produced — required to match base
+/// addresses used by CIP-1852 wallets. Without it, an enterprise (payment-
+/// only) address is returned, which doesn't see funds at base addresses.
+pub(crate) fn derive_scooper_pallas_address_with_stake(
+    secret_key_hex: &str,
+    stake_keyhash_hex: Option<&str>,
+) -> Result<Address> {
     use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
-    use pallas_crypto::hash::Hasher;
-    use pallas_crypto::key::ed25519::SecretKey;
-    use pallas_primitives::Hash;
 
-    let bytes = hex::decode(secret_key_hex).context("invalid secret key hex")?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
-    let sk = SecretKey::from(arr);
-    let pk = sk.public_key();
-    let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
-    let keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
-
+    let keyhash = derive_scooper_keyhash(secret_key_hex)?;
+    let delegation = match stake_keyhash_hex {
+        Some(s) => {
+            let bytes = hex::decode(s).context("invalid stake keyhash hex")?;
+            let arr: [u8; 28] = bytes.try_into().map_err(|_| {
+                anyhow::anyhow!("stake keyhash must be 28 bytes (got different length)")
+            })?;
+            ShelleyDelegationPart::Key(arr.into())
+        }
+        None => ShelleyDelegationPart::Null,
+    };
     let shelley = ShelleyAddress::new(
         Network::Testnet,
         ShelleyPaymentPart::Key(keyhash),
-        ShelleyDelegationPart::Null,
+        delegation,
     );
     Ok(Address::from(shelley))
 }
@@ -1143,55 +1309,92 @@ pub fn detect_pool_type(
         };
     };
 
-    let swap_action = pool_datum.actions.iter().find(|a| {
-        a.tag == BigInt::from(100) && a.enabled
-    });
+    // Look at every enabled action's first module and classify by which known
+    // module hash it matches. CS and CP swap actions use different tags
+    // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by tag.
+    let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
+    let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let cp_hash = exec.module_scripts.constant_product.hash.as_ref().to_vec();
+    let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
+    let mut matched_kind: Option<&'static str> = None;
+    for action in &pool_datum.actions {
+        if !action.enabled { continue; }
+        let Some(first) = action.modules.first() else { continue; };
+        if first.as_slice() == cp_hash.as_slice() {
+            matched_action = Some(action);
+            matched_kind = Some("cp");
+            break;
+        }
+        if let Some(h) = &cs_hash {
+            if first.as_slice() == h.as_slice() {
+                matched_action = Some(action);
+                matched_kind = Some("cs");
+                break;
+            }
+        }
+    }
+    if matched_action.is_none() {
+        // Log the unknown first-module hashes so the operator can see why
+        // detect_pool_type couldn't classify this pool. Until detect_pool_type
+        // learns the corresponding module, scoops referencing this pool will
+        // fail with `module: not found in module_state` on the wrong module.
+        let unknowns: Vec<String> = pool_datum
+            .actions
+            .iter()
+            .filter(|a| a.enabled)
+            .filter_map(|a| a.modules.first().map(hex::encode))
+            .collect();
+        warn!(
+            pool = %ident_hex,
+            modules = ?unknowns,
+            "pool's enabled actions reference unknown module hash(es); \
+             falling back to ConstantProduct (likely wrong)",
+        );
+    }
 
-    let Some(action) = swap_action else {
-        return PoolType::ConstantProduct {
+    let _action = match matched_action {
+        Some(a) => a,
+        None => return PoolType::ConstantProduct {
             fee: Rational {
                 num: BigInt::from(exec.fee.0),
                 den: BigInt::from(exec.fee.1),
             },
-        };
+        },
     };
 
-    let first_module = action.modules.first();
-
-    if let (Some(module_hash), Some(cs_script)) = (first_module, &exec.module_scripts.constant_sum) {
-        if module_hash.as_slice() == cs_script.hash.as_ref() {
-            let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-
-            // Priority: config file override > on-chain Create redeemer > defaults
-            if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
-                exec.pool_configs.get(&ident_hex)
-            {
-                return PoolType::ConstantSum {
-                    prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
-                    fee: Rational {
-                        num: BigInt::from(fee.0),
-                        den: BigInt::from(fee.1),
-                    },
-                };
-            }
-
-            if let Some(cs_config) = cs_config_from_tx {
-                info!(pool = %ident_hex, "CS pool config extracted from Create redeemer");
-                return PoolType::ConstantSum {
-                    prices: cs_config.prices.clone(),
-                    fee: cs_config.fee.clone(),
-                };
-            }
-
-            debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
+    if matched_kind == Some("cs") {
+        // Priority: config file override > on-chain Create redeemer > defaults
+        if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
+            exec.pool_configs.get(&ident_hex)
+        {
             return PoolType::ConstantSum {
-                prices: vec![BigInt::from(1); pool_datum.assets.len()],
+                prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
                 fee: Rational {
-                    num: BigInt::from(exec.fee.0),
-                    den: BigInt::from(exec.fee.1),
+                    num: BigInt::from(fee.0),
+                    den: BigInt::from(fee.1),
                 },
+                bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
             };
         }
+
+        if let Some(cs_config) = cs_config_from_tx {
+            info!(pool = %ident_hex, "CS pool config extracted from Create redeemer");
+            return PoolType::ConstantSum {
+                prices: cs_config.prices.clone(),
+                fee: cs_config.fee.clone(),
+                bounty_k: cs_config.bounty_k.clone(),
+            };
+        }
+
+        debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
+        return PoolType::ConstantSum {
+            prices: vec![BigInt::from(1); pool_datum.assets.len()],
+            fee: Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            },
+            bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+        };
     }
 
     PoolType::ConstantProduct {
