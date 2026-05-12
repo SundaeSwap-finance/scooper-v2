@@ -1,19 +1,65 @@
-//! Network interactions: submit transactions via cardano-submit-api or ogmios.
+//! Network interactions: submit transactions via cardano-submit-api,
+//! Blockfrost, or ogmios.
 
 use anyhow::{Context, Result, bail};
 
 /// Submit a CBOR-encoded signed transaction.
 ///
-/// Automatically detects the backend:
-/// - URLs containing `/api/submit/tx` use cardano-submit-api (raw CBOR POST)
-/// - All other URLs use Ogmios JSON-RPC (`submitTransaction`)
+/// Backend selection from the URL:
+/// - host contains `blockfrost.io` → Blockfrost `POST /tx/submit` with
+///   `project_id` header taken from the URL's `project_id` query parameter
+/// - URL contains `/api/submit/tx` → cardano-submit-api (raw CBOR POST)
+/// - otherwise → Ogmios JSON-RPC (`submitTransaction`)
 ///
 /// Returns the transaction hash on success.
 pub async fn submit_tx(url: &str, cbor: &[u8]) -> Result<String> {
-    if url.contains("/api/submit/tx") {
+    if url.contains("blockfrost.io") {
+        submit_blockfrost(url, cbor).await
+    } else if url.contains("/api/submit/tx") {
         submit_cardano_api(url, cbor).await
     } else {
         submit_ogmios(url, cbor).await
+    }
+}
+
+async fn submit_blockfrost(url: &str, cbor: &[u8]) -> Result<String> {
+    // Pull `project_id` out of the URL query, then strip it before POSTing —
+    // Blockfrost takes it as a header, not a query param.
+    let parsed = url::Url::parse(url).context("invalid blockfrost submit URL")?;
+    let project_id = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "project_id")
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "blockfrost submit URL must include ?project_id=<token>; got `{url}`"
+            )
+        })?;
+    let mut clean = parsed.clone();
+    clean.set_query(None);
+    let endpoint = clean.as_str().trim_end_matches('/').to_string();
+    let submit_url = if endpoint.ends_with("/tx/submit") {
+        endpoint
+    } else {
+        format!("{}/tx/submit", endpoint)
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&submit_url)
+        .header("project_id", project_id)
+        .header("Content-Type", "application/cbor")
+        .body(cbor.to_vec())
+        .send()
+        .await
+        .context("blockfrost submit request failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        // Blockfrost returns the tx hash as a quoted JSON string.
+        Ok(body.trim().trim_matches('"').to_string())
+    } else {
+        bail!("blockfrost submit failed ({}): {}", status, body);
     }
 }
 

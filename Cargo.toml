@@ -35,6 +35,7 @@ pallas-primitives = "0.34"
 pallas-traverse = "0.34"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 rustls-pemfile = "2"
+url = "2"
 plutus-parser = { version = "0.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

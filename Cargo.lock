@@ -4733,6 +4733,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uplc-turbo",
+ "url",
 ]
 
 [[package]]
