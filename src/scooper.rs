@@ -527,6 +527,9 @@ impl Scooper {
         let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
+            // Only Swap-shaped orders can be scooped by this path. Deposit /
+            // Withdraw / Claim aren't yet supported.
+            .filter(|o| matches!(o.constraint, crate::sundaev4::Constraint::Swap { .. }))
             .filter(|o| !in_flight_inputs.contains(&o.input))
             .filter(|o| {
                 if self.is_quarantined(&o.input, current_slot) {
@@ -757,7 +760,11 @@ impl Scooper {
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 ) {
                     Err(e) => format!("build: {e}"),
-                    Ok(build) => match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                    Ok(build) => {
+                        let dump_path = format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
+                        let _ = std::fs::write(&dump_path, &build.cbor);
+                        info!(path = %dump_path, bytes = build.cbor.len(), tx_hash = %build.tx_hash_hex, "diag: dumped failing build CBOR");
+                        match crate::sundaev4::evaluator::evaluate_scoop_tx(
                         &build.tx_body, &build.redeemers, &build.resolved_inputs,
                         &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
                         build.tx_hash, &exec.slot_config,
@@ -773,7 +780,8 @@ impl Scooper {
                                 total_steps * pad_num / pad_den, exec.max_tx_ex_steps,
                             )
                         }
-                    },
+                        }
+                    }
                 };
 
                 // Permanently quarantine the first order — it's structurally broken
@@ -874,6 +882,15 @@ impl Scooper {
             pools = ?pool_idents.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
             "multi-pool scoop tx built, submitting"
         );
+
+        // Dump tx CBOR for offline analysis. Filename includes tx hash so
+        // every attempt is preserved; cleanup is left to the operator.
+        let dump_path = format!("/tmp/scoop-tx-{}.cbor", final_tx.tx_hash_hex);
+        if let Err(e) = std::fs::write(&dump_path, &final_tx.cbor) {
+            warn!(error = %e, path = %dump_path, "failed to write tx CBOR dump");
+        } else {
+            info!(path = %dump_path, bytes = final_tx.cbor.len(), "wrote tx CBOR dump");
+        }
 
         match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
             Ok(submitted_hash) => {

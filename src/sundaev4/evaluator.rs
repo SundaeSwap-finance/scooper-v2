@@ -188,6 +188,7 @@ pub fn evaluate_scoop_tx(
             }
             Err(e) => {
                 // Log any trace output
+                warn!(script = %hex::encode(script_hash), n_logs = result.info.logs.len(), "script eval failed; emitting any traces");
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
                 }
