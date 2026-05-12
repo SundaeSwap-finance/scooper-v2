@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_crypto::hash::Hasher;
-use pallas_crypto::key::ed25519::SecretKey;
+use pallas_crypto::key::ed25519::{PublicKey, SecretKey, SecretKeyExtended, Signature};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway::{
     self, RedeemersKey, RedeemersValue, Redeemers, RedeemerTag, TransactionOutput, WitnessSet,
@@ -99,6 +99,15 @@ pub fn build_multi_pool_scoop_tx(
         let mut total_fee_budget = BigInt::from(0);
         let mut transcript_entries: Vec<TranscriptEntry> = Vec::new();
 
+        // Per-pool operation_tag for swap entries. CS dispatches its swap
+        // branch on tag == 3 (`tag_swap` in cs_check.ak) and rejects any other
+        // tag with `cs: unsupported operation_tag`. CP infers swap vs deposit
+        // from asset deltas and ignores the tag, so 100 is a safe sentinel.
+        let swap_tag: BigInt = match &batch.pool.pool_type {
+            PoolType::ConstantSum { .. } => BigInt::from(3),
+            PoolType::ConstantProduct { .. } => BigInt::from(100),
+        };
+
         // Process operations in the interleaved order they were accumulated.
         // This is critical: replaying swaps-then-continuations would produce
         // wrong intermediate reserves when routed orders interleave.
@@ -135,14 +144,27 @@ pub fn build_multi_pool_scoop_tx(
                     preminted_lp: pool.pool_datum.preminted_lp.clone(),
                 },
                 fee_budget,
-                operation_tag: BigInt::from(100),
+                operation_tag: swap_tag.clone(),
                 operation_data: void_pool_state.clone().to_plutus(),
             });
         }
 
-        let protocol_lp = swap_math::compute_protocol_lp(
-            &total_fee_budget, exec.protocol_share.0, exec.protocol_share.1,
-        );
+        // Protocol LP must come out of this pool's own fee_split config —
+        // each pool stores its own protocol_share hash in module_state, and
+        // fee_split.Operate checks `protocol_lp * ps_den <= total_fee * ps_num`
+        // and `(protocol_lp + 1) * ps_den > total_fee * ps_num`, both relative
+        // to the per-pool config. Using a global default produces the wrong
+        // protocol_lp for any pool created with a non-default share.
+        let (ps_num_bi, ps_den_bi) = batch
+            .pool
+            .fee_split_config
+            .as_ref()
+            .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
+            .unwrap_or_else(|| (
+                BigInt::from(exec.protocol_share.0),
+                BigInt::from(exec.protocol_share.1),
+            ));
+        let protocol_lp = &total_fee_budget * &ps_num_bi / &ps_den_bi;
         let final_total_lp = &initial_total_lp + &protocol_lp;
 
         if let Some(last) = transcript_entries.last_mut() {
@@ -239,8 +261,14 @@ pub fn build_multi_pool_scoop_tx(
         let pool_sorted_idx = pool_sorted_indices[batch_idx];
         let pool_output_idx = batch_to_pool_output[batch_idx];
 
+        // Action.tag selects which entry from pool.actions to evaluate. CS
+        // pools register their swap action under tag=3; CP under tag=100.
+        let action_tag = match &batch.pool.pool_type {
+            PoolType::ConstantSum { .. } => BigInt::from(3),
+            PoolType::ConstantProduct { .. } => BigInt::from(100),
+        };
         let pool_redeemer = PoolRedeemer::Action {
-            tag: BigInt::from(100),
+            tag: action_tag,
             transcript: per_pool[batch_idx].transcript.clone(),
             pool_input_index: BigInt::from(pool_sorted_idx as u64),
             pool_output_index: BigInt::from(pool_output_idx as u64),
@@ -262,22 +290,55 @@ pub fn build_multi_pool_scoop_tx(
                     config,
                 });
             }
-            PoolType::ConstantSum { prices, fee } => {
+            PoolType::ConstantSum { prices, fee, bounty_k } => {
+                let cs_cfg = ConstantSumConfig {
+                    prices: prices.clone(),
+                    fee: fee.clone(),
+                    bounty_k: bounty_k.clone(),
+                };
+                if let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() {
+                    let cs_cred = cs_script.hash.as_ref();
+                    let stored = batch.pool.pool_datum.module_state.iter()
+                        .find(|(cred, _)| cred.as_slice() == cs_cred)
+                        .map(|(_, h)| hex::encode(h));
+                    let pd = cs_cfg.clone().to_plutus();
+                    let cbor = minicbor::to_vec(&pd).unwrap_or_default();
+                    let expected = hex::encode(pallas_crypto::hash::Hasher::<256>::hash(&cbor));
+                    tracing::info!(
+                        pool = %batch.pool.pool_datum.identifier,
+                        stored_cs_hash = ?stored,
+                        expected_cs_hash = %expected,
+                        cs_cbor = %hex::encode(&cbor),
+                        "constant_sum hash diagnostic",
+                    );
+                }
                 cs_entries.push(CSOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
-                    config: ConstantSumConfig {
-                        prices: prices.clone(),
-                        fee: fee.clone(),
-                    },
+                    config: cs_cfg,
                 });
             }
         }
 
-        let fs_config = FeeSplitConfig {
-            protocol_share: Rational {
-                num: BigInt::from(exec.protocol_share.0),
-                den: BigInt::from(exec.protocol_share.1),
-            },
+        // Per-pool fee_split config from chain (recovered from the pool's
+        // mint tx or a recent scoop). Falls back to the global protocol_share
+        // from the scooper config, which only matches pools created with the
+        // same default — non-default pools will fail validation if we hit
+        // this branch.
+        let fs_config = match &batch.pool.fee_split_config {
+            Some(cfg) => cfg.clone(),
+            None => {
+                tracing::warn!(
+                    pool = %batch.pool.pool_datum.identifier,
+                    "no per-pool fee_split config; falling back to scooper-config default — \
+                     scoop will fail if the pool was created with a non-default protocol_share",
+                );
+                FeeSplitConfig {
+                    protocol_share: Rational {
+                        num: BigInt::from(exec.protocol_share.0),
+                        den: BigInt::from(exec.protocol_share.1),
+                    },
+                }
+            }
         };
 
         fs_entries.push(FSOperateEntry {
@@ -286,6 +347,10 @@ pub fn build_multi_pool_scoop_tx(
         });
 
         fairness_entries.push(FairnessOperateEntry {
+            pool_oref: OutputRef {
+                transaction_id: pool_oref.transaction_id.to_vec(),
+                output_index: pool_oref.index,
+            },
             pool_ident: batch.pool.pool_datum.identifier.clone(),
             scooper: scooper_keyhash.to_vec(),
         });
@@ -598,22 +663,37 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // ── Step 9: Assemble redeemer map ──────────────────────────────────────
-
-    let redeemer_pairs: Vec<(RedeemersKey, RedeemersValue)> = redeemer_info
+    //
+    // The ledger compares our `script_data_hash` against a hash it computes
+    // from the canonical-ordered redeemer map (sorted by tag, then index).
+    // If we emit entries in insertion order, the bytes don't match and Conway
+    // rejects with ScriptIntegrityHashMismatch — so sort here.
+    let mut redeemer_pairs: Vec<(RedeemersKey, RedeemersValue)> = redeemer_info
         .iter()
         .map(|(key, data, eu)| (key.clone(), RedeemersValue { data: data.clone(), ex_units: eu.clone() }))
         .collect();
+    redeemer_pairs.sort_by_key(|(k, _)| (k.tag as u8, k.index));
 
     let redeemers =
         Redeemers::Map(pallas_primitives::NonEmptyKeyValuePairs::Def(redeemer_pairs));
 
     // ── Step 10: Compute script_data_hash ──────────────────────────────────
-
-    let redeemers_cbor = minicbor::to_vec(&redeemers).context("encode redeemers")?;
-    let mut hasher = Hasher::<256>::new();
-    hasher.input(&redeemers_cbor);
-    hasher.input(language_views);
-    let script_data_hash: Hash<32> = hasher.finalize();
+    //
+    // Per Conway, script_data_hash = blake2b-256 of:
+    //   encode(redeemers) || encode(datums)? || encode(language_views)
+    // with datums omitted entirely when empty, and language_views encoded as
+    // a canonical map (V1 wrapped in bytes, V2/V3 raw arrays). Pallas's
+    // `ScriptData::hash` implements the canonical encoding exactly — match it
+    // here so the value we put in tx_body equals what the ledger computes
+    // while validating.
+    let script_data_hash: Hash<32> = {
+        let mut buf = Vec::new();
+        minicbor::encode(&redeemers, &mut buf).expect("encode redeemers");
+        // No attached datums (we only consume inline-datum UTxOs), so the
+        // datums section is omitted — see ScriptData::hash in pallas-primitives.
+        buf.extend_from_slice(language_views);
+        Hasher::<256>::hash(&buf)
+    };
 
     // ── Step 11: Assemble TransactionBody ──────────────────────────────────
 
@@ -773,6 +853,7 @@ pub fn build_multi_pool_scoop_tx(
             pool_datum: per_pool[out_idx].updated_datum.clone(),
             pool_type: batch.pool.pool_type.clone(),
             slot: current_slot,
+            fee_split_config: batch.pool.fee_split_config.clone(),
         };
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
     }
@@ -833,7 +914,30 @@ fn compute_script_ref_hash(script_ref: &crate::cardano_types::ScriptRef) -> Hash
     }
 }
 
-fn parse_secret_key(key_str: &str) -> Result<SecretKey> {
+/// Either a 32-byte standard ed25519 key or a 64-byte Cardano-extended key.
+/// Cardano HD-derived keys (BIP32 / CIP-1852) are always extended; the
+/// standard form is only useful for one-off keys provided as a raw seed.
+pub enum AnySecretKey {
+    Standard(SecretKey),
+    Extended(SecretKeyExtended),
+}
+
+impl AnySecretKey {
+    pub fn public_key(&self) -> PublicKey {
+        match self {
+            AnySecretKey::Standard(k) => k.public_key(),
+            AnySecretKey::Extended(k) => k.public_key(),
+        }
+    }
+    pub fn sign(&self, msg: impl AsRef<[u8]>) -> Signature {
+        match self {
+            AnySecretKey::Standard(k) => k.sign(msg),
+            AnySecretKey::Extended(k) => k.sign(msg),
+        }
+    }
+}
+
+fn parse_secret_key(key_str: &str) -> Result<AnySecretKey> {
     let hex_str = if key_str.trim_start().starts_with('{') {
         // Cardano JSON envelope: {"type":"...","cborHex":"5820<64hex>"}
         let envelope: serde_json::Value =
@@ -841,19 +945,31 @@ fn parse_secret_key(key_str: &str) -> Result<SecretKey> {
         let cbor_hex = envelope["cborHex"]
             .as_str()
             .context("missing cborHex field in signing key envelope")?;
-        // Strip the CBOR prefix "5820" (bytes tag for 32-byte bytestring)
-        cbor_hex
-            .strip_prefix("5820")
-            .context("unexpected cborHex prefix (expected 5820)")?
-            .to_string()
+        // Strip the CBOR prefix "5820" (bytes tag for 32-byte) or "5840" (64-byte).
+        if let Some(s) = cbor_hex.strip_prefix("5820") {
+            s.to_string()
+        } else if let Some(s) = cbor_hex.strip_prefix("5840") {
+            s.to_string()
+        } else {
+            anyhow::bail!("unexpected cborHex prefix (expected 5820 or 5840)")
+        }
     } else {
         key_str.to_string()
     };
     let bytes = hex::decode(&hex_str).context("invalid secret key hex")?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))?;
-    Ok(SecretKey::from(arr))
+    match bytes.len() {
+        32 => {
+            let arr: [u8; 32] = bytes.try_into().unwrap();
+            Ok(AnySecretKey::Standard(SecretKey::from(arr)))
+        }
+        64 => {
+            let arr: [u8; 64] = bytes.try_into().unwrap();
+            let ext = SecretKeyExtended::from_bytes(arr)
+                .map_err(|e| anyhow::anyhow!("invalid extended ed25519 secret key: {e}"))?;
+            Ok(AnySecretKey::Extended(ext))
+        }
+        n => anyhow::bail!("secret key must be 32 or 64 bytes, got {n}"),
+    }
 }
 
 /// Build the pool output Value (pallas conway::Value) from the pool's existing
