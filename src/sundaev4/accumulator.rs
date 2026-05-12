@@ -430,6 +430,7 @@ mod tests {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
+            fee_split_config: None,
         })
     }
 

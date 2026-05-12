@@ -329,7 +329,7 @@ pub struct OutputRef {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PoolType {
     ConstantProduct { fee: Rational },
-    ConstantSum { prices: Vec<BigInt>, fee: Rational },
+    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational },
     // Future: ConcentratedLiquidity { ... }
 }
 
@@ -346,6 +346,9 @@ pub struct ConstantProductConfig {
 pub struct ConstantSumConfig {
     pub prices: Vec<BigInt>,
     pub fee: Rational,
+    /// Quadratic rebalance bounty parameter. `(0, 1)` disables the bounty
+    /// mechanism — currently passthrough; we don't yet act on it.
+    pub bounty_k: Rational,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -387,7 +390,7 @@ pub struct CSOperateEntry {
     pub config: ConstantSumConfig,
 }
 
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FeeSplitConfig {
     pub protocol_share: Rational,
 }
@@ -408,10 +411,12 @@ pub struct FSOperateEntry {
 pub enum FairnessRedeemer {
     Create,
     Operate { entries: Vec<FairnessOperateEntry> },
+    Destroy,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct FairnessOperateEntry {
+    pub pool_oref: OutputRef,
     pub pool_ident: Ident,
     pub scooper: Vec<u8>,
 }
@@ -464,6 +469,13 @@ pub struct ScooperExecution {
     pub scooper_secret_key: String,
     #[serde(default)]
     pub scooper_secret_key_file: Option<String>,
+    /// Optional 28-byte hex stake key hash to attach as the delegation part
+    /// of the scooper's address. CIP-1852 wallets use base addresses (payment
+    /// + staking); funds sent to those addresses are unreachable from an
+    /// enterprise (payment-only) address. Leave unset to derive an enterprise
+    /// address (works for fresh testnet keys with no staking).
+    #[serde(default)]
+    pub scooper_stake_keyhash: Option<String>,
     pub submit_url: String,
     pub fee: (u64, u64),
     pub protocol_share: (u64, u64),
@@ -572,6 +584,11 @@ pub struct SundaeV4Pool {
     pub pool_datum: PoolDatum,
     pub pool_type: PoolType,
     pub slot: u64,
+    /// Resolved per-pool fee_split config (`protocol_share`), recovered from
+    /// the fee_split module's `Create`/`Operate` redeemer. `None` if not yet
+    /// recovered — tx_builder falls back to `exec.protocol_share` in that
+    /// case, which is wrong for any pool created with a non-default share.
+    pub fee_split_config: Option<FeeSplitConfig>,
 }
 
 impl PartialOrd for SundaeV4Pool {
@@ -891,21 +908,24 @@ mod tests {
 
     #[test]
     fn test_constant_sum_config_cbor_round_trip() {
-        // ConstantSumConfig { prices: [1, 2], fee: 3/1000 }
+        // ConstantSumConfig { prices: [1, 2], fee: 3/1000, bounty_k: 0/1 }
         let cfg = ConstantSumConfig {
             prices: vec![BigInt::from(1), BigInt::from(2)],
             fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
         };
         let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
         // Persisted byte shape used by sqlite tests in persistence::sqlite.
         // If this changes, update those test fixtures.
-        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffff");
+        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffff");
 
         let pd: PlutusData = minicbor::decode(&cbor).unwrap();
         let decoded: ConstantSumConfig = AsPlutus::from_plutus(pd).unwrap();
         assert_eq!(decoded.prices, cfg.prices);
         assert_eq!(decoded.fee.num, cfg.fee.num);
         assert_eq!(decoded.fee.den, cfg.fee.den);
+        assert_eq!(decoded.bounty_k.num, cfg.bounty_k.num);
+        assert_eq!(decoded.bounty_k.den, cfg.bounty_k.den);
     }
 
     #[test]

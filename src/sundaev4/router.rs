@@ -327,7 +327,7 @@ fn build_graph(
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
                 (fn_num, fn_den, Box::new(|_, _| PoolViewType::ConstantProduct))
             }
-            PoolType::ConstantSum { prices, fee } => {
+            PoolType::ConstantSum { prices, fee, .. } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
                 let prices = prices.clone();
@@ -585,6 +585,7 @@ mod tests {
                 },
             },
             slot: 100,
+            fee_split_config: None,
         });
 
         (ident, pool)
@@ -761,8 +762,13 @@ mod tests {
                     num: BigInt::from(3),
                     den: BigInt::from(1000),
                 },
+                bounty_k: crate::sundaev4::types::Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
             },
             slot: 100,
+            fee_split_config: None,
         });
 
         (ident, pool)

@@ -283,7 +283,7 @@ pub fn compute_swap_result(
                 fee_den,
             )
         }
-        PoolType::ConstantSum { prices, fee } => {
+        PoolType::ConstantSum { prices, fee, .. } => {
             swap_math::cs_swap_result(dx, prices, input_idx, output_idx, &fee.num, &fee.den)
         }
     }
@@ -410,6 +410,7 @@ mod tests {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
+            fee_split_config: None,
         })
     }
 
@@ -557,6 +558,7 @@ mod tests {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
+            fee_split_config: None,
         })
     }
 
@@ -590,6 +592,7 @@ mod tests {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             },
             slot: 100,
+            fee_split_config: None,
         })
     }
 
