@@ -982,9 +982,14 @@ impl Scooper {
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 
-                // Collect consumed orders from all batches
+                // Collect consumed orders from all batches. Both swaps and
+                // deposits sit on real on-chain UTxOs and must be tracked as
+                // in-flight so the next iteration doesn't re-attempt them.
                 let consumed_orders: Vec<_> = final_batches.iter()
-                    .flat_map(|b| b.swaps.iter().map(|s| s.order.clone()))
+                    .flat_map(|b| {
+                        b.swaps.iter().map(|s| s.order.clone())
+                            .chain(b.deposits.iter().map(|d| d.order.clone()))
+                    })
                     .collect();
 
                 // Build predicted pools for chain tracker
