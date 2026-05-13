@@ -917,18 +917,27 @@ pub fn build_multi_pool_scoop_tx(
             datum: DatumOption::InlineDatum(batch.pool.pool_datum.clone().to_plutus()),
             script_ref: None,
         });
+        let order_addr_bytes = {
+            let order_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                ShelleyDelegationPart::Null,
+            );
+            order_addr.to_vec()
+        };
         for swap in &batch.swaps {
             resolved_inputs.insert(swap.order.input.clone(), ResolvedTxOut {
-                address: {
-                    let order_addr = ShelleyAddress::new(
-                        Network::Testnet,
-                        ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
-                        ShelleyDelegationPart::Null,
-                    );
-                    order_addr.to_vec()
-                },
+                address: order_addr_bytes.clone(),
                 value: swap.order.value.clone(),
                 datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
+                script_ref: None,
+            });
+        }
+        for dep in &batch.deposits {
+            resolved_inputs.insert(dep.order.input.clone(), ResolvedTxOut {
+                address: order_addr_bytes.clone(),
+                value: dep.order.value.clone(),
+                datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
                 script_ref: None,
             });
         }

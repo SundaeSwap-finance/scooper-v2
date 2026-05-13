@@ -885,6 +885,7 @@ impl Scooper {
         // e.g. on deposits) fall back to a worst-case budget so we can still
         // submit and let the chain be authoritative. Production scoops should
         // pass eval; this just keeps the door open when uplc-turbo is wrong.
+        let mut first_pass_eval_failed = false;
         let padded_budgets: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)>
             = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &first_pass.tx_body,
@@ -908,6 +909,7 @@ impl Scooper {
                     }).collect()
                 }
                 Err(e) => {
+                    first_pass_eval_failed = true;
                     warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "final multi-pool eval failed; submitting with worst-case budget");
                     // Empirical observation: typical multi-pool scoop redeemers
                     // run at ~750k mem / 280M steps each. Pick a generous-but-
@@ -935,6 +937,23 @@ impl Scooper {
                 return false;
             }
         };
+
+        // If first-pass eval failed, re-run the evaluator on the rebuilt tx
+        // (with worst-case budgets). The eval will likely fail again — but
+        // the script context dump now corresponds to the tx hash we're
+        // actually submitting on chain, which is what we want for diffing.
+        if first_pass_eval_failed {
+            let _ = crate::sundaev4::evaluator::evaluate_scoop_tx(
+                &final_tx.tx_body,
+                &final_tx.redeemers,
+                &final_tx.resolved_inputs,
+                &final_tx.resolved_ref_inputs,
+                script_store,
+                &exec.plutus_v3_cost_model,
+                final_tx.tx_hash,
+                &exec.slot_config,
+            );
+        }
 
         let n_orders = accum.order_count();
         let n_pools = accum.pools.len();

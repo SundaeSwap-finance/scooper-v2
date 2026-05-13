@@ -33,6 +33,8 @@ pub enum DatumOption {
 
 /// Which script purpose this evaluation is for.
 pub enum ScriptPurpose {
+    /// Minting tokens under a policy id (== policy script hash)
+    Minting(Hash<28>),
     /// Spending a script UTxO: (output_reference, optional datum)
     Spending(OutputReference, Option<PlutusData>),
     /// Rewarding from a staking credential (withdraw-zero pattern)
@@ -113,8 +115,9 @@ fn build_tx_info(
     // fee: integer
     let fee = pd_int(tx_body.fee as i64);
 
-    // mint: empty Value (no minting in scoop txs)
-    let mint = encode_empty_value();
+    // mint: Map<PolicyId, Map<AssetName, Integer>>. V3 mint has no ADA=0
+    // stub (unlike output Values). Empty mint serializes as an empty map.
+    let mint = encode_mint(tx_body.mint.as_ref());
 
     // tx_certs: empty list
     let tx_certs = pd_array(vec![]);
@@ -203,6 +206,9 @@ fn build_tx_info(
 
 fn build_script_info(purpose: &ScriptPurpose) -> PlutusData {
     match purpose {
+        ScriptPurpose::Minting(policy_id) => {
+            constr(0, vec![PlutusData::BoundedBytes(policy_id.to_vec().into())])
+        }
         ScriptPurpose::Spending(oref, datum) => {
             let oref_pd = encode_output_reference(oref);
             let datum_option = match datum {
@@ -494,6 +500,30 @@ fn encode_empty_value() -> PlutusData {
     pd_map(vec![])
 }
 
+/// Encode the tx body's `mint` field as PlutusData for V3.
+///
+/// V3 shape is `Map PolicyId (Map AssetName Integer)` — no ADA=0 stub
+/// (unlike output Values). Empty/absent mint encodes as an empty map.
+fn encode_mint(
+    mint: Option<&pallas_primitives::conway::Multiasset<pallas_primitives::NonZeroInt>>,
+) -> PlutusData {
+    let Some(assets) = mint else {
+        return pd_map(vec![]);
+    };
+    let mut outer: Vec<(PlutusData, PlutusData)> = Vec::new();
+    for (policy_hash, tokens) in assets.iter() {
+        let policy_pd = PlutusData::BoundedBytes(policy_hash.to_vec().into());
+        let mut inner: Vec<(PlutusData, PlutusData)> = Vec::new();
+        for (token_name, qty) in tokens.iter() {
+            let token_pd = PlutusData::BoundedBytes(token_name.to_vec().into());
+            let qty_pd = pd_int(i64::from(*qty));
+            inner.push((token_pd, qty_pd));
+        }
+        outer.push((policy_pd, pd_map(inner)));
+    }
+    pd_map(outer)
+}
+
 /// Encode a validity range as Interval PlutusData.
 /// Slots are converted to POSIX milliseconds, matching the Cardano ledger.
 /// Interval = Constr(0, [LowerBound, UpperBound])
@@ -607,7 +637,19 @@ fn encode_redeemer_purpose(
             }
         }
         RedeemerTag::Mint => {
-            constr(0, vec![PlutusData::BoundedBytes(vec![].into())]) // Minting
+            // Mint redeemers are indexed by policy id in canonical (sorted)
+            // order over the tx's mint multiasset.
+            if let Some(mint) = &tx_body.mint {
+                let mut policies: Vec<_> = mint.iter().map(|(p, _)| *p).collect();
+                policies.sort();
+                if let Some(policy) = policies.get(key.index as usize) {
+                    constr(0, vec![PlutusData::BoundedBytes(policy.to_vec().into())])
+                } else {
+                    constr(0, vec![PlutusData::BoundedBytes(vec![].into())])
+                }
+            } else {
+                constr(0, vec![PlutusData::BoundedBytes(vec![].into())])
+            }
         }
         _ => {
             constr(0, vec![PlutusData::BoundedBytes(vec![].into())])

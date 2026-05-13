@@ -192,6 +192,17 @@ pub fn evaluate_scoop_tx(
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
                 }
+                // Dump the ScriptContext we built for this redeemer to disk
+                // — it's the input that diverges between our local uplc-turbo
+                // and the on-chain interpreter, so the bytes are useful when
+                // the chain accepts a tx we locally reject.
+                let dump_path = format!("/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                    hex::encode(tx_hash), hex::encode(script_hash), key.tag, key.index);
+                if let Err(write_err) = std::fs::write(&dump_path, &context_cbor) {
+                    warn!(error = %write_err, "couldn't write script context dump");
+                } else {
+                    warn!(path = %dump_path, bytes = context_cbor.len(), "wrote script context CBOR dump");
+                }
                 bail!(
                     "script {} ({:?}[{}]) evaluation failed: {e:?}",
                     hex::encode(script_hash),
@@ -246,6 +257,19 @@ fn resolve_script_and_purpose(
                 index: input.index,
             };
             Ok((script_hash, ScriptPurpose::Spending(oref, datum)))
+        }
+        RedeemerTag::Mint => {
+            let mint = tx_body
+                .mint
+                .as_ref()
+                .context("mint redeemer but no mint in tx body")?;
+            let mut policies: Vec<Hash<28>> = mint.iter().map(|(p, _)| *p).collect();
+            policies.sort();
+            let policy = policies
+                .get(key.index as usize)
+                .copied()
+                .context("mint redeemer index out of bounds")?;
+            Ok((policy, ScriptPurpose::Minting(policy)))
         }
         RedeemerTag::Reward => {
             // Find the withdrawal at this sorted index
