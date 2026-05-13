@@ -367,7 +367,7 @@ pub struct OrderValidatorEntry {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantProductRedeemer {
-    Create,
+    Create { initial_state: ConstantProductConfig },
     Operate { entries: Vec<CPOperateEntry> },
 }
 

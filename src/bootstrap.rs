@@ -1095,12 +1095,34 @@ fn needs_cs_lookup(
     true
 }
 
+/// True iff this pool is constant-product *and* we don't already know its
+/// config. Same logic as `needs_cs_lookup` but matched against the CP module
+/// hash.
+fn needs_cp_lookup(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
+) -> bool {
+    let Some(exec) = execution else { return false; };
+    let cp_hash = exec.module_scripts.constant_product.hash;
+    let is_cp = pool_datum.actions.iter().any(|a| {
+        a.enabled
+            && a.modules
+                .first()
+                .is_some_and(|h| h.as_slice() == cp_hash.as_ref())
+    });
+    if !is_cp { return false; }
+    if cp_configs.contains_key(&pool_datum.identifier) { return false; }
+    true
+}
+
 /// Per-pool module configs we try to recover during bootstrap. Each field is
 /// `None` when either the module isn't configured for the protocol or we
 /// couldn't find its config in the pool's tx history.
 #[derive(Default, Debug)]
 struct RecoveredPoolConfigs {
     cs: Option<sundaev4::ConstantSumConfig>,
+    cp: Option<sundaev4::ConstantProductConfig>,
     fee_split: Option<sundaev4::FeeSplitConfig>,
 }
 
@@ -1121,12 +1143,14 @@ async fn lookup_pool_module_configs(
     protocol: &SundaeV4Protocol,
     ident: &Ident,
     need_cs: bool,
+    need_cp: bool,
 ) -> Result<RecoveredPoolConfigs> {
     let exec = protocol
         .execution
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
+    let cp_hash = exec.module_scripts.constant_product.hash;
     let fs_hash = exec.module_scripts.fee_split.hash;
 
     let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
@@ -1139,6 +1163,7 @@ async fn lookup_pool_module_configs(
 
     let mut out = RecoveredPoolConfigs::default();
     let want_cs = need_cs && cs_hash.is_some();
+    let want_cp = need_cp;
 
     // Step 1: first tx (mint). Pool Create + per-module Create withdrawals are
     // here, so for static configs this single call is enough.
@@ -1152,10 +1177,13 @@ async fn lookup_pool_module_configs(
             out.cs = sundaev4::extract_cs_config_from_tx(&first_tx, h);
         }
     }
+    if want_cp {
+        out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, &cp_hash);
+    }
     out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, &fs_hash);
 
     let still_missing = |c: &RecoveredPoolConfigs| {
-        (want_cs && c.cs.is_none()) || c.fee_split.is_none()
+        (want_cs && c.cs.is_none()) || (want_cp && c.cp.is_none()) || c.fee_split.is_none()
     };
     if !still_missing(&out) {
         return Ok(out);
@@ -1185,6 +1213,9 @@ async fn lookup_pool_module_configs(
                 if let Some(h) = cs_hash.as_ref() {
                     out.cs = sundaev4::extract_cs_config_from_tx(&tx, h);
                 }
+            }
+            if want_cp && out.cp.is_none() {
+                out.cp = sundaev4::extract_cp_config_from_tx(&tx, &cp_hash);
             }
             if out.fee_split.is_none() {
                 out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, &fs_hash);
@@ -1223,6 +1254,10 @@ async fn bootstrap_v4(
         .as_ref()
         .and_then(|e| e.module_scripts.constant_sum.as_ref())
         .map(|cs| cs.hash.as_ref().to_vec());
+    let cp_module_hash: Option<Vec<u8>> = protocol
+        .execution
+        .as_ref()
+        .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
     let fs_module_hash: Option<Vec<u8>> = protocol
         .execution
         .as_ref()
@@ -1236,6 +1271,10 @@ async fn bootstrap_v4(
         Ident,
         sundaev4::ConstantSumConfig,
     > = std::collections::BTreeMap::new();
+    let mut cp_configs: std::collections::BTreeMap<
+        Ident,
+        sundaev4::ConstantProductConfig,
+    > = std::collections::BTreeMap::new();
     let mut fs_configs: std::collections::BTreeMap<
         Ident,
         sundaev4::FeeSplitConfig,
@@ -1247,6 +1286,10 @@ async fn bootstrap_v4(
             let parsed = sundaev4::ConstantSumConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted CS config decode failed")?;
             cs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+            let parsed = sundaev4::ConstantProductConfig::from_plutus(pd)
+                .context("bootstrap v4: persisted CP config decode failed")?;
+            cp_configs.insert(Ident::new(&cfg.pool_id), parsed);
         } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
             let parsed = sundaev4::FeeSplitConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted FS config decode failed")?;
@@ -1256,10 +1299,12 @@ async fn bootstrap_v4(
         // configured in this protocol.
     }
     let preloaded_cs = cs_configs.len();
+    let preloaded_cp = cp_configs.len();
     let preloaded_fs = fs_configs.len();
-    if preloaded_cs > 0 || preloaded_fs > 0 {
+    if preloaded_cs + preloaded_cp + preloaded_fs > 0 {
         info!(
             cs = preloaded_cs,
+            cp = preloaded_cp,
             fs = preloaded_fs,
             "bootstrap v4: hydrated per-module pool configs from DB",
         );
@@ -1301,13 +1346,15 @@ async fn bootstrap_v4(
         // call walks the pool's tx history (first tx → walk back from latest)
         // and gathers every module config it can find.
         let need_cs = needs_cs_lookup(&pool_datum, protocol.execution.as_ref(), &cs_configs);
+        let need_cp = needs_cp_lookup(&pool_datum, protocol.execution.as_ref(), &cp_configs);
         let need_fs = !fs_configs.contains_key(&pool_datum.identifier);
-        if need_cs || need_fs {
+        if need_cs || need_cp || need_fs {
             let recovered = lookup_pool_module_configs(
                 provider,
                 protocol,
                 &pool_datum.identifier,
                 need_cs,
+                need_cp,
             )
             .await
             .with_context(|| {
@@ -1338,6 +1385,28 @@ async fn bootstrap_v4(
                     "bootstrap v4: recovered CS pool config"
                 );
             }
+            if need_cp {
+                if let Some(cp_cfg) = recovered.cp {
+                    let cbor = minicbor::to_vec(&cp_cfg.clone().to_plutus())
+                        .context("bootstrap v4: encode ConstantProductConfig CBOR")?;
+                    new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
+                        pool_id: pool_datum.identifier.to_bytes().to_vec(),
+                        module_hash: cp_module_hash.clone().expect("cp_module_hash known when need_cp"),
+                        config_cbor: cbor,
+                        created_slot: utxo.slot,
+                    });
+                    cp_configs.insert(pool_datum.identifier.clone(), cp_cfg);
+                    info!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "bootstrap v4: recovered CP pool config"
+                    );
+                } else {
+                    warn!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "bootstrap v4: no CP config found in pool's tx history — scoop will fall back to defaults"
+                    );
+                }
+            }
             if need_fs {
                 if let Some(fs_cfg) = recovered.fee_split {
                     let cbor = minicbor::to_vec(&fs_cfg.clone().to_plutus())
@@ -1363,10 +1432,12 @@ async fn bootstrap_v4(
         }
 
         let resolved_cs = cs_configs.get(&pool_datum.identifier);
+        let resolved_cp = cp_configs.get(&pool_datum.identifier);
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
             protocol.execution.as_ref(),
             resolved_cs,
+            resolved_cp,
         );
         let fs_cfg = fs_configs.get(&pool_datum.identifier).cloned();
         pools.insert(

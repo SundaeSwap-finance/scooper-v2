@@ -79,6 +79,7 @@ pub struct SundaeV4Indexer {
 #[derive(Default)]
 pub struct PoolModuleConfigCache {
     pub cs: BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>,
+    pub cp: BTreeMap<Ident, crate::sundaev4::types::ConstantProductConfig>,
     pub fee_split: BTreeMap<Ident, crate::sundaev4::types::FeeSplitConfig>,
 }
 
@@ -174,12 +175,16 @@ impl SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
+        let cp_module_hash: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
         let fs_module_hash: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
             .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
         {
-            use crate::sundaev4::types::{ConstantSumConfig, FeeSplitConfig};
+            use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, FeeSplitConfig};
             let mut cache = self.module_configs.lock().await;
             for cfg in persisted_configs {
                 let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
@@ -188,6 +193,10 @@ impl SundaeV4Indexer {
                     let parsed = ConstantSumConfig::from_plutus(pd)
                         .context("could not parse persisted ConstantSumConfig")?;
                     cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
+                } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+                    let parsed = ConstantProductConfig::from_plutus(pd)
+                        .context("could not parse persisted ConstantProductConfig")?;
+                    cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
                 } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
                     let parsed = FeeSplitConfig::from_plutus(pd)
                         .context("could not parse persisted FeeSplitConfig")?;
@@ -196,13 +205,13 @@ impl SundaeV4Indexer {
             }
             info!(
                 cs = cache.cs.len(),
+                cp = cache.cp.len(),
                 fs = cache.fee_split.len(),
                 "v4: hydrated per-module pool configs from DB",
             );
         }
 
         let cache = self.module_configs.lock().await;
-        let cs_cache = &cache.cs;
         for txo in txos {
             let era = Era::try_from(txo.era)?;
             let parsed = MultiEraOutput::decode(era, &txo.txo)?;
@@ -221,7 +230,7 @@ impl SundaeV4Indexer {
                     let Some(pool_datum) = self.parse_pool(&output, &datums) else {
                         bail!("invalid pool datum");
                     };
-                    let pool_type = self.detect_pool_type_with_cache(&pool_datum, &cs_cache);
+                    let pool_type = self.detect_pool_type_with_cache(&pool_datum, &cache);
                     let fs_cfg = cache.fee_split.get(&pool_datum.identifier).cloned();
                     state.pools.insert(
                         pool_datum.identifier.clone(),
@@ -347,7 +356,7 @@ impl SundaeV4Indexer {
                 }
                 "pool" => {
                     if let Some(pd) = self.parse_pool(&output, &datums) {
-                        let pool_type = self.detect_pool_type_with_cache(&pd, &cs_cache);
+                        let pool_type = self.detect_pool_type_with_cache(&pd, &cache);
                         let fs_cfg = cache.fee_split.get(&pd.identifier).cloned();
                         state.spent_pools.push(SpentPool {
                             id: pd.identifier.clone(),
@@ -409,14 +418,15 @@ impl SundaeV4Indexer {
     }
 
     /// Detect the pool type from its datum's action modules, consulting the
-    /// `cs_cache` for previously-resolved CS pool configs.
+    /// per-module config caches.
     fn detect_pool_type_with_cache(
         &self,
         pool_datum: &PoolDatum,
-        cs_cache: &BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>,
+        cache: &PoolModuleConfigCache,
     ) -> crate::sundaev4::types::PoolType {
-        let cached = cs_cache.get(&pool_datum.identifier);
-        detect_pool_type(pool_datum, self.protocol.execution.as_ref(), cached)
+        let cs = cache.cs.get(&pool_datum.identifier);
+        let cp = cache.cp.get(&pool_datum.identifier);
+        detect_pool_type(pool_datum, self.protocol.execution.as_ref(), cs, cp)
     }
 
     fn parse_pool(
@@ -527,6 +537,32 @@ pub fn extract_fee_split_config_from_tx(
         // return the first entry's config; callers that need per-pool routing
         // should match by `pool_oref` instead.
         FeeSplitRedeemer::Operate { entries } => entries.into_iter().next().map(|e| e.config),
+    }
+}
+
+/// Try to extract a `ConstantProductConfig` from a tx's constant_product
+/// module withdrawal redeemer. Same dispatch as `extract_fee_split_config_from_tx`:
+/// `Create` carries the config directly, `Operate` carries one entry per
+/// pool — we return the first entry's config for the bootstrap-time use,
+/// and the caller can match by `pool_oref` if needed.
+pub fn extract_cp_config_from_tx(
+    tx: &MultiEraTx,
+    cp_script_hash: &ScriptHash,
+) -> Option<crate::sundaev4::types::ConstantProductConfig> {
+    use crate::sundaev4::types::ConstantProductRedeemer;
+
+    let mut account = vec![0xf0u8];
+    account.extend_from_slice(cp_script_hash.as_ref());
+    let sorted = tx.withdrawals_sorted_set();
+    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let redeemers = tx.redeemers();
+    let redeemer = redeemers
+        .iter()
+        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
+    match parsed {
+        ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
+        ConstantProductRedeemer::Operate { entries } => entries.into_iter().next().map(|e| e.config),
     }
 }
 
@@ -650,6 +686,11 @@ impl ChainIndex for SundaeV4Indexer {
         // given module, these return None — harmless. We use the result to
         // populate per-pool config caches.
         let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
+        let cp_config_from_tx = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| extract_cp_config_from_tx(&tx, &e.module_scripts.constant_product.hash));
         let fs_config_from_tx = self
             .protocol
             .execution
@@ -660,6 +701,10 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
+        let cp_module_hash_bytes: Option<Vec<u8>> = self.protocol
+            .execution
+            .as_ref()
+            .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
         let fs_module_hash_bytes: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -687,18 +732,22 @@ impl ChainIndex for SundaeV4Indexer {
                     });
 
                     let pool_id = pd.identifier.clone();
-                    // Resolution priority for the CS branch inside detect_pool_type:
+                    // Resolution priority for the CS/CP branch inside detect_pool_type:
                     //   1. config-file override (consulted internally)
                     //   2. this tx's Create redeemer
-                    //   3. previously-resolved persisted config (cs_cache)
+                    //   3. previously-resolved persisted config (cache)
                     //   4. defaults
                     let resolved_cs = cs_config_from_tx
                         .as_ref()
                         .or_else(|| module_cache.cs.get(&pool_id));
+                    let resolved_cp = cp_config_from_tx
+                        .as_ref()
+                        .or_else(|| module_cache.cp.get(&pool_id));
                     let pool_type = detect_pool_type(
                         &pd,
                         self.protocol.execution.as_ref(),
                         resolved_cs,
+                        resolved_cp,
                     );
 
                     // If we just learned this pool's CS config from a Create
@@ -720,6 +769,27 @@ impl ChainIndex for SundaeV4Indexer {
                             info!(
                                 pool = %hex::encode(pool_id.to_bytes()),
                                 "v4: persisted CS pool config from Create redeemer"
+                            );
+                        }
+                    }
+                    // Same for CP: persist on first sighting (Create or Operate).
+                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
+                        (cp_config_from_tx.as_ref(), &pool_type)
+                    {
+                        if !module_cache.cp.contains_key(&pool_id) {
+                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
+                                .context("encode ConstantProductConfig CBOR")?;
+                            changes.module_configs.push(PersistedModuleConfig {
+                                pool_id: pool_id.to_bytes().to_vec(),
+                                module_hash: cp_module_hash_bytes.clone()
+                                    .expect("cp_module_hash present when CP pool detected"),
+                                config_cbor: cbor,
+                                created_slot: slot,
+                            });
+                            module_cache.cp.insert(pool_id.clone(), cfg.clone());
+                            info!(
+                                pool = %hex::encode(pool_id.to_bytes()),
+                                "v4: persisted CP pool config from redeemer"
                             );
                         }
                     }
@@ -1299,6 +1369,7 @@ pub fn detect_pool_type(
     pool_datum: &PoolDatum,
     execution: Option<&crate::sundaev4::types::ScooperExecution>,
     cs_config_from_tx: Option<&crate::sundaev4::types::ConstantSumConfig>,
+    cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
 ) -> crate::sundaev4::types::PoolType {
     use crate::sundaev4::types::{PoolType, Rational};
     use crate::bigint::BigInt;
@@ -1355,10 +1426,12 @@ pub fn detect_pool_type(
     let _action = match matched_action {
         Some(a) => a,
         None => return PoolType::ConstantProduct {
-            fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
-            },
+            fee: cp_config_from_tx
+                .map(|c| c.fee.clone())
+                .unwrap_or_else(|| Rational {
+                    num: BigInt::from(exec.fee.0),
+                    den: BigInt::from(exec.fee.1),
+                }),
         },
     };
 
@@ -1397,10 +1470,15 @@ pub fn detect_pool_type(
         };
     }
 
+    // CP path: prefer the per-pool config (this tx's redeemer OR cached) over
+    // the global default — different CP pools can have different fees, and
+    // `verify_module_state` hashes the config we send.
     PoolType::ConstantProduct {
-        fee: Rational {
-            num: BigInt::from(exec.fee.0),
-            den: BigInt::from(exec.fee.1),
-        },
+        fee: cp_config_from_tx
+            .map(|c| c.fee.clone())
+            .unwrap_or_else(|| Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            }),
     }
 }
