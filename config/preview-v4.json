@@ -424,6 +424,10 @@
           "swap-order": {
             "hash": "e28383fcc7b2f5d96e9ea6c9318d341337b3f8fe336822e6f1f74bf1",
             "ref-utxo": "7bb147c441187c00ea8d69942b7923ceb209383d58170c96bc561ff0339c99c0#0"
+          },
+          "basic-order": {
+            "hash": "38bcb94b9b85c20a2b0b8b25636fd3b85922b6a6f6ad8ce7d42439d3",
+            "ref-utxo": "1646e4de752676d88d8a93c7c98793f1c96db70f838a2303a3640e3d8e61f0e7#0"
           }
         }
       }

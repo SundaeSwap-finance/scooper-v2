@@ -45,11 +45,30 @@ pub struct ContinuationSwap {
     pub dy: BigInt,
 }
 
+/// A resolved proportional Deposit, precomputed against a snapshot of pool
+/// reserves at the moment the order joined the batch. `dx[i]` is the amount
+/// of pool asset `i` the user actually contributes; `surplus` is whatever
+/// they offered above and beyond that, returned to them with their LP.
+#[derive(Clone)]
+pub struct ResolvedDeposit {
+    pub order: Arc<SundaeV4Order>,
+    /// Per pool asset, in pool-asset-order. Zero where the user offered
+    /// nothing of that asset or where their offer fell below the minimum
+    /// proportional unit (in which case the deposit can't be resolved at all).
+    pub dx: Vec<BigInt>,
+    /// LP tokens minted to the user.
+    pub lp_minted: BigInt,
+    /// Excess offered by the user that didn't fit the proportional unit and
+    /// is returned alongside their LP tokens. Empty if exact-fit.
+    pub surplus: Vec<(AssetClass, BigInt)>,
+}
+
 /// Identifies an operation in the batch's interleaved order.
 #[derive(Clone, Debug)]
 pub enum BatchOp {
     Swap(usize),
     Continuation(usize),
+    Deposit(usize),
 }
 
 /// A complete batch for one pool, ready for the tx builder.
@@ -59,8 +78,9 @@ pub struct Batch {
     pub pool_ident: Ident,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
-    /// The interleaved order of swaps and continuations as they were
-    /// accumulated. Used by the tx_builder to build transcript entries
+    pub deposits: Vec<ResolvedDeposit>,
+    /// The interleaved order of swaps, continuations, and deposits as they
+    /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
     pub ops_order: Vec<BatchOp>,
     pub final_assets: Vec<(AssetClass, BigInt)>,
@@ -125,6 +145,33 @@ pub fn find_pool_for_simple_order(
 
         if has_offer && has_ask {
             return Some(ident.clone());
+        }
+    }
+    None
+}
+
+/// Match a Deposit order to a pool by looking at the order's `min_received`
+/// list — the user names an LP token they want back, and Sundae's LP asset
+/// name is `0014df10` + pool ident. Returns `None` if the LP asset doesn't
+/// resolve to any indexed pool.
+pub fn find_pool_for_deposit_order(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Option<Ident> {
+    let min_received = match &order.constraint {
+        Constraint::Deposit { min_received, .. } => min_received,
+        _ => return None,
+    };
+    // CIP-67 LP asset label = 0014df10 (4 bytes).
+    const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
+    for (lp_asset, _) in min_received {
+        if lp_asset.token.len() < LP_LABEL.len() { continue; }
+        if &lp_asset.token[..LP_LABEL.len()] != LP_LABEL { continue; }
+        let ident_bytes = &lp_asset.token[LP_LABEL.len()..];
+        for (ident, _) in pools {
+            if ident.to_bytes() == ident_bytes {
+                return Some(ident.clone());
+            }
         }
     }
     None
@@ -217,6 +264,7 @@ pub fn assemble_batch(
         pool_ident: pool.pool_datum.identifier.clone(),
         swaps: selected,
         continuations: Vec::new(),
+        deposits: Vec::new(),
         ops_order,
         final_assets: running_assets,
         final_total_lp,
@@ -361,6 +409,94 @@ fn satisfies_min_received(
         return false;
     }
     dy >= min_qty
+}
+
+/// Resolve a CP Deposit against the current pool reserves.
+///
+/// Mirrors the CLI's basic deposit logic (`actions/order.ts`):
+///   gcd_reserves = gcd over all reserves
+///   bs[i]        = reserves[i] / gcd
+///   num_max      = min over i of floor(offered[i] / bs[i])
+///   dx[i]        = num_max * bs[i]
+///   lp_minted    = total_lp * num_max / gcd_reserves
+///   surplus[i]   = offered[i] - dx[i]
+///
+/// `offered` defaults to 0 for any pool asset the user didn't specify, which
+/// drives num_max to 0 — i.e. orders that don't include every pool asset
+/// (zaps) currently can't be filled by this path.
+pub fn resolve_cp_deposit(
+    pool: &SundaeV4Pool,
+    order: &Arc<SundaeV4Order>,
+) -> Result<ResolvedDeposit, String> {
+    use num_traits::{Signed, Zero};
+
+    if !matches!(pool.pool_type, PoolType::ConstantProduct { .. }) {
+        return Err("only constant-product deposit is supported for now".into());
+    }
+
+    let offered = match &order.constraint {
+        Constraint::Deposit { offered, .. } => offered,
+        _ => return Err("order is not a Deposit".into()),
+    };
+
+    // Map offered by asset for cheap lookup.
+    let offered_map: BTreeMap<&AssetClass, &BigInt> =
+        offered.iter().map(|(a, q)| (a, q)).collect();
+
+    let reserves: Vec<&BigInt> = pool.pool_datum.assets.iter().map(|(_, q)| q).collect();
+    let offered_per_pool: Vec<BigInt> = pool.pool_datum.assets.iter().map(|(a, _)| {
+        offered_map.get(a).map(|q| (*q).clone()).unwrap_or_else(|| BigInt::from(0))
+    }).collect();
+
+    // gcd over all reserves
+    let mut g = reserves[0].clone();
+    for r in &reserves[1..] { g = g.gcd(r); }
+    if g.is_zero() {
+        return Err("pool reserves are all zero".into());
+    }
+
+    let bs: Vec<BigInt> = reserves.iter().map(|r| (*r) / &g).collect();
+
+    // num_max = min_i floor(offered_i / bs_i). Where bs_i == 0 (i.e. a pool
+    // asset's reserve is zero — shouldn't happen for live pools) skip the
+    // constraint.
+    let mut num_max: Option<BigInt> = None;
+    for (off, b) in offered_per_pool.iter().zip(bs.iter()) {
+        if b.is_zero() { continue; }
+        let cap = off / b;
+        num_max = Some(match num_max.take() {
+            None => cap,
+            Some(prev) => if cap < prev { cap } else { prev },
+        });
+    }
+    let num_max = num_max.unwrap_or_else(|| BigInt::from(0));
+    if !num_max.is_positive() {
+        return Err("deposit can't be filled — offered doesn't cover one proportional unit".into());
+    }
+
+    let dx: Vec<BigInt> = bs.iter().map(|b| &num_max * b).collect();
+
+    // lp_minted = total_lp * num_max / gcd. For pools where total_lp ==
+    // sum(reserves) (menu-created), gcd divides total_lp exactly so this
+    // is integer; otherwise we floor.
+    let lp_minted = &pool.pool_datum.total_lp * &num_max / &g;
+    if !lp_minted.is_positive() {
+        return Err("deposit produces zero LP".into());
+    }
+
+    // Surplus = offered - dx for each pool asset (skip zeros).
+    let surplus: Vec<(AssetClass, BigInt)> = pool.pool_datum.assets.iter().enumerate()
+        .filter_map(|(i, (a, _))| {
+            let s = &offered_per_pool[i] - &dx[i];
+            if s.is_positive() { Some((a.clone(), s)) } else { None }
+        }).collect();
+
+    Ok(ResolvedDeposit {
+        order: order.clone(),
+        dx,
+        lp_minted,
+        surplus,
+    })
 }
 
 #[cfg(test)]

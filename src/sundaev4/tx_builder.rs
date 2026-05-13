@@ -66,7 +66,9 @@ pub fn build_multi_pool_scoop_tx(
     ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
 ) -> Result<MultiPoolBuildResult> {
     let m_pools = batches.len();
-    let n_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
+    let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
+    let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
+    let n_orders: usize = n_swap_orders + n_deposit_orders;
     if m_pools == 0 || n_orders == 0 {
         bail!("no batches or no swaps");
     }
@@ -88,6 +90,9 @@ pub fn build_multi_pool_scoop_tx(
     struct PerPoolData {
         transcript: Vec<TranscriptEntry>,
         updated_datum: PoolDatum,
+        /// Sum of LP minted by all deposits in this batch. Zero for swap-only
+        /// batches. Used to drive the pool_mint policy's LP mint entry below.
+        lp_minted: BigInt,
     }
 
     let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
@@ -111,40 +116,71 @@ pub fn build_multi_pool_scoop_tx(
         // Process operations in the interleaved order they were accumulated.
         // This is critical: replaying swaps-then-continuations would produce
         // wrong intermediate reserves when routed orders interleave.
+        //
+        // Each transcript entry's state_after is the running snapshot AFTER
+        // applying that op. Swaps shift two assets and leave total_lp at the
+        // current running value (CS keeps it constant; CP applies protocol_lp
+        // on the last entry below). Deposits add to all pool assets and grow
+        // total_lp (and circulating_lp) by lp_minted.
+        let mut running_total_lp = initial_total_lp.clone();
+        let mut running_circ_lp = pool.pool_datum.circulating_lp.clone();
+        let mut lp_minted_sum = BigInt::from(0);
         for op in &batch.ops_order {
-            let (input_idx, output_idx, dx, dy) = match op {
+            let prev_assets = running_assets.clone();
+            let (operation_tag, fee_budget) = match op {
                 crate::sundaev4::batch::BatchOp::Swap(i) => {
                     let s = &batch.swaps[*i];
-                    (s.input_idx, s.output_idx, &s.dx, &s.dy)
+                    running_assets[s.input_idx].1 = &running_assets[s.input_idx].1 + &s.dx;
+                    running_assets[s.output_idx].1 = &running_assets[s.output_idx].1 - &s.dy;
+                    let fb = swap_math::compute_fee_budget(
+                        &batch.pool.pool_type,
+                        &prev_assets,
+                        &running_assets,
+                        &initial_total_lp,
+                    );
+                    total_fee_budget = &total_fee_budget + &fb;
+                    (swap_tag.clone(), fb)
                 }
                 crate::sundaev4::batch::BatchOp::Continuation(i) => {
                     let c = &batch.continuations[*i];
-                    (c.input_idx, c.output_idx, &c.dx, &c.dy)
+                    running_assets[c.input_idx].1 = &running_assets[c.input_idx].1 + &c.dx;
+                    running_assets[c.output_idx].1 = &running_assets[c.output_idx].1 - &c.dy;
+                    let fb = swap_math::compute_fee_budget(
+                        &batch.pool.pool_type,
+                        &prev_assets,
+                        &running_assets,
+                        &initial_total_lp,
+                    );
+                    total_fee_budget = &total_fee_budget + &fb;
+                    (swap_tag.clone(), fb)
+                }
+                crate::sundaev4::batch::BatchOp::Deposit(i) => {
+                    let d = &batch.deposits[*i];
+                    for (idx, amt) in running_assets.iter_mut().enumerate() {
+                        amt.1 = &amt.1 + &d.dx[idx];
+                    }
+                    running_total_lp = &running_total_lp + &d.lp_minted;
+                    running_circ_lp = &running_circ_lp + &d.lp_minted;
+                    lp_minted_sum = &lp_minted_sum + &d.lp_minted;
+                    // CS reads tag_deposit=6 (cs_check.ak); CP infers from
+                    // asset deltas. fee_budget=0 by construction.
+                    let dep_tag = match &batch.pool.pool_type {
+                        PoolType::ConstantSum { .. } => BigInt::from(6),
+                        PoolType::ConstantProduct { .. } => BigInt::from(100),
+                    };
+                    (dep_tag, BigInt::from(0))
                 }
             };
-
-            let prev_assets = running_assets.clone();
-
-            running_assets[input_idx].1 = &running_assets[input_idx].1 + dx;
-            running_assets[output_idx].1 = &running_assets[output_idx].1 - dy;
-
-            let fee_budget = swap_math::compute_fee_budget(
-                &batch.pool.pool_type,
-                &prev_assets,
-                &running_assets,
-                &initial_total_lp,
-            );
-            total_fee_budget = &total_fee_budget + &fee_budget;
 
             transcript_entries.push(TranscriptEntry {
                 state_after: PoolState {
                     assets: running_assets.clone(),
-                    total_lp: initial_total_lp.clone(),
-                    circulating_lp: pool.pool_datum.circulating_lp.clone(),
+                    total_lp: running_total_lp.clone(),
+                    circulating_lp: running_circ_lp.clone(),
                     preminted_lp: pool.pool_datum.preminted_lp.clone(),
                 },
                 fee_budget,
-                operation_tag: swap_tag.clone(),
+                operation_tag,
                 operation_data: void_pool_state.clone().to_plutus(),
             });
         }
@@ -165,7 +201,12 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(exec.protocol_share.1),
             ));
         let protocol_lp = &total_fee_budget * &ps_num_bi / &ps_den_bi;
-        let final_total_lp = &initial_total_lp + &protocol_lp;
+        // Final total_lp = initial + lp_minted_sum (from deposits) + protocol_lp
+        // (CP fee accrual; CS keeps total_lp pinned and protocol_lp is 0 for it).
+        let final_total_lp = &running_total_lp + &protocol_lp;
+        // Circulating LP grew by lp_minted_sum during deposits; protocol_lp
+        // doesn't change circulating (it widens the gap that fee_split closes).
+        let final_circ_lp = &pool.pool_datum.circulating_lp + &lp_minted_sum;
 
         if let Some(last) = transcript_entries.last_mut() {
             last.fee_budget = &last.fee_budget - &protocol_lp;
@@ -175,7 +216,7 @@ pub fn build_multi_pool_scoop_tx(
         let updated_datum = PoolDatum {
             assets: batch.final_assets.clone(),
             total_lp: final_total_lp.clone(),
-            circulating_lp: pool.pool_datum.circulating_lp.clone(),
+            circulating_lp: final_circ_lp,
             preminted_lp: pool.pool_datum.preminted_lp.clone(),
             identifier: pool.pool_datum.identifier.clone(),
             actions: pool.pool_datum.actions.clone(),
@@ -185,6 +226,7 @@ pub fn build_multi_pool_scoop_tx(
         per_pool.push(PerPoolData {
             transcript: transcript_entries,
             updated_datum,
+            lp_minted: lp_minted_sum,
         });
     }
 
@@ -195,10 +237,35 @@ pub fn build_multi_pool_scoop_tx(
         .map(|b| b.pool.input.0.clone())
         .collect();
 
-    // All order orefs (flat list across all batches)
-    let all_order_orefs: Vec<TransactionInput> = batches.iter()
-        .flat_map(|b| b.swaps.iter().map(|s| s.order.input.0.clone()))
-        .collect();
+    // Flat list of all order inputs (both swaps and deposits), in
+    // batch-traversal order. Each entry carries enough info to look up its
+    // backing Resolved* later for fulfillment-output construction.
+    #[derive(Clone)]
+    enum FlatOrderKind {
+        Swap(usize),    // index into batch.swaps
+        Deposit(usize), // index into batch.deposits
+    }
+    #[derive(Clone)]
+    struct FlatOrder {
+        batch_idx: usize,
+        kind: FlatOrderKind,
+        order_ref: TransactionInput,
+    }
+    let flat_orders: Vec<FlatOrder> = batches.iter().enumerate().flat_map(|(bi, b)| {
+        let swaps = b.swaps.iter().enumerate().map(move |(si, s)| FlatOrder {
+            batch_idx: bi,
+            kind: FlatOrderKind::Swap(si),
+            order_ref: s.order.input.0.clone(),
+        });
+        let deps = b.deposits.iter().enumerate().map(move |(di, d)| FlatOrder {
+            batch_idx: bi,
+            kind: FlatOrderKind::Deposit(di),
+            order_ref: d.order.input.0.clone(),
+        });
+        swaps.chain(deps)
+    }).collect();
+    let all_order_orefs: Vec<TransactionInput> =
+        flat_orders.iter().map(|f| f.order_ref.clone()).collect();
 
     let mut sorted_inputs: Vec<TransactionInput> = pool_orefs.iter()
         .chain(all_order_orefs.iter())
@@ -357,22 +424,19 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // ── Step 4: Build order redeemers (N spend redeemers) ──────────────────
-
-    // Build a flat list of all swaps with their global order index
-    let mut global_order_idx = 0usize;
-    for batch in batches {
-        for _swap in &batch.swaps {
-            let idx = global_order_idx;
-            let order_key = RedeemersKey {
-                tag: RedeemerTag::Spend,
-                index: order_sorted_indices[idx] as u32,
-            };
-            let order_redeemer = OrderRedeemer::Scoop {
-                own_input_index: order_sorted_indices[idx] as u64,
-            };
-            redeemer_info.push((order_key.clone(), order_redeemer.to_plutus(), lookup_eu(&order_key)));
-            global_order_idx += 1;
-        }
+    //
+    // One Spend redeemer per order input — same shape (`Scoop { own_input_index }`)
+    // regardless of whether the order is a Swap or Deposit. The order validator
+    // dispatches on the constraint tag inside its withdraw handler.
+    for idx in 0..n_orders {
+        let order_key = RedeemersKey {
+            tag: RedeemerTag::Spend,
+            index: order_sorted_indices[idx] as u32,
+        };
+        let order_redeemer = OrderRedeemer::Scoop {
+            own_input_index: order_sorted_indices[idx] as u64,
+        };
+        redeemer_info.push((order_key.clone(), order_redeemer.to_plutus(), lookup_eu(&order_key)));
     }
 
     // ── Step 5: Build order validator entries ───────────────────────────────
@@ -418,10 +482,21 @@ pub fn build_multi_pool_scoop_tx(
             all_ref_inputs.push(cs.ref_utxo.0.clone());
         }
     }
-    // Order-side dispatcher reference. The order validator's withdraw requires
-    // the per-tag module's withdrawal; today every order is a Swap (tag 2).
-    if let Some(so) = &exec.module_scripts.swap_order {
-        all_ref_inputs.push(so.ref_utxo.0.clone());
+    // Order-side dispatcher references. The order validator's withdraw needs
+    // the matching module's withdrawal present in the tx, per constraint tag:
+    // tag 2 (Swap) → swap_order_module, tag 0/1/3 (Deposit/Withdraw/Claim) →
+    // basic_order_module. Only include refs we'll actually use.
+    let has_swap_orders = n_swap_orders > 0;
+    let has_basic_orders = n_deposit_orders > 0;
+    if has_swap_orders {
+        if let Some(so) = &exec.module_scripts.swap_order {
+            all_ref_inputs.push(so.ref_utxo.0.clone());
+        }
+    }
+    if has_basic_orders {
+        if let Some(bo) = &exec.module_scripts.basic_order {
+            all_ref_inputs.push(bo.ref_utxo.0.clone());
+        }
     }
     all_ref_inputs.push(settings.input.0.clone());
 
@@ -469,20 +544,24 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
 
-    // Per-tag order-module withdrawal. The contract dispatches via
+    // Per-tag order-module withdrawals. The contract dispatches via
     // `settings.order_modules[constraint_tag]` and requires the matching
-    // module's withdrawal to be present in the tx. Currently we only batch
-    // Swap-tagged orders, so emit a single swap_order withdrawal with unit
-    // redeemer (the module ignores its own redeemer).
-    let any_swap = batches.iter().any(|b| !b.swaps.is_empty());
-    if any_swap {
+    // module's withdrawal to be present. swap_order_module covers Swap (tag 2);
+    // basic_order_module covers Deposit/Withdraw/Claim (tag 0/1/3). Each
+    // takes a unit redeemer (`Constr 0 []`) — they don't read it.
+    let unit_redeemer = || pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121,
+        any_constructor: None,
+        fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+    });
+    if has_swap_orders {
         if let Some(so) = &exec.module_scripts.swap_order {
-            let unit = pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
-                tag: 121,
-                any_constructor: None,
-                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
-            });
-            withdrawals.push((reward_account(&so.hash), unit));
+            withdrawals.push((reward_account(&so.hash), unit_redeemer()));
+        }
+    }
+    if has_basic_orders {
+        if let Some(bo) = &exec.module_scripts.basic_order {
+            withdrawals.push((reward_account(&bo.hash), unit_redeemer()));
         }
     }
 
@@ -551,7 +630,18 @@ pub fn build_multi_pool_scoop_tx(
             .map(|c| c.dx.clone().unwrap().to_i64().unwrap_or(0))
             .sum::<i64>();
 
-        buy_inflow - sell_outflow
+        // ADA contributed by deposits (whichever pool asset is ADA gets its
+        // share of each deposit's dx vector).
+        let ada_idx = batch.pool.pool_datum.assets.iter().position(|(a, _)| {
+            a.policy.is_empty() && a.token.is_empty()
+        });
+        let deposit_ada: i64 = if let Some(idx) = ada_idx {
+            batch.deposits.iter()
+                .map(|d| d.dx[idx].clone().unwrap().to_i64().unwrap_or(0))
+                .sum::<i64>()
+        } else { 0 };
+
+        buy_inflow - sell_outflow + deposit_ada
     }).collect();
 
     // Pool outputs in pool_output_order (sorted by input position)
@@ -575,83 +665,66 @@ pub fn build_multi_pool_scoop_tx(
     let per_order_fee = TX_FEE / n_orders as u64;
     let last_order_fee = TX_FEE - per_order_fee * (n_orders as u64 - 1);
 
-    // Fulfillment outputs in input-sorted order
-    // Build a flat list of (order_filtered_index, batch_idx, swap_idx_in_batch)
-    struct FlatSwap<'a> {
-        batch_idx: usize,
-        swap: &'a crate::sundaev4::batch::ResolvedSwap,
-        filtered_idx: u64,
-    }
-
-    let mut flat_swaps: Vec<FlatSwap> = Vec::with_capacity(n_orders);
-    let mut gi = 0usize;
-    for (bi, batch) in batches.iter().enumerate() {
-        for swap in &batch.swaps {
-            flat_swaps.push(FlatSwap {
-                batch_idx: bi,
-                swap,
-                filtered_idx: order_filtered_indices[gi],
-            });
-            gi += 1;
-        }
-    }
-
-    // Sort by filtered input index for ascending output order
+    // Fulfillment outputs in input-sorted order — one per order (Swap or
+    // Deposit). The order validator iterates filtered order inputs and entries
+    // in lockstep; entries' output_index values are computed from this same
+    // sort, so the two stay aligned.
     let mut fulfillment_order: Vec<usize> = (0..n_orders).collect();
-    fulfillment_order.sort_by_key(|&i| flat_swaps[i].filtered_idx);
+    fulfillment_order.sort_by_key(|i| order_filtered_indices[*i]);
 
-    for (out_pos, &flat_idx) in fulfillment_order.iter().enumerate() {
-        let fs = &flat_swaps[flat_idx];
-        let swap = fs.swap;
-        let batch = &batches[fs.batch_idx];
-        let dest_address = resolve_destination(
-            &swap.order.datum.destination,
-            &swap.order.datum.owner,
-        )?;
-
-        // Use fulfillment override if present (routed orders), otherwise use
-        // the direct swap output.
-        let (output_asset, dy) = if let Some(fo) = &swap.fulfillment_override {
-            (&fo.output_asset, &fo.amount)
-        } else {
-            (&batch.pool.pool_datum.assets[swap.output_idx].0, &swap.dy)
+    for (out_pos, &fi) in fulfillment_order.iter().enumerate() {
+        let fo_meta = &flat_orders[fi];
+        let batch = &batches[fo_meta.batch_idx];
+        let order = match &fo_meta.kind {
+            FlatOrderKind::Swap(i) => &batch.swaps[*i].order,
+            FlatOrderKind::Deposit(i) => &batch.deposits[*i].order,
         };
+        let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
 
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
-
-        // Compute fulfillment from first principles:
-        // fulfillment = order_value - offer - fee + swap_result
-        let (offer_asset, offer_amount) = swap.order.swap_offered();
         let actual_fee = {
             use num_traits::ToPrimitive;
-            // Mirror the contract's `compute_fee_allowance(budget, share_batcher, fee, n)`
-            // from `lib/order_lib.ak`:
-            //   fee_share = fee / n; surplus = budget - fee_share
-            //   allowance = fee_share + share_batcher * surplus / 10000
-            // The contract enforces `fee_taken <= allowance * offered_this_fill / original_offered`.
-            // For full-fill swaps offered_this_fill == original_offered so the bound is just `allowance`.
-            // We bill the maximum allowance — the scooper claims their share_batcher cut.
-            let budget = swap.order.datum.budget.clone().unwrap()
+            let budget = order.datum.budget.clone().unwrap()
                 .to_u64().unwrap_or(0);
-            let share_bps = swap.order.datum.share_batcher.clone().unwrap()
+            let share_bps = order.datum.share_batcher.clone().unwrap()
                 .to_u64().unwrap_or(0);
             let fee_share = TX_FEE / (n_orders as u64);
             let surplus = budget.saturating_sub(fee_share);
             let allowance = fee_share + share_bps.saturating_mul(surplus) / 10_000;
-            // `fee` here is the per-order share of TX_FEE (with last-order absorbing
-            // remainder). It must not exceed the contract's allowance bound.
-            // TODO(phase-B): if `budget * n < TX_FEE` the contract rejects the batch.
-            // Pre-filter such orders during batching to avoid wasted submissions.
             fee.min(allowance)
         };
-        let fulfillment_value = build_fulfillment_value_from_order(
-            &swap.order.value,
-            offer_asset,
-            offer_amount,
-            output_asset,
-            dy,
-            actual_fee,
-        )?;
+
+        let fulfillment_value = match &fo_meta.kind {
+            FlatOrderKind::Swap(i) => {
+                let swap = &batch.swaps[*i];
+                let (output_asset, dy) = if let Some(fo) = &swap.fulfillment_override {
+                    (&fo.output_asset, &fo.amount)
+                } else {
+                    (&batch.pool.pool_datum.assets[swap.output_idx].0, &swap.dy)
+                };
+                let (offer_asset, offer_amount) = swap.order.swap_offered();
+                build_fulfillment_value_from_order(
+                    &swap.order.value,
+                    offer_asset,
+                    offer_amount,
+                    output_asset,
+                    dy,
+                    actual_fee,
+                )?
+            }
+            FlatOrderKind::Deposit(i) => {
+                let dep = &batch.deposits[*i];
+                let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+                build_deposit_fulfillment_value(
+                    &dep.order.value,
+                    &batch.pool.pool_datum.assets,
+                    &dep.dx,
+                    &lp_asset,
+                    &dep.lp_minted,
+                    actual_fee,
+                )?
+            }
+        };
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
@@ -661,6 +734,72 @@ pub fn build_multi_pool_scoop_tx(
             },
         ));
     }
+
+    // ── Step 8.5: LP mint for deposits ────────────────────────────────────
+    //
+    // Each pool with `lp_minted > 0` mints that many LP tokens under the
+    // pool_mint policy with asset name `0014df10 ++ pool_ident`. The minting
+    // redeemer is `PoolMintRedeemer::MintLP { pool_ident }` — one redeemer per
+    // mint entry. The order they appear in the mint map is canonical-sorted
+    // by policy hash (only one policy here, so trivial), with assets sorted
+    // by name within. The mint redeemer's index matches the policy's
+    // position in the sorted mint map (always 0 since we only mint LP).
+    let mint = {
+        use pallas_primitives::{NonEmptyKeyValuePairs, NonZeroInt};
+        use num_traits::{Signed, ToPrimitive};
+        let mut asset_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
+        for (i, batch) in batches.iter().enumerate() {
+            if per_pool[i].lp_minted.is_positive() {
+                let qty: i64 = per_pool[i].lp_minted.clone()
+                    .unwrap()
+                    .to_i64()
+                    .context("lp_minted doesn't fit in i64")?;
+                let mut name = vec![0x00, 0x14, 0xdf, 0x10];
+                name.extend_from_slice(batch.pool.pool_datum.identifier.to_bytes());
+                asset_pairs.push((
+                    PallasBytes::from(name),
+                    NonZeroInt::try_from(qty).expect("lp_minted positive"),
+                ));
+            }
+        }
+        if asset_pairs.is_empty() {
+            None
+        } else {
+            // Single policy (pool_mint) for all LP mints; sort assets by name.
+            asset_pairs.sort_by(|a, b| {
+                let av: Vec<u8> = a.0.clone().into();
+                let bv: Vec<u8> = b.0.clone().into();
+                av.cmp(&bv)
+            });
+            let policy = exec.module_scripts.pool_mint.hash;
+            let mint_redeemer_data = {
+                // One Mint redeemer per minting policy. With only pool_mint
+                // here, every deposit shares the same redeemer entry — but
+                // the contract reads `pool_ident` from it, so we'd need a
+                // redeemer per (policy, pool) pair if multiple pools mint.
+                // Today we restrict to a single deposit-target pool per tx.
+                let pool_idents: Vec<_> = batches.iter().enumerate()
+                    .filter(|(i, _)| per_pool[*i].lp_minted.is_positive())
+                    .map(|(_, b)| b.pool.pool_datum.identifier.clone())
+                    .collect();
+                if pool_idents.len() != 1 {
+                    anyhow::bail!(
+                        "multi-pool LP minting in one tx isn't supported by pool_mint \
+                         (only_own_lp check rejects mixed lp_names); got {} pools",
+                        pool_idents.len()
+                    );
+                }
+                let r = PoolMintRedeemer::MintLP { pool_ident: pool_idents.into_iter().next().unwrap() };
+                r.to_plutus()
+            };
+            let mint_key = RedeemersKey { tag: RedeemerTag::Mint, index: 0 };
+            redeemer_info.push((mint_key.clone(), mint_redeemer_data, lookup_eu(&mint_key)));
+            Some(NonEmptyKeyValuePairs::Def(vec![(
+                policy,
+                NonEmptyKeyValuePairs::Def(asset_pairs),
+            )]))
+        }
+    };
 
     // ── Step 9: Assemble redeemer map ──────────────────────────────────────
     //
@@ -713,7 +852,7 @@ pub fn build_multi_pool_scoop_tx(
         )),
         auxiliary_data_hash: None,
         validity_interval_start: Some(current_slot),
-        mint: None,
+        mint,
         script_data_hash: Some(script_data_hash),
         collateral: pallas_primitives::NonEmptySet::from_vec(vec![collateral_utxo.clone()]),
         required_signers: Some(
@@ -1078,6 +1217,89 @@ fn build_pool_output_value(
         lovelace,
         NonEmptyKeyValuePairs::Def(multiasset_pairs),
     ))
+}
+
+/// Resolve a pool's LP-token AssetClass. Sundae's LP asset is minted under
+/// the pool_mint policy with name `0014df10 ++ pool_ident` (CIP-67 label 222
+/// for LP).
+fn pool_lp_asset(
+    exec: &ScooperExecution,
+    pool: &SundaeV4Pool,
+) -> Result<AssetClass> {
+    let mut name = vec![0x00, 0x14, 0xdf, 0x10];
+    name.extend_from_slice(pool.pool_datum.identifier.to_bytes());
+    Ok(AssetClass {
+        policy: exec.module_scripts.pool_mint.hash.as_ref().to_vec(),
+        token: name,
+    })
+}
+
+/// Build fulfillment output value for a Deposit order. Mirrors actions/order.ts'
+/// deposit fulfillment: take the order's input value, subtract each `dx[i]`
+/// (the per-asset contribution to the pool), subtract the scooper fee in ADA,
+/// then add the freshly minted LP tokens. Any remaining offered asset (because
+/// the user offered more than fit a proportional unit) stays in the output
+/// as surplus.
+fn build_deposit_fulfillment_value(
+    order_value: &crate::cardano_types::Value,
+    pool_assets: &[(AssetClass, BigInt)],
+    dx: &[BigInt],
+    lp_asset: &AssetClass,
+    lp_minted: &BigInt,
+    fee: u64,
+) -> Result<ConwayValue> {
+    use num_traits::ToPrimitive;
+    use pallas_primitives::NonEmptyKeyValuePairs;
+
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let mut result = order_value.clone();
+    for (i, (asset, _)) in pool_assets.iter().enumerate() {
+        let cur = result.get(asset);
+        result.insert(asset, &cur - &dx[i]);
+    }
+    let cur_ada = result.get(&ada_asset);
+    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
+    let cur_lp = result.get(lp_asset);
+    result.insert(lp_asset, &cur_lp + lp_minted);
+
+    let lovelace = result.get(&ada_asset)
+        .clone()
+        .unwrap()
+        .to_u64()
+        .context("deposit fulfillment ADA doesn't fit in u64")?;
+    let mut policy_map: std::collections::BTreeMap<
+        Vec<u8>,
+        std::collections::BTreeMap<Vec<u8>, u64>,
+    > = std::collections::BTreeMap::new();
+    for (policy, tokens) in &result.0 {
+        if policy.is_empty() { continue; }
+        for (token_name, qty) in tokens {
+            let qty_u64 = qty.clone().unwrap().to_u64().unwrap_or(0);
+            if qty_u64 > 0 {
+                policy_map
+                    .entry(policy.clone())
+                    .or_default()
+                    .insert(token_name.clone(), qty_u64);
+            }
+        }
+    }
+    if policy_map.is_empty() {
+        return Ok(ConwayValue::Coin(lovelace));
+    }
+    let multiasset_pairs: Vec<_> = policy_map
+        .into_iter()
+        .map(|(policy, tokens)| {
+            let policy_hash: Hash<28> = Hash::from(policy.as_slice());
+            let token_pairs: Vec<_> = tokens.into_iter()
+                .map(|(name, qty)| (
+                    PallasBytes::from(name),
+                    PositiveCoin::try_from(qty).unwrap(),
+                ))
+                .collect();
+            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+        })
+        .collect();
+    Ok(ConwayValue::Multiasset(lovelace, NonEmptyKeyValuePairs::Def(multiasset_pairs)))
 }
 
 /// Build fulfillment output value from first principles:

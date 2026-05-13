@@ -371,6 +371,16 @@ pub enum ConstantProductRedeemer {
     Operate { entries: Vec<CPOperateEntry> },
 }
 
+/// Redeemer for the pool_mint policy. The scooper only uses `MintLP` (to mint
+/// LP tokens for Deposits); `CreatePool` is for pool genesis and `BurnPool`
+/// for full withdrawals — both run by the CLI, not the scooper.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum PoolMintRedeemer {
+    CreatePool { seed_utxo: OutputRef, settings_ref_index: u64 },
+    MintLP { pool_ident: Ident },
+    BurnPool { pool_ident: Ident },
+}
+
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct CPOperateEntry {
     pub pool_oref: OutputRef,
@@ -552,11 +562,15 @@ pub struct ModuleScripts {
     #[serde(default)]
     pub constant_sum: Option<ScriptRefInfo>,
     /// Per-tag order-side dispatcher modules. Keyed by constraint tag
-    /// (2 = Swap). Required for the modules referenced in
-    /// `settings.order_modules` — the order validator's withdraw handler
-    /// requires their withdrawals to be present.
+    /// (2 = Swap, 0 = Deposit, 1 = Withdraw, 3 = Claim). Required for
+    /// the modules referenced in `settings.order_modules` — the order
+    /// validator's withdraw handler requires their withdrawals to be
+    /// present.
     #[serde(default)]
     pub swap_order: Option<ScriptRefInfo>,
+    /// `basic_order_module` covers Deposit/Withdraw/Claim constraints.
+    #[serde(default)]
+    pub basic_order: Option<ScriptRefInfo>,
 }
 
 #[serde_with::serde_as]

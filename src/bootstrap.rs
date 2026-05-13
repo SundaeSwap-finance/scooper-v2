@@ -1606,6 +1606,9 @@ async fn bootstrap_v4(
         if let Some(ref so) = scripts.swap_order {
             all_refs.push(so);
         }
+        if let Some(ref bo) = scripts.basic_order {
+            all_refs.push(bo);
+        }
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {

@@ -180,6 +180,13 @@ impl Blueprint {
             "swapOrder",
             "swap_order",
         ).ok();
+        // Same for basic_order (handles Deposit/Withdraw/Claim).
+        let basic_order = make_info(
+            self,
+            &["basic_order_module", "basic_order", "basicOrder"],
+            "basicOrder",
+            "basic_order",
+        ).ok();
 
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2)?,
@@ -191,6 +198,7 @@ impl Blueprint {
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
             constant_sum,
             swap_order,
+            basic_order,
         })
     }
 }

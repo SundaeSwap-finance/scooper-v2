@@ -25,10 +25,11 @@ pub struct PoolAccum {
     pub initial_total_lp: BigInt,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
+    pub deposits: Vec<crate::sundaev4::batch::ResolvedDeposit>,
     /// Fee budget accumulated incrementally as operations are applied.
     /// Computed inline so we don't need to replay in the wrong order.
     total_fee_budget: BigInt,
-    /// Interleaved order of swaps and continuations.
+    /// Interleaved order of swaps, continuations, and deposits.
     ops_order: Vec<BatchOp>,
 }
 
@@ -66,6 +67,7 @@ impl Accumulator {
                 initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
                 swaps: Vec::new(),
                 continuations: Vec::new(),
+                deposits: Vec::new(),
                 total_fee_budget: BigInt::from(0),
                 ops_order: Vec::new(),
             }
@@ -100,6 +102,56 @@ impl Accumulator {
         let swap_idx = accum.swaps.len();
         accum.swaps.push(swap);
         accum.ops_order.push(BatchOp::Swap(swap_idx));
+        Ok(())
+    }
+
+    /// Try to add a CP proportional Deposit order to the accumulator.
+    ///
+    /// Resolves the deposit against the pool's *running* reserves (so two
+    /// deposits in the same scoop layer correctly even though the second
+    /// reads post-first-deposit state). Updates running reserves with the
+    /// user's per-asset contribution and bumps `initial_total_lp` by the
+    /// minted LP — `initial_total_lp` is the running pre-protocol_lp total
+    /// that the tx_builder reads to compute the final pool datum, so growing
+    /// it here keeps protocol_share / state_after_total_lp accounting consistent.
+    pub fn try_add_deposit(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        pool_ident: &Ident,
+        effective_pool: &Arc<SundaeV4Pool>,
+    ) -> Result<(), String> {
+        let accum = self.pools.entry(pool_ident.clone()).or_insert_with(|| {
+            PoolAccum {
+                pool: effective_pool.clone(),
+                ident: pool_ident.clone(),
+                running_assets: effective_pool.pool_datum.assets.clone(),
+                initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
+                swaps: Vec::new(),
+                continuations: Vec::new(),
+                deposits: Vec::new(),
+                total_fee_budget: BigInt::from(0),
+                ops_order: Vec::new(),
+            }
+        });
+
+        // Build a transient pool reflecting the accumulator's running reserves
+        // so resolve_cp_deposit applies to the post-previous-ops state.
+        let mut transient = (**effective_pool).clone();
+        transient.pool_datum.assets = accum.running_assets.clone();
+        transient.pool_datum.total_lp = accum.initial_total_lp.clone();
+
+        let deposit = batch::resolve_cp_deposit(&transient, order)?;
+
+        // Update running reserves: each asset i grows by dx[i].
+        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+            *amt = &*amt + &deposit.dx[i];
+        }
+        // total_lp grows by lp_minted.
+        accum.initial_total_lp = &accum.initial_total_lp + &deposit.lp_minted;
+
+        let dep_idx = accum.deposits.len();
+        accum.deposits.push(deposit);
+        accum.ops_order.push(BatchOp::Deposit(dep_idx));
         Ok(())
     }
 
@@ -167,6 +219,7 @@ impl Accumulator {
                         initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
                         swaps: Vec::new(),
                         continuations: Vec::new(),
+                        deposits: Vec::new(),
                         total_fee_budget: BigInt::from(0),
                         ops_order: Vec::new(),
                     }
@@ -323,16 +376,19 @@ impl Accumulator {
         }
     }
 
-    /// Total number of orders across all pools.
+    /// Total number of orders across all pools (swaps + deposits).
     pub fn order_count(&self) -> usize {
-        self.pools.values().map(|a| a.swaps.len()).sum()
+        self.pools.values().map(|a| a.swaps.len() + a.deposits.len()).sum()
     }
 
     /// Collect all order inputs across all accumulated pools.
     pub fn order_inputs(&self) -> Vec<&crate::cardano_types::TransactionInput> {
         self.pools
             .values()
-            .flat_map(|p| p.swaps.iter().map(|s| &s.order.input))
+            .flat_map(|p| {
+                p.swaps.iter().map(|s| &s.order.input)
+                    .chain(p.deposits.iter().map(|d| &d.order.input))
+            })
             .collect()
     }
 
@@ -348,7 +404,10 @@ impl Accumulator {
         let mut batches = Vec::new();
 
         for (_ident, accum) in self.pools {
-            if accum.swaps.is_empty() && accum.continuations.is_empty() {
+            if accum.swaps.is_empty()
+                && accum.continuations.is_empty()
+                && accum.deposits.is_empty()
+            {
                 continue;
             }
 
@@ -368,6 +427,7 @@ impl Accumulator {
                 pool_ident: accum.ident,
                 swaps: accum.swaps,
                 continuations: accum.continuations,
+                deposits: accum.deposits,
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,

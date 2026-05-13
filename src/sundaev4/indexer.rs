@@ -129,6 +129,9 @@ impl SundaeV4Indexer {
                 if let Some(so) = &scripts.swap_order {
                     set.insert(so.ref_utxo.clone());
                 }
+                if let Some(bo) = &scripts.basic_order {
+                    set.insert(bo.ref_utxo.clone());
+                }
                 set
             })
             .unwrap_or_default();
@@ -512,8 +515,11 @@ pub fn extract_cs_config_from_tx(
 /// Try to extract a `FeeSplitConfig` from a tx's fee_split module withdrawal
 /// redeemer. The redeemer is `Create { config }` in the pool's mint tx and
 /// `Operate { entries }` in every subsequent scoop. For Operate we accept the
-/// first entry's config (all entries share the same protocol_share per pool;
-/// the per-entry config is just re-asserted for each pool in the batch).
+/// Returns `Some(config)` only when the tx carries a `Create` redeemer for
+/// the fee_split module — i.e. the pool's mint tx. Operate redeemers carry
+/// one config entry per pool in a multi-pool scoop and are ambiguous without
+/// a `pool_oref`, so this function intentionally returns `None` for them.
+/// Use `extract_fee_split_config_for_pool_from_tx` when you have an oref.
 pub fn extract_fee_split_config_from_tx(
     tx: &MultiEraTx,
     fs_script_hash: &ScriptHash,
@@ -531,20 +537,13 @@ pub fn extract_fee_split_config_from_tx(
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config } => Some(config),
-        // Operate carries one entry per pool in the batch; for the bootstrap
-        // case (extracting per-pool config) the caller should prefer a Create
-        // tx, but Operate is acceptable when only `Operate` is available. We
-        // return the first entry's config; callers that need per-pool routing
-        // should match by `pool_oref` instead.
-        FeeSplitRedeemer::Operate { entries } => entries.into_iter().next().map(|e| e.config),
+        FeeSplitRedeemer::Operate { .. } => None,
     }
 }
 
-/// Try to extract a `ConstantProductConfig` from a tx's constant_product
-/// module withdrawal redeemer. Same dispatch as `extract_fee_split_config_from_tx`:
-/// `Create` carries the config directly, `Operate` carries one entry per
-/// pool — we return the first entry's config for the bootstrap-time use,
-/// and the caller can match by `pool_oref` if needed.
+/// Same shape as `extract_fee_split_config_from_tx`: returns `Some(config)`
+/// only for `Create` redeemers (mint tx). Operate's per-pool entries are
+/// only safe when matched against a known `pool_oref`.
 pub fn extract_cp_config_from_tx(
     tx: &MultiEraTx,
     cp_script_hash: &ScriptHash,
@@ -562,7 +561,7 @@ pub fn extract_cp_config_from_tx(
     let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
-        ConstantProductRedeemer::Operate { entries } => entries.into_iter().next().map(|e| e.config),
+        ConstantProductRedeemer::Operate { .. } => None,
     }
 }
 
