@@ -187,7 +187,7 @@ impl Accumulator {
         transient.pool_datum.assets = accum.running_assets.clone();
         transient.pool_datum.total_lp = accum.initial_total_lp.clone();
 
-        let withdraw = batch::resolve_cp_withdraw(&transient, order)?;
+        let withdraw = batch::resolve_proportional_withdraw(&transient, order)?;
 
         // Update running reserves: each asset i shrinks by dy[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {

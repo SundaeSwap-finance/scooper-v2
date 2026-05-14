@@ -1555,6 +1555,26 @@ pub fn detect_pool_type(
     }
 
     if matched_kind == Some("cl") {
+        // Priority: operator override > on-chain Create redeemer > defaults
+        if let Some(crate::sundaev4::types::PoolConfig::ConcentratedLiquidity {
+            sqrt_price_a, sqrt_price_b, fee,
+        }) = exec.pool_configs.get(&ident_hex) {
+            info!(pool = %ident_hex, "CL pool config from operator override");
+            return PoolType::ConcentratedLiquidity {
+                sqrt_price_a: Rational {
+                    num: BigInt::from(sqrt_price_a.0),
+                    den: BigInt::from(sqrt_price_a.1),
+                },
+                sqrt_price_b: Rational {
+                    num: BigInt::from(sqrt_price_b.0),
+                    den: BigInt::from(sqrt_price_b.1),
+                },
+                fee: Rational {
+                    num: BigInt::from(fee.0),
+                    den: BigInt::from(fee.1),
+                },
+            };
+        }
         if let Some(cl_config) = cl_config_from_tx {
             info!(pool = %ident_hex, "CL pool config extracted from Create redeemer");
             return PoolType::ConcentratedLiquidity {
@@ -1568,7 +1588,8 @@ pub fn detect_pool_type(
         // a tight range to avoid silent miscalculation — scoops against
         // this pool will fail with module-state hash mismatch, which is
         // the right loud failure.
-        warn!(pool = %ident_hex, "CL pool but no Create-redeemer config recovered yet");
+        warn!(pool = %ident_hex, "CL pool but no Create-redeemer config recovered yet — \
+            set a `concentrated-liquidity` pool-config override in scooper config to scoop this pool");
         return PoolType::ConcentratedLiquidity {
             sqrt_price_a: Rational { num: BigInt::from(1), den: BigInt::from(1) },
             sqrt_price_b: Rational { num: BigInt::from(1), den: BigInt::from(1) },

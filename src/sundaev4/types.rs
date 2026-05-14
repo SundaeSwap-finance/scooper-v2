@@ -499,6 +499,14 @@ pub enum PoolConfig {
         prices: Vec<i64>,
         fee: (u64, u64),
     },
+    /// Operator-provided override for CL pools whose Create-redeemer
+    /// config wasn't recoverable from chain history. Stored as a sqrt-
+    /// price range `[a, b]` with `a < b`, fee as `(num, den)`.
+    ConcentratedLiquidity {
+        sqrt_price_a: (i64, i64),
+        sqrt_price_b: (i64, i64),
+        fee: (u64, u64),
+    },
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

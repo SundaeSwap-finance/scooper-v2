@@ -774,17 +774,17 @@ pub fn build_multi_pool_scoop_tx(
         let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
 
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
-        let actual_fee = {
-            use num_traits::ToPrimitive;
-            let budget = order.datum.budget.clone().unwrap()
-                .to_u64().unwrap_or(0);
-            let share_bps = order.datum.share_batcher.clone().unwrap()
-                .to_u64().unwrap_or(0);
-            let fee_share = TX_FEE / (n_orders as u64);
-            let surplus = budget.saturating_sub(fee_share);
-            let allowance = fee_share + share_bps.saturating_mul(surplus) / 10_000;
-            fee.min(allowance)
-        };
+        // Take the full per_order share. The contract's
+        //   allowance = fee_share + share_batcher·(budget − fee_share)/10000
+        // can drop below fee_share when an order's budget is small, and the
+        // order_validator separately requires `budget·n >= tx_body.fee`
+        // (line 139 of validators/order.ak). Capping our deduction without
+        // also lowering tx_body.fee would break value conservation, and
+        // lowering tx.fee involves a fixed-point computation — left as a
+        // follow-up. For now we always take fee_share; orders that can't
+        // afford it get caught by the budget-too-low filter at the scooper
+        // and never reach this code.
+        let actual_fee = fee;
 
         let fulfillment_value = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => {

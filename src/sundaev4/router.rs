@@ -160,14 +160,39 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             let _ = raw_allocated;
             &fee_mult * price_in * &scale() / &(price_out * &fee_den)
         }
-        PoolViewType::ConcentratedLiquidity { .. } => {
-            // CL bisection-aware split routing isn't implemented yet. Returning
-            // 0 marginal here makes the lambda bisection allocate 0 to this
-            // pool, so it only contributes via the single-pool baseline scan
-            // in `optimize_split` — single-pool CL swaps still work, but
-            // mixed-pool splits skip CL. See TODO at the top of this match.
-            let _ = raw_allocated;
-            BigInt::from(0)
+        PoolViewType::ConcentratedLiquidity {
+            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+        } => {
+            // Marginal dy/dx in CL = derivative of the validator formula:
+            //   A→B:  dy = vb0·dva_eff / (spa_den·(va0+dva_eff))
+            //         where va0 = a·spb_num + L·spb_den
+            //               vb0 = b·spa_den + L·spa_num
+            //               dva_eff = (fee_mult/fee_den)·dx·spb_num
+            //         d(dy)/dx = (fm·vb0·va0·spb_num) / (fd·spa_den·va²)
+            //   B→A:  symmetric with (spa↔spb), (a↔b), va↔vb
+            let (a, b) = if *is_a_input {
+                (&pool.reserve_in, &pool.reserve_out)
+            } else {
+                (&pool.reserve_out, &pool.reserve_in)
+            };
+            let va0 = &(a * spb_num) + &(lp * spb_den);
+            let vb0 = &(b * spa_den) + &(lp * spa_num);
+            let dx_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
+            if *is_a_input {
+                let va = &va0 + &(&dx_eff * spb_num);
+                let denom = &fee_den * spa_den * &va * &va;
+                if !denom.is_positive() {
+                    return BigInt::from(0);
+                }
+                &fee_mult * &vb0 * &va0 * spb_num * &scale() / &denom
+            } else {
+                let vb = &vb0 + &(&dx_eff * spa_num);
+                let denom = &fee_den * spb_num * &vb * &vb;
+                if !denom.is_positive() {
+                    return BigInt::from(0);
+                }
+                &fee_mult * &va0 * &vb0 * spa_num * &scale() / &denom
+            }
         }
     }
 }
@@ -216,12 +241,49 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         BigInt::from(0)
                     }
                 }
-                PoolViewType::ConcentratedLiquidity { .. } => {
-                    // See marginal_at_allocation: CL pools opt out of the
-                    // bisection by reporting zero marginal, so they always
-                    // get zero allocation here. Single-pool CL swaps still
-                    // work via the baseline scan in `optimize_split`.
-                    BigInt::from(0)
+                PoolViewType::ConcentratedLiquidity {
+                    is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+                } => {
+                    // Invert marginal = λ:
+                    //   A→B: va² = (fm·vb0·va0·spb_num·SCALE) / (λ·fd·spa_den)
+                    //   dva_eff = isqrt(va²) − va0
+                    //   dx_eff  = dva_eff / spb_num
+                    //   dx_raw  = dx_eff · fd / fm
+                    //   B→A: symmetric (swap spa↔spb, va↔vb)
+                    let (a, b) = if *is_a_input {
+                        (&pool.reserve_in, &pool.reserve_out)
+                    } else {
+                        (&pool.reserve_out, &pool.reserve_in)
+                    };
+                    let va0 = &(a * spb_num) + &(lp * spb_den);
+                    let vb0 = &(b * spa_den) + &(lp * spa_num);
+                    let (numerator, denom, sp_input_num) = if *is_a_input {
+                        (
+                            &fee_mult * &vb0 * &va0 * spb_num * &sc,
+                            &fee_den * spa_den * lambda,
+                            spb_num,
+                        )
+                    } else {
+                        (
+                            &fee_mult * &va0 * &vb0 * spa_num * &sc,
+                            &fee_den * spb_num * lambda,
+                            spa_num,
+                        )
+                    };
+                    if !denom.is_positive() || !sp_input_num.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    let v_target = swap_math::isqrt(&(&numerator / &denom));
+                    let v0 = if *is_a_input { &va0 } else { &vb0 };
+                    let dv_eff = &v_target - v0;
+                    if !dv_eff.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    let dx_eff = &dv_eff / sp_input_num;
+                    if !dx_eff.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    &dx_eff * &fee_den / &fee_mult
                 }
             }
         })

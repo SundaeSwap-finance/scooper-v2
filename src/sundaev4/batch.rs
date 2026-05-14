@@ -560,17 +560,18 @@ pub fn resolve_proportional_deposit(
 /// `dy[i] = floor(reserves[i] * lp_burned / total_lp)` per pool asset. The
 /// pool keeps the floor remainder, so there is no surplus.
 ///
-/// Errors when the order isn't a Withdraw, the pool isn't CP, the user
-/// offered nothing, or the burn would pay out zero of every reserve.
-pub fn resolve_cp_withdraw(
+/// Works for any pool type that admits proportional reserve/LP changes:
+/// CP's non-swap check, CS's check_deposit-mirrored constraint (with
+/// `delta_v < 0`), and CL's `va1·vb1·lp²` invariant all hold for
+/// proportional shrinkage by the same scale factor. CS rejects withdraw
+/// on-chain via the operation_tag dispatch — we still build the tx but
+/// the validator will reject it; that's enforced earlier in the
+/// tx_builder.
+pub fn resolve_proportional_withdraw(
     pool: &SundaeV4Pool,
     order: &Arc<SundaeV4Order>,
 ) -> Result<ResolvedWithdraw, String> {
     use num_traits::Signed;
-
-    if !matches!(pool.pool_type, PoolType::ConstantProduct { .. }) {
-        return Err("only constant-product withdraw is supported for now".into());
-    }
 
     let offered = match &order.constraint {
         Constraint::Withdraw { offered, .. } => offered,

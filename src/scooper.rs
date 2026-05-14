@@ -524,6 +524,9 @@ impl Scooper {
         let in_flight_pools = self.v4_chain_tracker.in_flight_pools();
         let n_in_flight_orders = in_flight_inputs.len();
         let mut n_quarantined = 0u32;
+        // Inputs to be permanently quarantined this pass — collected in the
+        // filter chain (where we hold only `&self`) and applied below.
+        let mut quarantine_budget_zero: Vec<TransactionInput> = Vec::new();
         let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
@@ -539,16 +542,47 @@ impl Scooper {
             ))
             .filter(|o| !in_flight_inputs.contains(&o.input))
             .filter(|o| {
+                use num_traits::ToPrimitive;
                 if self.is_quarantined(&o.input, current_slot) {
                     n_quarantined += 1;
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                // Orders with budget == 0 are structurally unscoopable:
+                // order_validator enforces `budget * n >= tx_body.fee`
+                // and `tx_body.fee >= chain_min_fee > 0`. Mark them for
+                // permanent quarantine (applied below) so we stop
+                // dispatching them every cycle — V4 orders don't TTL.
+                let budget = o.datum.budget.clone().unwrap().to_u64().unwrap_or(0);
+                if budget == 0 {
+                    quarantine_budget_zero.push(o.input.clone());
+                    n_quarantined += 1;
+                    return false;
+                }
+                true
             })
             .cloned()
             .collect();
         candidates.sort_by_key(|o| o.slot);
+
+        // Apply any permanent quarantines deferred from the filter chain
+        // (we couldn't borrow `&mut self` while iterating).
+        for input in quarantine_budget_zero {
+            if !matches!(
+                self.quarantine.get(&input),
+                Some(Quarantine::Permanent { .. }),
+            ) {
+                warn!(
+                    order = %input,
+                    "permanently quarantining: budget == 0 (max_protocol_fee = 0); \
+                     can never satisfy `budget * n >= tx.fee`",
+                );
+                self.quarantine.insert(
+                    input,
+                    Quarantine::Permanent { reason: "budget == 0".into() },
+                );
+            }
+        }
+        self.sync_quarantine_metrics();
 
         if candidates.is_empty() {
             if n_in_flight_orders > 0 || n_quarantined > 0 {
