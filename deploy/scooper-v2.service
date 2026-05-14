@@ -1,0 +1,29 @@
+[Unit]
+Description=SundaeSwap Scooper V2
+After=network-online.target cardano-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/scooper-v2
+Environment=RUST_BACKTRACE=1
+Environment=RUST_LOG=info
+ExecStart=/home/ec2-user/scooper-v2/scooper-v2 --config /home/ec2-user/scooper-v2/config.json
+Restart=on-failure
+RestartSec=30
+LimitNOFILE=65536
+
+# Sensible memory + CPU isolation. The scooper is single-process so a
+# moderate cap is enough to catch runaway leaks without crashing legit
+# workloads.
+MemoryMax=4G
+TasksMax=512
+
+# Stop signal: SIGTERM, then SIGKILL after the timeout. Plenty for the
+# scooper to finish in-flight scoops, since we don't hold long-lived
+# state in flight (the chain tracker tolerates a forced kill).
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
