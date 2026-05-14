@@ -1,0 +1,79 @@
+# Prometheus alert rules for scooper-v2. Load via:
+#   rule_files:
+#     - /etc/prometheus/scooper-alerts.yml
+# in your Prometheus config.
+#
+# Thresholds are starting points calibrated for preview. Tune per environment.
+
+groups:
+  - name: scooper-v2
+    interval: 30s
+    rules:
+
+      # Indexer falling behind the chain. On preview, blocks land ~every 20s,
+      # so 50 slots ≈ a couple of blocks behind — fine. 600 slots (≈10min) is
+      # not fine: we'll miss any order that lands and gets scooped by another
+      # scooper before we even see it.
+      - alert: ScooperSyncLagHigh
+        expr: scooper_v4_sync_lag_slots > 600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scooper is {{ $value }} slots behind the chain tip"
+          description: "Indexer hasn't kept up — we'll lose races on new orders."
+
+      # Crash loop. uptime resets to near-zero on restart. If it stays under
+      # 5 min for sustained periods, the process is flapping.
+      - alert: ScooperCrashLooping
+        expr: scooper_uptime_seconds < 300
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scooper process has restarted within the last 5 min, repeatedly"
+          description: "systemd is restart-on-failure; sustained low uptime means real crashes."
+
+      # Pending orders but no submits. If we've seen pending orders for 5+
+      # minutes and our submitted counter hasn't moved, we're failing to
+      # scoop something we should be able to handle.
+      - alert: ScooperStuckPendingOrders
+        expr: scooper_v4_order_count > 0 and rate(scooper_batches_submitted_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} pending orders but no scoops in the last 5 min"
+          description: "Either every pending order is structurally unscoopable (check `scooper_quarantined_permanent`), or we have a build/submit bug."
+
+      # Non-race submit failures. RaceLost is expected at low rates in
+      # contested markets. SubmitError or BuildError growing means a real
+      # bug in our tx assembly or a chain-side issue we should know about.
+      - alert: ScooperSubmitErrors
+        expr: increase(scooper_batches_failed_total{reason="submit_error"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} submit_error failures in the last 10 min"
+          description: "Submit returned a non-BadInputsUTxO error. Check journal for the chain's rejection."
+
+      - alert: ScooperBuildErrors
+        expr: increase(scooper_batches_failed_total{reason="build_error"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} build_error failures in the last 10 min"
+          description: "We couldn't assemble the final tx. This is almost certainly a code bug."
+
+      # Wallet getting low. Below 100 ADA you're a couple of scoops away
+      # from not having UTxOs to spend. Top up well before this fires.
+      - alert: ScooperWalletLow
+        expr: scooper_v4_wallet_lovelace < 100000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scooper wallet has {{ $value | humanize }} lovelace"
+          description: "Top up the scooper wallet."

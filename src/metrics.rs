@@ -2,12 +2,38 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 
 use crate::scooper::QuarantineSnapshot;
 use crate::sundaev3::{Ident, SundaeV3HistoricalState};
 use crate::sundaev4::SundaeV4HistoricalState;
+
+/// Reason a scoop batch failed to land. Used as a Prometheus label so
+/// operators can triage `scooper_batches_failed_total` by cause without
+/// grepping logs. Keep these names short and stable — they become part
+/// of an external API.
+#[derive(Copy, Clone, Debug)]
+pub enum BatchFailureReason {
+    /// `BadInputsUTxO` from the chain — another scooper got there first.
+    RaceLost,
+    /// Submit returned a non-BadInputsUTxO error (Blockfrost 4xx/5xx,
+    /// validator failure, value-conservation, etc.).
+    SubmitError,
+    /// Local tx-build step failed before we even attempted submission.
+    BuildError,
+}
+
+impl BatchFailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RaceLost => "race_lost",
+            Self::SubmitError => "submit_error",
+            Self::BuildError => "build_error",
+        }
+    }
+}
 
 /// Snapshot of in-flight transaction state, shared with the server for dashboard display.
 #[derive(Clone, Default)]
@@ -19,10 +45,17 @@ pub struct InFlightSnapshot {
 /// Scooper-originated counters shared between the scooper task and the server.
 pub struct Metrics {
     pub batches_submitted: AtomicU64,
-    pub batches_failed: AtomicU64,
-    pub races_lost: AtomicU64,
     pub orders_scooped: AtomicU64,
     pub in_flight_txs: AtomicU64,
+    // Per-reason failure buckets. Emitted as labeled samples on
+    // `scooper_batches_failed_total{reason="..."}`. Use
+    // `record_batch_failure(reason)` rather than touching these directly.
+    failed_race_lost: AtomicU64,
+    failed_submit_error: AtomicU64,
+    failed_build_error: AtomicU64,
+    /// Process start instant — used to compute `scooper_uptime_seconds`
+    /// so operators can spot crash loops without scraping systemd state.
+    start_instant: Instant,
     in_flight_snapshot: std::sync::Mutex<InFlightSnapshot>,
     quarantine_snapshot: std::sync::Mutex<QuarantineSnapshot>,
 }
@@ -31,13 +64,26 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             batches_submitted: AtomicU64::new(0),
-            batches_failed: AtomicU64::new(0),
-            races_lost: AtomicU64::new(0),
             orders_scooped: AtomicU64::new(0),
             in_flight_txs: AtomicU64::new(0),
+            failed_race_lost: AtomicU64::new(0),
+            failed_submit_error: AtomicU64::new(0),
+            failed_build_error: AtomicU64::new(0),
+            start_instant: Instant::now(),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
             quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
         }
+    }
+
+    /// Record a batch failure for the given reason. Replaces direct access
+    /// to the now-private per-reason atomics.
+    pub fn record_batch_failure(&self, reason: BatchFailureReason) {
+        let counter = match reason {
+            BatchFailureReason::RaceLost => &self.failed_race_lost,
+            BatchFailureReason::SubmitError => &self.failed_submit_error,
+            BatchFailureReason::BuildError => &self.failed_build_error,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Update the in-flight snapshot from current chain tracker state.
@@ -95,6 +141,13 @@ pub async fn render_metrics(
         let network_tip = state.network_tip_slot.unwrap_or(0);
         write_gauge(&mut out, "scooper_v4_network_tip_slot", "Network tip slot from upstream node", network_tip);
 
+        // sync_lag = chain tip − last processed. Cleaner alert target
+        // than sync_pct (which loses precision at high tip values).
+        // Zero or negative when caught up. We clamp to 0 so the gauge
+        // type stays non-negative.
+        let sync_lag = network_tip.saturating_sub(state.tip_slot);
+        write_gauge(&mut out, "scooper_v4_sync_lag_slots", "Slots between our last processed block and the network tip", sync_lag);
+
         let sync_pct = if network_tip > 0 {
             state.tip_slot as f64 / network_tip as f64 * 100.0
         } else {
@@ -150,14 +203,32 @@ pub async fn render_metrics(
 
     // Scooper-originated counters
     write_counter(&mut out, "scooper_batches_submitted_total", "Total batches successfully submitted", metrics.batches_submitted.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_batches_failed_total", "Total batches that failed to submit", metrics.batches_failed.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_races_lost_total", "Total scoop races lost (BadInputsUTxO)", metrics.races_lost.load(Ordering::Relaxed));
     write_counter(&mut out, "scooper_orders_scooped_total", "Total orders successfully scooped", metrics.orders_scooped.load(Ordering::Relaxed));
     write_gauge(&mut out, "scooper_in_flight_txs", "Number of in-flight transactions in chain tracker", metrics.in_flight_txs.load(Ordering::Relaxed));
+
+    // Failure breakdown: one counter, multiple reason labels. Lets
+    // operators alert on the dominant failure mode rather than a single
+    // opaque rate. `race_lost` is expected to be non-zero at steady
+    // state; sustained growth of `submit_error` or `build_error` is a
+    // bug signal.
+    let _ = writeln!(out, "# HELP scooper_batches_failed_total Total batches that failed to submit, by reason");
+    let _ = writeln!(out, "# TYPE scooper_batches_failed_total counter");
+    for (reason, value) in [
+        (BatchFailureReason::RaceLost.label(),     metrics.failed_race_lost.load(Ordering::Relaxed)),
+        (BatchFailureReason::SubmitError.label(),  metrics.failed_submit_error.load(Ordering::Relaxed)),
+        (BatchFailureReason::BuildError.label(),   metrics.failed_build_error.load(Ordering::Relaxed)),
+    ] {
+        let _ = writeln!(out, "scooper_batches_failed_total{{reason=\"{reason}\"}} {value}");
+    }
 
     let q = metrics.quarantine_snapshot();
     write_gauge(&mut out, "scooper_quarantined_permanent", "Number of permanently quarantined orders", q.permanent.len());
     write_gauge(&mut out, "scooper_quarantined_temporary", "Number of temporarily quarantined orders", q.temporary.len());
+
+    // Uptime since process start. Dropping near zero unexpectedly is the
+    // canonical crash-loop signal.
+    let uptime = metrics.start_instant.elapsed().as_secs();
+    write_gauge(&mut out, "scooper_uptime_seconds", "Seconds since this scooper process started", uptime);
 
     out
 }

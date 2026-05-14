@@ -979,6 +979,7 @@ impl Scooper {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx rebuild failed");
+                self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::BuildError);
                 return false;
             }
         };
@@ -1060,10 +1061,14 @@ impl Scooper {
                 true
             }
             Err(e) => {
-                self.metrics.batches_failed.fetch_add(1, Ordering::Relaxed);
                 let msg = e.to_string();
-                if msg.contains("BadInputsUTxO") {
-                    self.metrics.races_lost.fetch_add(1, Ordering::Relaxed);
+                let reason = if msg.contains("BadInputsUTxO") {
+                    crate::metrics::BatchFailureReason::RaceLost
+                } else {
+                    crate::metrics::BatchFailureReason::SubmitError
+                };
+                self.metrics.record_batch_failure(reason);
+                if matches!(reason, crate::metrics::BatchFailureReason::RaceLost) {
                     let pool_strs: Vec<String> = pool_idents.iter().map(|i| i.to_string()).collect();
                     info!(
                         tx_hash = %final_tx.tx_hash_hex,
