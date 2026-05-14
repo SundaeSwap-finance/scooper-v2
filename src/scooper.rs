@@ -631,90 +631,94 @@ impl Scooper {
                 break;
             }
 
-            // Match order to pool. Swap orders match by asset overlap; Deposit
-            // orders by the LP token in `min_received`; Withdraw orders by the
-            // LP token in `offered`.
-            let pool_ident = match &order.constraint {
-                crate::sundaev4::Constraint::Deposit { .. } =>
-                    batch::find_pool_for_deposit_order(order, &v4_state.pools),
-                crate::sundaev4::Constraint::Withdraw { .. } =>
-                    batch::find_pool_for_withdraw_order(order, &v4_state.pools),
-                _ => batch::find_pool_for_simple_order(order, &v4_state.pools),
-            };
-            tracing::info!(
-                order = %order.input,
-                kind = ?std::mem::discriminant(&order.constraint),
-                matched_pool = ?pool_ident.as_ref().map(|i| i.to_string()),
-                "order dispatch",
-            );
-
-            // Clone + try add (direct or routed)
+            // Dispatch by constraint kind. Deposit/Withdraw target a specific
+            // pool identified by the LP token in the order's offered/
+            // min_received list — direct match by ident.
+            //
+            // Swap orders are pool-agnostic on chain: the constraint just
+            // says "give me ≥ min_received of asset B for X of asset A". Any
+            // pool, or split across pools, that satisfies that is valid. So
+            // we ALWAYS route swaps through the router — it picks the best
+            // single-pool or multi-pool split. Falling back to "first pool
+            // with both assets" picked a suboptimal pool and rejected the
+            // order when a better pool existed.
             let mut candidate = accum.clone();
-            let added = if let Some(ref pool_ident) = pool_ident {
-                let effective_pool = if candidate.pools.contains_key(pool_ident) {
-                    candidate.pools[pool_ident].pool.clone()
-                } else {
-                    match self.v4_chain_tracker.latest_predicted_pool(pool_ident) {
-                        Some(predicted) => predicted.pool.clone(),
-                        None => match v4_state.pools.get(pool_ident) {
-                            Some(p) => p.clone(),
-                            None => { skip_no_pool += 1; continue; },
-                        },
-                    }
-                };
-
-                let result = match &order.constraint {
-                    crate::sundaev4::Constraint::Deposit { .. } =>
-                        candidate.try_add_deposit(order, pool_ident, &effective_pool),
-                    crate::sundaev4::Constraint::Withdraw { .. } =>
-                        candidate.try_add_withdraw(order, pool_ident, &effective_pool),
-                    _ => candidate.try_add_order(order, pool_ident, &effective_pool),
-                };
-                match result {
-                    Ok(_) => true,
-                    Err(e) => {
-                        skip_add_failed += 1;
-                        tracing::info!(error = %e, order = %order.input, "try_add failed");
-                        false
+            let added = match &order.constraint {
+                crate::sundaev4::Constraint::Deposit { .. } => {
+                    let Some(pool_ident) = batch::find_pool_for_deposit_order(order, &v4_state.pools) else {
+                        tracing::info!(order = %order.input, "order dispatch: deposit, no pool match");
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    tracing::info!(order = %order.input, kind = "deposit", matched_pool = %pool_ident, "order dispatch");
+                    let effective_pool = pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, &pool_ident);
+                    let Some(effective_pool) = effective_pool else {
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    match candidate.try_add_deposit(order, &pool_ident, &effective_pool) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            skip_add_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add failed");
+                            false
+                        }
                     }
                 }
-            } else {
-                skip_no_pool += 1;
-                false
-            };
-
-            // If direct matching failed, try routing. Routing only applies to
-            // Swap orders — Deposit/Withdraw/Claim have fixed-target pools.
-            if !added && matches!(order.constraint, crate::sundaev4::Constraint::Swap { .. }) {
-                let (offer_asset, offer_amount) = order.swap_offered();
-                let (ask_asset, _) = order.swap_min_received();
-                if offer_asset != ask_asset {
-                    if let Some(route) = router::find_optimal_route(
-                        &v4_state.pools,
-                        offer_asset,
-                        ask_asset,
-                        offer_amount,
-                    ) {
-                        if router::is_routed(&route) {
-                            candidate = accum.clone();
-                            if candidate.try_add_routed_order(
-                                order, &route, &v4_state.pools,
-                            ).is_err() {
-                                skip_route_failed += 1;
-                                continue;
-                            }
-                        } else {
-                            skip_no_route += 1;
-                            continue;
+                crate::sundaev4::Constraint::Withdraw { .. } => {
+                    let Some(pool_ident) = batch::find_pool_for_withdraw_order(order, &v4_state.pools) else {
+                        tracing::info!(order = %order.input, "order dispatch: withdraw, no pool match");
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    tracing::info!(order = %order.input, kind = "withdraw", matched_pool = %pool_ident, "order dispatch");
+                    let effective_pool = pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, &pool_ident);
+                    let Some(effective_pool) = effective_pool else {
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    match candidate.try_add_withdraw(order, &pool_ident, &effective_pool) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            skip_add_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add failed");
+                            false
                         }
-                    } else {
-                        skip_no_route += 1;
+                    }
+                }
+                _ => {
+                    // Swap: route through the optimizer regardless of whether
+                    // it ends up as single-pool or split.
+                    let (offer_asset, offer_amount) = order.swap_offered();
+                    let (ask_asset, _) = order.swap_min_received();
+                    if offer_asset == ask_asset {
                         continue;
                     }
-                } else {
-                    continue;
+                    let Some(route) = router::find_optimal_route(
+                        &v4_state.pools, offer_asset, ask_asset, offer_amount,
+                    ) else {
+                        tracing::info!(order = %order.input, "order dispatch: swap, no route");
+                        skip_no_route += 1;
+                        continue;
+                    };
+                    tracing::info!(
+                        order = %order.input,
+                        kind = "swap",
+                        hops = route.hops.len(),
+                        splits_per_hop = ?route.hops.iter().map(|h| h.splits.len()).collect::<Vec<_>>(),
+                        total_output = %route.total_output,
+                        "order dispatch",
+                    );
+                    match candidate.try_add_routed_order(order, &route, &v4_state.pools) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            skip_route_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add_routed failed");
+                            false
+                        }
+                    }
                 }
-            }
+            };
 
             // Only checkpoint when this order actually joined the accumulator.
             // Pushing on failure would seed checkpoints[0] with an empty state
@@ -1137,6 +1141,24 @@ impl Scooper {
 /// The error string from submit is `"ogmios submit failed (status): {json}"`.
 /// The JSON portion is the Ogmios error object with structure:
 ///   `{"code":...,"data":{"badInputs":["txhash#idx",...]}}`
+/// Resolve the effective pool snapshot to scoop against — preferring an
+/// already-accumulated state, then the chain tracker's in-flight prediction
+/// (so we chain off our own pending tx), then the on-chain state.
+fn pick_effective_pool(
+    accum: &Accumulator,
+    chain_tracker: &crate::sundaev4::chain_tracker::ChainTracker,
+    v4_state: &crate::sundaev4::SundaeV4State,
+    pool_ident: &Ident,
+) -> Option<Arc<crate::sundaev4::SundaeV4Pool>> {
+    if accum.pools.contains_key(pool_ident) {
+        return Some(accum.pools[pool_ident].pool.clone());
+    }
+    if let Some(predicted) = chain_tracker.latest_predicted_pool(pool_ident) {
+        return Some(predicted.pool.clone());
+    }
+    v4_state.pools.get(pool_ident).cloned()
+}
+
 fn parse_bad_inputs(msg: &str) -> std::collections::BTreeSet<String> {
     /// Minimal typed representation of the Ogmios error envelope.
     #[derive(serde::Deserialize)]

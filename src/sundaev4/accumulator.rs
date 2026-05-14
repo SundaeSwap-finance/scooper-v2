@@ -80,8 +80,7 @@ impl Accumulator {
             &accum.running_assets,
             &accum.initial_total_lp,
             &effective_pool.pool_type,
-        )
-        .ok_or_else(|| "order cannot execute against running pool state".to_string())?;
+        )?;
 
         // Capture reserves before update for fee budget computation
         let prev_assets = accum.running_assets.clone();

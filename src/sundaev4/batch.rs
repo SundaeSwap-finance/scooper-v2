@@ -245,7 +245,7 @@ pub fn assemble_batch(
                 continue;
             }
 
-            if let Some(swap) = try_execute_order(
+            if let Ok(swap) = try_execute_order(
                 order,
                 &running_assets,
                 &initial_total_lp,
@@ -316,28 +316,34 @@ pub fn try_execute_order(
     running_assets: &[(AssetClass, BigInt)],
     running_total_lp: &BigInt,
     pool_type: &PoolType,
-) -> Option<ResolvedSwap> {
-    let Some((input_idx, output_idx)) = detect_swap_direction(order, running_assets) else {
-        return None;
-    };
+) -> Result<ResolvedSwap, String> {
+    let (input_idx, output_idx) = detect_swap_direction(order, running_assets)
+        .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
     // dx comes from the order's remaining_offered amount (partial fills not yet supported).
     let dx = order.swap_offered().1.clone();
     if !dx.is_positive() {
-        return None;
+        return Err(format!("offered amount not positive: {dx}"));
     }
 
     let dy = compute_swap_result(pool_type, running_assets, running_total_lp, input_idx, output_idx, &dx);
     if !dy.is_positive() {
-        return None;
+        return Err(format!(
+            "swap result not positive: dy={dy} dx={dx} reserves=[{}, {}] total_lp={running_total_lp}",
+            &running_assets[input_idx].1, &running_assets[output_idx].1,
+        ));
     }
 
     // Check min_received constraint
-    if !satisfies_min_received(order, &running_assets[output_idx].0, &dy) {
-        return None;
+    let (_, min_qty) = order.swap_min_received();
+    if &dy < min_qty {
+        return Err(format!(
+            "computed dy={dy} below min_received={min_qty} (dx={dx}, reserves=[in={}, out={}])",
+            &running_assets[input_idx].1, &running_assets[output_idx].1,
+        ));
     }
 
-    Some(ResolvedSwap {
+    Ok(ResolvedSwap {
         order: order.clone(),
         input_idx,
         output_idx,
