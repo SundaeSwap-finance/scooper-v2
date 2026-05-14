@@ -138,12 +138,12 @@ impl Accumulator {
         });
 
         // Build a transient pool reflecting the accumulator's running reserves
-        // so resolve_cp_deposit applies to the post-previous-ops state.
+        // so the resolver applies to the post-previous-ops state.
         let mut transient = (**effective_pool).clone();
         transient.pool_datum.assets = accum.running_assets.clone();
         transient.pool_datum.total_lp = accum.initial_total_lp.clone();
 
-        let deposit = batch::resolve_cp_deposit(&transient, order)?;
+        let deposit = batch::resolve_proportional_deposit(&transient, order)?;
 
         // Update running reserves: each asset i grows by dx[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {

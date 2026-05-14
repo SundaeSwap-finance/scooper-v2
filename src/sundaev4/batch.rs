@@ -461,15 +461,16 @@ fn satisfies_min_received(
 /// `offered` defaults to 0 for any pool asset the user didn't specify, which
 /// drives num_max to 0 — i.e. orders that don't include every pool asset
 /// (zaps) currently can't be filled by this path.
-pub fn resolve_cp_deposit(
+/// Resolve a proportional deposit. The math (gcd over reserves, scale factor
+/// k, `lp_minted = total_lp * k / g`) works identically for CP and CS pools:
+/// both validators reduce to "delta is proportional to reserves, LP minted
+/// is floored against the ratio" — for CS this falls out of the price-aware
+/// V_b/V_a check, since proportional reserves give `V_a/V_b = (g+k)/g`.
+pub fn resolve_proportional_deposit(
     pool: &SundaeV4Pool,
     order: &Arc<SundaeV4Order>,
 ) -> Result<ResolvedDeposit, String> {
     use num_traits::{Signed, Zero};
-
-    if !matches!(pool.pool_type, PoolType::ConstantProduct { .. }) {
-        return Err("only constant-product deposit is supported for now".into());
-    }
 
     let offered = match &order.constraint {
         Constraint::Deposit { offered, .. } => offered,
