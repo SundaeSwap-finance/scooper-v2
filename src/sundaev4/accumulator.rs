@@ -26,6 +26,7 @@ pub struct PoolAccum {
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<crate::sundaev4::batch::ResolvedDeposit>,
+    pub withdraws: Vec<crate::sundaev4::batch::ResolvedWithdraw>,
     /// Fee budget accumulated incrementally as operations are applied.
     /// Computed inline so we don't need to replay in the wrong order.
     total_fee_budget: BigInt,
@@ -68,6 +69,7 @@ impl Accumulator {
                 swaps: Vec::new(),
                 continuations: Vec::new(),
                 deposits: Vec::new(),
+                withdraws: Vec::new(),
                 total_fee_budget: BigInt::from(0),
                 ops_order: Vec::new(),
             }
@@ -129,6 +131,7 @@ impl Accumulator {
                 swaps: Vec::new(),
                 continuations: Vec::new(),
                 deposits: Vec::new(),
+                withdraws: Vec::new(),
                 total_fee_budget: BigInt::from(0),
                 ops_order: Vec::new(),
             }
@@ -152,6 +155,50 @@ impl Accumulator {
         let dep_idx = accum.deposits.len();
         accum.deposits.push(deposit);
         accum.ops_order.push(BatchOp::Deposit(dep_idx));
+        Ok(())
+    }
+
+    /// Try to add a Withdraw order targeting `pool_ident`. Inverse of
+    /// `try_add_deposit`: the user offers LP, the scooper burns it, and the
+    /// pool's reserves shrink by `dy[i]`. The pool's `total_lp` shrinks by
+    /// `lp_burned`.
+    pub fn try_add_withdraw(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        pool_ident: &Ident,
+        effective_pool: &Arc<SundaeV4Pool>,
+    ) -> Result<(), String> {
+        let accum = self.pools.entry(pool_ident.clone()).or_insert_with(|| {
+            PoolAccum {
+                pool: effective_pool.clone(),
+                ident: pool_ident.clone(),
+                running_assets: effective_pool.pool_datum.assets.clone(),
+                initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
+                swaps: Vec::new(),
+                continuations: Vec::new(),
+                deposits: Vec::new(),
+                withdraws: Vec::new(),
+                total_fee_budget: BigInt::from(0),
+                ops_order: Vec::new(),
+            }
+        });
+
+        let mut transient = (**effective_pool).clone();
+        transient.pool_datum.assets = accum.running_assets.clone();
+        transient.pool_datum.total_lp = accum.initial_total_lp.clone();
+
+        let withdraw = batch::resolve_cp_withdraw(&transient, order)?;
+
+        // Update running reserves: each asset i shrinks by dy[i].
+        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+            *amt = &*amt - &withdraw.dy[i];
+        }
+        // total_lp shrinks by lp_burned.
+        accum.initial_total_lp = &accum.initial_total_lp - &withdraw.lp_burned;
+
+        let w_idx = accum.withdraws.len();
+        accum.withdraws.push(withdraw);
+        accum.ops_order.push(BatchOp::Withdraw(w_idx));
         Ok(())
     }
 
@@ -220,6 +267,7 @@ impl Accumulator {
                         swaps: Vec::new(),
                         continuations: Vec::new(),
                         deposits: Vec::new(),
+                        withdraws: Vec::new(),
                         total_fee_budget: BigInt::from(0),
                         ops_order: Vec::new(),
                     }
@@ -376,9 +424,9 @@ impl Accumulator {
         }
     }
 
-    /// Total number of orders across all pools (swaps + deposits).
+    /// Total number of orders across all pools (swaps + deposits + withdraws).
     pub fn order_count(&self) -> usize {
-        self.pools.values().map(|a| a.swaps.len() + a.deposits.len()).sum()
+        self.pools.values().map(|a| a.swaps.len() + a.deposits.len() + a.withdraws.len()).sum()
     }
 
     /// Collect all order inputs across all accumulated pools.
@@ -388,6 +436,7 @@ impl Accumulator {
             .flat_map(|p| {
                 p.swaps.iter().map(|s| &s.order.input)
                     .chain(p.deposits.iter().map(|d| &d.order.input))
+                    .chain(p.withdraws.iter().map(|w| &w.order.input))
             })
             .collect()
     }
@@ -407,6 +456,7 @@ impl Accumulator {
             if accum.swaps.is_empty()
                 && accum.continuations.is_empty()
                 && accum.deposits.is_empty()
+                && accum.withdraws.is_empty()
             {
                 continue;
             }
@@ -428,6 +478,7 @@ impl Accumulator {
                 swaps: accum.swaps,
                 continuations: accum.continuations,
                 deposits: accum.deposits,
+                withdraws: accum.withdraws,
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,

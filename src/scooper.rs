@@ -527,14 +527,15 @@ impl Scooper {
         let mut candidates: Vec<_> = v4_state
             .orders
             .iter()
-            // Swap + (proportional) Deposit are handled. Withdraw / Claim
-            // aren't yet supported, and Deposits that don't fit a proportional
+            // Swap, (proportional) Deposit, and Withdraw are handled. Claim
+            // isn't yet supported. Deposits that don't fit a proportional
             // unit against any indexed pool get filtered out in the matching
-            // step below.
+            // step below; CS withdraws fall out at resolve time.
             .filter(|o| matches!(
                 o.constraint,
                 crate::sundaev4::Constraint::Swap { .. }
-                    | crate::sundaev4::Constraint::Deposit { .. },
+                    | crate::sundaev4::Constraint::Deposit { .. }
+                    | crate::sundaev4::Constraint::Withdraw { .. },
             ))
             .filter(|o| !in_flight_inputs.contains(&o.input))
             .filter(|o| {
@@ -597,10 +598,13 @@ impl Scooper {
             }
 
             // Match order to pool. Swap orders match by asset overlap; Deposit
-            // orders match by the LP token named in their `min_received`.
+            // orders by the LP token in `min_received`; Withdraw orders by the
+            // LP token in `offered`.
             let pool_ident = match &order.constraint {
                 crate::sundaev4::Constraint::Deposit { .. } =>
                     batch::find_pool_for_deposit_order(order, &v4_state.pools),
+                crate::sundaev4::Constraint::Withdraw { .. } =>
+                    batch::find_pool_for_withdraw_order(order, &v4_state.pools),
                 _ => batch::find_pool_for_simple_order(order, &v4_state.pools),
             };
             tracing::info!(
@@ -628,13 +632,15 @@ impl Scooper {
                 let result = match &order.constraint {
                     crate::sundaev4::Constraint::Deposit { .. } =>
                         candidate.try_add_deposit(order, pool_ident, &effective_pool),
+                    crate::sundaev4::Constraint::Withdraw { .. } =>
+                        candidate.try_add_withdraw(order, pool_ident, &effective_pool),
                     _ => candidate.try_add_order(order, pool_ident, &effective_pool),
                 };
                 match result {
                     Ok(_) => true,
                     Err(e) => {
                         skip_add_failed += 1;
-                        tracing::info!(error = %e, order = %order.input, "try_add_order/deposit failed");
+                        tracing::info!(error = %e, order = %order.input, "try_add failed");
                         false
                     }
                 }
@@ -801,6 +807,7 @@ impl Scooper {
                     diag_order_count = diag.order_count(),
                     first_batch_swaps = diag_batches.first().map(|b| b.swaps.len()),
                     first_batch_deposits = diag_batches.first().map(|b| b.deposits.len()),
+                    first_batch_withdraws = diag_batches.first().map(|b| b.withdraws.len()),
                     "diag rebuild input",
                 );
                 let reason = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
@@ -982,13 +989,15 @@ impl Scooper {
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 
-                // Collect consumed orders from all batches. Both swaps and
-                // deposits sit on real on-chain UTxOs and must be tracked as
-                // in-flight so the next iteration doesn't re-attempt them.
+                // Collect consumed orders from all batches. Swaps, deposits,
+                // and withdraws all sit on real on-chain UTxOs and must be
+                // tracked as in-flight so the next iteration doesn't re-attempt
+                // them.
                 let consumed_orders: Vec<_> = final_batches.iter()
                     .flat_map(|b| {
                         b.swaps.iter().map(|s| s.order.clone())
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
+                            .chain(b.withdraws.iter().map(|w| w.order.clone()))
                     })
                     .collect();
 

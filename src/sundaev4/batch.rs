@@ -63,12 +63,26 @@ pub struct ResolvedDeposit {
     pub surplus: Vec<(AssetClass, BigInt)>,
 }
 
+/// A resolved proportional Withdraw. The user offers an exact amount of LP
+/// (`lp_burned`); the scooper burns it all and the pool pays out per-asset
+/// `dy[i] = floor(reserves[i] * lp_burned / total_lp)`. The pool keeps the
+/// floor remainder, so there's no withdraw surplus (in contrast to deposit).
+#[derive(Clone)]
+pub struct ResolvedWithdraw {
+    pub order: Arc<SundaeV4Order>,
+    /// Amount of LP burned. Equal to whatever the user offered.
+    pub lp_burned: BigInt,
+    /// Per pool asset, in pool-asset-order. Amount paid out to the user.
+    pub dy: Vec<BigInt>,
+}
+
 /// Identifies an operation in the batch's interleaved order.
 #[derive(Clone, Debug)]
 pub enum BatchOp {
     Swap(usize),
     Continuation(usize),
     Deposit(usize),
+    Withdraw(usize),
 }
 
 /// A complete batch for one pool, ready for the tx builder.
@@ -79,6 +93,7 @@ pub struct Batch {
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<ResolvedDeposit>,
+    pub withdraws: Vec<ResolvedWithdraw>,
     /// The interleaved order of swaps, continuations, and deposits as they
     /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
@@ -162,12 +177,33 @@ pub fn find_pool_for_deposit_order(
         Constraint::Deposit { min_received, .. } => min_received,
         _ => return None,
     };
-    // CIP-67 LP asset label = 0014df10 (4 bytes).
+    find_pool_by_lp_asset(min_received, pools)
+}
+
+/// Find the pool a Withdraw order targets via the LP token in `offered`.
+/// Mirrors `find_pool_for_deposit_order`, just reading from the other side.
+pub fn find_pool_for_withdraw_order(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Option<Ident> {
+    let offered = match &order.constraint {
+        Constraint::Withdraw { offered, .. } => offered,
+        _ => return None,
+    };
+    find_pool_by_lp_asset(offered, pools)
+}
+
+/// Search a `(asset, qty)` list for a CIP-67 LP token (label `0014df10`) and
+/// return the pool whose identifier matches the token's suffix.
+fn find_pool_by_lp_asset(
+    assets: &[(AssetClass, BigInt)],
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Option<Ident> {
     const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
-    for (lp_asset, _) in min_received {
-        if lp_asset.token.len() < LP_LABEL.len() { continue; }
-        if &lp_asset.token[..LP_LABEL.len()] != LP_LABEL { continue; }
-        let ident_bytes = &lp_asset.token[LP_LABEL.len()..];
+    for (asset, _) in assets {
+        if asset.token.len() < LP_LABEL.len() { continue; }
+        if &asset.token[..LP_LABEL.len()] != LP_LABEL { continue; }
+        let ident_bytes = &asset.token[LP_LABEL.len()..];
         for (ident, _) in pools {
             if ident.to_bytes() == ident_bytes {
                 return Some(ident.clone());
@@ -265,6 +301,7 @@ pub fn assemble_batch(
         swaps: selected,
         continuations: Vec::new(),
         deposits: Vec::new(),
+        withdraws: Vec::new(),
         ops_order,
         final_assets: running_assets,
         final_total_lp,
@@ -497,6 +534,61 @@ pub fn resolve_cp_deposit(
         lp_minted,
         surplus,
     })
+}
+
+/// Resolve a Withdraw order against a CP pool. The user offers a single LP
+/// asset; we burn `lp_burned = offered_lp` and pay out
+/// `dy[i] = floor(reserves[i] * lp_burned / total_lp)` per pool asset. The
+/// pool keeps the floor remainder, so there is no surplus.
+///
+/// Errors when the order isn't a Withdraw, the pool isn't CP, the user
+/// offered nothing, or the burn would pay out zero of every reserve.
+pub fn resolve_cp_withdraw(
+    pool: &SundaeV4Pool,
+    order: &Arc<SundaeV4Order>,
+) -> Result<ResolvedWithdraw, String> {
+    use num_traits::Signed;
+
+    if !matches!(pool.pool_type, PoolType::ConstantProduct { .. }) {
+        return Err("only constant-product withdraw is supported for now".into());
+    }
+
+    let offered = match &order.constraint {
+        Constraint::Withdraw { offered, .. } => offered,
+        _ => return Err("order is not a Withdraw".into()),
+    };
+
+    // Withdrawals offer exactly one LP token; locate it via the CIP-67 label
+    // and confirm it belongs to this pool.
+    const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
+    let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
+    let lp_burned = offered.iter()
+        .find_map(|(a, q)| {
+            if a.token.len() < LP_LABEL.len() { return None; }
+            if &a.token[..LP_LABEL.len()] != LP_LABEL { return None; }
+            if &a.token[LP_LABEL.len()..] != pool_ident_bytes { return None; }
+            Some(q.clone())
+        })
+        .ok_or_else(|| "withdraw order doesn't offer this pool's LP token".to_string())?;
+
+    if !lp_burned.is_positive() {
+        return Err("withdraw offers zero LP".into());
+    }
+
+    let total_lp = &pool.pool_datum.total_lp;
+    if !total_lp.is_positive() {
+        return Err("pool total_lp is zero".into());
+    }
+
+    let dy: Vec<BigInt> = pool.pool_datum.assets.iter().map(|(_, r)| {
+        r * &lp_burned / total_lp
+    }).collect();
+
+    if dy.iter().all(|q| !q.is_positive()) {
+        return Err("withdraw pays out zero of every reserve".into());
+    }
+
+    Ok(ResolvedWithdraw { order: order.clone(), lp_burned, dy })
 }
 
 #[cfg(test)]

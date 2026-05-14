@@ -68,7 +68,8 @@ pub fn build_multi_pool_scoop_tx(
     let m_pools = batches.len();
     let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
-    let n_orders: usize = n_swap_orders + n_deposit_orders;
+    let n_withdraw_orders: usize = batches.iter().map(|b| b.withdraws.len()).sum();
+    let n_orders: usize = n_swap_orders + n_deposit_orders + n_withdraw_orders;
     if m_pools == 0 || n_orders == 0 {
         bail!("no batches or no swaps");
     }
@@ -93,6 +94,9 @@ pub fn build_multi_pool_scoop_tx(
         /// Sum of LP minted by all deposits in this batch. Zero for swap-only
         /// batches. Used to drive the pool_mint policy's LP mint entry below.
         lp_minted: BigInt,
+        /// Sum of LP burned by all withdraws in this batch. Zero unless there
+        /// are withdraws. The pool_mint entry uses `lp_minted - lp_burned`.
+        lp_burned: BigInt,
     }
 
     let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
@@ -125,6 +129,7 @@ pub fn build_multi_pool_scoop_tx(
         let mut running_total_lp = initial_total_lp.clone();
         let mut running_circ_lp = pool.pool_datum.circulating_lp.clone();
         let mut lp_minted_sum = BigInt::from(0);
+        let mut lp_burned_sum = BigInt::from(0);
         for op in &batch.ops_order {
             let prev_assets = running_assets.clone();
             let (operation_tag, fee_budget) = match op {
@@ -170,6 +175,26 @@ pub fn build_multi_pool_scoop_tx(
                     };
                     (dep_tag, BigInt::from(0))
                 }
+                crate::sundaev4::batch::BatchOp::Withdraw(i) => {
+                    let w = &batch.withdraws[*i];
+                    for (idx, amt) in running_assets.iter_mut().enumerate() {
+                        amt.1 = &amt.1 - &w.dy[idx];
+                    }
+                    running_total_lp = &running_total_lp - &w.lp_burned;
+                    running_circ_lp = &running_circ_lp - &w.lp_burned;
+                    lp_burned_sum = &lp_burned_sum + &w.lp_burned;
+                    // CP doesn't have a dedicated withdraw tag; the
+                    // non-swap branch checks proportionality and accepts
+                    // both deposit and withdraw. CS contracts don't
+                    // support withdraw on-chain (cs_check rejects it).
+                    let wd_tag = match &batch.pool.pool_type {
+                        PoolType::ConstantProduct { .. } => BigInt::from(100),
+                        PoolType::ConstantSum { .. } => {
+                            anyhow::bail!("CS withdraw not supported on-chain");
+                        }
+                    };
+                    (wd_tag, BigInt::from(0))
+                }
             };
 
             transcript_entries.push(TranscriptEntry {
@@ -201,12 +226,13 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(exec.protocol_share.1),
             ));
         let protocol_lp = &total_fee_budget * &ps_num_bi / &ps_den_bi;
-        // Final total_lp = initial + lp_minted_sum (from deposits) + protocol_lp
+        // Final total_lp = running (already includes deposits/withdraws) + protocol_lp
         // (CP fee accrual; CS keeps total_lp pinned and protocol_lp is 0 for it).
         let final_total_lp = &running_total_lp + &protocol_lp;
-        // Circulating LP grew by lp_minted_sum during deposits; protocol_lp
-        // doesn't change circulating (it widens the gap that fee_split closes).
-        let final_circ_lp = &pool.pool_datum.circulating_lp + &lp_minted_sum;
+        // Circulating LP grew by lp_minted_sum (deposits) and shrank by
+        // lp_burned_sum (withdraws); protocol_lp doesn't change circulating
+        // (it widens the gap that fee_split closes).
+        let final_circ_lp = &pool.pool_datum.circulating_lp + &lp_minted_sum - &lp_burned_sum;
 
         if let Some(last) = transcript_entries.last_mut() {
             last.fee_budget = &last.fee_budget - &protocol_lp;
@@ -227,6 +253,7 @@ pub fn build_multi_pool_scoop_tx(
             transcript: transcript_entries,
             updated_datum,
             lp_minted: lp_minted_sum,
+            lp_burned: lp_burned_sum,
         });
     }
 
@@ -237,13 +264,14 @@ pub fn build_multi_pool_scoop_tx(
         .map(|b| b.pool.input.0.clone())
         .collect();
 
-    // Flat list of all order inputs (both swaps and deposits), in
+    // Flat list of all order inputs (swaps, deposits, and withdraws), in
     // batch-traversal order. Each entry carries enough info to look up its
     // backing Resolved* later for fulfillment-output construction.
     #[derive(Clone)]
     enum FlatOrderKind {
-        Swap(usize),    // index into batch.swaps
-        Deposit(usize), // index into batch.deposits
+        Swap(usize),     // index into batch.swaps
+        Deposit(usize),  // index into batch.deposits
+        Withdraw(usize), // index into batch.withdraws
     }
     #[derive(Clone)]
     struct FlatOrder {
@@ -262,7 +290,12 @@ pub fn build_multi_pool_scoop_tx(
             kind: FlatOrderKind::Deposit(di),
             order_ref: d.order.input.0.clone(),
         });
-        swaps.chain(deps)
+        let wds = b.withdraws.iter().enumerate().map(move |(wi, w)| FlatOrder {
+            batch_idx: bi,
+            kind: FlatOrderKind::Withdraw(wi),
+            order_ref: w.order.input.0.clone(),
+        });
+        swaps.chain(deps).chain(wds)
     }).collect();
     let all_order_orefs: Vec<TransactionInput> =
         flat_orders.iter().map(|f| f.order_ref.clone()).collect();
@@ -487,7 +520,7 @@ pub fn build_multi_pool_scoop_tx(
     // tag 2 (Swap) → swap_order_module, tag 0/1/3 (Deposit/Withdraw/Claim) →
     // basic_order_module. Only include refs we'll actually use.
     let has_swap_orders = n_swap_orders > 0;
-    let has_basic_orders = n_deposit_orders > 0;
+    let has_basic_orders = n_deposit_orders > 0 || n_withdraw_orders > 0;
     if has_swap_orders {
         if let Some(so) = &exec.module_scripts.swap_order {
             all_ref_inputs.push(so.ref_utxo.0.clone());
@@ -641,7 +674,15 @@ pub fn build_multi_pool_scoop_tx(
                 .sum::<i64>()
         } else { 0 };
 
-        buy_inflow - sell_outflow + deposit_ada
+        // ADA paid out to users by withdraws (whichever pool asset is ADA
+        // gets its share of each withdraw's dy vector).
+        let withdraw_ada: i64 = if let Some(idx) = ada_idx {
+            batch.withdraws.iter()
+                .map(|w| w.dy[idx].clone().unwrap().to_i64().unwrap_or(0))
+                .sum::<i64>()
+        } else { 0 };
+
+        buy_inflow - sell_outflow + deposit_ada - withdraw_ada
     }).collect();
 
     // Pool outputs in pool_output_order (sorted by input position)
@@ -678,6 +719,7 @@ pub fn build_multi_pool_scoop_tx(
         let order = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => &batch.swaps[*i].order,
             FlatOrderKind::Deposit(i) => &batch.deposits[*i].order,
+            FlatOrderKind::Withdraw(i) => &batch.withdraws[*i].order,
         };
         let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
 
@@ -724,6 +766,18 @@ pub fn build_multi_pool_scoop_tx(
                     actual_fee,
                 )?
             }
+            FlatOrderKind::Withdraw(i) => {
+                let wd = &batch.withdraws[*i];
+                let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+                build_withdraw_fulfillment_value(
+                    &wd.order.value,
+                    &batch.pool.pool_datum.assets,
+                    &wd.dy,
+                    &lp_asset,
+                    &wd.lp_burned,
+                    actual_fee,
+                )?
+            }
         };
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
@@ -735,37 +789,37 @@ pub fn build_multi_pool_scoop_tx(
         ));
     }
 
-    // ── Step 8.5: LP mint for deposits ────────────────────────────────────
+    // ── Step 8.5: LP mint/burn for deposits and withdraws ──────────────────
     //
-    // Each pool with `lp_minted > 0` mints that many LP tokens under the
-    // pool_mint policy with asset name `0014df10 ++ pool_ident`. The minting
-    // redeemer is `PoolMintRedeemer::MintLP { pool_ident }` — one redeemer per
-    // mint entry. The order they appear in the mint map is canonical-sorted
-    // by policy hash (only one policy here, so trivial), with assets sorted
-    // by name within. The mint redeemer's index matches the policy's
-    // position in the sorted mint map (always 0 since we only mint LP).
+    // Each pool with a non-zero net LP delta (`lp_minted - lp_burned`) emits
+    // one entry under the pool_mint policy with asset name
+    // `0014df10 ++ pool_ident`. Quantity is positive for net mint (deposit-
+    // heavy) and negative for net burn (withdraw-heavy). The minting redeemer
+    // is `PoolMintRedeemer::MintLP { pool_ident }` — the policy's `only_own_lp`
+    // check doesn't constrain sign, so the same redeemer covers both.
+    // The mint redeemer's index matches the policy's position in the sorted
+    // mint map (always 0 since we only use pool_mint).
     let mint = {
         use pallas_primitives::{NonEmptyKeyValuePairs, NonZeroInt};
-        use num_traits::{Signed, ToPrimitive};
+        use num_traits::{ToPrimitive, Zero};
         let mut asset_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
         for (i, batch) in batches.iter().enumerate() {
-            if per_pool[i].lp_minted.is_positive() {
-                let qty: i64 = per_pool[i].lp_minted.clone()
-                    .unwrap()
-                    .to_i64()
-                    .context("lp_minted doesn't fit in i64")?;
-                let mut name = vec![0x00, 0x14, 0xdf, 0x10];
-                name.extend_from_slice(batch.pool.pool_datum.identifier.to_bytes());
-                asset_pairs.push((
-                    PallasBytes::from(name),
-                    NonZeroInt::try_from(qty).expect("lp_minted positive"),
-                ));
-            }
+            let net = &per_pool[i].lp_minted - &per_pool[i].lp_burned;
+            if net.is_zero() { continue; }
+            let qty: i64 = net.clone().unwrap()
+                .to_i64()
+                .context("net LP delta doesn't fit in i64")?;
+            let mut name = vec![0x00, 0x14, 0xdf, 0x10];
+            name.extend_from_slice(batch.pool.pool_datum.identifier.to_bytes());
+            asset_pairs.push((
+                PallasBytes::from(name),
+                NonZeroInt::try_from(qty).expect("net LP delta nonzero"),
+            ));
         }
         if asset_pairs.is_empty() {
             None
         } else {
-            // Single policy (pool_mint) for all LP mints; sort assets by name.
+            // Single policy (pool_mint) for all LP entries; sort assets by name.
             asset_pairs.sort_by(|a, b| {
                 let av: Vec<u8> = a.0.clone().into();
                 let bv: Vec<u8> = b.0.clone().into();
@@ -774,17 +828,19 @@ pub fn build_multi_pool_scoop_tx(
             let policy = exec.module_scripts.pool_mint.hash;
             let mint_redeemer_data = {
                 // One Mint redeemer per minting policy. With only pool_mint
-                // here, every deposit shares the same redeemer entry — but
-                // the contract reads `pool_ident` from it, so we'd need a
-                // redeemer per (policy, pool) pair if multiple pools mint.
-                // Today we restrict to a single deposit-target pool per tx.
+                // here, every entry shares it — but the contract reads
+                // `pool_ident` from the redeemer, so all entries must target
+                // the same pool. Today we restrict to a single pool with a
+                // non-zero LP delta per tx.
                 let pool_idents: Vec<_> = batches.iter().enumerate()
-                    .filter(|(i, _)| per_pool[*i].lp_minted.is_positive())
+                    .filter(|(i, _)| {
+                        !(&per_pool[*i].lp_minted - &per_pool[*i].lp_burned).is_zero()
+                    })
                     .map(|(_, b)| b.pool.pool_datum.identifier.clone())
                     .collect();
                 if pool_idents.len() != 1 {
                     anyhow::bail!(
-                        "multi-pool LP minting in one tx isn't supported by pool_mint \
+                        "multi-pool LP mint/burn in one tx isn't supported by pool_mint \
                          (only_own_lp check rejects mixed lp_names); got {} pools",
                         pool_idents.len()
                     );
@@ -938,6 +994,14 @@ pub fn build_multi_pool_scoop_tx(
                 address: order_addr_bytes.clone(),
                 value: dep.order.value.clone(),
                 datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
+                script_ref: None,
+            });
+        }
+        for wd in &batch.withdraws {
+            resolved_inputs.insert(wd.order.input.clone(), ResolvedTxOut {
+                address: order_addr_bytes.clone(),
+                value: wd.order.value.clone(),
+                datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
                 script_ref: None,
             });
         }
@@ -1276,6 +1340,74 @@ fn build_deposit_fulfillment_value(
         .unwrap()
         .to_u64()
         .context("deposit fulfillment ADA doesn't fit in u64")?;
+    let mut policy_map: std::collections::BTreeMap<
+        Vec<u8>,
+        std::collections::BTreeMap<Vec<u8>, u64>,
+    > = std::collections::BTreeMap::new();
+    for (policy, tokens) in &result.0 {
+        if policy.is_empty() { continue; }
+        for (token_name, qty) in tokens {
+            let qty_u64 = qty.clone().unwrap().to_u64().unwrap_or(0);
+            if qty_u64 > 0 {
+                policy_map
+                    .entry(policy.clone())
+                    .or_default()
+                    .insert(token_name.clone(), qty_u64);
+            }
+        }
+    }
+    if policy_map.is_empty() {
+        return Ok(ConwayValue::Coin(lovelace));
+    }
+    let multiasset_pairs: Vec<_> = policy_map
+        .into_iter()
+        .map(|(policy, tokens)| {
+            let policy_hash: Hash<28> = Hash::from(policy.as_slice());
+            let token_pairs: Vec<_> = tokens.into_iter()
+                .map(|(name, qty)| (
+                    PallasBytes::from(name),
+                    PositiveCoin::try_from(qty).unwrap(),
+                ))
+                .collect();
+            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+        })
+        .collect();
+    Ok(ConwayValue::Multiasset(lovelace, NonEmptyKeyValuePairs::Def(multiasset_pairs)))
+}
+
+/// Build the fulfillment output value for a Withdraw order.
+///
+/// Starts from the order's input value (which contains the LP tokens the
+/// user offered), burns `lp_burned` of the pool's LP asset, adds the per-
+/// asset `dy[i]` reserves the user receives back, and subtracts the
+/// scooper fee in ADA.
+fn build_withdraw_fulfillment_value(
+    order_value: &crate::cardano_types::Value,
+    pool_assets: &[(AssetClass, BigInt)],
+    dy: &[BigInt],
+    lp_asset: &AssetClass,
+    lp_burned: &BigInt,
+    fee: u64,
+) -> Result<ConwayValue> {
+    use num_traits::ToPrimitive;
+    use pallas_primitives::NonEmptyKeyValuePairs;
+
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let mut result = order_value.clone();
+    let cur_lp = result.get(lp_asset);
+    result.insert(lp_asset, &cur_lp - lp_burned);
+    for (i, (asset, _)) in pool_assets.iter().enumerate() {
+        let cur = result.get(asset);
+        result.insert(asset, &cur + &dy[i]);
+    }
+    let cur_ada = result.get(&ada_asset);
+    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
+
+    let lovelace = result.get(&ada_asset)
+        .clone()
+        .unwrap()
+        .to_u64()
+        .context("withdraw fulfillment ADA doesn't fit in u64")?;
     let mut policy_map: std::collections::BTreeMap<
         Vec<u8>,
         std::collections::BTreeMap<Vec<u8>, u64>,
