@@ -35,6 +35,90 @@ impl BatchFailureReason {
     }
 }
 
+/// Which pool family a counter sample is attributed to. Multi-pool
+/// scoops increment each involved family's counter, so the sum of
+/// `{pool_type=...}` samples can exceed the unlabeled tx count.
+#[derive(Copy, Clone, Debug)]
+pub enum PoolFamily {
+    ConstantProduct,
+    ConstantSum,
+    ConcentratedLiquidity,
+}
+
+impl PoolFamily {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ConstantProduct => "cp",
+            Self::ConstantSum => "cs",
+            Self::ConcentratedLiquidity => "cl",
+        }
+    }
+}
+
+/// Lock-free histogram with fixed bucket boundaries, emitted in Prometheus
+/// histogram exposition format. Each observation atomically increments the
+/// bucket whose upper bound it falls in; at render time we cumulate.
+///
+/// Keep boundaries narrow and few — every bucket is a Prometheus time
+/// series. Boundaries are upper bounds in seconds (matching Prometheus
+/// convention; `+Inf` is appended implicitly).
+pub struct Histogram {
+    boundaries: &'static [f64],
+    /// One bucket per boundary, plus one implicit `+Inf` bucket.
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    /// Sum of observations as microseconds. Tracked as integer to avoid
+    /// float atomics; converted to seconds at render time.
+    sum_micros: AtomicU64,
+}
+
+impl Histogram {
+    pub fn new(boundaries: &'static [f64]) -> Self {
+        let buckets = (0..=boundaries.len())
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        Self {
+            boundaries,
+            buckets,
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+
+    /// Record an observation in seconds. Floors to microsecond precision in
+    /// the sum (sufficient for latency histograms — Prometheus reports
+    /// avg = sum/count which doesn't care about sub-µs precision).
+    pub fn observe(&self, seconds: f64) {
+        let bucket_idx = self
+            .boundaries
+            .iter()
+            .position(|b| seconds <= *b)
+            .unwrap_or(self.boundaries.len());
+        self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let micros = (seconds * 1_000_000.0).max(0.0) as u64;
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn write(&self, out: &mut String, name: &str, help: &str) {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        // Prometheus histograms expose cumulative counts: bucket{le="0.1"} is
+        // the number of obs with value <= 0.1, INCLUDING those that fell in
+        // smaller buckets. So accumulate as we walk.
+        let mut cum: u64 = 0;
+        for (i, b) in self.boundaries.iter().enumerate() {
+            cum += self.buckets[i].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{b}\"}} {cum}");
+        }
+        cum += self.buckets[self.boundaries.len()].load(Ordering::Relaxed);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cum}");
+        let sum_secs = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let _ = writeln!(out, "{name}_sum {sum_secs}");
+        let _ = writeln!(out, "{name}_count {}", self.count.load(Ordering::Relaxed));
+    }
+}
+
 /// Snapshot of in-flight transaction state, shared with the server for dashboard display.
 #[derive(Clone, Default)]
 pub struct InFlightSnapshot {
@@ -53,12 +137,26 @@ pub struct Metrics {
     failed_race_lost: AtomicU64,
     failed_submit_error: AtomicU64,
     failed_build_error: AtomicU64,
+    /// Per-pool-family counter of orders scooped. Incremented once per
+    /// (scoop tx, distinct pool family) — i.e. a mixed-pool tx
+    /// increments multiple families.
+    scooped_cp: AtomicU64,
+    scooped_cs: AtomicU64,
+    scooped_cl: AtomicU64,
+    /// Submit latency histogram in seconds. Buckets are tuned for
+    /// Blockfrost: most submits land in 100ms-2s, tail past 5s is a
+    /// sign of upstream trouble.
+    pub submit_latency: Histogram,
     /// Process start instant — used to compute `scooper_uptime_seconds`
     /// so operators can spot crash loops without scraping systemd state.
     start_instant: Instant,
     in_flight_snapshot: std::sync::Mutex<InFlightSnapshot>,
     quarantine_snapshot: std::sync::Mutex<QuarantineSnapshot>,
 }
+
+const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
+];
 
 impl Metrics {
     pub fn new() -> Self {
@@ -69,6 +167,10 @@ impl Metrics {
             failed_race_lost: AtomicU64::new(0),
             failed_submit_error: AtomicU64::new(0),
             failed_build_error: AtomicU64::new(0),
+            scooped_cp: AtomicU64::new(0),
+            scooped_cs: AtomicU64::new(0),
+            scooped_cl: AtomicU64::new(0),
+            submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
             start_instant: Instant::now(),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
             quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
@@ -84,6 +186,18 @@ impl Metrics {
             BatchFailureReason::BuildError => &self.failed_build_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record `n` orders scooped against a particular pool family. Callers
+    /// should bucket their batch's orders by family and call once per
+    /// family with the per-family count.
+    pub fn record_pool_family_orders(&self, family: PoolFamily, n: u64) {
+        let counter = match family {
+            PoolFamily::ConstantProduct => &self.scooped_cp,
+            PoolFamily::ConstantSum => &self.scooped_cs,
+            PoolFamily::ConcentratedLiquidity => &self.scooped_cl,
+        };
+        counter.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Update the in-flight snapshot from current chain tracker state.
@@ -158,6 +272,25 @@ pub async fn render_metrics(
         write_gauge(&mut out, "scooper_v4_pool_count", "Number of tracked V4 pools", state.pools.len());
         write_gauge(&mut out, "scooper_v4_order_count", "Number of pending V4 orders", state.orders.len());
 
+        // Age of the oldest pending order, in seconds. Computed from
+        // `order.slot` (first-seen slot at index time) against the
+        // current chain tip. Lets ops alert on "we have pending work
+        // that's been sitting around" without waiting for a 5-min rate
+        // window — useful when a single stuck order is the symptom of
+        // an upstream bug. Zero when no orders pending.
+        let oldest_slot = state.orders.iter().map(|o| o.slot).min();
+        let tip_for_age = if state.tip_slot > 0 { state.tip_slot } else { network_tip };
+        let oldest_age_secs = match oldest_slot {
+            Some(s) if tip_for_age > s => tip_for_age.saturating_sub(s),
+            _ => 0,
+        };
+        write_gauge(
+            &mut out,
+            "scooper_v4_oldest_pending_order_age_seconds",
+            "Age (in chain seconds, ≈ slots on Cardano mainnet) of the oldest pending order. 0 when no orders pending.",
+            oldest_age_secs,
+        );
+
         let wallet_lovelace: u64 = state.wallet_utxos.values()
             .map(|v| {
                 let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
@@ -224,6 +357,26 @@ pub async fn render_metrics(
     let q = metrics.quarantine_snapshot();
     write_gauge(&mut out, "scooper_quarantined_permanent", "Number of permanently quarantined orders", q.permanent.len());
     write_gauge(&mut out, "scooper_quarantined_temporary", "Number of temporarily quarantined orders", q.temporary.len());
+
+    // Per-pool-family scoop counts. Sum across labels can exceed the
+    // unlabeled `orders_scooped_total` since a mixed-pool tx counts
+    // against each family it touched.
+    let _ = writeln!(out, "# HELP scooper_orders_scooped_by_pool_type_total Orders scooped, by pool family");
+    let _ = writeln!(out, "# TYPE scooper_orders_scooped_by_pool_type_total counter");
+    for (family, value) in [
+        (PoolFamily::ConstantProduct.label(),       metrics.scooped_cp.load(Ordering::Relaxed)),
+        (PoolFamily::ConstantSum.label(),           metrics.scooped_cs.load(Ordering::Relaxed)),
+        (PoolFamily::ConcentratedLiquidity.label(), metrics.scooped_cl.load(Ordering::Relaxed)),
+    ] {
+        let _ = writeln!(out, "scooper_orders_scooped_by_pool_type_total{{pool_type=\"{family}\"}} {value}");
+    }
+
+    // Submit latency histogram.
+    metrics.submit_latency.write(
+        &mut out,
+        "scooper_submit_latency_seconds",
+        "Time spent in the chain-submit call (Blockfrost or equivalent)",
+    );
 
     // Uptime since process start. Dropping near zero unexpectedly is the
     // canonical crash-loop signal.

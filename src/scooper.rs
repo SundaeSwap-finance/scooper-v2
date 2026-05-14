@@ -1022,11 +1022,29 @@ impl Scooper {
             info!(path = %dump_path, bytes = final_tx.cbor.len(), "wrote tx CBOR dump");
         }
 
-        match crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await {
+        let submit_start = std::time::Instant::now();
+        let submit_result = crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await;
+        self.metrics.submit_latency.observe(submit_start.elapsed().as_secs_f64());
+        match submit_result {
             Ok(submitted_hash) => {
                 info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
+
+                // Per-pool-family attribution: a batch is a list of pools,
+                // each typed. Count the orders against each family that
+                // appeared in the batch (a mixed-pool tx increments
+                // multiple families).
+                use crate::sundaev4::PoolType;
+                for batch in &final_batches {
+                    let family = match &batch.pool.pool_type {
+                        PoolType::ConstantProduct { .. } => crate::metrics::PoolFamily::ConstantProduct,
+                        PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
+                        PoolType::ConcentratedLiquidity { .. } => crate::metrics::PoolFamily::ConcentratedLiquidity,
+                    };
+                    let n = (batch.swaps.len() + batch.deposits.len() + batch.withdraws.len()) as u64;
+                    self.metrics.record_pool_family_orders(family, n);
+                }
 
                 // Collect consumed orders from all batches. Swaps, deposits,
                 // and withdraws all sit on real on-chain UTxOs and must be
