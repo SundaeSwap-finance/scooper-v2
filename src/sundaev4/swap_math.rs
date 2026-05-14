@@ -87,6 +87,78 @@ pub fn cs_swap_result(
     &numerator / price_out
 }
 
+/// Concentrated-liquidity swap. The virtual-reserve formulas in the validator
+/// aren't symmetric in (A,B): VA always uses spb, VB always uses spa, and the
+/// denominators differ between A→B and B→A. Caller passes (a, b, lp) in pool-
+/// positional order plus `is_a_input` to pick the direction.
+///
+/// VA = a·spb_num + L·spb_den, VB = b·spa_den + L·spa_num
+///   A→B: dy = floor(VB · dVA_eff / ((VA + dVA_eff) · spa_den))   with dVA_eff = dx_eff·spb_num
+///   B→A: dy = floor(VA · dVB_eff / ((VB + dVB_eff) · spb_num))   with dVB_eff = dx_eff·spa_num
+pub fn cl_swap_result(
+    a: &BigInt,
+    b: &BigInt,
+    lp: &BigInt,
+    dx: &BigInt,
+    is_a_input: bool,
+    spa_num: &BigInt,
+    spa_den: &BigInt,
+    spb_num: &BigInt,
+    spb_den: &BigInt,
+    fee_num: &BigInt,
+    fee_den: &BigInt,
+) -> BigInt {
+    let fee = dx * fee_num / fee_den;
+    let dx_eff = dx - &fee;
+    let va0 = &(a * spb_num) + &(lp * spb_den);
+    let vb0 = &(b * spa_den) + &(lp * spa_num);
+    if is_a_input {
+        let dva_eff = &dx_eff * spb_num;
+        let denom = &(&va0 + &dva_eff) * spa_den;
+        if denom.is_zero() {
+            warn!("cl_swap_result: zero denominator (A→B)");
+            return BigInt::from(0);
+        }
+        &vb0 * &dva_eff / &denom
+    } else {
+        let dvb_eff = &dx_eff * spa_num;
+        let denom = &(&vb0 + &dvb_eff) * spb_num;
+        if denom.is_zero() {
+            warn!("cl_swap_result: zero denominator (B→A)");
+            return BigInt::from(0);
+        }
+        &va0 * &dvb_eff / &denom
+    }
+}
+
+/// Concentrated-liquidity fee budget via the quadratic formula.
+///
+/// `|C| = spb_num·spa_den − spb_den·spa_num`,
+/// `B   = a1·spb_num·spa_num + b1·spb_den·spa_den`,
+/// `A   = a1·b1·spb_num·spa_den`,
+/// `fee_budget = floor((B + √(B² + 4·A·|C|)) / (2·|C|)) − lp_after`.
+///
+/// Returns 0 when `|C| ≤ 0` (degenerate range, treated as no fee).
+pub fn cl_fee_budget(
+    a1: &BigInt,
+    b1: &BigInt,
+    lp_after: &BigInt,
+    spa_num: &BigInt,
+    spa_den: &BigInt,
+    spb_num: &BigInt,
+    spb_den: &BigInt,
+) -> BigInt {
+    let abs_c = &(spb_num * spa_den) - &(spb_den * spa_num);
+    if !abs_c.is_positive() {
+        return BigInt::from(0);
+    }
+    let big_b = &(&(a1 * spb_num) * spa_num) + &(&(b1 * spb_den) * spa_den);
+    let big_a = &(&(a1 * b1) * spb_num) * spa_den;
+    let disc = &(&big_b * &big_b) + &(&(&BigInt::from(4) * &big_a) * &abs_c);
+    let root = isqrt(&disc);
+    &(&big_b + &root) / &(&BigInt::from(2) * &abs_c) - lp_after
+}
+
 /// Fee budget for constant-sum pools:
 /// v0 = Σ(before_i * prices_i), v1 = Σ(after_i * prices_i)
 /// fee_budget = floor(v1 * lp_before / v0) - lp_before
@@ -136,6 +208,18 @@ pub fn compute_fee_budget(
             let before: Vec<BigInt> = assets_before.iter().map(|(_, a)| a.clone()).collect();
             let after: Vec<BigInt> = assets_after.iter().map(|(_, a)| a.clone()).collect();
             cs_fee_budget(&before, &after, lp_before, prices)
+        }
+        super::types::PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, .. } => {
+            // The CL fee budget is a pure function of the after-state and
+            // the pool's sqrt-price bounds; the before-state determines
+            // lp_before for callers that want the *delta* over a sequence
+            // of swaps, but here we compute it as `formula − lp_after`
+            // which already encodes both the achievable and tight bounds.
+            cl_fee_budget(
+                &assets_after[0].1, &assets_after[1].1, lp_before,
+                &sqrt_price_a.num, &sqrt_price_a.den,
+                &sqrt_price_b.num, &sqrt_price_b.den,
+            )
         }
     }
 }

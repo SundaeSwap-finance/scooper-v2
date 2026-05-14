@@ -110,11 +110,13 @@ pub fn build_multi_pool_scoop_tx(
 
         // Per-pool operation_tag for swap entries. CS dispatches its swap
         // branch on tag == 3 (`tag_swap` in cs_check.ak) and rejects any other
-        // tag with `cs: unsupported operation_tag`. CP infers swap vs deposit
-        // from asset deltas and ignores the tag, so 100 is a safe sentinel.
+        // tag with `cs: unsupported operation_tag`. CP and CL infer swap vs
+        // non-swap from asset deltas and ignore the tag, so 100 is a safe
+        // sentinel for both.
         let swap_tag: BigInt = match &batch.pool.pool_type {
             PoolType::ConstantSum { .. } => BigInt::from(3),
             PoolType::ConstantProduct { .. } => BigInt::from(100),
+            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         };
 
         // Process operations in the interleaved order they were accumulated.
@@ -167,11 +169,12 @@ pub fn build_multi_pool_scoop_tx(
                     running_total_lp = &running_total_lp + &d.lp_minted;
                     running_circ_lp = &running_circ_lp + &d.lp_minted;
                     lp_minted_sum = &lp_minted_sum + &d.lp_minted;
-                    // CS reads tag_deposit=6 (cs_check.ak); CP infers from
-                    // asset deltas. fee_budget=0 by construction.
+                    // CS reads tag_deposit=6 (cs_check.ak); CP and CL infer
+                    // from asset deltas. fee_budget=0 by construction.
                     let dep_tag = match &batch.pool.pool_type {
                         PoolType::ConstantSum { .. } => BigInt::from(6),
                         PoolType::ConstantProduct { .. } => BigInt::from(100),
+                        PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
                     };
                     (dep_tag, BigInt::from(0))
                 }
@@ -189,6 +192,7 @@ pub fn build_multi_pool_scoop_tx(
                     // support withdraw on-chain (cs_check rejects it).
                     let wd_tag = match &batch.pool.pool_type {
                         PoolType::ConstantProduct { .. } => BigInt::from(100),
+                        PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
                         PoolType::ConstantSum { .. } => {
                             anyhow::bail!("CS withdraw not supported on-chain");
                         }
@@ -353,6 +357,7 @@ pub fn build_multi_pool_scoop_tx(
 
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
+    let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -362,10 +367,11 @@ pub fn build_multi_pool_scoop_tx(
         let pool_output_idx = batch_to_pool_output[batch_idx];
 
         // Action.tag selects which entry from pool.actions to evaluate. CS
-        // pools register their swap action under tag=3; CP under tag=100.
+        // pools register their swap action under tag=3; CP and CL under tag=100.
         let action_tag = match &batch.pool.pool_type {
             PoolType::ConstantSum { .. } => BigInt::from(3),
             PoolType::ConstantProduct { .. } => BigInt::from(100),
+            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         };
         let pool_redeemer = PoolRedeemer::Action {
             tag: action_tag,
@@ -415,6 +421,33 @@ pub fn build_multi_pool_scoop_tx(
                 cs_entries.push(CSOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
                     config: cs_cfg,
+                });
+            }
+            PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
+                let cl_cfg = ConcentratedLiquidityConfig {
+                    sqrt_price_a: sqrt_price_a.clone(),
+                    sqrt_price_b: sqrt_price_b.clone(),
+                    fee: fee.clone(),
+                };
+                if let Some(cl_script) = exec.module_scripts.concentrated_liquidity.as_ref() {
+                    let cl_cred = cl_script.hash.as_ref();
+                    let stored = batch.pool.pool_datum.module_state.iter()
+                        .find(|(cred, _)| cred.as_slice() == cl_cred)
+                        .map(|(_, h)| hex::encode(h));
+                    let pd = cl_cfg.clone().to_plutus();
+                    let cbor = minicbor::to_vec(&pd).unwrap_or_default();
+                    let expected = hex::encode(pallas_crypto::hash::Hasher::<256>::hash(&cbor));
+                    tracing::info!(
+                        pool = %batch.pool.pool_datum.identifier,
+                        stored_cl_hash = ?stored,
+                        expected_cl_hash = %expected,
+                        cl_cbor = %hex::encode(&cbor),
+                        "concentrated_liquidity hash diagnostic",
+                    );
+                }
+                cl_entries.push(CLOperateEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                    config: cl_cfg,
                 });
             }
         }
@@ -493,6 +526,7 @@ pub fn build_multi_pool_scoop_tx(
 
     let has_cp = !cp_entries.is_empty();
     let has_cs = !cs_entries.is_empty();
+    let has_cl = !cl_entries.is_empty();
 
     let fs_redeemer = FeeSplitRedeemer::Operate { entries: fs_entries };
     let fairness_redeemer = FairnessRedeemer::Operate { entries: fairness_entries };
@@ -513,6 +547,11 @@ pub fn build_multi_pool_scoop_tx(
     if has_cs {
         if let Some(cs) = &exec.module_scripts.constant_sum {
             all_ref_inputs.push(cs.ref_utxo.0.clone());
+        }
+    }
+    if has_cl {
+        if let Some(cl) = &exec.module_scripts.concentrated_liquidity {
+            all_ref_inputs.push(cl.ref_utxo.0.clone());
         }
     }
     // Order-side dispatcher references. The order validator's withdraw needs
@@ -573,6 +612,17 @@ pub fn build_multi_pool_scoop_tx(
             withdrawals.push((
                 reward_account(&cs_script.hash),
                 cs_redeemer.to_plutus(),
+            ));
+        }
+    }
+
+    // Conditionally add CL withdrawal
+    if has_cl {
+        if let Some(cl_script) = &exec.module_scripts.concentrated_liquidity {
+            let cl_redeemer = ConcentratedLiquidityRedeemer::Operate { entries: cl_entries };
+            withdrawals.push((
+                reward_account(&cl_script.hash),
+                cl_redeemer.to_plutus(),
             ));
         }
     }

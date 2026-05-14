@@ -305,6 +305,7 @@ impl Accumulator {
                 let dy = batch::compute_swap_result(
                     &effective_pool.pool_type,
                     &accum.running_assets,
+                    &accum.initial_total_lp,
                     input_idx,
                     output_idx,
                     &dx,

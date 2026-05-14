@@ -330,7 +330,16 @@ pub struct OutputRef {
 pub enum PoolType {
     ConstantProduct { fee: Rational },
     ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational },
-    // Future: ConcentratedLiquidity { ... }
+    /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
+    /// bound the pool's price range (`a < b`). The validator works on
+    /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
+    /// and the CP invariant `VA·VB = L²·spb_num·spa_den`. Cross-range
+    /// execution is done by the router splitting across multiple CL pools.
+    ConcentratedLiquidity {
+        sqrt_price_a: Rational,
+        sqrt_price_b: Rational,
+        fee: Rational,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -349,6 +358,13 @@ pub struct ConstantSumConfig {
     /// Quadratic rebalance bounty parameter. `(0, 1)` disables the bounty
     /// mechanism — currently passthrough; we don't yet act on it.
     pub bounty_k: Rational,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConcentratedLiquidityConfig {
+    pub sqrt_price_a: Rational,
+    pub sqrt_price_b: Rational,
+    pub fee: Rational,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -392,6 +408,19 @@ pub enum ConstantSumRedeemer {
     Create { initial_state: PlutusData },
     Operate { entries: Vec<CSOperateEntry> },
     Destroy,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum ConcentratedLiquidityRedeemer {
+    Create { initial_state: ConcentratedLiquidityConfig },
+    Operate { entries: Vec<CLOperateEntry> },
+    Destroy,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct CLOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: ConcentratedLiquidityConfig,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -561,6 +590,9 @@ pub struct ModuleScripts {
     /// Optional: only required when scooping constant-sum pools.
     #[serde(default)]
     pub constant_sum: Option<ScriptRefInfo>,
+    /// Optional: only required when scooping concentrated-liquidity pools.
+    #[serde(default)]
+    pub concentrated_liquidity: Option<ScriptRefInfo>,
     /// Per-tag order-side dispatcher modules. Keyed by constraint tag
     /// (2 = Swap, 0 = Deposit, 1 = Withdraw, 3 = Claim). Required for
     /// the modules referenced in `settings.order_modules` — the order

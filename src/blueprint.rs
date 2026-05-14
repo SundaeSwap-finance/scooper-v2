@@ -187,6 +187,13 @@ impl Blueprint {
             "basicOrder",
             "basic_order",
         ).ok();
+        // Concentrated liquidity module (optional — only present when CL pools exist).
+        let concentrated_liquidity = make_info(
+            self,
+            &["concentrated_liquidity_module", "concentrated_liquidity", "concentratedLiquidity"],
+            "concentratedLiquidity",
+            "concentrated_liquidity",
+        ).ok();
 
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2)?,
@@ -197,6 +204,7 @@ impl Blueprint {
             pool_mint: make_info(self, mappings[5].0, mappings[5].1, mappings[5].2)?,
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
             constant_sum,
+            concentrated_liquidity,
             swap_order,
             basic_order,
         })

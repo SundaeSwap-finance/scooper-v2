@@ -314,7 +314,7 @@ pub fn assemble_batch(
 pub fn try_execute_order(
     order: &Arc<SundaeV4Order>,
     running_assets: &[(AssetClass, BigInt)],
-    _running_total_lp: &BigInt,
+    running_total_lp: &BigInt,
     pool_type: &PoolType,
 ) -> Option<ResolvedSwap> {
     let Some((input_idx, output_idx)) = detect_swap_direction(order, running_assets) else {
@@ -327,7 +327,7 @@ pub fn try_execute_order(
         return None;
     }
 
-    let dy = compute_swap_result(pool_type, running_assets, input_idx, output_idx, &dx);
+    let dy = compute_swap_result(pool_type, running_assets, running_total_lp, input_idx, output_idx, &dx);
     if !dy.is_positive() {
         return None;
     }
@@ -347,10 +347,14 @@ pub fn try_execute_order(
     })
 }
 
-/// Dispatch swap result computation based on pool type.
+/// Dispatch swap result computation based on pool type. `total_lp` is only
+/// used by `ConcentratedLiquidity` (CP/CS swap math doesn't depend on LP);
+/// callers should pass the pool's current `total_lp` so CL math can derive
+/// virtual reserves.
 pub fn compute_swap_result(
     pool_type: &PoolType,
     assets: &[(AssetClass, BigInt)],
+    total_lp: &BigInt,
     input_idx: usize,
     output_idx: usize,
     dx: &BigInt,
@@ -371,6 +375,20 @@ pub fn compute_swap_result(
         PoolType::ConstantSum { prices, fee, .. } => {
             swap_math::cs_swap_result(dx, prices, input_idx, output_idx, &fee.num, &fee.den)
         }
+        PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
+            // CL pools have exactly 2 assets in positional order [A, B].
+            // The validator's virtual-reserve formulas always use the same
+            // (a, b, spa, spb) layout regardless of swap direction; only the
+            // dx_eff multiplier and the denominator's sqrt-price differ.
+            let (a, b) = (&assets[0].1, &assets[1].1);
+            let is_a_input = input_idx == 0;
+            swap_math::cl_swap_result(
+                a, b, total_lp, dx, is_a_input,
+                &sqrt_price_a.num, &sqrt_price_a.den,
+                &sqrt_price_b.num, &sqrt_price_b.den,
+                &fee.num, &fee.den,
+            )
+        }
     }
 }
 
@@ -380,7 +398,7 @@ pub fn compute_swap_result(
 pub fn check_order_executability(
     order: &Arc<SundaeV4Order>,
     pool_assets: &[(AssetClass, BigInt)],
-    _total_lp: &BigInt,
+    total_lp: &BigInt,
     pool_type: &PoolType,
 ) -> Result<ResolvedSwap, String> {
     let (input_idx, output_idx) = detect_swap_direction(order, pool_assets)
@@ -392,7 +410,7 @@ pub fn check_order_executability(
         return Err("offered amount not positive".to_string());
     }
 
-    let dy = compute_swap_result(pool_type, pool_assets, input_idx, output_idx, &dx);
+    let dy = compute_swap_result(pool_type, pool_assets, total_lp, input_idx, output_idx, &dx);
     if !dy.is_positive() {
         return Err("swap output not positive".to_string());
     }

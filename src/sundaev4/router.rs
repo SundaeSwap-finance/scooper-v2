@@ -27,6 +27,19 @@ pub enum PoolViewType {
         /// Price of the output asset in this direction.
         price_out: BigInt,
     },
+    /// Concentrated liquidity. Stored in pool-positional `(a, b)` order
+    /// plus a flag for swap direction so `pool_output` can dispatch to
+    /// the right validator-matching branch of `cl_swap_result`. `lp` is
+    /// the pool's current `total_lp` (CL swap math depends on LP via
+    /// virtual reserves).
+    ConcentratedLiquidity {
+        is_a_input: bool,
+        spa_num: BigInt,
+        spa_den: BigInt,
+        spb_num: BigInt,
+        spb_den: BigInt,
+        lp: BigInt,
+    },
 }
 
 /// Lightweight pool view for the router (direction-aware).
@@ -85,6 +98,23 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
             let fee_den = BigInt::from(pool.fee_den);
             swap_math::cs_swap_result(dx, &[price_in.clone(), price_out.clone()], 0, 1, &fee_num, &fee_den)
         }
+        PoolViewType::ConcentratedLiquidity {
+            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+        } => {
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            // pool.reserve_in / reserve_out are direction-oriented; map back
+            // to pool-positional (a, b) using is_a_input.
+            let (a, b) = if *is_a_input {
+                (&pool.reserve_in, &pool.reserve_out)
+            } else {
+                (&pool.reserve_out, &pool.reserve_in)
+            };
+            swap_math::cl_swap_result(
+                a, b, lp, dx, *is_a_input,
+                spa_num, spa_den, spb_num, spb_den, &fee_num, &fee_den,
+            )
+        }
     };
     // Cap at reserve_out — can't withdraw more than the pool holds.
     // (CP naturally stays below reserves; CS can exceed them.)
@@ -129,6 +159,15 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             // CS marginal is constant: dy/dx = price_in * fee_mult / (price_out * fee_den)
             let _ = raw_allocated;
             &fee_mult * price_in * &scale() / &(price_out * &fee_den)
+        }
+        PoolViewType::ConcentratedLiquidity { .. } => {
+            // CL bisection-aware split routing isn't implemented yet. Returning
+            // 0 marginal here makes the lambda bisection allocate 0 to this
+            // pool, so it only contributes via the single-pool baseline scan
+            // in `optimize_split` — single-pool CL swaps still work, but
+            // mixed-pool splits skip CL. See TODO at the top of this match.
+            let _ = raw_allocated;
+            BigInt::from(0)
         }
     }
 }
@@ -176,6 +215,13 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     } else {
                         BigInt::from(0)
                     }
+                }
+                PoolViewType::ConcentratedLiquidity { .. } => {
+                    // See marginal_at_allocation: CL pools opt out of the
+                    // bisection by reporting zero marginal, so they always
+                    // get zero allocation here. Single-pool CL swaps still
+                    // work via the baseline scan in `optimize_split`.
+                    BigInt::from(0)
                 }
             }
         })
@@ -326,6 +372,23 @@ fn build_graph(
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
                 (fn_num, fn_den, Box::new(|_, _| PoolViewType::ConstantProduct))
+            }
+            PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
+                let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
+                let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
+                let spa_num = sqrt_price_a.num.clone();
+                let spa_den = sqrt_price_a.den.clone();
+                let spb_num = sqrt_price_b.num.clone();
+                let spb_den = sqrt_price_b.den.clone();
+                let lp = pool.pool_datum.total_lp.clone();
+                (fn_num, fn_den, Box::new(move |i, _| PoolViewType::ConcentratedLiquidity {
+                    is_a_input: i == 0,
+                    spa_num: spa_num.clone(),
+                    spa_den: spa_den.clone(),
+                    spb_num: spb_num.clone(),
+                    spb_den: spb_den.clone(),
+                    lp: lp.clone(),
+                }))
             }
             PoolType::ConstantSum { prices, fee, .. } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);

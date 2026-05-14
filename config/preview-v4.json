@@ -428,6 +428,10 @@
           "basic-order": {
             "hash": "38bcb94b9b85c20a2b0b8b25636fd3b85922b6a6f6ad8ce7d42439d3",
             "ref-utxo": "1646e4de752676d88d8a93c7c98793f1c96db70f838a2303a3640e3d8e61f0e7#0"
+          },
+          "concentrated-liquidity": {
+            "hash": "432e04903f7b7944064d53f61817f71a84f47585dab3f788876807a4",
+            "ref-utxo": "eda42fcb57f36db037b738b3eff602f0eb767da2b95189079df644ff6c851948#0"
           }
         }
       }
