@@ -23,6 +23,11 @@ pub enum BatchFailureReason {
     SubmitError,
     /// Local tx-build step failed before we even attempted submission.
     BuildError,
+    /// Local UPLC eval failed (e.g. `ExplicitErrorTerm`). We treat this as a
+    /// scooper bug — we built a tx that doesn't pass our own scripts. The
+    /// cycle bails to avoid submitting txs we can't verify; the offending
+    /// script context is dumped to /tmp for offline diagnosis.
+    EvalError,
 }
 
 impl BatchFailureReason {
@@ -31,6 +36,7 @@ impl BatchFailureReason {
             Self::RaceLost => "race_lost",
             Self::SubmitError => "submit_error",
             Self::BuildError => "build_error",
+            Self::EvalError => "eval_error",
         }
     }
 }
@@ -137,6 +143,7 @@ pub struct Metrics {
     failed_race_lost: AtomicU64,
     failed_submit_error: AtomicU64,
     failed_build_error: AtomicU64,
+    failed_eval_error: AtomicU64,
     /// Per-pool-family counter of orders scooped. Incremented once per
     /// (scoop tx, distinct pool family) — i.e. a mixed-pool tx
     /// increments multiple families.
@@ -167,6 +174,7 @@ impl Metrics {
             failed_race_lost: AtomicU64::new(0),
             failed_submit_error: AtomicU64::new(0),
             failed_build_error: AtomicU64::new(0),
+            failed_eval_error: AtomicU64::new(0),
             scooped_cp: AtomicU64::new(0),
             scooped_cs: AtomicU64::new(0),
             scooped_cl: AtomicU64::new(0),
@@ -184,6 +192,7 @@ impl Metrics {
             BatchFailureReason::RaceLost => &self.failed_race_lost,
             BatchFailureReason::SubmitError => &self.failed_submit_error,
             BatchFailureReason::BuildError => &self.failed_build_error,
+            BatchFailureReason::EvalError => &self.failed_eval_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -350,6 +359,7 @@ pub async fn render_metrics(
         (BatchFailureReason::RaceLost.label(),     metrics.failed_race_lost.load(Ordering::Relaxed)),
         (BatchFailureReason::SubmitError.label(),  metrics.failed_submit_error.load(Ordering::Relaxed)),
         (BatchFailureReason::BuildError.label(),   metrics.failed_build_error.load(Ordering::Relaxed)),
+        (BatchFailureReason::EvalError.label(),    metrics.failed_eval_error.load(Ordering::Relaxed)),
     ] {
         let _ = writeln!(out, "scooper_batches_failed_total{{reason=\"{reason}\"}} {value}");
     }

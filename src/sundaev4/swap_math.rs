@@ -131,6 +131,70 @@ pub fn cl_swap_result(
     }
 }
 
+/// Maximum *raw* (pre-fee) dx that a CL pool can absorb without driving its
+/// actual `reserve_out` below zero. Used by the router to cap allocations for
+/// already-depleted pools — without this, CL virtual reserves can let the
+/// formula produce dy > actual b, which fails value conservation at submit.
+///
+/// Returns `None` if the pool can't absorb any positive dx (e.g. reserve_out
+/// already zero, or the pool is at its price boundary).
+pub fn cl_max_dx_for_reserve(
+    a: &BigInt,
+    b: &BigInt,
+    lp: &BigInt,
+    is_a_input: bool,
+    spa_num: &BigInt,
+    spa_den: &BigInt,
+    spb_num: &BigInt,
+    spb_den: &BigInt,
+    fee_num: &BigInt,
+    fee_den: &BigInt,
+) -> Option<BigInt> {
+    let va0 = &(a * spb_num) + &(lp * spb_den);
+    let vb0 = &(b * spa_den) + &(lp * spa_num);
+    let fee_mult = fee_den - fee_num;
+    if !fee_mult.is_positive() {
+        return None;
+    }
+    if is_a_input {
+        // dy = vb0·dva_eff / ((va0+dva_eff)·spa_den);  set dy = b:
+        //   dva_eff_max = b·spa_den·va0 / (vb0 - b·spa_den) = b·spa_den·va0 / (L·spa_num)
+        if !b.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        let denom = lp * spa_num;
+        if !denom.is_positive() {
+            return None;
+        }
+        let dva_eff_max = (b * spa_den * &va0) / &denom;
+        if !dva_eff_max.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        let dx_eff_max = &dva_eff_max / spb_num;
+        if !dx_eff_max.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        Some(&dx_eff_max * fee_den / &fee_mult)
+    } else {
+        if !a.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        let denom = lp * spb_den;
+        if !denom.is_positive() {
+            return None;
+        }
+        let dvb_eff_max = (a * spb_num * &vb0) / &denom;
+        if !dvb_eff_max.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        let dx_eff_max = &dvb_eff_max / spa_num;
+        if !dx_eff_max.is_positive() {
+            return Some(BigInt::from(0));
+        }
+        Some(&dx_eff_max * fee_den / &fee_mult)
+    }
+}
+
 /// Concentrated-liquidity fee budget via the quadratic formula.
 ///
 /// `|C| = spb_num·spa_den − spb_den·spa_num`,

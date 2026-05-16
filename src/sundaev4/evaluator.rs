@@ -108,6 +108,17 @@ pub struct EvalResult {
     pub budgets: Vec<(RedeemersKey, ExUnits)>,
 }
 
+/// Information about a script eval failure that the caller can persist to
+/// disk later (after confirming the tx made it on chain) for offline
+/// comparison against the chain's view of the same context. Populated by
+/// `evaluate_scoop_tx` via its optional `failure_capture` out-param.
+pub struct FailedScriptContext {
+    pub script_hash: Hash<28>,
+    pub redeemer_key: RedeemersKey,
+    pub context_cbor: Vec<u8>,
+    pub error: String,
+}
+
 /// Evaluate all scripts in a scoop transaction locally.
 ///
 /// For each redeemer, builds the appropriate ScriptContext, looks up the script,
@@ -121,6 +132,7 @@ pub fn evaluate_scoop_tx(
     cost_model: &[i64],
     tx_hash: Hash<32>,
     slot_config: &crate::sundaev4::types::SlotConfig,
+    failure_capture: Option<&mut Option<FailedScriptContext>>,
 ) -> Result<EvalResult> {
     use uplc_turbo::arena::Arena;
     use uplc_turbo::binder::DeBruijn;
@@ -192,23 +204,24 @@ pub fn evaluate_scoop_tx(
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
                 }
-                // Dump the ScriptContext we built for this redeemer to disk
-                // — it's the input that diverges between our local uplc-turbo
-                // and the on-chain interpreter, so the bytes are useful when
-                // the chain accepts a tx we locally reject.
-                let dump_path = format!("/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
-                    hex::encode(tx_hash), hex::encode(script_hash), key.tag, key.index);
-                if let Err(write_err) = std::fs::write(&dump_path, &context_cbor) {
-                    warn!(error = %write_err, "couldn't write script context dump");
-                } else {
-                    warn!(path = %dump_path, bytes = context_cbor.len(), "wrote script context CBOR dump");
-                }
-                bail!(
+                let err_msg = format!(
                     "script {} ({:?}[{}]) evaluation failed: {e:?}",
                     hex::encode(script_hash),
                     key.tag,
                     key.index,
                 );
+                // Stash the context bytes for the caller to persist *only* if
+                // the tx ends up on chain. Writing here unconditionally would
+                // spam /tmp with binary-search candidates that never submit.
+                if let Some(slot) = failure_capture {
+                    *slot = Some(FailedScriptContext {
+                        script_hash,
+                        redeemer_key: key.clone(),
+                        context_cbor: context_cbor.clone(),
+                        error: err_msg.clone(),
+                    });
+                }
+                bail!(err_msg);
             }
         }
     }

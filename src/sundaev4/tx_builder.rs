@@ -15,7 +15,7 @@ use plutus_parser::AsPlutus;
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::{Credential, PlutusAddress, Referenced};
-use crate::sundaev4::batch::Batch;
+use crate::sundaev4::batch::{Batch, GlobalOp, ScoopPlan};
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::*;
 
@@ -25,7 +25,99 @@ type ConwayValue = conway::Value;
 use std::collections::BTreeMap;
 use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 
-pub const TX_FEE: u64 = 3_000_000;
+// Placeholder fee used for the first-pass build (before we know the real
+// ex_units and tx_size). The scooper computes the exact required fee from
+// `compute_tx_fee` after eval and passes it to the rebuild via the
+// `fee_override` parameter, so this value never lands on chain.
+//
+// IMPORTANT: keep this CLOSE TO THE MINIMUM realistic fee, not an upper
+// bound. The order validator's contract check is `each order's budget * n
+// >= fee`, evaluated against THIS placeholder during first-pass eval. If
+// the placeholder is too pessimistic, orders whose `budget * n` could
+// satisfy the real fee fail the eval and abort the cycle. The minimum
+// realistic scoop fee is ~1.5 ADA (1 pool, 1 order, current tracing-on
+// contracts). Setting placeholder = 1.5 ADA means every order with budget
+// >= 1.5 ADA passes any first-pass eval; the rebuild's higher fee_override
+// is still checked against `budget * n` in the on-chain re-eval, which
+// scales with n so it stays satisfied.
+pub const TX_FEE: u64 = 1_500_000;
+
+// Upper bound on the *real* fee any single scoop tx can have under our
+// current cost model — used to size collateral selection so the
+// collateral_return output stays above min_utxo even when the rebuild
+// writes a fee much larger than `TX_FEE`. Observed real fees range
+// 1.5–4M lovelace; 6M leaves comfortable headroom.
+pub const MAX_REAL_TX_FEE: u64 = 6_000_000;
+
+// Cardano protocol fee coefficients (preview/mainnet, stable for years).
+// TODO: pull from `cardano.protocol.parameters` via Acropolis instead of
+// hardcoding — same subscription planned for the cap-limit work.
+const TX_FEE_PER_BYTE: u64 = 44;
+const TX_FEE_FIXED: u64 = 155_381;
+const PRICE_MEM_NUM: u64 = 577;
+const PRICE_MEM_DEN: u64 = 10_000;
+const PRICE_STEP_NUM: u64 = 721;
+const PRICE_STEP_DEN: u64 = 10_000_000;
+
+/// Conway-era reference-script fee parameters (preview/mainnet).
+/// `min_fee_ref_script_cost_per_byte = 15`; tiered with a 6/5 growth factor
+/// every `REF_SCRIPT_TIER_SIZE` bytes.
+const REF_SCRIPT_BASE_FEE: u128 = 15;
+const REF_SCRIPT_TIER_SIZE: u128 = 25_600;
+const REF_SCRIPT_MUL_NUM: u128 = 6;
+const REF_SCRIPT_MUL_DEN: u128 = 5;
+
+/// Conway tiered reference-script fee.
+///
+/// Each `TIER_SIZE` bytes costs more than the previous tier:
+///   tier 0: BASE per byte
+///   tier 1: BASE * 6/5 per byte
+///   tier 2: BASE * (6/5)^2 per byte
+///   ...
+/// Final result is `floor(total)`. Implemented with u128 rational arithmetic
+/// (common denominator = `5^(n_tiers-1)`) to avoid float precision drift.
+pub fn compute_ref_script_fee(total_ref_script_bytes: u64) -> u64 {
+    if total_ref_script_bytes == 0 {
+        return 0;
+    }
+    let mut chunks: Vec<u128> = Vec::new();
+    let mut remaining = total_ref_script_bytes as u128;
+    while remaining > 0 {
+        let chunk = remaining.min(REF_SCRIPT_TIER_SIZE);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    let n = chunks.len() as u32;
+    // sum_i chunks[i] * BASE * (6^i / 5^i)
+    // = sum_i chunks[i] * BASE * 6^i * 5^(n-1-i)  / 5^(n-1)
+    let mut total_num: u128 = 0;
+    for (i, &chunk) in chunks.iter().enumerate() {
+        let i = i as u32;
+        let six_pow = REF_SCRIPT_MUL_NUM.pow(i);
+        let five_pow_rem = REF_SCRIPT_MUL_DEN.pow(n - 1 - i);
+        total_num += chunk * REF_SCRIPT_BASE_FEE * six_pow * five_pow_rem;
+    }
+    let total_den = REF_SCRIPT_MUL_DEN.pow(n - 1);
+    (total_num / total_den) as u64
+}
+
+/// Compute the minimum protocol fee for a tx with the given size, total
+/// ex_units, and total reference-script bytes, per the Conway fee formula:
+///   fee = a*size + b
+///       + ceil(priceMem*mem) + ceil(priceStep*cpu)
+///       + tiered_ref_script_fee(ref_bytes)
+pub fn compute_tx_fee(
+    tx_size: u64,
+    total_mem: u64,
+    total_steps: u64,
+    total_ref_script_bytes: u64,
+) -> u64 {
+    let size_fee = TX_FEE_PER_BYTE * tx_size + TX_FEE_FIXED;
+    let mem_fee = (PRICE_MEM_NUM * total_mem).div_ceil(PRICE_MEM_DEN);
+    let step_fee = (PRICE_STEP_NUM * total_steps).div_ceil(PRICE_STEP_DEN);
+    let ref_fee = compute_ref_script_fee(total_ref_script_bytes);
+    size_fee + mem_fee + step_fee + ref_fee
+}
 const POOL_MIN_ADA: u64 = 2_000_000;
 const VALIDITY_RANGE: u64 = 180;
 
@@ -36,6 +128,9 @@ pub struct MultiPoolBuildResult {
     pub cbor: Vec<u8>,
     pub tx_hash: Hash<32>,
     pub tx_hash_hex: String,
+    /// Total byte size of all reference scripts attached to this tx — used to
+    /// compute the Conway-era ref-script fee component on the rebuild pass.
+    pub total_ref_script_bytes: u64,
     pub tx_body: conway::PseudoTransactionBody<TransactionOutput>,
     pub resolved_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
     pub resolved_ref_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
@@ -55,7 +150,7 @@ pub struct MultiPoolBuildResult {
 /// - M CP/FS/fairness entries (one per pool)
 /// - Fee split: TX_FEE / N total orders
 pub fn build_multi_pool_scoop_tx(
-    batches: &[Batch],
+    plan: &ScoopPlan,
     settings: &SundaeV4Settings,
     exec: &ScooperExecution,
     current_slot: u64,
@@ -64,7 +159,13 @@ pub fn build_multi_pool_scoop_tx(
     collateral_value: &crate::cardano_types::Value,
     ex_units: Option<&[(RedeemersKey, ExUnits)]>,
     ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
+    fee_override: Option<u64>,
 ) -> Result<MultiPoolBuildResult> {
+    // First-pass builds use the TX_FEE upper bound; the rebuild passes the
+    // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
+    let tx_fee = fee_override.unwrap_or(TX_FEE);
+    let batches: &[Batch] = &plan.batches;
+    let routes = &plan.routes;
     let m_pools = batches.len();
     let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
@@ -74,12 +175,40 @@ pub fn build_multi_pool_scoop_tx(
         bail!("no batches or no swaps");
     }
 
+    // Synthesize a global_seq if the caller passed an empty one (legacy paths
+    // that pass `&[Batch]` directly via test_harness wrap them in an empty
+    // ScoopPlan). For non-routed batches, ordering doesn't cross pools, so
+    // any consistent enumeration works.
+    let synthesized_seq: Vec<GlobalOp>;
+    let global_seq: &[GlobalOp] = if plan.global_seq.is_empty() {
+        synthesized_seq = batches.iter().enumerate().flat_map(|(bi, b)| {
+            (0..b.ops_order.len()).map(move |oi| GlobalOp { batch_idx: bi, op_idx: oi })
+        }).collect();
+        &synthesized_seq
+    } else {
+        &plan.global_seq
+    };
+
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
     let pk = sk.public_key();
     let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
     let scooper_keyhash: Hash<28> = Hasher::<224>::hash(&pk_bytes);
 
-    // ── Step 1: Per-pool transcript + updated datums ───────────────────────
+    // ── Step 1: Streaming walk → per-pool transcripts + per-route outputs ──
+    //
+    // We walk `global_seq` in order, applying each op to its pool's running
+    // state, computing dy at tx-time, and threading routed-order dy through
+    // hops via per-route `RouteState`. This is the "current_inputs /
+    // current_pool_state / current_outputs" model: pool state evolves per-op,
+    // routed-order hop inputs cascade from previous hops' actual dy, and
+    // routed-order final fulfillment amounts accumulate into `final_output`.
+    //
+    // Why this matters for CL: per-entry protocol_lp distribution bumps
+    // `lp_before` for subsequent entries, which changes the validator's
+    // expected dy. Recomputing here against the *bumped* running_total_lp
+    // gives the validator-tight dy; for routed orders this dy propagates
+    // through subsequent hops via the route's hop_input tracking, so the
+    // user's fulfillment matches the actual cascade output.
 
     let void_pool_state = PoolState {
         assets: vec![],
@@ -97,155 +226,339 @@ pub fn build_multi_pool_scoop_tx(
         /// Sum of LP burned by all withdraws in this batch. Zero unless there
         /// are withdraws. The pool_mint entry uses `lp_minted - lp_burned`.
         lp_burned: BigInt,
+        /// Effective dy for each swap in this batch (used for direct, non-
+        /// routed fulfillment). Routed-order fulfillment reads from
+        /// `route_states[route_idx].final_output` instead.
+        effective_swap_dys: Vec<BigInt>,
+        /// Pool reserves at end of the transcript loop.
+        final_assets_actual: Vec<(AssetClass, BigInt)>,
     }
 
-    let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
+    /// Per-route state threaded through the streaming walk.
+    struct RouteState {
+        /// Incoming amount for hop k (= sum of hop k-1's actual dys across
+        /// all splits, except hop 0 which starts at the user's offered amount).
+        hop_input: Vec<BigInt>,
+        /// Tracks how much of `hop_input[k]` we've already allocated to splits
+        /// 0..split_idx, so the last split absorbs the integer-division
+        /// remainder.
+        hop_allocated: Vec<BigInt>,
+        /// Accumulated final-hop dy — what the user's fulfillment output pays.
+        final_output: BigInt,
+        final_output_asset: AssetClass,
+    }
 
-    for batch in batches {
-        let pool = &batch.pool;
-        let initial_total_lp = pool.pool_datum.total_lp.clone();
-        let mut running_assets = pool.pool_datum.assets.clone();
-        let mut total_fee_budget = BigInt::from(0);
-        let mut transcript_entries: Vec<TranscriptEntry> = Vec::new();
+    // Initialize per-pool state.
+    let mut per_pool_running_assets: Vec<Vec<(AssetClass, BigInt)>> = batches.iter()
+        .map(|b| b.pool.pool_datum.assets.clone())
+        .collect();
+    let mut per_pool_running_total_lp: Vec<BigInt> = batches.iter()
+        .map(|b| b.pool.pool_datum.total_lp.clone())
+        .collect();
+    let mut per_pool_running_circ_lp: Vec<BigInt> = batches.iter()
+        .map(|b| b.pool.pool_datum.circulating_lp.clone())
+        .collect();
+    let mut per_pool_lp_minted: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    let mut per_pool_lp_burned: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    let mut per_pool_cum_gross_fb: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    let mut per_pool_cum_protocol_lp: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    let mut per_pool_transcripts: Vec<Vec<TranscriptEntry>> = vec![Vec::new(); m_pools];
+    let mut per_pool_effective_swap_dys: Vec<Vec<BigInt>> = batches.iter()
+        .map(|b| b.swaps.iter().map(|s| s.dy.clone()).collect())
+        .collect();
 
-        // Per-pool operation_tag for swap entries. CS dispatches its swap
-        // branch on tag == 3 (`tag_swap` in cs_check.ak) and rejects any other
-        // tag with `cs: unsupported operation_tag`. CP and CL infer swap vs
-        // non-swap from asset deltas and ignore the tag, so 100 is a safe
-        // sentinel for both.
-        let swap_tag: BigInt = match &batch.pool.pool_type {
-            PoolType::ConstantSum { .. } => BigInt::from(3),
-            PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-        };
-
-        // Process operations in the interleaved order they were accumulated.
-        // This is critical: replaying swaps-then-continuations would produce
-        // wrong intermediate reserves when routed orders interleave.
-        //
-        // Each transcript entry's state_after is the running snapshot AFTER
-        // applying that op. Swaps shift two assets and leave total_lp at the
-        // current running value (CS keeps it constant; CP applies protocol_lp
-        // on the last entry below). Deposits add to all pool assets and grow
-        // total_lp (and circulating_lp) by lp_minted.
-        let mut running_total_lp = initial_total_lp.clone();
-        let mut running_circ_lp = pool.pool_datum.circulating_lp.clone();
-        let mut lp_minted_sum = BigInt::from(0);
-        let mut lp_burned_sum = BigInt::from(0);
-        for op in &batch.ops_order {
-            let prev_assets = running_assets.clone();
-            let (operation_tag, fee_budget) = match op {
-                crate::sundaev4::batch::BatchOp::Swap(i) => {
-                    let s = &batch.swaps[*i];
-                    running_assets[s.input_idx].1 = &running_assets[s.input_idx].1 + &s.dx;
-                    running_assets[s.output_idx].1 = &running_assets[s.output_idx].1 - &s.dy;
-                    let fb = swap_math::compute_fee_budget(
-                        &batch.pool.pool_type,
-                        &prev_assets,
-                        &running_assets,
-                        &initial_total_lp,
-                    );
-                    total_fee_budget = &total_fee_budget + &fb;
-                    (swap_tag.clone(), fb)
-                }
-                crate::sundaev4::batch::BatchOp::Continuation(i) => {
-                    let c = &batch.continuations[*i];
-                    running_assets[c.input_idx].1 = &running_assets[c.input_idx].1 + &c.dx;
-                    running_assets[c.output_idx].1 = &running_assets[c.output_idx].1 - &c.dy;
-                    let fb = swap_math::compute_fee_budget(
-                        &batch.pool.pool_type,
-                        &prev_assets,
-                        &running_assets,
-                        &initial_total_lp,
-                    );
-                    total_fee_budget = &total_fee_budget + &fb;
-                    (swap_tag.clone(), fb)
-                }
-                crate::sundaev4::batch::BatchOp::Deposit(i) => {
-                    let d = &batch.deposits[*i];
-                    for (idx, amt) in running_assets.iter_mut().enumerate() {
-                        amt.1 = &amt.1 + &d.dx[idx];
-                    }
-                    running_total_lp = &running_total_lp + &d.lp_minted;
-                    running_circ_lp = &running_circ_lp + &d.lp_minted;
-                    lp_minted_sum = &lp_minted_sum + &d.lp_minted;
-                    // CS reads tag_deposit=6 (cs_check.ak); CP and CL infer
-                    // from asset deltas. fee_budget=0 by construction.
-                    let dep_tag = match &batch.pool.pool_type {
-                        PoolType::ConstantSum { .. } => BigInt::from(6),
-                        PoolType::ConstantProduct { .. } => BigInt::from(100),
-                        PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                    };
-                    (dep_tag, BigInt::from(0))
-                }
-                crate::sundaev4::batch::BatchOp::Withdraw(i) => {
-                    let w = &batch.withdraws[*i];
-                    for (idx, amt) in running_assets.iter_mut().enumerate() {
-                        amt.1 = &amt.1 - &w.dy[idx];
-                    }
-                    running_total_lp = &running_total_lp - &w.lp_burned;
-                    running_circ_lp = &running_circ_lp - &w.lp_burned;
-                    lp_burned_sum = &lp_burned_sum + &w.lp_burned;
-                    // CP doesn't have a dedicated withdraw tag; the
-                    // non-swap branch checks proportionality and accepts
-                    // both deposit and withdraw. CS contracts don't
-                    // support withdraw on-chain (cs_check rejects it).
-                    let wd_tag = match &batch.pool.pool_type {
-                        PoolType::ConstantProduct { .. } => BigInt::from(100),
-                        PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                        PoolType::ConstantSum { .. } => {
-                            anyhow::bail!("CS withdraw not supported on-chain");
-                        }
-                    };
-                    (wd_tag, BigInt::from(0))
-                }
-            };
-
-            transcript_entries.push(TranscriptEntry {
-                state_after: PoolState {
-                    assets: running_assets.clone(),
-                    total_lp: running_total_lp.clone(),
-                    circulating_lp: running_circ_lp.clone(),
-                    preminted_lp: pool.pool_datum.preminted_lp.clone(),
-                },
-                fee_budget,
-                operation_tag,
-                operation_data: void_pool_state.clone().to_plutus(),
-            });
+    // Per-pool fee_split protocol_share. fee_split.Operate runs once per pool
+    // and checks the cumulative protocol_lp captured across the transcript
+    // matches `floor(total_fee * ps_num / ps_den)`. Using a global default
+    // would produce the wrong protocol_lp for any pool with a non-default share.
+    //
+    // CS pools are special: their `Operate` validator asserts `before_lp ==
+    // after_lp` on every swap entry, so we must not apply per-entry protocol_lp
+    // bumps for them at all. Protocol cuts for CS flow via the bounty/claim
+    // path, not fee_split. Hard-pin ps to (0, 1) here regardless of any
+    // recovered or fallback config.
+    let per_pool_ps: Vec<(BigInt, BigInt)> = batches.iter().map(|batch| {
+        if matches!(batch.pool.pool_type, PoolType::ConstantSum { .. }) {
+            return (BigInt::from(0), BigInt::from(1));
         }
-
-        // Protocol LP must come out of this pool's own fee_split config —
-        // each pool stores its own protocol_share hash in module_state, and
-        // fee_split.Operate checks `protocol_lp * ps_den <= total_fee * ps_num`
-        // and `(protocol_lp + 1) * ps_den > total_fee * ps_num`, both relative
-        // to the per-pool config. Using a global default produces the wrong
-        // protocol_lp for any pool created with a non-default share.
-        let (ps_num_bi, ps_den_bi) = batch
-            .pool
-            .fee_split_config
-            .as_ref()
+        batch.pool.fee_split_config.as_ref()
             .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
             .unwrap_or_else(|| (
                 BigInt::from(exec.protocol_share.0),
                 BigInt::from(exec.protocol_share.1),
-            ));
-        let protocol_lp = &total_fee_budget * &ps_num_bi / &ps_den_bi;
-        // Final total_lp = running (already includes deposits/withdraws) + protocol_lp
-        // (CP fee accrual; CS keeps total_lp pinned and protocol_lp is 0 for it).
-        let final_total_lp = &running_total_lp + &protocol_lp;
-        // Circulating LP grew by lp_minted_sum (deposits) and shrank by
-        // lp_burned_sum (withdraws); protocol_lp doesn't change circulating
-        // (it widens the gap that fee_split closes).
-        let final_circ_lp = &pool.pool_datum.circulating_lp + &lp_minted_sum - &lp_burned_sum;
+            ))
+    }).collect();
 
-        if let Some(last) = transcript_entries.last_mut() {
-            last.fee_budget = &last.fee_budget - &protocol_lp;
-            last.state_after.total_lp = final_total_lp.clone();
+    // Per-pool operation_tag for swap entries. CS dispatches on tag==3
+    // (`tag_swap` in cs_check.ak); CP/CL infer from asset deltas.
+    let per_pool_swap_tag: Vec<BigInt> = batches.iter().map(|b| match &b.pool.pool_type {
+        PoolType::ConstantSum { .. } => BigInt::from(3),
+        PoolType::ConstantProduct { .. } => BigInt::from(100),
+        PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+    }).collect();
+
+    // Initialize per-route state. hop_input[0] = order's offered amount
+    // (entry-hop incoming). Subsequent hops start at 0 and accumulate dys.
+    let mut route_states: Vec<RouteState> = routes.iter().map(|r| {
+        let n_hops = r.hops.len();
+        let mut hop_input = vec![BigInt::from(0); n_hops];
+        hop_input[0] = r.order.swap_offered().1.clone();
+        RouteState {
+            hop_input,
+            hop_allocated: vec![BigInt::from(0); n_hops],
+            final_output: BigInt::from(0),
+            final_output_asset: r.final_output_asset.clone(),
         }
+    }).collect();
+
+    // Diagnostic: dump initial pool state so the next ValueNotConservedUTxO can be
+    // reconstructed offline. Keyed by short pool ident prefix.
+    for (i, b) in batches.iter().enumerate() {
+        tracing::debug!(
+            walk = "init-pool",
+            batch_idx = i,
+            pool = %b.pool_ident,
+            assets = ?b.pool.pool_datum.assets.iter().map(|(a, q)| {
+                format!("{}={}", short_asset(a), q)
+            }).collect::<Vec<_>>(),
+            total_lp = %b.pool.pool_datum.total_lp,
+            "streaming walk: initial pool state",
+        );
+    }
+    for (r_idx, r) in routes.iter().enumerate() {
+        tracing::debug!(
+            walk = "init-route",
+            route_idx = r_idx,
+            order = %r.order.input,
+            n_hops = r.hops.len(),
+            offered = %r.order.swap_offered().1,
+            final_output_asset = %short_asset(&r.final_output_asset),
+            "streaming walk: route init",
+        );
+    }
+
+    for g in global_seq {
+        let batch_idx = g.batch_idx;
+        let op_idx = g.op_idx;
+        let batch = &batches[batch_idx];
+        let op = &batch.ops_order[op_idx];
+        let pool_type = batch.pool.pool_type.clone();
+
+        let running_assets = &mut per_pool_running_assets[batch_idx];
+        let running_total_lp = &mut per_pool_running_total_lp[batch_idx];
+        let running_circ_lp = &mut per_pool_running_circ_lp[batch_idx];
+
+        let prev_assets = running_assets.clone();
+
+        let (operation_tag, gross_fb) = match op {
+            crate::sundaev4::batch::BatchOp::Swap(i) => {
+                let s = &batch.swaps[*i];
+                // dx is fixed by the order (direct) or by the route's entry
+                // split allocation (routed primary); both stored on `s.dx`.
+                let dx = s.dx.clone();
+                // dy: recompute fresh against the current pool state
+                // (including any LP bumps from prior CL entries).
+                let dy = crate::sundaev4::batch::compute_swap_result(
+                    &pool_type, running_assets, running_total_lp,
+                    s.input_idx, s.output_idx, &dx,
+                );
+                per_pool_effective_swap_dys[batch_idx][*i] = dy.clone();
+                running_assets[s.input_idx].1 = &running_assets[s.input_idx].1 + &dx;
+                running_assets[s.output_idx].1 = &running_assets[s.output_idx].1 - &dy;
+                tracing::debug!(
+                    walk = "op-swap",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    swap_idx = *i,
+                    route = ?s.route.as_ref().map(|r| (r.route_idx, r.hop_idx, r.split_idx)),
+                    dx = %dx, dy = %dy,
+                    "streaming walk: swap op",
+                );
+                // If this is a routed-primary, thread dy → next hop's incoming
+                // (or final_output if last hop).
+                if let Some(rref) = &s.route {
+                    let rs = &mut route_states[rref.route_idx];
+                    let n_hops = rs.hop_input.len();
+                    if rref.hop_idx + 1 < n_hops {
+                        rs.hop_input[rref.hop_idx + 1] = &rs.hop_input[rref.hop_idx + 1] + &dy;
+                    } else {
+                        rs.final_output = &rs.final_output + &dy;
+                    }
+                }
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type, &prev_assets, running_assets, running_total_lp,
+                );
+                (per_pool_swap_tag[batch_idx].clone(), fb)
+            }
+            crate::sundaev4::batch::BatchOp::Continuation(i) => {
+                let c = &batch.continuations[*i];
+                let rref = &c.route;
+                let route = &routes[rref.route_idx];
+                let hop = &route.hops[rref.hop_idx];
+                let split_count = hop.split_input_props.len();
+                // Entry-hop continuations: dx is the router's allocation
+                // (stored on `c.dx` = `split.input_amount`). Later hops:
+                // rescale against the actual incoming flow tracked in
+                // route_state.hop_input[hop_idx]; the last split absorbs the
+                // integer-division remainder so value is conserved exactly.
+                let dx = if rref.hop_idx == 0 {
+                    c.dx.clone()
+                } else {
+                    let rs = &mut route_states[rref.route_idx];
+                    let incoming = rs.hop_input[rref.hop_idx].clone();
+                    if split_count == 1 {
+                        incoming
+                    } else if rref.split_idx == split_count - 1 {
+                        &incoming - &rs.hop_allocated[rref.hop_idx]
+                    } else if num_traits::Signed::is_positive(&hop.hop_total_at_route_time) {
+                        let proportional =
+                            &incoming * &c.dx / &hop.hop_total_at_route_time;
+                        rs.hop_allocated[rref.hop_idx] =
+                            &rs.hop_allocated[rref.hop_idx] + &proportional;
+                        proportional
+                    } else {
+                        c.dx.clone()
+                    }
+                };
+                let dy = crate::sundaev4::batch::compute_swap_result(
+                    &pool_type, running_assets, running_total_lp,
+                    c.input_idx, c.output_idx, &dx,
+                );
+                running_assets[c.input_idx].1 = &running_assets[c.input_idx].1 + &dx;
+                running_assets[c.output_idx].1 = &running_assets[c.output_idx].1 - &dy;
+                tracing::debug!(
+                    walk = "op-cont",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    cont_idx = *i,
+                    route_idx = rref.route_idx,
+                    hop_idx = rref.hop_idx,
+                    split_idx = rref.split_idx,
+                    dx = %dx, dy = %dy,
+                    "streaming walk: continuation op",
+                );
+                let rs = &mut route_states[rref.route_idx];
+                let n_hops = rs.hop_input.len();
+                if rref.hop_idx + 1 < n_hops {
+                    rs.hop_input[rref.hop_idx + 1] = &rs.hop_input[rref.hop_idx + 1] + &dy;
+                } else {
+                    rs.final_output = &rs.final_output + &dy;
+                }
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type, &prev_assets, running_assets, running_total_lp,
+                );
+                (per_pool_swap_tag[batch_idx].clone(), fb)
+            }
+            crate::sundaev4::batch::BatchOp::Deposit(i) => {
+                let d = &batch.deposits[*i];
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 + &d.dx[idx];
+                }
+                *running_total_lp = &*running_total_lp + &d.lp_minted;
+                *running_circ_lp = &*running_circ_lp + &d.lp_minted;
+                per_pool_lp_minted[batch_idx] =
+                    &per_pool_lp_minted[batch_idx] + &d.lp_minted;
+                let dep_tag = match &pool_type {
+                    PoolType::ConstantSum { .. } => BigInt::from(6),
+                    PoolType::ConstantProduct { .. } => BigInt::from(100),
+                    PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+                };
+                (dep_tag, BigInt::from(0))
+            }
+            crate::sundaev4::batch::BatchOp::Withdraw(i) => {
+                let w = &batch.withdraws[*i];
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 - &w.dy[idx];
+                }
+                *running_total_lp = &*running_total_lp - &w.lp_burned;
+                *running_circ_lp = &*running_circ_lp - &w.lp_burned;
+                per_pool_lp_burned[batch_idx] =
+                    &per_pool_lp_burned[batch_idx] + &w.lp_burned;
+                let wd_tag = match &pool_type {
+                    PoolType::ConstantProduct { .. } => BigInt::from(100),
+                    PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+                    PoolType::ConstantSum { .. } => {
+                        anyhow::bail!("CS withdraw not supported on-chain");
+                    }
+                };
+                (wd_tag, BigInt::from(0))
+            }
+        };
+
+        // Per-entry protocol_lp share. fee_split.Operate's check is
+        // *cumulative* per pool: protocol_lp = floor(total_gross * ps_num /
+        // ps_den) where total_gross = sum of every entry's gross fee. A naive
+        // per-entry floor (`floor(g_i * ps/...)`) loses rounding remainders
+        // and the sum falls short of the cumulative floor. Instead, advance a
+        // cumulative-floor target and let each entry's contribution be the
+        // delta; the rounding "carry" naturally lands on whichever entry tips
+        // the running product across the next ps_den boundary.
+        // CS pools have ps=(0,1) (CS swaps must keep LP fixed), so the target
+        // stays at 0 and every entry contributes 0 — leaves LP untouched.
+        let (ps_num_bi, ps_den_bi) = &per_pool_ps[batch_idx];
+        let new_cum_gross_fb = &per_pool_cum_gross_fb[batch_idx] + &gross_fb;
+        let new_cum_protocol_lp = &new_cum_gross_fb * ps_num_bi / ps_den_bi;
+        let op_protocol_lp =
+            &new_cum_protocol_lp - &per_pool_cum_protocol_lp[batch_idx];
+        let submitted_fee_budget = &gross_fb - &op_protocol_lp;
+        per_pool_cum_protocol_lp[batch_idx] = new_cum_protocol_lp;
+        per_pool_cum_gross_fb[batch_idx] = new_cum_gross_fb;
+        *running_total_lp = &*running_total_lp + &op_protocol_lp;
+
+        per_pool_transcripts[batch_idx].push(TranscriptEntry {
+            state_after: PoolState {
+                assets: running_assets.clone(),
+                total_lp: running_total_lp.clone(),
+                circulating_lp: running_circ_lp.clone(),
+                preminted_lp: batch.pool.pool_datum.preminted_lp.clone(),
+            },
+            fee_budget: submitted_fee_budget,
+            operation_tag,
+            operation_data: void_pool_state.clone().to_plutus(),
+        });
+    }
+
+    // End-of-walk summary: per-pool final state + per-route final_output.
+    for (i, b) in batches.iter().enumerate() {
+        let deltas: Vec<String> = per_pool_running_assets[i].iter()
+            .zip(b.pool.pool_datum.assets.iter())
+            .map(|((a, post), (_, pre))| {
+                let delta = post - pre;
+                format!("{}={:+}", short_asset(a), delta)
+            }).collect();
+        tracing::info!(
+            walk = "final-pool",
+            batch_idx = i,
+            pool = %b.pool_ident,
+            deltas = ?deltas,
+            total_lp_delta = %(&per_pool_running_total_lp[i] - &b.pool.pool_datum.total_lp),
+            "streaming walk: final pool state",
+        );
+    }
+    for (r_idx, rs) in route_states.iter().enumerate() {
+        tracing::info!(
+            walk = "final-route",
+            route_idx = r_idx,
+            hop_input = ?rs.hop_input.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+            final_output = %rs.final_output,
+            final_output_asset = %short_asset(&rs.final_output_asset),
+            "streaming walk: final route state",
+        );
+    }
+
+    // Materialise PerPoolData from the running state.
+    let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
+    for (i, batch) in batches.iter().enumerate() {
+        let pool = &batch.pool;
+        let final_total_lp = per_pool_running_total_lp[i].clone();
+        let final_circ_lp = &pool.pool_datum.circulating_lp
+            + &per_pool_lp_minted[i]
+            - &per_pool_lp_burned[i];
+        let final_assets_actual = per_pool_running_assets[i].clone();
 
         let updated_datum = PoolDatum {
-            assets: batch.final_assets.clone(),
-            total_lp: final_total_lp.clone(),
+            assets: final_assets_actual.clone(),
+            total_lp: final_total_lp,
             circulating_lp: final_circ_lp,
             preminted_lp: pool.pool_datum.preminted_lp.clone(),
             identifier: pool.pool_datum.identifier.clone(),
@@ -254,10 +567,12 @@ pub fn build_multi_pool_scoop_tx(
         };
 
         per_pool.push(PerPoolData {
-            transcript: transcript_entries,
+            transcript: std::mem::take(&mut per_pool_transcripts[i]),
             updated_datum,
-            lp_minted: lp_minted_sum,
-            lp_burned: lp_burned_sum,
+            lp_minted: per_pool_lp_minted[i].clone(),
+            lp_burned: per_pool_lp_burned[i].clone(),
+            effective_swap_dys: std::mem::take(&mut per_pool_effective_swap_dys[i]),
+            final_assets_actual,
         });
     }
 
@@ -366,13 +681,21 @@ pub fn build_multi_pool_scoop_tx(
         let pool_sorted_idx = pool_sorted_indices[batch_idx];
         let pool_output_idx = batch_to_pool_output[batch_idx];
 
-        // Action.tag selects which entry from pool.actions to evaluate. CS
-        // pools register their swap action under tag=3; CP and CL under tag=100.
-        let action_tag = match &batch.pool.pool_type {
-            PoolType::ConstantSum { .. } => BigInt::from(3),
-            PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-        };
+        // Action.tag selects which entry from pool.actions to evaluate.
+        // Different pools were initialised with different tags (some use 3,
+        // others 100); we can't hardcode. Per-entry dispatch within a module
+        // uses the transcript entry's `operation_tag` field, which is a
+        // separate concept from this action tag.
+        // TODO(audit): pools store their action catalogue inline on the datum,
+        // so "first enabled" is brittle for any pool that ever registers
+        // multiple actions. Audit feedback should move the catalogue into a
+        // settings UTxO referenced from the datum.
+        let action_tag = batch.pool.pool_datum.actions.iter()
+            .find(|a| a.enabled)
+            .map(|a| a.tag.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "pool {} has no enabled action entry", batch.pool_ident
+            ))?;
         let pool_redeemer = PoolRedeemer::Action {
             tag: action_tag,
             transcript: per_pool[batch_idx].transcript.clone(),
@@ -528,6 +851,21 @@ pub fn build_multi_pool_scoop_tx(
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
 
+    // pool_mint is only needed when the tx actually mints or burns LP tokens
+    // (deposits/withdraws). Pure-swap batches grow the protocol_lp gap inside
+    // each pool's datum but don't mint anything on chain — pool_lib's
+    // check_lp_accounting compares `circulating + preminted` (not total_lp)
+    // against `net_lp_minted`, so it's satisfied by 0 mint when only swaps
+    // happen. The gap can be minted later by a separate "claim" tx. Skipping
+    // pool_mint's ref script here drops ~5KB of ref_script_bytes per
+    // pure-swap scoop, which on the tiered Conway fee saves real lovelace.
+    let has_lp_mint_or_burn = {
+        use num_traits::Zero;
+        per_pool_lp_minted.iter()
+            .zip(per_pool_lp_burned.iter())
+            .any(|(m, b)| !(m - b).clone().unwrap().is_zero())
+    };
+
     let fs_redeemer = FeeSplitRedeemer::Operate { entries: fs_entries };
     let fairness_redeemer = FairnessRedeemer::Operate { entries: fairness_entries };
 
@@ -538,9 +876,11 @@ pub fn build_multi_pool_scoop_tx(
         exec.module_scripts.order.ref_utxo.0.clone(),
         exec.module_scripts.fee_split.ref_utxo.0.clone(),
         exec.module_scripts.fairness.ref_utxo.0.clone(),
-        exec.module_scripts.pool_mint.ref_utxo.0.clone(),
         exec.module_scripts.settings.ref_utxo.0.clone(),
     ];
+    if has_lp_mint_or_burn {
+        all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
+    }
     if has_cp {
         all_ref_inputs.push(exec.module_scripts.constant_product.ref_utxo.0.clone());
     }
@@ -676,63 +1016,30 @@ pub fn build_multi_pool_scoop_tx(
     //   - cont_buy_inflow: dx for CONTINUATIONS where input is ADA (pool receives ADA
     //     from routing — this ADA came from another pool's sell outflow)
     //
-    // Pool output ADA delta: buy orders add ADA to the pool, sell orders remove it.
+    // Pool output ADA delta: derived directly from the actual per-pool
+    // final reserves we tracked in `per_pool[i].final_assets_actual`,
+    // which reflects every applied op (including any recomputed CL dys
+    // that diverge from the accumulator's projection). This is more
+    // robust than summing per-op `dx`/`dy` aggregates that ignore the
+    // recompute path.
     let ada_asset = AssetClass { policy: vec![], token: vec![] };
-    let pool_ada_deltas: Vec<i64> = batches.iter().map(|batch| {
+    let pool_ada_deltas: Vec<i64> = (0..batches.len()).map(|batch_idx| {
         use num_traits::ToPrimitive;
-
-        // ADA flowing OUT of the pool (sell orders where output is ADA)
-        let sell_outflow: i64 = batch.swaps.iter()
-            .filter(|s| {
-                let out = &batch.pool.pool_datum.assets[s.output_idx].0;
-                out.policy.is_empty() && out.token.is_empty()
-            })
-            .map(|s| s.dy.clone().unwrap().to_i64().unwrap_or(0))
-            .sum::<i64>()
-            + batch.continuations.iter()
-            .filter(|c| {
-                let out = &batch.pool.pool_datum.assets[c.output_idx].0;
-                out.policy.is_empty() && out.token.is_empty()
-            })
-            .map(|c| c.dy.clone().unwrap().to_i64().unwrap_or(0))
-            .sum::<i64>();
-
-        // ADA flowing INTO the pool (buy orders where input is ADA)
-        let buy_inflow: i64 = batch.swaps.iter()
-            .filter(|s| {
-                let inp = &batch.pool.pool_datum.assets[s.input_idx].0;
-                inp.policy.is_empty() && inp.token.is_empty()
-            })
-            .map(|s| s.dx.clone().unwrap().to_i64().unwrap_or(0))
-            .sum::<i64>()
-            + batch.continuations.iter()
-            .filter(|c| {
-                let inp = &batch.pool.pool_datum.assets[c.input_idx].0;
-                inp.policy.is_empty() && inp.token.is_empty()
-            })
-            .map(|c| c.dx.clone().unwrap().to_i64().unwrap_or(0))
-            .sum::<i64>();
-
-        // ADA contributed by deposits (whichever pool asset is ADA gets its
-        // share of each deposit's dx vector).
+        let batch = &batches[batch_idx];
+        let final_assets = &per_pool[batch_idx].final_assets_actual;
         let ada_idx = batch.pool.pool_datum.assets.iter().position(|(a, _)| {
             a.policy.is_empty() && a.token.is_empty()
         });
-        let deposit_ada: i64 = if let Some(idx) = ada_idx {
-            batch.deposits.iter()
-                .map(|d| d.dx[idx].clone().unwrap().to_i64().unwrap_or(0))
-                .sum::<i64>()
-        } else { 0 };
-
-        // ADA paid out to users by withdraws (whichever pool asset is ADA
-        // gets its share of each withdraw's dy vector).
-        let withdraw_ada: i64 = if let Some(idx) = ada_idx {
-            batch.withdraws.iter()
-                .map(|w| w.dy[idx].clone().unwrap().to_i64().unwrap_or(0))
-                .sum::<i64>()
-        } else { 0 };
-
-        buy_inflow - sell_outflow + deposit_ada - withdraw_ada
+        match ada_idx {
+            Some(idx) => {
+                let initial: i64 = batch.pool.pool_datum.assets[idx].1
+                    .clone().unwrap().to_i64().unwrap_or(0);
+                let final_v: i64 = final_assets[idx].1
+                    .clone().unwrap().to_i64().unwrap_or(0);
+                final_v - initial
+            }
+            None => 0,
+        }
     }).collect();
 
     // Pool outputs in pool_output_order (sorted by input position)
@@ -740,7 +1047,7 @@ pub fn build_multi_pool_scoop_tx(
         let batch = &batches[batch_idx];
         let pool_datum_pd = per_pool[batch_idx].updated_datum.clone().to_plutus();
         let pool_output_value = build_pool_output_value(
-            &batch.pool, &batch.final_assets, pool_ada_deltas[batch_idx],
+            &batch.pool, &per_pool[batch_idx].final_assets_actual, pool_ada_deltas[batch_idx],
         )?;
         outputs.push(TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
@@ -753,8 +1060,8 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // Fee split across all orders
-    let per_order_fee = TX_FEE / n_orders as u64;
-    let last_order_fee = TX_FEE - per_order_fee * (n_orders as u64 - 1);
+    let per_order_fee = tx_fee / n_orders as u64;
+    let last_order_fee = tx_fee - per_order_fee * (n_orders as u64 - 1);
 
     // Fulfillment outputs in input-sorted order — one per order (Swap or
     // Deposit). The order validator iterates filtered order inputs and entries
@@ -789,18 +1096,32 @@ pub fn build_multi_pool_scoop_tx(
         let fulfillment_value = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => {
                 let swap = &batch.swaps[*i];
-                let (output_asset, dy) = if let Some(fo) = &swap.fulfillment_override {
-                    (&fo.output_asset, &fo.amount)
-                } else {
-                    (&batch.pool.pool_datum.assets[swap.output_idx].0, &swap.dy)
+                // Routed orders: fulfillment dy + output asset come from the
+                // streaming walk's accumulated final-hop output (sum across
+                // any splits of the last hop). Direct swaps use the dy we
+                // recomputed against the pool's running state — that's
+                // already the validator-tight bound after any CL lp bump.
+                let (output_asset, dy_owned);
+                let (output_asset_ref, dy_ref): (&AssetClass, &BigInt) = match &swap.route {
+                    Some(rref) => {
+                        let rs = &route_states[rref.route_idx];
+                        (&rs.final_output_asset, &rs.final_output)
+                    }
+                    None => {
+                        output_asset =
+                            batch.pool.pool_datum.assets[swap.output_idx].0.clone();
+                        dy_owned = per_pool[fo_meta.batch_idx]
+                            .effective_swap_dys[*i].clone();
+                        (&output_asset, &dy_owned)
+                    }
                 };
                 let (offer_asset, offer_amount) = swap.order.swap_offered();
                 build_fulfillment_value_from_order(
                     &swap.order.value,
                     offer_asset,
                     offer_amount,
-                    output_asset,
-                    dy,
+                    output_asset_ref,
+                    dy_ref,
                     actual_fee,
                 )?
             }
@@ -947,7 +1268,7 @@ pub fn build_multi_pool_scoop_tx(
     let body = conway::PseudoTransactionBody {
         inputs: sorted_inputs.into(),
         outputs,
-        fee: TX_FEE,
+        fee: tx_fee,
         ttl: Some(ttl),
         certificates: None,
         withdrawals: Some(pallas_primitives::NonEmptyKeyValuePairs::Def(
@@ -975,12 +1296,12 @@ pub fn build_multi_pool_scoop_tx(
                     );
                     PallasBytes::from(scooper_addr.to_vec())
                 },
-                value: build_collateral_return_value(collateral_value, TX_FEE * 3 / 2)?,
+                value: build_collateral_return_value(collateral_value, (tx_fee * 3).div_ceil(2))?,
                 datum_option: None,
                 script_ref: None,
             },
         )),
-        total_collateral: Some(TX_FEE * 3 / 2),
+        total_collateral: Some((tx_fee * 3).div_ceil(2)),
         reference_inputs: pallas_primitives::NonEmptySet::from_vec(all_ref_inputs.clone()),
         voting_procedures: None,
         proposal_procedures: None,
@@ -1095,7 +1416,7 @@ pub fn build_multi_pool_scoop_tx(
         let batch = &batches[out_idx];
         let predicted_input = crate::cardano_types::TransactionInput::new(body_hash, batch_idx as u64);
         let mut predicted_value = batch.pool.value.clone();
-        for (asset, new_amount) in &batch.final_assets {
+        for (asset, new_amount) in &per_pool[out_idx].final_assets_actual {
             if asset.policy.is_empty() && asset.token.is_empty() {
                 continue; // ADA handled below
             }
@@ -1129,10 +1450,34 @@ pub fn build_multi_pool_scoop_tx(
 
     let tx_cbor = minicbor::to_vec(&tx).context("encode tx")?;
 
+    // Sum the raw CBOR byte size of every reference-script attached to this
+    // tx, for the Conway-era tiered ref-script fee component.
+    let total_ref_script_bytes: u64 = all_ref_inputs.iter()
+        .filter_map(|input| {
+            let ct_input = crate::cardano_types::TransactionInput(input.clone());
+            let txo = ref_utxo_outputs.get(&ct_input)
+                .or_else(|| {
+                    if input == &settings.input.0 {
+                        // settings UTxO isn't in ref_utxo_outputs; skip
+                        None
+                    } else {
+                        None
+                    }
+                })?;
+            match &txo.script_ref {
+                Some(crate::cardano_types::ScriptRef::PlutusV1(s)) => Some(s.as_ref().len() as u64),
+                Some(crate::cardano_types::ScriptRef::PlutusV2(s)) => Some(s.as_ref().len() as u64),
+                Some(crate::cardano_types::ScriptRef::PlutusV3(s)) => Some(s.as_ref().len() as u64),
+                Some(crate::cardano_types::ScriptRef::Native(_)) | None => None,
+            }
+        })
+        .sum();
+
     Ok(MultiPoolBuildResult {
         cbor: tx_cbor,
         tx_hash: body_hash,
         tx_hash_hex,
+        total_ref_script_bytes,
         tx_body: tx.transaction_body,
         resolved_inputs,
         resolved_ref_inputs,
@@ -1664,6 +2009,18 @@ fn build_collateral_return_value(
 }
 
 /// Convert a PlutusAddress to raw address bytes.
+/// Short display for an asset class: "ADA" for the ada asset, otherwise
+/// hex(policy[..4]).hex(token). Used only by diagnostic logging.
+fn short_asset(a: &AssetClass) -> String {
+    if a.policy.is_empty() && a.token.is_empty() {
+        return "ADA".to_string();
+    }
+    let pol = hex::encode(&a.policy);
+    let tk = hex::encode(&a.token);
+    let pol_short: String = pol.chars().take(8).collect();
+    format!("{}.{}", pol_short, tk)
+}
+
 fn plutus_address_to_bytes(addr: &PlutusAddress) -> Result<Vec<u8>> {
     let payment = match &addr.payment_credential {
         Credential::VerificationKey(hash) => ShelleyPaymentPart::Key(*hash),

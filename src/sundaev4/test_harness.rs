@@ -19,7 +19,7 @@ pub(crate) mod test_harness {
     use crate::cardano_types::{AssetClass, Value};
     use crate::multisig::Multisig;
     use crate::sundaev3::Ident;
-    use crate::sundaev4::batch::Batch;
+    use crate::sundaev4::batch::{Batch, ScoopPlan};
     use crate::sundaev4::evaluator::{EvalResult, ScriptStore, evaluate_scoop_tx};
     use crate::sundaev4::submit::encode_language_views;
     use crate::sundaev4::tx_builder::{MultiPoolBuildResult, build_multi_pool_scoop_tx};
@@ -127,6 +127,7 @@ pub(crate) mod test_harness {
             let exec = ScooperExecution {
                 scooper_secret_key: SCOOPER_SECRET_KEY.to_string(),
                 scooper_secret_key_file: None,
+                scooper_stake_keyhash: None,
                 submit_url: String::new(),
                 fee: (3, 1000),
                 protocol_share: (1, 2),
@@ -142,6 +143,9 @@ pub(crate) mod test_harness {
                 max_tx_ex_steps: 10_000_000_000,
                 max_tx_size: 16_384,
                 budget_padding: (6, 5),
+                blacklisted_pools: std::collections::BTreeSet::new(),
+                cost_per_pool_lovelace: 0,
+                cost_per_step_lovelace: 0,
             };
 
             // Collateral: deterministic UTxO with enough ADA
@@ -171,8 +175,26 @@ pub(crate) mod test_harness {
             settings: &SundaeV4Settings,
             slot: u64,
         ) -> anyhow::Result<(MultiPoolBuildResult, EvalResult)> {
+            // Non-routed convenience: wrap a slice of batches in an empty
+            // ScoopPlan. Routed tests should use `build_and_eval_plan`.
+            let plan = ScoopPlan {
+                batches: batches.to_vec(),
+                routes: Vec::new(),
+                global_seq: Vec::new(),
+            };
+            self.build_and_eval_plan(&plan, settings, slot)
+        }
+
+        /// Build + eval from a full ScoopPlan (with routes + global_seq).
+        /// Use this when testing routed orders via the accumulator.
+        pub fn build_and_eval_plan(
+            &self,
+            plan: &ScoopPlan,
+            settings: &SundaeV4Settings,
+            slot: u64,
+        ) -> anyhow::Result<(MultiPoolBuildResult, EvalResult)> {
             let build = build_multi_pool_scoop_tx(
-                batches,
+                plan,
                 settings,
                 &self.exec,
                 slot,
@@ -181,6 +203,7 @@ pub(crate) mod test_harness {
                 &self.collateral_value,
                 None, // no ex_units → default budgets
                 &self.ref_utxo_outputs,
+                None, // fee_override
             )?;
 
             let eval = evaluate_scoop_tx(
@@ -192,6 +215,7 @@ pub(crate) mod test_harness {
                 PLUTUS_V3_COST_MODEL,
                 build.tx_hash,
                 &self.exec.slot_config,
+                None,
             )?;
 
             Ok((build, eval))

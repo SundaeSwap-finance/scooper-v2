@@ -70,6 +70,48 @@ pub struct HopResult {
     pub total_output: BigInt,
 }
 
+/// Per-order routing limits derived from the order's budget and the scooper's
+/// `cost_per_pool_lovelace` / `cost_per_step_lovelace` config. Used to cap how
+/// much fan-out an order can buy with its scooper fee: low-budget orders get
+/// shorter paths and fewer splits; high-budget orders can take the maximally
+/// optimal route.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RoutingLimits {
+    /// Max distinct pools the route may touch. `usize::MAX` = unlimited.
+    pub max_pools: usize,
+    /// Max total split entries across all hops (count of `SplitEntry`s in the
+    /// `RoutingPlan`). `usize::MAX` = unlimited.
+    pub max_steps: usize,
+}
+
+impl RoutingLimits {
+    /// Unlimited — preserves pre-fan-out-gating behaviour.
+    pub fn unlimited() -> Self {
+        Self { max_pools: usize::MAX, max_steps: usize::MAX }
+    }
+
+    /// Compute limits from an order's lovelace budget and per-unit costs.
+    /// `cost_per_pool == 0` or `cost_per_step == 0` means that axis is
+    /// unlimited.
+    pub fn from_budget(
+        budget_lovelace: u64,
+        cost_per_pool: u64,
+        cost_per_step: u64,
+    ) -> Self {
+        let max_pools = if cost_per_pool == 0 {
+            usize::MAX
+        } else {
+            (budget_lovelace / cost_per_pool) as usize
+        };
+        let max_steps = if cost_per_step == 0 {
+            usize::MAX
+        } else {
+            (budget_lovelace / cost_per_step) as usize
+        };
+        Self { max_pools, max_steps }
+    }
+}
+
 /// Complete multi-hop routing plan.
 #[derive(Clone, Debug)]
 pub struct RoutingPlan {
@@ -86,6 +128,43 @@ pub struct RoutingPlan {
 }
 
 // ─── Swap Output ─────────────────────────────────────────────────────────────
+
+/// Whether a pool can absorb a given dx without its dy exceeding actual
+/// reserve_out. Always true for CP/CS (their dy is bounded by reserve_out
+/// naturally — CP — or by the input value — CS). For CL, checks against
+/// `cl_max_dx_for_reserve`.
+fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
+    match &pool.view_type {
+        PoolViewType::ConstantProduct => true,
+        PoolViewType::ConstantSum { .. } => {
+            // CS can in principle absorb arbitrary dx but its dy may exceed
+            // reserve_out for large inputs. TODO: add a tight cap analogous to
+            // `cl_max_dx_for_reserve` — currently we rely on `pool_output`'s
+            // post-hoc clamp, which silently truncates and breaks value
+            // conservation if CS gets saturated.
+            let _ = dx;
+            true
+        }
+        PoolViewType::ConcentratedLiquidity {
+            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+        } => {
+            let (a, b) = if *is_a_input {
+                (&pool.reserve_in, &pool.reserve_out)
+            } else {
+                (&pool.reserve_out, &pool.reserve_in)
+            };
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            match swap_math::cl_max_dx_for_reserve(
+                a, b, lp, *is_a_input, spa_num, spa_den, spb_num, spb_den,
+                &fee_num, &fee_den,
+            ) {
+                Some(cap) => dx <= &cap,
+                None => false,
+            }
+        }
+    }
+}
 
 /// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
@@ -283,7 +362,20 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     if !dx_eff.is_positive() {
                         return BigInt::from(0);
                     }
-                    &dx_eff * &fee_den / &fee_mult
+                    let raw = &dx_eff * &fee_den / &fee_mult;
+                    // Cap at the dx that would drive dy to reserve_out. CL
+                    // virtual reserves can far exceed the actual pool reserves;
+                    // without this cap the bisection happily allocates more
+                    // than the pool can pay out, and the tx_builder produces
+                    // a negative pool output → ValueNotConservedUTxO at submit.
+                    let max_dx = swap_math::cl_max_dx_for_reserve(
+                        a, b, lp, *is_a_input, spa_num, spa_den, spb_num, spb_den,
+                        &fee_num, &fee_den,
+                    );
+                    match max_dx {
+                        Some(cap) if raw > cap => cap,
+                        _ => raw,
+                    }
                 }
             }
         })
@@ -374,25 +466,32 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         }
     }
 
-    // Normalize allocations to sum exactly to total_input
+    // Normalize allocations to sum exactly to total_input — but only when we
+    // can do so without exceeding any per-pool CL cap. Adjust the largest
+    // allocation by the rounding remainder; if the result would push it past
+    // its CL cap, leave the allocation undersized so the caller can detect
+    // "can't fully route" via the sum-check in `evaluate_path`.
     let alloc_sum: BigInt = best_allocs.iter().fold(BigInt::from(0), |a, b| &a + b);
-    if &alloc_sum != total_input && alloc_sum.is_positive() {
-        let mut scaled: Vec<BigInt> = best_allocs
-            .iter()
-            .map(|a| a * total_input / &alloc_sum)
-            .collect();
-        let new_sum: BigInt = scaled.iter().fold(BigInt::from(0), |a, b| &a + b);
-        if &new_sum < total_input {
-            // Add remainder to largest allocation
-            let max_idx = scaled
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.cmp(b.1))
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            scaled[max_idx] = &scaled[max_idx] + &(total_input - &new_sum);
+    if &alloc_sum < total_input && alloc_sum.is_positive() {
+        let remainder = total_input - &alloc_sum;
+        // Find a pool whose CL cap (or unbounded CP/CS) can absorb the remainder.
+        let mut absorber: Option<usize> = None;
+        for (i, pool) in pools.iter().enumerate() {
+            if !best_allocs[i].is_positive() {
+                continue;
+            }
+            let proposed = &best_allocs[i] + &remainder;
+            if !pool_can_absorb(pool, &proposed) {
+                continue;
+            }
+            absorber = Some(i);
+            break;
         }
-        best_allocs = scaled;
+        if let Some(i) = absorber {
+            best_allocs[i] = &best_allocs[i] + &remainder;
+        }
+        // If no pool can absorb the remainder, the caller (evaluate_path)
+        // detects sum < total_input and rejects the path.
     }
 
     // Build results
@@ -562,21 +661,76 @@ fn find_paths(
 // ─── Path Evaluation ─────────────────────────────────────────────────────────
 
 /// Evaluate a path: for each hop, split optimally among available pools.
-fn evaluate_path(path: &[PathHop], input_amount: &BigInt) -> Vec<HopResult> {
+/// Returns an empty Vec when any hop can't fully consume its input — e.g. all
+/// the hop's CL pools are saturated and CP/CS alternatives can't soak the
+/// remainder, or the route's pool/step budget would be exceeded. Caller
+/// treats empty as "this path is infeasible".
+fn evaluate_path(
+    path: &[PathHop],
+    input_amount: &BigInt,
+    limits: &RoutingLimits,
+) -> Vec<HopResult> {
     let mut results = Vec::new();
     let mut current_amount = input_amount.clone();
+    // Reserve ≥1 step+pool for each remaining hop so we can't blow the budget
+    // on the first hop and starve the rest.
+    let mut steps_remaining = limits.max_steps;
+    let mut pools_remaining = limits.max_pools;
 
-    for hop in path {
-        let splits = if hop.pools.len() == 1 {
-            let out = pool_output(&hop.pools[0], &current_amount);
+    for (hop_idx, hop) in path.iter().enumerate() {
+        let n_remaining_after = path.len() - hop_idx - 1;
+        let max_splits_here = steps_remaining
+            .saturating_sub(n_remaining_after)
+            .min(pools_remaining.saturating_sub(n_remaining_after))
+            .max(1);
+
+        let splits = if hop.pools.len() == 1 || max_splits_here == 1 {
+            // Single-pool hop OR budget allows only one split: pick the
+            // best single pool for current_amount and route everything
+            // through it. For CL, this guards against virtual-reserve
+            // overrun; CP/CS pass unconditionally.
+            let candidates: Vec<&PoolView> = hop.pools.iter()
+                .filter(|p| pool_can_absorb(p, &current_amount))
+                .collect();
+            if candidates.is_empty() {
+                return Vec::new();
+            }
+            let best = candidates.iter()
+                .max_by_key(|p| pool_output(p, &current_amount))
+                .copied()
+                .expect("candidates non-empty");
+            let out = pool_output(best, &current_amount);
             vec![SplitEntry {
-                pool: hop.pools[0].clone(),
+                pool: best.clone(),
                 input_amount: current_amount.clone(),
                 output_amount: out,
             }]
         } else {
-            optimize_split(&hop.pools, &current_amount)
+            let mut s = optimize_split(&hop.pools, &current_amount);
+            // Cap by per-hop budget: if the unconstrained optimizer chose
+            // more pools than this hop is allowed, keep only the largest
+            // allocations and re-optimize over those.
+            if s.len() > max_splits_here {
+                s.sort_by(|a, b| b.input_amount.cmp(&a.input_amount));
+                let kept_pools: Vec<PoolView> = s.iter()
+                    .take(max_splits_here)
+                    .map(|e| e.pool.clone())
+                    .collect();
+                s = optimize_split(&kept_pools, &current_amount);
+            }
+            // optimize_split may return undersized allocations when CL caps
+            // prevent fully absorbing current_amount. Reject the path in that
+            // case — the order can't fill via this routing.
+            let total_in: BigInt = s.iter().fold(BigInt::from(0), |a, e| &a + &e.input_amount);
+            if &total_in < &current_amount {
+                return Vec::new();
+            }
+            s
         };
+
+        // Charge this hop's actual splits against the remaining budget.
+        steps_remaining = steps_remaining.saturating_sub(splits.len());
+        pools_remaining = pools_remaining.saturating_sub(splits.len());
 
         let total_out: BigInt = splits.iter().fold(BigInt::from(0), |a, s| &a + &s.output_amount);
 
@@ -605,9 +759,16 @@ pub fn find_optimal_route(
     input_token: &AssetClass,
     output_token: &AssetClass,
     amount: &BigInt,
+    limits: RoutingLimits,
 ) -> Option<RoutingPlan> {
     let graph = build_graph(pools);
-    let paths = find_paths(&graph, input_token, output_token, 4);
+    // Each hop adds at least 1 pool and at least 1 step to the route, so
+    // capping search depth at `min(max_pools, max_steps, 4)` discards paths
+    // we'd reject anyway and saves the optimization work.
+    let max_depth = 4
+        .min(limits.max_pools.max(1))
+        .min(limits.max_steps.max(1));
+    let paths = find_paths(&graph, input_token, output_token, max_depth);
 
     if paths.is_empty() {
         return None;
@@ -617,11 +778,23 @@ pub fn find_optimal_route(
     let mut best_output = BigInt::from(0);
 
     for path in &paths {
-        let hops = evaluate_path(path, amount);
+        let hops = evaluate_path(path, amount, &limits);
         let total_out = hops
             .last()
             .map(|h| h.total_output.clone())
             .unwrap_or_else(|| BigInt::from(0));
+
+        // Final safety check (evaluate_path enforces budgets but pool count
+        // can over-count if the same pool ident appears in two hops).
+        let distinct_pools: std::collections::BTreeSet<_> = hops.iter()
+            .flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone()))
+            .collect();
+        let total_steps: usize = hops.iter().map(|h| h.splits.len()).sum();
+        if distinct_pools.len() > limits.max_pools
+            || total_steps > limits.max_steps
+        {
+            continue;
+        }
 
         if total_out > best_output {
             best_output = total_out.clone();
@@ -730,6 +903,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -752,6 +926,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1_000_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -776,6 +951,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -798,6 +974,7 @@ mod tests {
             &ada(),
             &token(0xAA),
             &BigInt::from(10_000_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -820,6 +997,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(5_000_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -845,6 +1023,7 @@ mod tests {
             &token(0xAA),
             &token(0xDD),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -915,6 +1094,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -944,6 +1124,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -974,6 +1155,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(100_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -1009,6 +1191,7 @@ mod tests {
             &token(0xAA),
             &token(0xCC),
             &BigInt::from(300),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -1036,6 +1219,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -1065,6 +1249,7 @@ mod tests {
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_some());
         let plan = route.unwrap();
@@ -1087,6 +1272,7 @@ mod tests {
             &token(0xBB),
             &token(0xCC),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_none());
     }
@@ -1100,6 +1286,7 @@ mod tests {
             &ada(),
             &token(0xAA),
             &BigInt::from(1000),
+            RoutingLimits::unlimited(),
         );
         assert!(route.is_none());
     }

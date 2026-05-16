@@ -546,6 +546,23 @@ pub struct ScooperExecution {
     /// Default: (6, 5) i.e. 20% padding.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
+    /// Pool idents (hex) to exclude from scooping. Used to skip pools whose
+    /// on-chain config is structurally inconsistent (e.g. a CS-classified pool
+    /// with a non-zero fee_split protocol_share — cs_check requires
+    /// `before_lp == after_lp` per swap, so fee_split's cumulative
+    /// `floor(total_fee * ps_num/ps_den)` target is unsatisfiable).
+    #[serde(default)]
+    pub blacklisted_pools: std::collections::BTreeSet<String>,
+    /// Lovelace charged against an order's budget for each pool its route
+    /// touches. 0 = no limit. Together with `cost_per_step_lovelace` this
+    /// gates router fan-out by what the order paid for: a 1-ADA order gets a
+    /// direct match, a 5-ADA order can spread across many pools and hops.
+    #[serde(default)]
+    pub cost_per_pool_lovelace: u64,
+    /// Lovelace charged against an order's budget for each routing "step"
+    /// (split entry across all hops). 0 = no limit.
+    #[serde(default)]
+    pub cost_per_step_lovelace: u64,
 }
 
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }

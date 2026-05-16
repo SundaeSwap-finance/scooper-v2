@@ -16,23 +16,36 @@ use crate::sundaev4::types::*;
 
 
 /// A resolved swap with precomputed math.
+///
+/// For routed orders, the *primary* entry hop split is stored as a
+/// `ResolvedSwap` (because it owns the order input); other entry-hop splits
+/// and all subsequent-hop splits are stored as `ContinuationSwap`. The
+/// `route` field links a primary swap back to its route metadata — `None`
+/// means a direct (non-routed) swap.
 #[derive(Clone)]
 pub struct ResolvedSwap {
     pub order: Arc<SundaeV4Order>,
     pub input_idx: usize,
     pub output_idx: usize,
+    /// Router-recommended input amount; tx_builder uses this directly for
+    /// entry-hop primary swaps (single-pool routes are entry-hop primaries
+    /// with split_count=1).
     pub dx: BigInt,
+    /// Router-recommended output amount. Kept as a fallback / sanity reference;
+    /// tx_builder recomputes dy at tx-time against the actual running pool state.
     pub dy: BigInt,
-    /// For routed orders: the actual output asset and amount (from final hop).
-    /// When None, fulfillment uses this swap's output_idx/dy directly.
-    pub fulfillment_override: Option<FulfillmentOverride>,
+    /// `Some(route_idx)` if this is the entry-hop primary split of a routed
+    /// order — its fulfillment output comes from the route's accumulated
+    /// final-hop dy (see `RouteInfo`). `None` for direct single-hop swaps.
+    pub route: Option<RouteRef>,
 }
 
-/// Override for the fulfillment output of a routed order.
-#[derive(Clone)]
-pub struct FulfillmentOverride {
-    pub output_asset: AssetClass,
-    pub amount: BigInt,
+/// Pointer into `ScoopPlan.routes` describing where in a route this op lives.
+#[derive(Clone, Debug)]
+pub struct RouteRef {
+    pub route_idx: usize,
+    pub hop_idx: usize,
+    pub split_idx: usize,
 }
 
 /// Continuation swap from a routed order passing through this pool.
@@ -41,8 +54,40 @@ pub struct FulfillmentOverride {
 pub struct ContinuationSwap {
     pub input_idx: usize,
     pub output_idx: usize,
+    /// Router-recommended dx. For *entry-hop* continuations this is taken
+    /// verbatim at tx-time (the router's allocation across split pools is the
+    /// authoritative split of the user's offer). For *later-hop* continuations
+    /// this acts as the numerator of a proportional split — tx_builder rescales
+    /// against the actual previous-hop output to handle dy drift from CL
+    /// recompute and similar.
     pub dx: BigInt,
-    pub dy: BigInt,
+    pub route: RouteRef,
+}
+
+/// Per-route metadata, indexed by `RouteRef.route_idx`. Carries the
+/// information the tx-time streaming walk needs to thread dy through hops
+/// and produce a final fulfillment amount for the order.
+#[derive(Clone, Debug)]
+pub struct RouteInfo {
+    /// The order that owns this route — its destination receives the
+    /// `final_output_asset` totaling `final_output` (sum of last-hop dys).
+    pub order: Arc<SundaeV4Order>,
+    /// Per-hop structural info (split count, router's split proportions, etc).
+    pub hops: Vec<RouteHopInfo>,
+    pub final_output_asset: AssetClass,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteHopInfo {
+    /// Router-recommended input allocation per split. At route time this sums
+    /// to either the user's offered amount (hop 0) or the previous hop's
+    /// router-projected dy (later hops). At tx time, *later* hops rescale the
+    /// actual incoming flow proportionally to these values; entry hop uses
+    /// them verbatim.
+    pub split_input_props: Vec<BigInt>,
+    /// Sum of `split_input_props` (= router-time hop input). Used as the
+    /// denominator for the proportional rescale on later hops.
+    pub hop_total_at_route_time: BigInt,
 }
 
 /// A resolved proportional Deposit, precomputed against a snapshot of pool
@@ -83,6 +128,26 @@ pub enum BatchOp {
     Continuation(usize),
     Deposit(usize),
     Withdraw(usize),
+}
+
+/// Cross-batch pointer to an op for the global topological walk. `op_idx`
+/// indexes into `batches[batch_idx].ops_order`.
+#[derive(Clone, Copy, Debug)]
+pub struct GlobalOp {
+    pub batch_idx: usize,
+    pub op_idx: usize,
+}
+
+/// Output of the accumulator: per-pool batches plus the cross-pool info
+/// (routes + global op order) the tx builder needs to thread dy through
+/// multi-hop routes at tx-build time. Walking `global_seq` in order respects
+/// both intra-pool ordering (each pool's `ops_order` is a subsequence) and
+/// inter-pool route ordering (a route's hop k always appears before hop k+1).
+#[derive(Clone)]
+pub struct ScoopPlan {
+    pub batches: Vec<Batch>,
+    pub routes: Vec<RouteInfo>,
+    pub global_seq: Vec<GlobalOp>,
 }
 
 /// A complete batch for one pool, ready for the tx builder.
@@ -349,7 +414,7 @@ pub fn try_execute_order(
         output_idx,
         dx,
         dy,
-        fulfillment_override: None,
+        route: None,
     })
 }
 
@@ -437,7 +502,7 @@ pub fn check_order_executability(
         output_idx,
         dx,
         dy,
-        fulfillment_override: None,
+        route: None,
     })
 }
 

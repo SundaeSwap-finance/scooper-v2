@@ -109,10 +109,10 @@ impl Blueprint {
             (&["constant_product_module", "constant_product", "constantProduct"], "constantProduct", "constant_product"),
             (&["fee_split_module", "fee_split", "feeSplit"], "feeSplit", "fee_split"),
             (&["fairness_module", "fairness"], "fairness", "fairness"),
-            (&["pool_validator", "pool"], "pool", "pool"),
-            (&["order_validator"], "order", "order"),
-            (&["pool_mint"], "poolMint", "pool_mint"),
-            (&["settings_validator"], "settings", "settings"),
+            (&["pool_validator", "pool", "vault"], "pool", "pool"),
+            (&["order_validator", "order"], "order", "order"),
+            (&["pool_mint", "poolMint"], "poolMint", "pool_mint"),
+            (&["settings_validator", "settings"], "settings", "settings"),
         ];
 
         fn find_by_patterns<'a>(bp: &'a Blueprint, patterns: &[&str]) -> Option<&'a Validator> {

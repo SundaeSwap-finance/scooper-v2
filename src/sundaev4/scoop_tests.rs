@@ -380,6 +380,7 @@ mod tests {
 
         let route = router::find_optimal_route(
             &pool_map, &token_e(), &token_b(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
         ).expect("router should find E→A→B path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
         assert!(router::is_routed(&route));
@@ -388,11 +389,11 @@ mod tests {
         accum.try_add_routed_order(&order, &route, &pool_map)
             .expect("routed order should execute");
 
-        let batches = accum.into_batches();
-        assert_eq!(batches.len(), 2, "routed order touches 2 pools");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2, "routed order touches 2 pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&batches, &settings, 1000)
+        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
             .expect("routed E→A→B build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -435,6 +436,7 @@ mod tests {
 
         let route = router::find_optimal_route(
             &pool_map, &token_a(), &token_f(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
         ).expect("router should find A→E→F path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
 
@@ -442,11 +444,11 @@ mod tests {
         accum.try_add_routed_order(&order, &route, &pool_map)
             .expect("routed order should execute");
 
-        let batches = accum.into_batches();
-        assert_eq!(batches.len(), 2, "routed order touches 2 CS pools");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2, "routed order touches 2 CS pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&batches, &settings, 1000)
+        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
             .expect("routed A→E→F build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -502,19 +504,20 @@ mod tests {
         let order_eb = make_order(token_e(), 5_000_000, token_b(), 1, 3);
         let route = router::find_optimal_route(
             &pool_map, &token_e(), &token_b(), &order_eb.swap_offered().1,
+            router::RoutingLimits::unlimited(),
         ).expect("router should find E→B path");
         assert_eq!(route.hops.len(), 2);
 
         accum.try_add_routed_order(&order_eb, &route, &pool_map)
             .expect("routed E→B order should execute");
 
-        let batches = accum.into_batches();
+        let plan = accum.into_plan();
         // CS A/E pool has direct + routed leg, CP pool has direct + routed leg
         // CS E/F pool is not involved (route goes E→A→B, not through E/F)
-        assert_eq!(batches.len(), 2, "direct + routed orders touch 2 pools");
+        assert_eq!(plan.batches.len(), 2, "direct + routed orders touch 2 pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&batches, &settings, 1000)
+        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
             .expect("mixed direct+routed build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());

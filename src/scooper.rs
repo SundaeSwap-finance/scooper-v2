@@ -496,10 +496,14 @@ impl Scooper {
         // falling back to the last processed block slot.
         let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
 
-        // Select collateral — needs enough ADA for total_collateral (TX_FEE * 1.5)
-        // plus min UTxO on the collateral return output.
+        // Select collateral. Must cover total_collateral (= final tx_fee * 1.5)
+        // plus min UTxO on the collateral return output. We size against
+        // `MAX_REAL_TX_FEE` (not the first-pass `TX_FEE` placeholder), since
+        // the rebuild writes the real fee via fee_override — and a too-small
+        // collateral input makes collateral_return drop below min_utxo.
         let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
-        let min_collateral_ada = crate::sundaev4::tx_builder::TX_FEE * 3 / 2 + MIN_COLLATERAL_RETURN;
+        let min_collateral_ada =
+            crate::sundaev4::tx_builder::MAX_REAL_TX_FEE * 3 / 2 + MIN_COLLATERAL_RETURN;
         let collateral = v4_state
             .wallet_utxos
             .iter()
@@ -621,6 +625,28 @@ impl Scooper {
         let mut accum = Accumulator::new(exec.protocol_share);
         let mut checkpoints: Vec<Accumulator> = Vec::new();
 
+        // Base pool view for dispatch:
+        //   1. Drop blacklisted pools (structurally unscoopable; e.g. CS pool
+        //      with non-zero fee_split protocol_share that cs_check can never
+        //      honour).
+        //   2. Overlay chain-tracker predictions so the swap router and
+        //      deposit/withdraw lookups both chain off our own in-flight txs
+        //      rather than the stale on-chain UTxO that we've already spent.
+        //      Without this overlay, the router would route against the
+        //      pre-spend pool input and the resulting tx would race itself —
+        //      node returns BadInputsUTxO since our own predecessor tx in the
+        //      mempool already consumed that input.
+        let pools_filtered: std::collections::BTreeMap<_, _> = v4_state.pools.iter()
+            .filter(|(ident, _)| !exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes())))
+            .map(|(ident, pool)| {
+                let effective = self.v4_chain_tracker
+                    .latest_predicted_pool(ident)
+                    .map(|p| p.pool.clone())
+                    .unwrap_or_else(|| pool.clone());
+                (ident.clone(), effective)
+            })
+            .collect();
+
         let mut skip_no_pool = 0u32;
         let mut skip_add_failed = 0u32;
         let mut skip_no_route = 0u32;
@@ -645,7 +671,7 @@ impl Scooper {
             let mut candidate = accum.clone();
             let added = match &order.constraint {
                 crate::sundaev4::Constraint::Deposit { .. } => {
-                    let Some(pool_ident) = batch::find_pool_for_deposit_order(order, &v4_state.pools) else {
+                    let Some(pool_ident) = batch::find_pool_for_deposit_order(order, &pools_filtered) else {
                         tracing::info!(order = %order.input, "order dispatch: deposit, no pool match");
                         skip_no_pool += 1;
                         continue;
@@ -666,7 +692,7 @@ impl Scooper {
                     }
                 }
                 crate::sundaev4::Constraint::Withdraw { .. } => {
-                    let Some(pool_ident) = batch::find_pool_for_withdraw_order(order, &v4_state.pools) else {
+                    let Some(pool_ident) = batch::find_pool_for_withdraw_order(order, &pools_filtered) else {
                         tracing::info!(order = %order.input, "order dispatch: withdraw, no pool match");
                         skip_no_pool += 1;
                         continue;
@@ -687,15 +713,31 @@ impl Scooper {
                     }
                 }
                 _ => {
-                    // Swap: route through the optimizer regardless of whether
-                    // it ends up as single-pool or split.
+                    // Swap: route through the optimizer against the
+                    // accumulator's *current* pool state, so prior orders'
+                    // depletion is visible. The router then naturally splits
+                    // across CL+non-CL pools when an earlier order has
+                    // drained the optimal CL pool.
                     let (offer_asset, offer_amount) = order.swap_offered();
                     let (ask_asset, _) = order.swap_min_received();
                     if offer_asset == ask_asset {
                         continue;
                     }
+                    let pool_view = candidate.current_pool_view(&pools_filtered);
+                    // Per-order fan-out limits: the order's tx-fee budget
+                    // buys it a number of pools and routing steps. Orders
+                    // paying more get more elaborate routes.
+                    let order_budget_lov: u64 = {
+                        use num_traits::ToPrimitive;
+                        order.datum.budget.clone().unwrap().to_u64().unwrap_or(0)
+                    };
+                    let limits = router::RoutingLimits::from_budget(
+                        order_budget_lov,
+                        exec.cost_per_pool_lovelace,
+                        exec.cost_per_step_lovelace,
+                    );
                     let Some(route) = router::find_optimal_route(
-                        &v4_state.pools, offer_asset, ask_asset, offer_amount,
+                        &pool_view, offer_asset, ask_asset, offer_amount, limits,
                     ) else {
                         tracing::info!(order = %order.input, "order dispatch: swap, no route");
                         skip_no_route += 1;
@@ -709,7 +751,7 @@ impl Scooper {
                         total_output = %route.total_output,
                         "order dispatch",
                     );
-                    match candidate.try_add_routed_order(order, &route, &v4_state.pools) {
+                    match candidate.try_add_routed_order(order, &route, &pool_view) {
                         Ok(_) => true,
                         Err(e) => {
                             skip_route_failed += 1;
@@ -746,20 +788,43 @@ impl Scooper {
 
         // ── Phase 2: Binary search for largest batch within limits ────────
 
-        let within_limits = |accum: &Accumulator| -> bool {
-            let batches = accum.clone().into_batches();
+        /// Three-state result of testing whether a candidate accumulator
+        /// produces a viable tx. We never submit txs we can't evaluate, so
+        /// eval failure is treated as a hard bail — not a "fall back to
+        /// worst-case budget" hint. See the failure taxonomy in scoop().
+        #[derive(Debug)]
+        enum Fitness {
+            Fits,
+            Overbudget,
+            Bail(String),
+        }
+
+        let within_limits = |accum: &Accumulator| -> Fitness {
+            let plan = accum.clone().into_plan();
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                &batches, &settings, &exec, current_slot, language_views,
+                &plan, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+                None,
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(error = %e, n_orders = accum.order_count(), "tx build failed");
-                    return false;
+                    // Build failures here mean the tx couldn't be assembled
+                    // (e.g. tx_builder hit an internal invariant). Bail — it's
+                    // a scooper bug, not a too-many-orders issue.
+                    return Fitness::Bail(format!("build: {e}"));
                 },
             };
 
-            let eval = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+            // Cheap pre-check: if the tx is already over the chain's size
+            // limit, eval would just be wasted work (and noise — we'd dump
+            // contexts for an obviously-too-big tx). Treat as Overbudget so
+            // the binary search shrinks the batch.
+            if build.cbor.len() > exec.max_tx_size {
+                return Fitness::Overbudget;
+            }
+
+            let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
+            let r = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &build.tx_body,
                 &build.redeemers,
                 &build.resolved_inputs,
@@ -768,60 +833,93 @@ impl Scooper {
                 &exec.plutus_v3_cost_model,
                 build.tx_hash,
                 &exec.slot_config,
+                Some(&mut failure),
             ) {
-                Ok(r) => Some(r),
+                Ok(r) => r,
                 Err(e) => {
-                    // Local eval can produce ExplicitErrorTerm where the chain
-                    // would actually accept — particularly for Deposit txs the
-                    // uplc-turbo bytecode path appears to diverge from the
-                    // on-chain interpreter. Don't gate the binary search on
-                    // it: pretend the budget is the worst case so the search
-                    // still picks SOMETHING, and let the actual chain submit
-                    // produce the authoritative verdict.
-                    warn!(error = %e, n_orders = accum.order_count(), "local tx eval failed; submitting anyway with worst-case budget");
-                    None
-                },
+                    // UPLC eval failure = scooper bug (we built a tx that
+                    // doesn't pass our own scripts). Dump the context for
+                    // offline diagnosis, then bail the entire scoop cycle —
+                    // submitting on a guess could execute orders out of
+                    // expected sequence.
+                    if let Some(cap) = failure {
+                        let ctx_dump = format!(
+                            "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                            build.tx_hash_hex,
+                            hex::encode(cap.script_hash),
+                            cap.redeemer_key.tag,
+                            cap.redeemer_key.index,
+                        );
+                        let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                        let tx_dump = format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
+                        let _ = std::fs::write(&tx_dump, &build.cbor);
+                    }
+                    return Fitness::Bail(format!("eval: {e}"));
+                }
             };
 
-            let (total_mem, total_steps) = match &eval {
-                Some(r) => (
-                    r.budgets.iter().map(|(_, eu)| eu.mem).sum(),
-                    r.budgets.iter().map(|(_, eu)| eu.steps).sum(),
-                ),
-                None => (exec.max_tx_ex_mem / 2, exec.max_tx_ex_steps / 2),
-            };
+            let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
+            let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
             let tx_size = build.cbor.len();
 
             let (pad_num, pad_den) = exec.budget_padding;
             let padded_mem = total_mem * pad_num / pad_den;
             let padded_steps = total_steps * pad_num / pad_den;
 
-            padded_mem <= exec.max_tx_ex_mem
+            let fits = padded_mem <= exec.max_tx_ex_mem
                 && padded_steps <= exec.max_tx_ex_steps
-                && tx_size <= exec.max_tx_size
+                && tx_size <= exec.max_tx_size;
+            if fits { Fitness::Fits } else { Fitness::Overbudget }
         };
 
         // Binary search: find the largest checkpoint index that's within limits.
         // checkpoints[i] has (i+1) orders.
+        //
+        // Three-way outcome handling:
+        // - Fits        → best = this index; try larger
+        // - Overbudget  → try smaller
+        // - Bail        → eval failure is a scooper bug. Don't submit anything
+        //                 this cycle — log and return. Context dump is already
+        //                 written by within_limits for offline diagnosis.
         let mut lo: usize = 0;
         let mut hi: usize = checkpoints.len() - 1;
         let mut best: Option<usize> = None;
+        let mut bail_reason: Option<String> = None;
+
+        let probe = |idx: usize| -> Fitness { within_limits(&checkpoints[idx]) };
 
         // Quick check: try the full batch first (common case)
-        if within_limits(&checkpoints[hi]) {
-            best = Some(hi);
-        } else {
-            // Binary search between lo and hi
-            while lo <= hi {
-                let mid = lo + (hi - lo) / 2;
-                if within_limits(&checkpoints[mid]) {
-                    best = Some(mid);
-                    lo = mid + 1;
-                } else {
-                    if mid == 0 { break; }
-                    hi = mid - 1;
+        match probe(hi) {
+            Fitness::Fits => { best = Some(hi); }
+            Fitness::Overbudget => {
+                // Binary search between lo and hi
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    match probe(mid) {
+                        Fitness::Fits => {
+                            best = Some(mid);
+                            lo = mid + 1;
+                        }
+                        Fitness::Overbudget => {
+                            if mid == 0 { break; }
+                            hi = mid - 1;
+                        }
+                        Fitness::Bail(reason) => { bail_reason = Some(reason); break; }
+                    }
                 }
             }
+            Fitness::Bail(reason) => { bail_reason = Some(reason); }
+        }
+
+        if let Some(reason) = bail_reason {
+            warn!(
+                reason,
+                n_candidates = checkpoints.len(),
+                "scoop cycle aborted: tx build or eval failed — likely a scooper bug; \
+                 context dump in /tmp/script-ctx-* for diagnosis",
+            );
+            self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+            return false;
         }
 
         let had_successful_build = best.is_some();
@@ -839,45 +937,74 @@ impl Scooper {
             None => {
                 // Re-run smallest batch (1 order) to capture the error at warn level
                 let diag = checkpoints.first().unwrap();
-                let diag_batches = diag.clone().into_batches();
-                tracing::info!(
-                    diag_batches_n = diag_batches.len(),
-                    diag_order_count = diag.order_count(),
-                    first_batch_swaps = diag_batches.first().map(|b| b.swaps.len()),
-                    first_batch_deposits = diag_batches.first().map(|b| b.deposits.len()),
-                    first_batch_withdraws = diag_batches.first().map(|b| b.withdraws.len()),
-                    "diag rebuild input",
-                );
-                let reason = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                    &diag_batches, &settings, &exec, current_slot, language_views,
+                // Binary search returned None — re-run the smallest checkpoint
+                // (1 order) to determine WHY. The taxonomy:
+                //   - build error    → quarantine (structurally broken)
+                //   - eval failure   → scooper bug; bail (don't quarantine)
+                //   - over budget    → quarantine (one order can't fit; too fat)
+                let diag_plan = diag.clone().into_plan();
+                let (quarantine_reason, eval_bug_reason): (Option<String>, Option<String>) =
+                    match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+                    &diag_plan, &settings, &exec, current_slot, language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+                    None,
                 ) {
-                    Err(e) => format!("build: {e}"),
+                    Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
-                        let dump_path = format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
-                        let _ = std::fs::write(&dump_path, &build.cbor);
-                        info!(path = %dump_path, bytes = build.cbor.len(), tx_hash = %build.tx_hash_hex, "diag: dumped failing build CBOR");
+                        let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
                         match crate::sundaev4::evaluator::evaluate_scoop_tx(
-                        &build.tx_body, &build.redeemers, &build.resolved_inputs,
-                        &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
-                        build.tx_hash, &exec.slot_config,
-                    ) {
-                        Err(e) => format!("eval: {e}"),
-                        Ok(r) => {
-                            let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
-                            let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
-                            let (pad_num, pad_den) = exec.budget_padding;
-                            format!(
-                                "over limits: mem={}/{}, steps={}/{}, size=n/a",
-                                total_mem * pad_num / pad_den, exec.max_tx_ex_mem,
-                                total_steps * pad_num / pad_den, exec.max_tx_ex_steps,
-                            )
-                        }
+                            &build.tx_body, &build.redeemers, &build.resolved_inputs,
+                            &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
+                            build.tx_hash, &exec.slot_config,
+                            Some(&mut failure),
+                        ) {
+                            Err(e) => {
+                                // Eval failure on the minimal batch — definitely a
+                                // scooper bug. Dump context + bail; don't penalise
+                                // the order.
+                                if let Some(cap) = failure {
+                                    let ctx_dump = format!(
+                                        "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                                        build.tx_hash_hex,
+                                        hex::encode(cap.script_hash),
+                                        cap.redeemer_key.tag,
+                                        cap.redeemer_key.index,
+                                    );
+                                    let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                                    let tx_dump = format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
+                                    let _ = std::fs::write(&tx_dump, &build.cbor);
+                                }
+                                (None, Some(format!("eval: {e}")))
+                            }
+                            Ok(r) => {
+                                let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
+                                let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
+                                let (pad_num, pad_den) = exec.budget_padding;
+                                (Some(format!(
+                                    "over limits: mem={}/{}, steps={}/{}, size={}/{}",
+                                    total_mem * pad_num / pad_den, exec.max_tx_ex_mem,
+                                    total_steps * pad_num / pad_den, exec.max_tx_ex_steps,
+                                    build.cbor.len(), exec.max_tx_size,
+                                )), None)
+                            }
                         }
                     }
                 };
 
-                // Permanently quarantine the first order — it's structurally broken
+                if let Some(reason) = eval_bug_reason {
+                    warn!(
+                        reason,
+                        n_candidates = checkpoints.len(),
+                        "scoop cycle aborted: smallest batch fails eval — likely a scooper bug; \
+                         context dumped to /tmp/script-ctx-*",
+                    );
+                    self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    return false;
+                }
+
+                let reason = quarantine_reason.expect("either eval_bug or quarantine reason set");
+                // Quarantine the offending order(s): they're truly structurally
+                // unsound (build error) or too big to ever fit alone (over budget).
                 let bad_inputs = diag.order_inputs();
                 for input in bad_inputs {
                     warn!(order = %input, %reason, "permanently quarantining order");
@@ -913,11 +1040,12 @@ impl Scooper {
         let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
 
         // Build → evaluate → rebuild with exact budgets.
-        let final_batches = accum.clone().into_batches();
+        let final_plan = accum.clone().into_plan();
 
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_batches, &settings, &exec, current_slot, language_views,
+            &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
+            None,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -926,11 +1054,11 @@ impl Scooper {
             }
         };
 
-        // Local eval. If it fails (uplc-turbo divergence vs on-chain interp,
-        // e.g. on deposits) fall back to a worst-case budget so we can still
-        // submit and let the chain be authoritative. Production scoops should
-        // pass eval; this just keeps the door open when uplc-turbo is wrong.
-        let mut first_pass_eval_failed = false;
+        // Local eval. binary search already ran eval on this exact batch and
+        // got Ok, so this should succeed too — anything else is a scooper bug
+        // (race condition, builder non-determinism, etc.). Bail and dump on
+        // failure rather than guessing a budget.
+        let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
         let padded_budgets: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)>
             = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &first_pass.tx_body,
@@ -941,40 +1069,62 @@ impl Scooper {
                 &exec.plutus_v3_cost_model,
                 first_pass.tx_hash,
                 &exec.slot_config,
+                Some(&mut failure),
             ) {
                 Ok(r) => {
-                    // TODO: uplc-turbo underestimates the fairness script by
-                    // ~12% vs the Cardano node evaluator. Apply 15% padding
-                    // until the root cause is identified and fixed.
-                    r.budgets.iter().map(|(k, eu)| {
-                        (k.clone(), pallas_primitives::ExUnits {
-                            mem: eu.mem + eu.mem / 7,
-                            steps: eu.steps + eu.steps / 7,
-                        })
-                    }).collect()
+                    // Submit the evaluator's exact budgets with no padding. If
+                    // turbo underestimates and the node rejects the tx for
+                    // exceeding budget, the submit-failure branch dumps the tx
+                    // + resolved inputs to /tmp/submit-fail-* so the divergence
+                    // can be shared with the uplc-turbo team.
+                    r.budgets.iter().map(|(k, eu)| (k.clone(), eu.clone())).collect()
                 }
                 Err(e) => {
-                    first_pass_eval_failed = true;
-                    warn!(error = %e, tx_hash = %first_pass.tx_hash_hex, "final multi-pool eval failed; submitting with worst-case budget");
-                    // Empirical observation: typical multi-pool scoop redeemers
-                    // run at ~750k mem / 280M steps each. Pick a generous-but-
-                    // safe per-redeemer budget so the sum stays well under the
-                    // tx limits. With N redeemers the total is N × (1M, 350M);
-                    // for a 10-redeemer tx that's 10M mem / 3.5B steps, still
-                    // comfortably under the 16.5M / 10B caps.
-                    first_pass.redeemers.iter().map(|(k, _, _)| {
-                        (k.clone(), pallas_primitives::ExUnits {
-                            mem: 1_000_000,
-                            steps: 350_000_000,
-                        })
-                    }).collect()
+                    if let Some(cap) = failure {
+                        let ctx_dump = format!(
+                            "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                            first_pass.tx_hash_hex,
+                            hex::encode(cap.script_hash),
+                            cap.redeemer_key.tag,
+                            cap.redeemer_key.index,
+                        );
+                        let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                        let tx_dump = format!("/tmp/scoop-tx-{}.cbor", first_pass.tx_hash_hex);
+                        let _ = std::fs::write(&tx_dump, &first_pass.cbor);
+                    }
+                    warn!(
+                        error = %e,
+                        tx_hash = %first_pass.tx_hash_hex,
+                        "first_pass eval failed after binary-search Ok — likely a scooper bug; \
+                         context dumped to /tmp/script-ctx-* — aborting scoop cycle",
+                    );
+                    self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    return false;
                 }
             };
 
+        // Compute the exact protocol fee from the first-pass size and the
+        // evaluated ex_units. The final rebuild changes per-order fee share
+        // (and therefore output ADA values), but those values stay in the
+        // same CBOR uint encoding bracket (5 bytes for amounts in the
+        // hundreds of thousands to billions of lovelace), so final size
+        // matches first_pass size to within 0–1 bytes. Add a small buffer
+        // anyway in case the encoding nudges, since fee underpayment fails
+        // the submit.
+        let total_eval_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
+        let total_eval_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
+        let computed_fee = crate::sundaev4::tx_builder::compute_tx_fee(
+            first_pass.cbor.len() as u64,
+            total_eval_mem,
+            total_eval_steps,
+            first_pass.total_ref_script_bytes,
+        ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
+
         let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_batches, &settings, &exec, current_slot, language_views,
+            &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, Some(&padded_budgets),
             &v4_state.ref_utxo_outputs,
+            Some(computed_fee),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -984,43 +1134,26 @@ impl Scooper {
             }
         };
 
-        // If first-pass eval failed, re-run the evaluator on the rebuilt tx
-        // (with worst-case budgets). The eval will likely fail again — but
-        // the script context dump now corresponds to the tx hash we're
-        // actually submitting on chain, which is what we want for diffing.
-        if first_pass_eval_failed {
-            let _ = crate::sundaev4::evaluator::evaluate_scoop_tx(
-                &final_tx.tx_body,
-                &final_tx.redeemers,
-                &final_tx.resolved_inputs,
-                &final_tx.resolved_ref_inputs,
-                script_store,
-                &exec.plutus_v3_cost_model,
-                final_tx.tx_hash,
-                &exec.slot_config,
-            );
-        }
-
         let n_orders = accum.order_count();
         let n_pools = accum.pools.len();
         let pool_idents: Vec<_> = accum.pools.keys().cloned().collect();
 
+        let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
+        let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
+        let final_size = final_tx.cbor.len();
         info!(
             tx_hash = %final_tx.tx_hash_hex,
             n_orders,
             n_pools,
             pools = ?pool_idents.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            submitted_mem,
+            mem_pct = format!("{:.1}%", submitted_mem as f64 / exec.max_tx_ex_mem as f64 * 100.0),
+            submitted_steps,
+            steps_pct = format!("{:.1}%", submitted_steps as f64 / exec.max_tx_ex_steps as f64 * 100.0),
+            final_size,
+            size_pct = format!("{:.1}%", final_size as f64 / exec.max_tx_size as f64 * 100.0),
             "multi-pool scoop tx built, submitting"
         );
-
-        // Dump tx CBOR for offline analysis. Filename includes tx hash so
-        // every attempt is preserved; cleanup is left to the operator.
-        let dump_path = format!("/tmp/scoop-tx-{}.cbor", final_tx.tx_hash_hex);
-        if let Err(e) = std::fs::write(&dump_path, &final_tx.cbor) {
-            warn!(error = %e, path = %dump_path, "failed to write tx CBOR dump");
-        } else {
-            info!(path = %dump_path, bytes = final_tx.cbor.len(), "wrote tx CBOR dump");
-        }
 
         let submit_start = std::time::Instant::now();
         let submit_result = crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await;
@@ -1031,12 +1164,18 @@ impl Scooper {
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 
+                // Persist the submitted tx CBOR for offline replay / diffing.
+                let tx_dump = format!("/tmp/scoop-tx-{}.cbor", final_tx.tx_hash_hex);
+                if let Err(e) = std::fs::write(&tx_dump, &final_tx.cbor) {
+                    warn!(error = %e, path = %tx_dump, "failed to write tx CBOR dump");
+                }
+
                 // Per-pool-family attribution: a batch is a list of pools,
                 // each typed. Count the orders against each family that
                 // appeared in the batch (a mixed-pool tx increments
                 // multiple families).
                 use crate::sundaev4::PoolType;
-                for batch in &final_batches {
+                for batch in &final_plan.batches {
                     let family = match &batch.pool.pool_type {
                         PoolType::ConstantProduct { .. } => crate::metrics::PoolFamily::ConstantProduct,
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
@@ -1050,7 +1189,7 @@ impl Scooper {
                 // and withdraws all sit on real on-chain UTxOs and must be
                 // tracked as in-flight so the next iteration doesn't re-attempt
                 // them.
-                let consumed_orders: Vec<_> = final_batches.iter()
+                let consumed_orders: Vec<_> = final_plan.batches.iter()
                     .flat_map(|b| {
                         b.swaps.iter().map(|s| s.order.clone())
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
@@ -1080,7 +1219,19 @@ impl Scooper {
             }
             Err(e) => {
                 let msg = e.to_string();
-                let reason = if msg.contains("BadInputsUTxO") {
+                // Race-lost classifier covers both shapes the node uses when
+                // our inputs were already spent:
+                //   - BadInputsUTxO: somebody else's tx beat us to a pool/order
+                //   - ConwayMempoolFailure "All inputs are spent. Transaction
+                //     has probably already been included": our own previous
+                //     submission was already accepted and we resubmitted
+                //     (typically a state-lag artefact between submit and
+                //     indexer-confirm). Both should be treated as RaceLost so
+                //     we don't flag them as uplc-turbo divergence.
+                let is_race_lost = msg.contains("BadInputsUTxO")
+                    || msg.contains("ConwayMempoolFailure")
+                    || msg.contains("All inputs are spent");
+                let reason = if is_race_lost {
                     crate::metrics::BatchFailureReason::RaceLost
                 } else {
                     crate::metrics::BatchFailureReason::SubmitError
@@ -1122,7 +1273,20 @@ impl Scooper {
                     }
                     self.sync_quarantine_metrics();
                 } else {
-                    error!(error = %msg, tx_hash = %final_tx.tx_hash_hex, "multi-pool scoop tx submit failed");
+                    // Non-race submit failures most often mean the node
+                    // disagreed with our local eval on script budget. Dump
+                    // the tx CBOR so we can hand it to the uplc-turbo team
+                    // to diagnose the divergence.
+                    let dump_path = format!("/tmp/submit-fail-{}.cbor", final_tx.tx_hash_hex);
+                    if let Err(write_err) = std::fs::write(&dump_path, &final_tx.cbor) {
+                        warn!(error = %write_err, path = %dump_path, "failed to write submit-fail tx dump");
+                    }
+                    error!(
+                        error = %msg,
+                        tx_hash = %final_tx.tx_hash_hex,
+                        dump = %dump_path,
+                        "multi-pool scoop tx submit failed — tx CBOR dumped for uplc-turbo diagnosis"
+                    );
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);

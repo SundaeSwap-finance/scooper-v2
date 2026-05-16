@@ -11,33 +11,66 @@ use std::sync::Arc;
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::Ident;
-use crate::sundaev4::batch::{self, Batch, BatchOp, ContinuationSwap, FulfillmentOverride, ResolvedSwap};
+use crate::sundaev4::batch::{
+    self, Batch, BatchOp, ContinuationSwap, GlobalOp, ResolvedSwap, RouteHopInfo, RouteInfo,
+    RouteRef, ScoopPlan,
+};
 use crate::sundaev4::router::RoutingPlan;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::SundaeV4Pool;
 
 /// Per-pool running state within a multi-pool tx being built incrementally.
+///
+/// The accumulator mirrors the tx-builder's streaming walk so that
+/// CL swap math (which depends on `total_lp` via virtual reserves) gives the
+/// *same* dy at accumulation time as at tx-build time. Without this, the
+/// router would route against the accumulator's projection and the tx-builder
+/// would compute different dys, leading to value-conservation failures.
+///
+/// Specifically: `running_total_lp` is incrementally bumped per swap entry
+/// (cumulative-target trick on protocol_lp), and grown/shrunk by
+/// deposit/withdraw LP deltas. Use this for both router queries and swap
+/// math.
 #[derive(Clone)]
 pub struct PoolAccum {
     pub pool: Arc<SundaeV4Pool>,
     pub ident: Ident,
     pub running_assets: Vec<(AssetClass, BigInt)>,
-    pub initial_total_lp: BigInt,
+    /// Live LP including per-entry protocol_lp bumps and deposit/withdraw
+    /// effects. Mirrors tx_builder's running_total_lp at this point in the walk.
+    pub running_total_lp: BigInt,
+    pub running_circ_lp: BigInt,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<crate::sundaev4::batch::ResolvedDeposit>,
     pub withdraws: Vec<crate::sundaev4::batch::ResolvedWithdraw>,
-    /// Fee budget accumulated incrementally as operations are applied.
-    /// Computed inline so we don't need to replay in the wrong order.
-    total_fee_budget: BigInt,
+    /// Cumulative gross fee_budget across all swap entries in this pool.
+    /// Used together with `cum_protocol_lp` for the per-entry protocol_lp
+    /// distribution (cumulative-target trick).
+    cum_gross_fb: BigInt,
+    /// Cumulative protocol_lp captured so far = floor(cum_gross_fb * ps_num / ps_den).
+    cum_protocol_lp: BigInt,
+    /// Per-pool protocol_share (num, den). Snapped at first-touch from the
+    /// pool's fee_split_config (or global default if unset).
+    ps: (BigInt, BigInt),
     /// Interleaved order of swaps, continuations, and deposits.
     ops_order: Vec<BatchOp>,
 }
 
 /// Incrementally-built multi-pool transaction state.
+///
+/// `routes` and `global_seq` track cross-pool data the tx_builder needs to
+/// recompute dy at tx-time and thread it through multi-hop cascades:
+/// - `routes[r]` describes route `r`'s hop structure / fulfillment asset.
+/// - `global_seq` records ops in the order they were added across all pools;
+///   this is the topological order the tx-time streaming walk consumes.
 #[derive(Clone)]
 pub struct Accumulator {
     pub pools: BTreeMap<Ident, PoolAccum>,
+    routes: Vec<RouteInfo>,
+    /// Order ops were added across all pools, stored as `(pool_ident, op_idx_in_pool)`.
+    /// Resolved to `(batch_idx, op_idx)` in `into_plan` once batches are materialised.
+    global_seq_raw: Vec<(Ident, usize)>,
     protocol_share: (u64, u64),
 }
 
@@ -45,8 +78,67 @@ impl Accumulator {
     pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
             pools: BTreeMap::new(),
+            routes: Vec::new(),
+            global_seq_raw: Vec::new(),
             protocol_share,
         }
+    }
+
+    /// Initialise a fresh per-pool state from the chain pool.
+    fn fresh_pool_accum(
+        &self,
+        pool_ident: &Ident,
+        effective_pool: &Arc<SundaeV4Pool>,
+    ) -> PoolAccum {
+        // CS pools must have ps=(0, 1): their Operate validator forbids LP
+        // change on swap entries; protocol cuts flow via bounty/claim. See
+        // matching note in tx_builder's per_pool_ps.
+        let ps = if matches!(effective_pool.pool_type, crate::sundaev4::types::PoolType::ConstantSum { .. }) {
+            (BigInt::from(0), BigInt::from(1))
+        } else {
+            effective_pool
+                .fee_split_config
+                .as_ref()
+                .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
+                .unwrap_or_else(|| (
+                    BigInt::from(self.protocol_share.0),
+                    BigInt::from(self.protocol_share.1),
+                ))
+        };
+        PoolAccum {
+            pool: effective_pool.clone(),
+            ident: pool_ident.clone(),
+            running_assets: effective_pool.pool_datum.assets.clone(),
+            running_total_lp: effective_pool.pool_datum.total_lp.clone(),
+            running_circ_lp: effective_pool.pool_datum.circulating_lp.clone(),
+            swaps: Vec::new(),
+            continuations: Vec::new(),
+            deposits: Vec::new(),
+            withdraws: Vec::new(),
+            cum_gross_fb: BigInt::from(0),
+            cum_protocol_lp: BigInt::from(0),
+            ps,
+            ops_order: Vec::new(),
+        }
+    }
+
+    /// Build a transient pool map reflecting the accumulator's running state.
+    /// Pools the accumulator hasn't touched fall through to `fallback`. Use
+    /// this for router queries so the router accounts for prior orders'
+    /// depletion of pool reserves.
+    pub fn current_pool_view(
+        &self,
+        fallback: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    ) -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
+        let mut view: BTreeMap<Ident, Arc<SundaeV4Pool>> = fallback.clone();
+        for (ident, accum) in &self.pools {
+            let mut synthetic = (*accum.pool).clone();
+            synthetic.pool_datum.assets = accum.running_assets.clone();
+            synthetic.pool_datum.total_lp = accum.running_total_lp.clone();
+            synthetic.pool_datum.circulating_lp = accum.running_circ_lp.clone();
+            view.insert(ident.clone(), Arc::new(synthetic));
+        }
+        view
     }
 
     /// Try to add an order targeting `pool_ident`. If the pool hasn't been
@@ -60,25 +152,13 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> Result<(), String> {
-        let accum = self.pools.entry(pool_ident.clone()).or_insert_with(|| {
-            PoolAccum {
-                pool: effective_pool.clone(),
-                ident: pool_ident.clone(),
-                running_assets: effective_pool.pool_datum.assets.clone(),
-                initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
-                swaps: Vec::new(),
-                continuations: Vec::new(),
-                deposits: Vec::new(),
-                withdraws: Vec::new(),
-                total_fee_budget: BigInt::from(0),
-                ops_order: Vec::new(),
-            }
-        });
+        let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
+        let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
 
         let swap = batch::try_execute_order(
             order,
             &accum.running_assets,
-            &accum.initial_total_lp,
+            &accum.running_total_lp,
             &effective_pool.pool_type,
         )?;
 
@@ -91,18 +171,28 @@ impl Accumulator {
         accum.running_assets[swap.output_idx].1 =
             &accum.running_assets[swap.output_idx].1 - &swap.dy;
 
-        // Accumulate fee budget with correct intermediate reserves
+        // Per-entry protocol_lp bump (cumulative-target trick — see tx_builder).
+        // Keeps running_total_lp in sync with what tx_builder will see, so any
+        // CL dys computed against the post-bump LP match between accumulator
+        // and tx_builder. CS pools have ps=(0, _) by current design so this is
+        // a no-op for them.
         let fb = swap_math::compute_fee_budget(
             &effective_pool.pool_type,
             &prev_assets,
             &accum.running_assets,
-            &accum.initial_total_lp,
+            &accum.running_total_lp,
         );
-        accum.total_fee_budget = &accum.total_fee_budget + &fb;
+        accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
+        let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
+        let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
+        accum.cum_protocol_lp = new_cum_protocol_lp;
+        accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
 
         let swap_idx = accum.swaps.len();
         accum.swaps.push(swap);
+        let op_idx = accum.ops_order.len();
         accum.ops_order.push(BatchOp::Swap(swap_idx));
+        self.global_seq_raw.push((pool_ident.clone(), op_idx));
         Ok(())
     }
 
@@ -121,26 +211,14 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> Result<(), String> {
-        let accum = self.pools.entry(pool_ident.clone()).or_insert_with(|| {
-            PoolAccum {
-                pool: effective_pool.clone(),
-                ident: pool_ident.clone(),
-                running_assets: effective_pool.pool_datum.assets.clone(),
-                initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
-                swaps: Vec::new(),
-                continuations: Vec::new(),
-                deposits: Vec::new(),
-                withdraws: Vec::new(),
-                total_fee_budget: BigInt::from(0),
-                ops_order: Vec::new(),
-            }
-        });
+        let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
+        let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
 
         // Build a transient pool reflecting the accumulator's running reserves
         // so the resolver applies to the post-previous-ops state.
         let mut transient = (**effective_pool).clone();
         transient.pool_datum.assets = accum.running_assets.clone();
-        transient.pool_datum.total_lp = accum.initial_total_lp.clone();
+        transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let deposit = batch::resolve_proportional_deposit(&transient, order)?;
 
@@ -148,12 +226,14 @@ impl Accumulator {
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
             *amt = &*amt + &deposit.dx[i];
         }
-        // total_lp grows by lp_minted.
-        accum.initial_total_lp = &accum.initial_total_lp + &deposit.lp_minted;
+        accum.running_total_lp = &accum.running_total_lp + &deposit.lp_minted;
+        accum.running_circ_lp = &accum.running_circ_lp + &deposit.lp_minted;
 
         let dep_idx = accum.deposits.len();
         accum.deposits.push(deposit);
+        let op_idx = accum.ops_order.len();
         accum.ops_order.push(BatchOp::Deposit(dep_idx));
+        self.global_seq_raw.push((pool_ident.clone(), op_idx));
         Ok(())
     }
 
@@ -167,24 +247,12 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> Result<(), String> {
-        let accum = self.pools.entry(pool_ident.clone()).or_insert_with(|| {
-            PoolAccum {
-                pool: effective_pool.clone(),
-                ident: pool_ident.clone(),
-                running_assets: effective_pool.pool_datum.assets.clone(),
-                initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
-                swaps: Vec::new(),
-                continuations: Vec::new(),
-                deposits: Vec::new(),
-                withdraws: Vec::new(),
-                total_fee_budget: BigInt::from(0),
-                ops_order: Vec::new(),
-            }
-        });
+        let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
+        let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
 
         let mut transient = (**effective_pool).clone();
         transient.pool_datum.assets = accum.running_assets.clone();
-        transient.pool_datum.total_lp = accum.initial_total_lp.clone();
+        transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let withdraw = batch::resolve_proportional_withdraw(&transient, order)?;
 
@@ -192,24 +260,27 @@ impl Accumulator {
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
             *amt = &*amt - &withdraw.dy[i];
         }
-        // total_lp shrinks by lp_burned.
-        accum.initial_total_lp = &accum.initial_total_lp - &withdraw.lp_burned;
+        accum.running_total_lp = &accum.running_total_lp - &withdraw.lp_burned;
+        accum.running_circ_lp = &accum.running_circ_lp - &withdraw.lp_burned;
 
         let w_idx = accum.withdraws.len();
         accum.withdraws.push(withdraw);
+        let op_idx = accum.ops_order.len();
         accum.ops_order.push(BatchOp::Withdraw(w_idx));
+        self.global_seq_raw.push((pool_ident.clone(), op_idx));
         Ok(())
     }
 
     /// Try to add a routed order (multi-hop and/or split) to the accumulator.
     ///
-    /// For the entry hop's primary pool (largest allocation), creates a
-    /// `ResolvedSwap` with a `fulfillment_override` pointing to the final
-    /// hop's output. For all other pools in the route (including split pools
-    /// on the entry hop), creates `ContinuationSwap` entries.
+    /// Records the route as `RouteInfo` for tx-build-time use. The entry-hop
+    /// first split becomes a `ResolvedSwap` (which owns the order input).
+    /// Every other split — entry-hop or later — becomes a `ContinuationSwap`.
+    /// Both carry a `RouteRef { route_idx, hop_idx, split_idx }` so the
+    /// tx-builder can thread dy through hops at build time.
     ///
-    /// Returns `Ok(())` on success or `Err(reason)` if the route can't execute
-    /// against the running pool states.
+    /// Fee budget computed here is router-projected; tx_builder recomputes
+    /// fresh per-pool fee budgets during its streaming walk.
     pub fn try_add_routed_order(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,
@@ -218,12 +289,13 @@ impl Accumulator {
     ) -> Result<(), String> {
         use num_traits::Signed;
 
-        // Clone pool accums for trial execution
+        // Clone pool accums for trial execution; only committed on full success.
         let mut trial_pools = self.pools.clone();
+        let mut trial_global_seq: Vec<(Ident, usize)> = Vec::new();
 
-        // Track the primary pool ident (first split of first hop) for
-        // fulfillment override lookup after all hops complete.
-        let mut primary_pool_ident: Option<Ident> = None;
+        // Reserve route_idx; populate `hops` as we walk.
+        let route_idx = self.routes.len();
+        let mut hops_info: Vec<RouteHopInfo> = Vec::with_capacity(route.hops.len());
 
         let mut final_output_asset: Option<AssetClass> = None;
         let mut final_output_amount = BigInt::from(0);
@@ -244,6 +316,11 @@ impl Accumulator {
                 .map(|s| s.input_amount.clone())
                 .fold(BigInt::from(0), |a, b| &a + &b);
 
+            hops_info.push(RouteHopInfo {
+                split_input_props: hop.splits.iter().map(|s| s.input_amount.clone()).collect(),
+                hop_total_at_route_time: hop_total.clone(),
+            });
+
             for (split_idx, split) in hop.splits.iter().enumerate() {
                 let pool_ident = &split.pool.ident;
 
@@ -257,23 +334,11 @@ impl Accumulator {
                 };
 
                 // Initialize pool accum if not already present
-                let accum = trial_pools.entry(pool_ident.clone()).or_insert_with(|| {
-                    PoolAccum {
-                        pool: effective_pool.clone(),
-                        ident: pool_ident.clone(),
-                        running_assets: effective_pool.pool_datum.assets.clone(),
-                        initial_total_lp: effective_pool.pool_datum.total_lp.clone(),
-                        swaps: Vec::new(),
-                        continuations: Vec::new(),
-                        deposits: Vec::new(),
-                        withdraws: Vec::new(),
-                        total_fee_budget: BigInt::from(0),
-                        ops_order: Vec::new(),
-                    }
-                });
+                let fresh = self.fresh_pool_accum(pool_ident, &effective_pool);
+                let accum = trial_pools.entry(pool_ident.clone()).or_insert(fresh);
 
                 // Determine input/output direction for this pool
-                let (input_idx, output_idx) = self.find_direction_for_tokens(
+                let (input_idx, output_idx) = Self::find_direction_for_tokens_static(
                     &accum.running_assets,
                     &hop.input_token,
                     &hop.output_token,
@@ -304,7 +369,7 @@ impl Accumulator {
                 let dy = batch::compute_swap_result(
                     &effective_pool.pool_type,
                     &accum.running_assets,
-                    &accum.initial_total_lp,
+                    &accum.running_total_lp,
                     input_idx,
                     output_idx,
                     &dx,
@@ -322,14 +387,19 @@ impl Accumulator {
                 accum.running_assets[output_idx].1 =
                     &accum.running_assets[output_idx].1 - &dy;
 
-                // Accumulate fee budget with correct intermediate reserves
+                // Per-entry protocol_lp bump (mirrors tx_builder) so CL dy
+                // computed for subsequent ops in this pool matches tx-time.
                 let fb = swap_math::compute_fee_budget(
                     &effective_pool.pool_type,
                     &prev_assets,
                     &accum.running_assets,
-                    &accum.initial_total_lp,
+                    &accum.running_total_lp,
                 );
-                accum.total_fee_budget = &accum.total_fee_budget + &fb;
+                accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
+                let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
+                let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
+                accum.cum_protocol_lp = new_cum_protocol_lp;
+                accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
 
                 this_hop_output = &this_hop_output + &dy;
 
@@ -339,11 +409,12 @@ impl Accumulator {
                     final_output_amount = &final_output_amount + &dy;
                 }
 
-                if is_entry_hop && split_idx == 0 {
-                    primary_pool_ident = Some(pool_ident.clone());
-                }
+                let route_ref = RouteRef { route_idx, hop_idx, split_idx };
 
-                // Push to trial accum with ops_order tracking
+                // Entry-hop first split is the primary (owns order). All
+                // others are continuations with route metadata for tx-time
+                // cascade reconstruction.
+                let op_idx_in_pool = accum.ops_order.len();
                 if is_entry_hop && split_idx == 0 {
                     let idx = accum.swaps.len();
                     accum.swaps.push(ResolvedSwap {
@@ -352,7 +423,7 @@ impl Accumulator {
                         output_idx,
                         dx: dx.clone(),
                         dy: dy.clone(),
-                        fulfillment_override: None,
+                        route: Some(route_ref),
                     });
                     accum.ops_order.push(BatchOp::Swap(idx));
                 } else {
@@ -361,10 +432,11 @@ impl Accumulator {
                         input_idx,
                         output_idx,
                         dx: dx.clone(),
-                        dy: dy.clone(),
+                        route: route_ref,
                     });
                     accum.ops_order.push(BatchOp::Continuation(idx));
                 }
+                trial_global_seq.push((pool_ident.clone(), op_idx_in_pool));
             }
 
             prev_hop_output = this_hop_output;
@@ -379,31 +451,24 @@ impl Accumulator {
             ));
         }
 
-        // Set fulfillment override on the primary swap if multi-hop or multi-split.
-        // Must update the swap in trial_pools directly since that's what gets committed.
-        if route.hops.len() > 1 || route.hops.iter().any(|h| h.splits.len() > 1) {
-            if let (Some(pi), Some(out_asset)) = (&primary_pool_ident, &final_output_asset) {
-                if let Some(accum) = trial_pools.get_mut(pi) {
-                    // The primary swap was the last one pushed to this pool's accum
-                    if let Some(swap) = accum.swaps.last_mut() {
-                        swap.fulfillment_override = Some(FulfillmentOverride {
-                            output_asset: out_asset.clone(),
-                            amount: final_output_amount.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        let route_info = RouteInfo {
+            order: order.clone(),
+            hops: hops_info,
+            final_output_asset: final_output_asset
+                .ok_or_else(|| "route has no hops".to_string())?,
+        };
 
-        // Commit: replace pool states
+        // Commit: replace pool states + record route + append to global_seq
         self.pools = trial_pools;
+        self.routes.push(route_info);
+        self.global_seq_raw.extend(trial_global_seq);
 
         Ok(())
     }
 
     /// Find which pool asset indices correspond to the given input/output tokens.
-    fn find_direction_for_tokens(
-        &self,
+    /// Static variant — usable while `trial_pools` holds a mutable borrow of `self.pools`.
+    fn find_direction_for_tokens_static(
         running_assets: &[(AssetClass, BigInt)],
         input_token: &AssetClass,
         output_token: &AssetClass,
@@ -445,14 +510,21 @@ impl Accumulator {
         self.pools.is_empty() || self.order_count() == 0
     }
 
-    /// Convert accumulated state into `Vec<Batch>` for the tx builder.
+    /// Convert accumulated state into a `ScoopPlan` for the tx builder.
     ///
-    /// Uses the fee budget that was accumulated incrementally during
-    /// `try_add_order` / `try_add_routed_order` to compute `final_total_lp`.
-    pub fn into_batches(self) -> Vec<Batch> {
+    /// `ScoopPlan` carries per-pool `Batch`es plus the cross-pool metadata the
+    /// tx builder needs to recompute dy at tx-time and thread it through
+    /// multi-hop routes: `routes` (per-route hop structure + fulfillment asset)
+    /// and `global_seq` (topological op order). Fee budget computed here is
+    /// router-projected — tx_builder recomputes it fresh during its streaming
+    /// walk.
+    pub fn into_plan(self) -> ScoopPlan {
         let mut batches = Vec::new();
+        // Map Ident → batch_idx so we can translate `global_seq_raw` (keyed by
+        // pool_ident) into `GlobalOp { batch_idx, op_idx }`.
+        let mut ident_to_batch_idx: BTreeMap<Ident, usize> = BTreeMap::new();
 
-        for (_ident, accum) in self.pools {
+        for (ident, accum) in self.pools {
             if accum.swaps.is_empty()
                 && accum.continuations.is_empty()
                 && accum.deposits.is_empty()
@@ -461,17 +533,14 @@ impl Accumulator {
                 continue;
             }
 
-            // Fee budget was accumulated incrementally during try_add_order /
-            // try_add_routed_order, so we use it directly instead of replaying
-            // (replay in a different order than accumulation would produce wrong
-            // intermediate reserves when continuations are interleaved with swaps).
-            let total_protocol_lp = swap_math::compute_protocol_lp(
-                &accum.total_fee_budget,
-                self.protocol_share.0,
-                self.protocol_share.1,
-            );
-            let final_total_lp = &accum.initial_total_lp + &total_protocol_lp;
+            // Accumulator already applied per-entry protocol_lp bumps as it
+            // went, so `running_total_lp` is the final LP including all
+            // protocol_lp captured for this pool. tx_builder computes its own
+            // per-entry values during its streaming walk — this field is
+            // informational (used by tests).
+            let final_total_lp = accum.running_total_lp.clone();
 
+            ident_to_batch_idx.insert(ident.clone(), batches.len());
             batches.push(Batch {
                 pool: accum.pool,
                 pool_ident: accum.ident,
@@ -485,7 +554,31 @@ impl Accumulator {
             });
         }
 
-        batches
+        // Resolve raw (Ident, op_idx) entries to (batch_idx, op_idx). Skip
+        // entries pointing at filtered-out empty pools — none should exist
+        // since global_seq is only populated when an op was actually pushed.
+        let global_seq: Vec<GlobalOp> = self.global_seq_raw
+            .iter()
+            .filter_map(|(ident, op_idx)| {
+                ident_to_batch_idx.get(ident).map(|&batch_idx| GlobalOp {
+                    batch_idx,
+                    op_idx: *op_idx,
+                })
+            })
+            .collect();
+
+        return ScoopPlan {
+            batches,
+            routes: self.routes,
+            global_seq,
+        };
+    }
+
+    /// Backwards-compatible: return only the batches, dropping route/global_seq
+    /// metadata. Used by tests that don't drive the tx_builder.
+    #[cfg(test)]
+    pub fn into_batches(self) -> Vec<Batch> {
+        self.into_plan().batches
     }
 }
 
