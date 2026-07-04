@@ -160,6 +160,10 @@ pub fn build_multi_pool_scoop_tx(
     ex_units: Option<&[(RedeemersKey, ExUnits)]>,
     ref_utxo_outputs: &BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     fee_override: Option<u64>,
+    // `order_configs`: OrderConfig settings entries keyed by token name —
+    // resolves each order's `config_token` to its `required_constraints`
+    // set so the right constraint-module withdrawals can be added (PR #11).
+    order_configs: &BTreeMap<Vec<u8>, std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>>,
 ) -> Result<MultiPoolBuildResult> {
     // First-pass builds use the TX_FEE upper bound; the rebuild passes the
     // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
@@ -835,15 +839,52 @@ pub fn build_multi_pool_scoop_tx(
     let mut input_sorted_order: Vec<usize> = (0..n_orders).collect();
     input_sorted_order.sort_by_key(|&i| order_filtered_indices[i]);
 
+    // Modular order constraints (PR #11): each order references an
+    // OrderConfig settings entry by `config_token`. Build `configs[]` =
+    // unique config_tokens used by orders in this batch, and set each
+    // entry's `config_index` to its config's slot in that list. Each
+    // config's `ref_index` is filled in further down, once the canonical
+    // ref-input ordering is known.
+    let order_config_token = |flat_idx: usize| -> Vec<u8> {
+        let flat = &flat_orders[flat_idx];
+        let batch = &batches[flat.batch_idx];
+        match &flat.kind {
+            FlatOrderKind::Swap(i) => batch.swaps[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Deposit(i) => batch.deposits[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Withdraw(i) => batch.withdraws[*i].order.datum.config_token.clone(),
+        }
+    };
+    let mut unique_config_tokens: Vec<Vec<u8>> = Vec::new();
+    let mut order_config_indices: Vec<u64> = Vec::with_capacity(n_orders);
+    for &flat_idx in &input_sorted_order {
+        let token = order_config_token(flat_idx);
+        let idx = unique_config_tokens
+            .iter()
+            .position(|t| t == &token)
+            .unwrap_or_else(|| {
+                unique_config_tokens.push(token);
+                unique_config_tokens.len() - 1
+            });
+        order_config_indices.push(idx as u64);
+    }
+    // OrderValidatorRedeemer.configs[i].ref_index needs the canonical
+    // ref-input position of each OrderConfig's settings UTxO. We compute
+    // it after all_ref_inputs is assembled below; for now stash just the
+    // entries.
     let order_validator_entries: Vec<OrderValidatorEntry> = input_sorted_order
         .iter()
         .enumerate()
         .map(|(out_pos, _flat_idx)| OrderValidatorEntry {
             output_index: (m_pools + out_pos) as u64,
+            config_index: order_config_indices[out_pos],
         })
         .collect();
 
+    // Placeholder — the real OrderValidatorRedeemer is built further down
+    // once `canonical_ref_order` is known. We just need a value here so
+    // existing code that references `order_validator_redeemer` compiles.
     let order_validator_redeemer = OrderValidatorRedeemer {
+        configs: Vec::new(),
         entries: order_validator_entries,
     };
 
@@ -894,23 +935,123 @@ pub fn build_multi_pool_scoop_tx(
             all_ref_inputs.push(cl.ref_utxo.0.clone());
         }
     }
-    // Order-side dispatcher references. The order validator's withdraw needs
-    // the matching module's withdrawal present in the tx, per constraint tag:
-    // tag 2 (Swap) → swap_order_module, tag 0/1/3 (Deposit/Withdraw/Claim) →
-    // basic_order_module. Only include refs we'll actually use.
-    let has_swap_orders = n_swap_orders > 0;
-    let has_basic_orders = n_deposit_orders > 0 || n_withdraw_orders > 0;
-    if has_swap_orders {
-        if let Some(so) = &exec.module_scripts.swap_order {
-            all_ref_inputs.push(so.ref_utxo.0.clone());
+    // PR #11 modular order constraints. For each unique OrderConfig token
+    // referenced by orders in this batch:
+    //   1. resolve its settings UTxO from the indexer cache (add to ref inputs)
+    //   2. union its `required_constraints` into `required_constraint_hashes`
+    // Then add a script-ref for each required constraint module (so its
+    // withdrawal can run) and emit the withdrawal itself further below.
+    let mut unique_order_configs: Vec<(Vec<u8>, std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>)> =
+        Vec::new();
+    for token in &unique_config_tokens {
+        if let Some(oc) = order_configs.get(token) {
+            unique_order_configs.push((token.clone(), oc.clone()));
+        } else if !token.is_empty() {
+            tracing::warn!(
+                token = %hex::encode(token),
+                "scoop: order references unknown OrderConfig; tx will likely fail on chain",
+            );
         }
     }
-    if has_basic_orders {
-        if let Some(bo) = &exec.module_scripts.basic_order {
-            all_ref_inputs.push(bo.ref_utxo.0.clone());
+    let mut required_constraint_hashes: std::collections::BTreeSet<Vec<u8>> =
+        std::collections::BTreeSet::new();
+    for (_, oc) in &unique_order_configs {
+        for h in &oc.config.required_constraints {
+            required_constraint_hashes.insert(h.clone());
         }
+    }
+    let constraint_script_refs = |hash: &[u8]| -> Option<&ScriptRefInfo> {
+        for slot in [
+            &exec.module_scripts.swap_order,
+            &exec.module_scripts.basic_order,
+            &exec.module_scripts.route_order,
+            &exec.module_scripts.fairness_order,
+            &exec.module_scripts.strategy_order,
+        ] {
+            if let Some(sri) = slot {
+                if sri.hash.as_ref() == hash {
+                    return Some(sri);
+                }
+            }
+        }
+        None
+    };
+    for h in &required_constraint_hashes {
+        if let Some(sri) = constraint_script_refs(h) {
+            all_ref_inputs.push(sri.ref_utxo.0.clone());
+        } else {
+            tracing::warn!(
+                hash = %hex::encode(h),
+                "scoop: required constraint module has no configured script ref",
+            );
+        }
+    }
+    // Each OrderConfig's settings UTxO is a reference input — the base
+    // order_validator's withdraw handler reads it as the `configs[i]` lookup
+    // resolution.
+    for (_, oc) in &unique_order_configs {
+        all_ref_inputs.push(oc.input.0.clone());
     }
     all_ref_inputs.push(settings.input.0.clone());
+
+    // Compute the canonical sort that on-chain ScriptContext.reference_inputs
+    // delivers (Cardano ledger sorts by (txId bytes, output_index)). We use
+    // this to set `ref_index` on `OrderValidatorConfig` and
+    // `FairnessOrderRedeemer.settings_input_index`.
+    let canonical_ref_order: Vec<TransactionInput> = {
+        let mut v = all_ref_inputs.clone();
+        v.sort_by(|a, b| {
+            a.transaction_id
+                .cmp(&b.transaction_id)
+                .then(a.index.cmp(&b.index))
+        });
+        v
+    };
+    let canonical_index_of = |input: &TransactionInput| -> u64 {
+        canonical_ref_order
+            .iter()
+            .position(|i| i == input)
+            .expect("ref input must be in canonical order") as u64
+    };
+
+    let settings_input_index = canonical_index_of(&settings.input.0);
+    // Re-resolve OrderValidatorConfig.ref_index now that we know the
+    // canonical position of each OrderConfig settings UTxO.
+    let order_validator_configs: Vec<OrderValidatorConfig> = unique_config_tokens
+        .iter()
+        .map(|token| {
+            let ref_index = unique_order_configs
+                .iter()
+                .find(|(t, _)| t == token)
+                .map(|(_, oc)| canonical_index_of(&oc.input.0))
+                .unwrap_or(0);
+            OrderValidatorConfig {
+                ref_index,
+                token: token.clone(),
+            }
+        })
+        .collect();
+    let order_validator_redeemer = OrderValidatorRedeemer {
+        configs: order_validator_configs,
+        entries: order_validator_redeemer.entries,
+    };
+    // Compute the scooper's slot in `authorized_scoopers` for the
+    // fairness_order constraint's redeemer (PR #11).
+    let authorized_scooper_index: u64 = settings
+        .datum
+        .authorized_scoopers
+        .as_ref()
+        .and_then(|list| {
+            list.iter()
+                .position(|kh| kh.as_slice() == scooper_keyhash.as_ref())
+        })
+        .map(|i| i as u64)
+        .unwrap_or(0);
+
+    // Legacy compatibility helpers — kept for the unit-redeemer paths below
+    // that don't care about the new per-class metadata.
+    let has_swap_orders = n_swap_orders > 0;
+    let _has_basic_orders = n_deposit_orders > 0 || n_withdraw_orders > 0;
 
     // ── Step 7: Build withdrawal map ───────────────────────────────────────
 
@@ -967,26 +1108,97 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
 
-    // Per-tag order-module withdrawals. The contract dispatches via
-    // `settings.order_modules[constraint_tag]` and requires the matching
-    // module's withdrawal to be present. swap_order_module covers Swap (tag 2);
-    // basic_order_module covers Deposit/Withdraw/Claim (tag 0/1/3). Each
-    // takes a unit redeemer (`Constr 0 []`) — they don't read it.
+    // Modular order constraints (PR #11). For each constraint hash listed in
+    // any orders' OrderConfig.required_constraints, add a withdrawal with the
+    // shape that module expects:
+    //   swap_order, basic_order → unit (Constr 0 [])
+    //   route_order             → List<List<RouteStep>> (one inner list per
+    //                              order carrying route_order)
+    //   fairness_order          → { settings_input_index, authorized_scooper_index }
+    //   strategy_order          → (deferred; SSE ingestion TBD)
+    // Unknown / unconfigured constraint hashes are skipped — the on-chain
+    // order_validator's withdraw handler will then fail, but the diagnostic
+    // is clearer than a silent encoding mismatch.
     let unit_redeemer = || pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
         tag: 121,
         any_constructor: None,
         fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
     });
-    if has_swap_orders {
-        if let Some(so) = &exec.module_scripts.swap_order {
-            withdrawals.push((reward_account(&so.hash), unit_redeemer()));
-        }
+    let classify_hash = |h: &[u8]| -> Option<&'static str> {
+        let matches = |s: &Option<ScriptRefInfo>| s.as_ref().map_or(false, |si| si.hash.as_ref() == h);
+        if matches(&exec.module_scripts.swap_order) { Some("swap_order") }
+        else if matches(&exec.module_scripts.basic_order) { Some("basic_order") }
+        else if matches(&exec.module_scripts.route_order) { Some("route_order") }
+        else if matches(&exec.module_scripts.fairness_order) { Some("fairness_order") }
+        else if matches(&exec.module_scripts.strategy_order) { Some("strategy_order") }
+        else { None }
+    };
+    // Precompute the route_order redeemer if needed. It's a per-order
+    // List<List<RouteStep>>, one inner list for each order whose OrderConfig
+    // includes route_order — in canonical input-sort order. Each step is
+    // (pool_input_index, transcript_step_index). For unrouted single-pool
+    // scoops every order has one step at its assigned batch's pool.
+    let route_order_hash = exec.module_scripts.route_order.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let route_redeemer = || -> pallas_primitives::PlutusData {
+        let route_steps: Vec<pallas_primitives::PlutusData> = input_sorted_order.iter().filter_map(|&flat_idx| {
+            let config_token = order_config_token(flat_idx);
+            let oc = order_configs.get(&config_token)?;
+            let route_hash = route_order_hash.as_ref()?;
+            if !oc.config.required_constraints.iter().any(|h| h == route_hash) {
+                return None;
+            }
+            let batch_idx = flat_orders[flat_idx].batch_idx;
+            let pool_input_idx = pool_sorted_indices[batch_idx] as u64;
+            // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
+            let step = pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
+                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                        (pool_input_idx as i128).try_into().unwrap_or_else(|_| 0i64.into()),
+                    )),
+                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(0i64.into())),
+                ]),
+            });
+            // Inner list = [single step] for this order.
+            Some(pallas_primitives::PlutusData::Array(
+                pallas_codec::utils::MaybeIndefArray::Indef(vec![step]),
+            ))
+        }).collect();
+        pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(route_steps))
+    };
+    for h in required_constraint_hashes.iter() {
+        let class = classify_hash(h);
+        let raw_hash: Hash<28> = match h.as_slice().try_into() {
+            Ok(arr) => Hash::new(arr),
+            Err(_) => continue,
+        };
+        let redeemer = match class {
+            Some("swap_order") | Some("basic_order") => unit_redeemer(),
+            Some("route_order") => route_redeemer(),
+            Some("fairness_order") => {
+                crate::sundaev4::types::FairnessOrderRedeemer {
+                    settings_input_index,
+                    authorized_scooper_index,
+                }.to_plutus()
+            }
+            Some("strategy_order") => {
+                tracing::warn!("scoop: strategy_order required but ingestion not yet implemented");
+                continue;
+            }
+            None => {
+                tracing::warn!(
+                    hash = %hex::encode(h),
+                    "scoop: required constraint hash didn't match any configured module",
+                );
+                continue;
+            }
+            _ => unreachable!(),
+        };
+        withdrawals.push((reward_account(&raw_hash), redeemer));
     }
-    if has_basic_orders {
-        if let Some(bo) = &exec.module_scripts.basic_order {
-            withdrawals.push((reward_account(&bo.hash), unit_redeemer()));
-        }
-    }
+    // `has_swap_orders` retained for tests that still gate on this flag.
+    let _ = has_swap_orders;
 
     withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -1377,7 +1589,6 @@ pub fn build_multi_pool_scoop_tx(
             });
         }
     }
-
     // Build resolved reference inputs
     let mut resolved_ref_inputs = BTreeMap::new();
     for ref_input_key in all_ref_inputs.iter() {
@@ -1408,6 +1619,26 @@ pub fn build_multi_pool_scoop_tx(
         datum: DatumOption::InlineDatum(settings.datum.clone().to_plutus()),
         script_ref: None,
     });
+    // OrderConfig settings entries — the order_validator's withdraw handler
+    // resolves `config.ref_index` to one of these and checks its value
+    // carries a token under settings_policy matching `config.token` and that
+    // its inline datum decodes as `OrderConfig`.
+    let settings_addr_bytes = {
+        let settings_addr = ShelleyAddress::new(
+            Network::Testnet,
+            ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
+            ShelleyDelegationPart::Null,
+        );
+        settings_addr.to_vec()
+    };
+    for (_, oc) in &unique_order_configs {
+        resolved_ref_inputs.insert(oc.input.clone(), ResolvedTxOut {
+            address: settings_addr_bytes.clone(),
+            value: oc.value.clone(),
+            datum: DatumOption::InlineDatum(oc.config.clone().to_plutus()),
+            script_ref: None,
+        });
+    }
 
     // ── Step 14: Build predicted pool UTxOs ─────────────────────────────────
 

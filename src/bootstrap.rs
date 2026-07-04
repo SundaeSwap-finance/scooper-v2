@@ -1555,13 +1555,25 @@ async fn bootstrap_v4(
                 continue;
             };
             let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+            let swap_order_hash: Vec<u8> = protocol
+                .execution
+                .as_ref()
+                .and_then(|e| e.module_scripts.swap_order.as_ref())
+                .map(|s| s.hash.as_ref().to_vec())
+                .unwrap_or_default();
+            let basic_order_hash: Vec<u8> = protocol
+                .execution
+                .as_ref()
+                .and_then(|e| e.module_scripts.basic_order.as_ref())
+                .map(|s| s.hash.as_ref().to_vec())
+                .unwrap_or_default();
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
                 .and_then(|data| {
                     sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
                 })
                 .and_then(|datum| {
-                    sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                    sundaev4::Constraint::from_order_datum(&datum, &swap_order_hash, &basic_order_hash)
                         .map(|constraint| (datum, constraint))
                         .map_err(|e| format!("{e}"))
                 }) {
@@ -1592,28 +1604,56 @@ async fn bootstrap_v4(
         .await
         .context("bootstrap v4: fetch settings UTxOs")?;
     let mut settings = None;
+    let mut order_configs: std::collections::BTreeMap<Vec<u8>, Arc<sundaev4::SundaeV4OrderConfig>> =
+        std::collections::BTreeMap::new();
     for utxo in &settings_utxos {
-        if !utxo.value.get(&protocol.settings_nft).is_positive() {
+        let Some(ref cbor) = utxo.datum_cbor else { continue };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else { continue };
+        if utxo.value.get(&protocol.settings_nft).is_positive() {
+            // Global settings entry — empty-name token under settings_mint.
+            if let Ok(datum) = sundaev4::SettingsDatum::from_plutus(data) {
+                let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                settings = Some(Arc::new(sundaev4::SundaeV4Settings {
+                    input,
+                    value: utxo.value.clone(),
+                    datum,
+                    slot: utxo.slot,
+                }));
+            }
             continue;
         }
-        let Some(ref cbor) = utxo.datum_cbor else {
-            continue;
-        };
-        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
-            continue;
-        };
-        let Ok(datum) = sundaev4::SettingsDatum::from_plutus(data) else {
-            continue;
-        };
-        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-        settings = Some(Arc::new(sundaev4::SundaeV4Settings {
-            input,
-            value: utxo.value.clone(),
-            datum,
-            slot: utxo.slot,
-        }));
-        break;
+        // Non-global settings entry: try OrderConfig (PR #11). Other shapes
+        // (e.g. PoolConfig minted by mint-pool-config) are ignored — the
+        // scooper doesn't consume them directly.
+        let token_name = utxo
+            .value
+            .0
+            .get(&protocol.settings_nft.policy)
+            .and_then(|tokens| {
+                tokens.iter().find_map(|(name, qty)| {
+                    if !name.is_empty() && qty.is_positive() {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        let parsed = sundaev4::OrderConfig::from_plutus(data).ok();
+        if let (Some(token_name), Some(oc)) = (token_name, parsed) {
+            let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+            order_configs.insert(
+                token_name.clone(),
+                Arc::new(sundaev4::SundaeV4OrderConfig {
+                    input,
+                    value: utxo.value.clone(),
+                    token_name,
+                    config: oc,
+                    slot: utxo.slot,
+                }),
+            );
+        }
     }
+    info!(count = order_configs.len(), "bootstrap v4: hydrated OrderConfig settings entries");
 
     // Fetch wallet UTxOs if execution is configured. Probe both the
     // enterprise address (payment-only) and, if a stake keyhash is configured,
@@ -1691,6 +1731,15 @@ async fn bootstrap_v4(
         }
         if let Some(ref bo) = scripts.basic_order {
             all_refs.push(bo);
+        }
+        if let Some(ref ro) = scripts.route_order {
+            all_refs.push(ro);
+        }
+        if let Some(ref fo) = scripts.fairness_order {
+            all_refs.push(fo);
+        }
+        if let Some(ref so) = scripts.strategy_order {
+            all_refs.push(so);
         }
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
@@ -1862,6 +1911,7 @@ async fn bootstrap_v4(
         s.orders = orders;
         s.invalid_orders = invalid_orders;
         s.settings = settings;
+        s.order_configs = order_configs;
         s.wallet_utxos = wallet_utxos;
         s.ref_utxo_outputs = ref_utxo_outputs;
         s.network_tip_slot = Some(tip_slot);

@@ -193,6 +193,10 @@ pub(crate) mod test_harness {
             settings: &SundaeV4Settings,
             slot: u64,
         ) -> anyhow::Result<(MultiPoolBuildResult, EvalResult)> {
+            let empty_order_configs: std::collections::BTreeMap<
+                Vec<u8>,
+                std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>,
+            > = std::collections::BTreeMap::new();
             let build = build_multi_pool_scoop_tx(
                 plan,
                 settings,
@@ -204,6 +208,7 @@ pub(crate) mod test_harness {
                 None, // no ex_units → default budgets
                 &self.ref_utxo_outputs,
                 None, // fee_override
+                &empty_order_configs,
             )?;
 
             let eval = evaluate_scoop_tx(

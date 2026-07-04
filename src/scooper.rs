@@ -804,7 +804,7 @@ impl Scooper {
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &plan, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                None,
+                None, &v4_state.order_configs,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -947,7 +947,7 @@ impl Scooper {
                     match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                     &diag_plan, &settings, &exec, current_slot, language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                    None,
+                    None, &v4_state.order_configs,
                 ) {
                     Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
@@ -1045,7 +1045,7 @@ impl Scooper {
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-            None,
+            None, &v4_state.order_configs,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1125,6 +1125,7 @@ impl Scooper {
             &collateral_input.0, &collateral_value, Some(&padded_budgets),
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
+            &v4_state.order_configs,
         ) {
             Ok(r) => r,
             Err(e) => {

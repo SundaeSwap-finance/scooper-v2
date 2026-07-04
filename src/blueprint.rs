@@ -187,6 +187,25 @@ impl Blueprint {
             "basicOrder",
             "basic_order",
         ).ok();
+        // Route/Fairness/Strategy constraint modules (PR #11).
+        let route_order = make_info(
+            self,
+            &["route_order_module", "route_order", "routeOrder", "route_constraint"],
+            "routeOrder",
+            "route_order",
+        ).ok();
+        let fairness_order = make_info(
+            self,
+            &["fairness_order_module", "fairness_order", "fairnessOrder", "fairness_order_constraint"],
+            "fairnessOrder",
+            "fairness_order",
+        ).ok();
+        let strategy_order = make_info(
+            self,
+            &["strategy_order_module", "strategy_order", "strategyOrder", "strategy_order_constraint"],
+            "strategyOrder",
+            "strategy_order",
+        ).ok();
         // Concentrated liquidity module (optional — only present when CL pools exist).
         let concentrated_liquidity = make_info(
             self,
@@ -207,6 +226,9 @@ impl Blueprint {
             concentrated_liquidity,
             swap_order,
             basic_order,
+            route_order,
+            fairness_order,
+            strategy_order,
         })
     }
 }

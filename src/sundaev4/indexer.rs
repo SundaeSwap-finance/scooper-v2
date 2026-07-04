@@ -36,6 +36,11 @@ pub struct SundaeV4State {
     pub pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
     pub orders: Vec<Arc<SundaeV4Order>>,
     pub settings: Option<Arc<SundaeV4Settings>>,
+    /// OrderConfig settings entries, keyed by their token name (the asset
+    /// name under `settings_mint` policy). Each order's `config_token`
+    /// indexes into this map. Populated from `settings`-typed UTxOs whose
+    /// datum decodes as `OrderConfig` (PR #11 modular order constraints).
+    pub order_configs: BTreeMap<Vec<u8>, Arc<SundaeV4OrderConfig>>,
     pub spent_orders: Vec<SpentOrder<SundaeV4Order>>,
     pub spent_pools: Vec<SpentPool<SundaeV4Pool>>,
     pub invalid_orders: Vec<InvalidOrder>,
@@ -47,6 +52,28 @@ pub struct SundaeV4State {
     pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub scoop_stats: ScoopStats,
     datums: DatumLookup,
+}
+
+/// An OrderConfig settings entry. The order_validator's withdraw handler
+/// resolves an order's `config_token` to this entry as a reference input,
+/// then checks the order's constraints list matches `config.required_constraints`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SundaeV4OrderConfig {
+    pub input: crate::cardano_types::TransactionInput,
+    pub value: crate::cardano_types::Value,
+    /// Token name (asset name under settings_mint policy) — duplicated here
+    /// for convenience; equals the parent map key.
+    #[serde(serialize_with = "v4_hex::bytes")]
+    pub token_name: Vec<u8>,
+    pub config: crate::sundaev4::types::OrderConfig,
+    pub slot: u64,
+}
+
+mod v4_hex {
+    use serde::Serializer;
+    pub fn bytes<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(v))
+    }
 }
 
 pub type SundaeV4HistoricalState = HistoricalState<SundaeV4State>;
@@ -195,6 +222,20 @@ impl SundaeV4Indexer {
             .execution
             .as_ref()
             .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+        // Constraint script hashes — used to find the right entry in the
+        // order datum's `constraints: List<(hash, Data)>` list (PR #11).
+        let swap_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.swap_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
+        let basic_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.basic_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
         {
             use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, ConcentratedLiquidityConfig, FeeSplitConfig};
             let mut cache = self.module_configs.lock().await;
@@ -264,7 +305,9 @@ impl SundaeV4Indexer {
                 "order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                            crate::sundaev4::Constraint::from_order_datum(
+                                &datum, &swap_order_hash, &basic_order_hash,
+                            )
                                 .map(|c| (datum, c))
                                 .map_err(|e| format!("constraint decode: {e}"))
                         })
@@ -291,7 +334,9 @@ impl SundaeV4Indexer {
                 "invalid_order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                            crate::sundaev4::Constraint::from_order_datum(
+                                &datum, &swap_order_hash, &basic_order_hash,
+                            )
                                 .map(|c| (datum, c))
                                 .map_err(|e| format!("constraint decode: {e}"))
                         })
@@ -325,6 +370,41 @@ impl SundaeV4Indexer {
                         slot: txo.created_slot,
                     }));
                 }
+                "order_config" => {
+                    // PR #11: OrderConfig settings entries are at the same
+                    // address as the global SettingsDatum but carry a
+                    // different (non-empty) token name and a 2-field
+                    // `OrderConfig { label, required_constraints }` datum.
+                    let token_name = output
+                        .value
+                        .0
+                        .get(&self.protocol.settings_nft.policy)
+                        .and_then(|tokens| {
+                            tokens.iter().find_map(|(name, qty)| {
+                                if !name.is_empty() && qty.is_positive() {
+                                    Some(name.to_vec())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                    let parsed: Option<crate::sundaev4::types::OrderConfig> =
+                        output.datum.parse(&datums);
+                    if let (Some(token_name), Some(oc)) = (token_name, parsed) {
+                        state.order_configs.insert(
+                            token_name.clone(),
+                            Arc::new(SundaeV4OrderConfig {
+                                input: txo.txo_id,
+                                value: output.value,
+                                token_name,
+                                config: oc,
+                                slot: txo.created_slot,
+                            }),
+                        );
+                    } else {
+                        warn!(input = %txo.txo_id, "v4: order_config txo could not be reparsed on load");
+                    }
+                }
                 "wallet" => {
                     state.wallet_utxos.insert(txo.txo_id, output.value);
                 }
@@ -354,7 +434,9 @@ impl SundaeV4Indexer {
                 "order" => {
                     if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums) {
                         if let Ok(constraint) =
-                            crate::sundaev4::Constraint::from_plutus_constraint(&od.constraints)
+                            crate::sundaev4::Constraint::from_order_datum(
+                                &od, &swap_order_hash, &basic_order_hash,
+                            )
                         {
                             state.spent_orders.push(SpentOrder {
                                 order: Arc::new(SundaeV4Order {
@@ -478,6 +560,34 @@ impl SundaeV4Indexer {
         } else {
             None
         }
+    }
+
+    /// Try to parse a `settings`-typed UTxO as an `OrderConfig` settings entry.
+    /// Returns `Some((token_name, OrderConfig))` when the UTxO carries a
+    /// non-empty-name token under `settings_mint` policy AND its inline
+    /// datum decodes as `OrderConfig`. The empty-name token is reserved for
+    /// the global SettingsDatum entry.
+    fn parse_order_config(
+        &self,
+        tx_out: &TransactionOutput,
+        datums: &ScopedDatumLookup,
+    ) -> Option<(Vec<u8>, crate::sundaev4::types::OrderConfig)> {
+        let settings_policy = &self.protocol.settings_nft.policy;
+        let token_name = tx_out
+            .value
+            .0
+            .get(settings_policy)
+            .and_then(|tokens| {
+                tokens.iter().find_map(|(name, qty)| {
+                    if !name.is_empty() && qty.is_positive() {
+                        Some(name.to_vec())
+                    } else {
+                        None
+                    }
+                })
+            })?;
+        let order_config: crate::sundaev4::types::OrderConfig = tx_out.datum.parse(datums)?;
+        Some((token_name, order_config))
     }
 
     fn parse_redeemer<T: AsPlutus>(&self, tx: &MultiEraTx, spend_index: usize) -> Option<T> {
@@ -700,6 +810,9 @@ impl ChainIndex for SundaeV4Indexer {
         let mut new_orders = vec![];
         let mut new_invalid_orders = vec![];
         let mut new_settings = None;
+        /// (token_name, OrderConfigEntry) — newly-discovered OrderConfig
+        /// settings entries in this tx.
+        let mut new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)> = vec![];
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
 
@@ -741,6 +854,18 @@ impl ChainIndex for SundaeV4Indexer {
             .execution
             .as_ref()
             .and_then(|e| extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash));
+        let swap_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.swap_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
+        let basic_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.basic_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
         let cs_module_hash_bytes: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -914,7 +1039,9 @@ impl ChainIndex for SundaeV4Indexer {
                 let tx_out = cardano_types::convert_txo(output);
                 match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                     .and_then(|datum| {
-                        crate::sundaev4::Constraint::from_plutus_constraint(&datum.constraints)
+                        crate::sundaev4::Constraint::from_order_datum(
+                            &datum, &swap_order_hash, &basic_order_hash,
+                        )
                             .map(|c| (datum, c))
                             .map_err(|e| format!("constraint decode: {e}"))
                     }) {
@@ -975,6 +1102,26 @@ impl ChainIndex for SundaeV4Indexer {
                         datum: sd,
                         slot,
                     }));
+                } else if let Some((token_name, oc)) = self.parse_order_config(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "order_config".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+                    new_order_configs.push((
+                        token_name.clone(),
+                        Arc::new(SundaeV4OrderConfig {
+                            input: this_input,
+                            value: tx_out.value,
+                            token_name,
+                            config: oc,
+                            slot,
+                        }),
+                    ));
                 }
             }
 
@@ -1206,6 +1353,23 @@ impl ChainIndex for SundaeV4Indexer {
             state.settings = None;
         }
 
+        // Remove any OrderConfig entries whose UTxO was spent (admin updated
+        // or burned). The replacement entry, if any, is detected via the
+        // settings-script-hash output branch above and re-added.
+        let mut spent_order_config_tokens: Vec<Vec<u8>> = Vec::new();
+        for (token, oc) in state.order_configs.iter() {
+            if spent_inputs.contains(&oc.input) {
+                spent_order_config_tokens.push(token.clone());
+                changes.spent_txos.push(SpentTxo {
+                    input: oc.input.clone(),
+                    spending_tx_id: this_tx_hash.to_vec(),
+                });
+            }
+        }
+        for token in spent_order_config_tokens {
+            state.order_configs.remove(&token);
+        }
+
         // Apply new pool state — emit events for new/updated pools.
         // Use known_pool_idents (captured before retain) so that scoops
         // (which remove then re-add the pool) emit Updated, not Created.
@@ -1246,6 +1410,15 @@ impl ChainIndex for SundaeV4Indexer {
                 settings: settings.clone(),
             });
             state.settings = Some(settings);
+        }
+
+        for (token_name, oc) in new_order_configs.drain(..) {
+            info!(
+                token = %hex::encode(&token_name),
+                constraints = oc.config.required_constraints.len(),
+                "v4: new OrderConfig settings entry",
+            );
+            state.order_configs.insert(token_name, oc);
         }
 
         if !changes.is_empty() {

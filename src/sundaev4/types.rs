@@ -146,12 +146,20 @@ impl serde::Serialize for Destination {
     }
 }
 
-/// Wire-format order datum, mirroring Aiken's `OrderDatum`.
+/// Wire-format order datum, mirroring Aiken's `OrderDatum` after the modular
+/// order-constraints refactor (PR #11).
 ///
-/// `constraints` is opaque on-chain — its leading Constr tag dispatches to a
-/// constraint shape (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Decode with
-/// [`Constraint::from_plutus_constraint`] and store the result alongside the
-/// datum on [`SundaeV4Order`] so callers don't re-decode per-access.
+/// The pre-PR-#11 shape carried a single tagged-union `constraints` Data; the
+/// tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim) picked the variant. The new
+/// shape carries a list of `(constraint_script_hash, constraint_data)` tuples;
+/// the constraint *type* is now identified by which script's hash is keyed in
+/// the list. The inner Data still uses the same ctor tags (Swap=2; Basic 0/1/3
+/// for Deposit/Withdraw/Claim) so decoding the inner Data is unchanged.
+///
+/// `config_token` is the asset name of the OrderConfig settings entry whose
+/// `required_constraints` set this order claims to satisfy. The order
+/// validator's withdraw handler looks up that entry as a reference input and
+/// checks the order's constraints list matches `required_constraints` exactly.
 #[derive(Clone, AsPlutus, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OrderDatum {
     pub owner: Multisig,
@@ -160,14 +168,31 @@ pub struct OrderDatum {
     pub budget: BigInt,
     /// Scooper share of `budget - fee_share` surplus, in basis points (0..=10000).
     pub share_batcher: BigInt,
-    /// Opaque constraint payload — see [`Constraint`] for the decoded form.
-    pub constraints: PlutusData,
+    /// Asset name of the OrderConfig settings entry this order's constraints
+    /// must match.
+    #[serde(serialize_with = "hex_ser::bytes")]
+    pub config_token: Vec<u8>,
+    /// List of `(constraint_script_hash, constraint_data)` tuples. Decode
+    /// one by hash via [`OrderDatum::find_constraint_by_hash`], then pass
+    /// the inner Data to [`Constraint::from_plutus_constraint`].
+    pub constraints: Vec<(Vec<u8>, PlutusData)>,
     pub extension: PlutusData,
 }
 
-/// Decoded form of `OrderDatum.constraints`. The constructor tag picks the variant.
+impl OrderDatum {
+    /// Look up the constraint Data for a given constraint script hash.
+    /// Returns `None` if the order doesn't carry that constraint.
+    pub fn find_constraint_by_hash(&self, hash: &[u8]) -> Option<&PlutusData> {
+        self.constraints.iter().find_map(|(h, d)| if h == hash { Some(d) } else { None })
+    }
+}
+
+/// Decoded form of a single constraint entry pulled out of
+/// `OrderDatum.constraints`. The constructor tag of the inner Data picks
+/// the variant; the constraint *class* (swap vs basic) is identified by
+/// which script hash keyed the entry in the parent list.
 ///
-/// Shapes match the contract's per-tag extractors (see `lib/constraints/`):
+/// Shapes match the contract's per-class extractors (see `lib/constraints/`):
 /// - Basic (Deposit/Withdraw/Claim): `offered` and `min_received` are `List<(AssetClass, Int)>`.
 /// - Swap: `offered: AssetClass` (no quantity), `original_offered: Int`,
 ///   `remaining_offered: Int`, `min_received: List<(AssetClass, Int)>`.
@@ -236,6 +261,26 @@ impl Constraint {
             3 => Constraint::Claim { offered: list_pair(0)?, min_received: list_pair(1)? },
             t => anyhow::bail!("unknown constraint tag {t}"),
         })
+    }
+
+    /// Decode the constraint of interest from an OrderDatum by walking its
+    /// constraints list to find an entry under either `swap_order_hash` or
+    /// `basic_order_hash`, then decoding that inner Data. The constraint
+    /// *class* is implicit in the hash; the inner Data's ctor tag picks
+    /// the variant (Swap=2 for swap_order; Deposit=0 / Withdraw=1 /
+    /// Claim=3 for basic_order).
+    pub fn from_order_datum(
+        datum: &OrderDatum,
+        swap_order_hash: &[u8],
+        basic_order_hash: &[u8],
+    ) -> anyhow::Result<Self> {
+        let constraint_data = datum
+            .find_constraint_by_hash(swap_order_hash)
+            .or_else(|| datum.find_constraint_by_hash(basic_order_hash))
+            .ok_or_else(|| {
+                anyhow::anyhow!("order has neither swap_order nor basic_order constraint")
+            })?;
+        Self::from_plutus_constraint(constraint_data)
     }
 
     /// Constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Matches the
@@ -376,14 +421,49 @@ pub struct ConcentratedLiquidityConfig {
 // Withdrawal redeemer types
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Redeemer for the base order_validator withdraw handler (PR #11).
+///
+/// `configs[i]` enumerates each OrderConfig settings entry referenced by the
+/// orders in this tx, by its reference-input index + token name. `entries[j]`
+/// then enumerates each order being scooped — `output_index` points at the
+/// order's fulfillment output and `config_index` picks which entry of
+/// `configs` the order's `config_token` matches.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct OrderValidatorRedeemer {
+    pub configs: Vec<OrderValidatorConfig>,
     pub entries: Vec<OrderValidatorEntry>,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OrderValidatorConfig {
+    pub ref_index: u64,
+    pub token: Vec<u8>,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct OrderValidatorEntry {
     pub output_index: u64,
+    pub config_index: u64,
+}
+
+/// Settings-entry datum for an OrderConfig (PR #11). One of these is minted
+/// per (role, constraint set) pair — e.g. role="swap" gets
+/// `[swap_order, route_order, fairness_order]`. Each order's `config_token`
+/// references the entry whose `required_constraints` it claims to fulfill.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OrderConfig {
+    #[serde(serialize_with = "hex_ser::bytes")]
+    pub label: Vec<u8>,
+    #[serde(serialize_with = "hex_ser::vec_bytes")]
+    pub required_constraints: Vec<Vec<u8>>,
+}
+
+/// Redeemer for the fairness_order_constraint withdraw handler — pins which
+/// authorized scooper signed the tx by referencing the global settings entry.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct FairnessOrderRedeemer {
+    pub settings_input_index: u64,
+    pub authorized_scooper_index: u64,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -635,16 +715,29 @@ pub struct ModuleScripts {
     /// Optional: only required when scooping concentrated-liquidity pools.
     #[serde(default)]
     pub concentrated_liquidity: Option<ScriptRefInfo>,
-    /// Per-tag order-side dispatcher modules. Keyed by constraint tag
-    /// (2 = Swap, 0 = Deposit, 1 = Withdraw, 3 = Claim). Required for
-    /// the modules referenced in `settings.order_modules` — the order
-    /// validator's withdraw handler requires their withdrawals to be
-    /// present.
+    /// Per-class constraint validators (modular order constraints, PR #11).
+    /// Every order's OrderConfig lists which constraint hashes it requires;
+    /// the order_validator's withdraw handler requires each listed constraint
+    /// to also withdraw. Slots are `Option` so a deployment that doesn't use
+    /// e.g. strategy orders can omit that module.
     #[serde(default)]
     pub swap_order: Option<ScriptRefInfo>,
-    /// `basic_order_module` covers Deposit/Withdraw/Claim constraints.
+    /// `basic_order_constraint` covers Deposit/Withdraw/Claim shapes.
     #[serde(default)]
     pub basic_order: Option<ScriptRefInfo>,
+    /// `route_order_constraint` carries the per-order route table (pool
+    /// whitelist + per-step pool_input / transcript_step indices).
+    #[serde(default)]
+    pub route_order: Option<ScriptRefInfo>,
+    /// `fairness_order_constraint` pins the authorized scooper for the tx
+    /// via the global settings entry's authorized_scoopers list.
+    #[serde(default)]
+    pub fairness_order: Option<ScriptRefInfo>,
+    /// `strategy_order_constraint` accepts a `List<SignedStrategyExecution>`
+    /// redeemer signed off-chain. The scooper doesn't yet construct these —
+    /// optional until strategy execution ingestion is designed.
+    #[serde(default)]
+    pub strategy_order: Option<ScriptRefInfo>,
 }
 
 #[serde_with::serde_as]
@@ -728,7 +821,7 @@ impl SundaeV4Order {
     ) -> Self {
         let (offer_asset, offer_qty) = offer;
         let min_recv_list = vec![min_received];
-        let constraints = PlutusData::Constr(pallas_primitives::Constr {
+        let swap_data = PlutusData::Constr(pallas_primitives::Constr {
             tag: 121 + 2, // Swap
             any_constructor: None,
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
@@ -743,15 +836,23 @@ impl SundaeV4Order {
             any_constructor: None,
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
         });
+        // Test-only synthetic constraint hash for the swap_order_constraint.
+        // The decoded `Constraint` only depends on the inner Data's ctor tag,
+        // so any hash that matches the one passed to `from_order_datum`
+        // works. We use a fixed test hash here and decode via
+        // `from_plutus_constraint` directly (which doesn't care about hashes).
+        const TEST_SWAP_HASH: [u8; 28] = [0xAA; 28];
+        let constraints = vec![(TEST_SWAP_HASH.to_vec(), swap_data.clone())];
         let datum = OrderDatum {
             owner,
             destination,
             budget,
             share_batcher: BigInt::from(0),
-            constraints: constraints.clone(),
+            config_token: Vec::new(),
+            constraints,
             extension: unit,
         };
-        let constraint = Constraint::from_plutus_constraint(&constraints)
+        let constraint = Constraint::from_plutus_constraint(&swap_data)
             .expect("test_swap_order: constraint should decode");
         SundaeV4Order { input, value, datum, constraint, slot }
     }
@@ -896,12 +997,14 @@ mod tests {
                 min_recv.to_plutus(),                  // min_received: List<(AssetClass, Int)>
             ]),
         });
+        const SWAP_HASH: [u8; 28] = [0xAA; 28];
         let datum = OrderDatum {
             owner: Multisig::Signature(vec![0xaa; 28]),
             destination: Destination::SelfDestination,
             budget: BigInt::from(1_000_000),
             share_batcher: BigInt::from(50),
-            constraints: constraints.clone(),
+            config_token: vec![0xbb; 32],
+            constraints: vec![(SWAP_HASH.to_vec(), constraints.clone())],
             extension: unit,
         };
 
@@ -912,7 +1015,10 @@ mod tests {
         assert_eq!(decoded.budget, BigInt::from(1_000_000));
         assert_eq!(decoded.share_batcher, BigInt::from(50));
 
-        let parsed = Constraint::from_plutus_constraint(&decoded.constraints).unwrap();
+        let inner = decoded
+            .find_constraint_by_hash(&SWAP_HASH)
+            .expect("decoded order should carry the test swap constraint");
+        let parsed = Constraint::from_plutus_constraint(inner).unwrap();
         match parsed {
             Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
                 assert_eq!(offered, ada);
