@@ -11,14 +11,14 @@
       "project-id": "previewUJJvqX2v9TOOAis8dZWiuyTPfJxJIKgH"
     },
     "v4": {
-      "pool-script-hash": "d24894a11609ef876879d1b2f174d40ce174e2e057745cde51ff5d3f",
+      "pool-script-hash": "214a9841042bcbfd10d1cd7cbeaba46a68df644dee665f581ec0cf02",
       "order-script-hashes": [
-        "b17a6e9b1520df20a335a231a137ff1ff1fe299714b957963595e943"
+        "9a25ecd03c3b290b741acdefa054923d3dd26623f14e57f44bf8da92"
       ],
-      "settings-script-hash": "24efebd52afe0fca7f4221521dedac14d077f3c96dcd7cf52024232d",
-      "settings-nft": "5f30a888eebf4d2a253953dde49a179af095ad75594dddea2703c59b.",
-      "pool-nft-policy": "9175afb9ec0628f23ec2ea1e22aeaede225e6e3b6cecfa26b6ad0ba1",
-      "starting-point": "111465268.dd36aa3a426424e2f27857ca1527d1ab9095c405e4602f3d85df4f13dcd731d8",
+      "settings-script-hash": "4fc157fe13a75c6a581767f7772996623970fc975dbde6a41c876a66",
+      "settings-nft": "0bc15c1eb8a2c70d40b94f43b5ec7ac840e4cda09e6f1a01512a02bc.",
+      "pool-nft-policy": "975459b453bcf0d5dc72c837cc39e6473d98d7138733dab5269021d8",
+      "starting-point": "113087829.da3343c5567f00186b90f9ff51104b6d2355c6a5d221d007d8148924e0e93061",
       "execution": {
         "scooper-secret-key": "68eca8def78fb41d307bc79a8b7eeece30bb5bae63682ce491c6978a728b6953f4d641889e6eaa048c0b29b6344f8e37cf850e5516c60f5d350fd3fb51e7e888",
         "scooper-stake-keyhash": "19f8f253c67c91082c43d306cd4edf825494ff8dc69b6678b83aa669",
@@ -389,49 +389,61 @@
           "slot-length": 1000
         },
         "module-scripts": {
-          "constant-product": {
-            "hash": "c8ae46dfd41effcb7380cb88d5779cba9a9653d0881f3b1921accb45",
-            "ref-utxo": "a707124a87082d1d938048d8731071db705c23b4e9080180b1b1f247ff730149#0"
+          "pool": {
+            "hash": "214a9841042bcbfd10d1cd7cbeaba46a68df644dee665f581ec0cf02",
+            "ref-utxo": "592baca734437013c830015bb808047a37046be96fd673ebecbdc386a47be150#0"
           },
-          "constant-sum": {
-            "hash": "e78a7636ea7da72a80926be6011d04e6559cf4b6908e1766d1b03787",
-            "ref-utxo": "7d6bfc4bb7b39a4560ea5e09dd4288bf86746d40a4120c362d27cfda7233dc42#0"
+          "order": {
+            "hash": "9a25ecd03c3b290b741acdefa054923d3dd26623f14e57f44bf8da92",
+            "ref-utxo": "150d2dd24cc77187164b5432e1ccd1b495074e8bfddcb2ca8fdb1d73fbba223d#0"
+          },
+          "pool-mint": {
+            "hash": "975459b453bcf0d5dc72c837cc39e6473d98d7138733dab5269021d8",
+            "ref-utxo": "f350e9d2c66ca1382c0f3d5c3a8e5623c27714bc39c7b09c8714d7dfa798e472#0"
+          },
+          "settings": {
+            "hash": "4fc157fe13a75c6a581767f7772996623970fc975dbde6a41c876a66",
+            "ref-utxo": "6bb4fadfdc98a7320e0ef883b222b4404df498a85e2380a47a48337b118430f3#0"
           },
           "fee-split": {
             "hash": "6613e11220fd8ee5eef589640bcd0f7588333047bb69548e052ac13a",
-            "ref-utxo": "81dd948391a07d8c599ea878be5519b76a931f3b37c1827159db8dc70fd46484#0"
+            "ref-utxo": "da2fa9ef93469d9732d4ea01f90016bd308adfbdc43ef2505cd55ddcbfc914e2#0"
           },
           "fairness": {
-            "hash": "72c240a73c14dedadca3b6f7848e256ae41ec0b96c29f46c0494ca4a",
-            "ref-utxo": "64e71bd8026989ba27a58b0cbd40efb0e64adc05e676857a6d7a329845f78248#0"
+            "hash": "7e76fbe605941bfa723c2df1e6832b56101ca11306673efe13a79c11",
+            "ref-utxo": "6e547e68e61bc46e6b0cbc71501b2ee7db343b7b25ffc18383df7897b2e61ad2#0"
           },
-          "pool": {
-            "hash": "d24894a11609ef876879d1b2f174d40ce174e2e057745cde51ff5d3f",
-            "ref-utxo": "74f92344161bfda2b2ed4c80f734f761181e4ed599e808c44195a3aff3356021#0"
+          "constant-sum": {
+            "hash": "ae886386dbb256d75aea85e027b3ce3e82926f56edaab74306a42098",
+            "ref-utxo": "908bf96ff63aef3eb4e92511bb3ecba0673ae16977426f966ccac52c408f22a8#0"
           },
-          "order": {
-            "hash": "b17a6e9b1520df20a335a231a137ff1ff1fe299714b957963595e943",
-            "ref-utxo": "d1d409adda6b428ac9d54a940375113f212a3a134473867b5c79376af7a19f9c#0"
-          },
-          "pool-mint": {
-            "hash": "9175afb9ec0628f23ec2ea1e22aeaede225e6e3b6cecfa26b6ad0ba1",
-            "ref-utxo": "7e384e7c8491144caca3dbc0696ecc711d78f1d98b1c07fd67884de831c32941#0"
-          },
-          "settings": {
-            "hash": "24efebd52afe0fca7f4221521dedac14d077f3c96dcd7cf52024232d",
-            "ref-utxo": "e2798ba51da38b0eba64ed3b891ad624c4f5e8465762502f913d66bd6ebf27e3#0"
-          },
-          "swap-order": {
-            "hash": "e28383fcc7b2f5d96e9ea6c9318d341337b3f8fe336822e6f1f74bf1",
-            "ref-utxo": "7bb147c441187c00ea8d69942b7923ceb209383d58170c96bc561ff0339c99c0#0"
-          },
-          "basic-order": {
-            "hash": "38bcb94b9b85c20a2b0b8b25636fd3b85922b6a6f6ad8ce7d42439d3",
-            "ref-utxo": "1646e4de752676d88d8a93c7c98793f1c96db70f838a2303a3640e3d8e61f0e7#0"
+          "constant-product": {
+            "hash": "11ef3cd8f8ab1891f5a24c389a9a52ace16bb0af1346182ec57de90a",
+            "ref-utxo": "e546e83754b12a89c0e78905d4c32f3c6d4c1088c35255ae34700754a658d978#0"
           },
           "concentrated-liquidity": {
-            "hash": "432e04903f7b7944064d53f61817f71a84f47585dab3f788876807a4",
-            "ref-utxo": "eda42fcb57f36db037b738b3eff602f0eb767da2b95189079df644ff6c851948#0"
+            "hash": "c1c3e1fbcb5b495fff596e35e1389fe0882be01ba703d42df4198fb0",
+            "ref-utxo": "b7892d7eed322ca72a2b7e6fc2f3fe339356ba4a4e8884a7177eb14582af8a81#0"
+          },
+          "swap-order": {
+            "hash": "1a38df57b59e75ad39fdb06fdf8c97ce435297ecfe5b68a3ea523053",
+            "ref-utxo": "fc2065e5fa6c9dc61e9be24416dd61efe9d97074ba8bf6b229cc486d53ea4060#0"
+          },
+          "basic-order": {
+            "hash": "3c1477d302e413f7fed7aff025dc65455d550c9a32409b17c7c6177d",
+            "ref-utxo": "d857f92c3cc2f33c6e75e67ff5ebce24ec0ec344c066e6191b826a4b0468c3ed#0"
+          },
+          "route-order": {
+            "hash": "ef81595b5b8cf9bc5f0adfb0b8f3a2d60edef9d33755ca87fa86c077",
+            "ref-utxo": "dac13b9b2293e263b1490d161f550d2e1b056c7c791ad44d3e17d3045ffc78b1#0"
+          },
+          "fairness-order": {
+            "hash": "b0df1c266988ab3bb5497bf9f6d8749a5f7726e88d43fca52efaa7f4",
+            "ref-utxo": "e0d5a7105d47b8441a53019fc991bc0b9a7d44a7a68d259e0bfb00f7e2ed08f8#0"
+          },
+          "strategy-order": {
+            "hash": "b298d0cb82fd8006d34e83d253e9250af4a35ac9af06573f94a48286",
+            "ref-utxo": "b569d3b7226952ff5c13395e8bdf336fb7dff5f22114ae1269dfa1205830405e#0"
           }
         }
       }
