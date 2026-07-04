@@ -445,7 +445,11 @@
             "hash": "b298d0cb82fd8006d34e83d253e9250af4a35ac9af06573f94a48286",
             "ref-utxo": "b569d3b7226952ff5c13395e8bdf336fb7dff5f22114ae1269dfa1205830405e#0"
           }
-        }
+        },
+        "budget-padding": [
+          3,
+          2
+        ]
       }
     }
   },

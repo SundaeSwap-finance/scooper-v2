@@ -1107,12 +1107,20 @@ impl Scooper {
                 Some(&mut failure),
             ) {
                 Ok(r) => {
-                    // Submit the evaluator's exact budgets with no padding. If
-                    // turbo underestimates and the node rejects the tx for
-                    // exceeding budget, the submit-failure branch dumps the tx
-                    // + resolved inputs to /tmp/submit-fail-* so the divergence
-                    // can be shared with the uplc-turbo team.
-                    r.budgets.iter().map(|(k, eu)| (k.clone(), eu.clone())).collect()
+                    // Inflate the evaluator's exact budgets by `budget_padding`
+                    // before submitting. uplc-turbo's CEK step accounting
+                    // doesn't always match cardano-node's exactly (we've seen
+                    // ~0.04% under-estimates), and a node rejection for budget
+                    // overrun aborts the whole scoop cycle — cheap insurance.
+                    // Padding-vs-max-budget gating already happens in
+                    // `within_limits` during the fitness binary search.
+                    let (pad_num, pad_den) = exec.budget_padding;
+                    r.budgets.iter().map(|(k, eu)| {
+                        let mut padded = eu.clone();
+                        padded.mem = eu.mem * pad_num / pad_den;
+                        padded.steps = eu.steps * pad_num / pad_den;
+                        (k.clone(), padded)
+                    }).collect()
                 }
                 Err(e) => {
                     if let Some(cap) = failure {
