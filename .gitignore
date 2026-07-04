@@ -2,4 +2,6 @@
 /downloads
 /logs
 .mcp.json
-scooper-devnet.db
+*.db
+logs.txt
+config/*.bak
