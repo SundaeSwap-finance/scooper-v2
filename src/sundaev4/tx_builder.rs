@@ -121,6 +121,26 @@ pub fn compute_tx_fee(
 const POOL_MIN_ADA: u64 = 2_000_000;
 const VALIDITY_RANGE: u64 = 180;
 
+// Conway-era coinsPerUtxoByte (preview/mainnet, stable). Used to compute
+// minUtxo for outputs whose datum size varies — e.g. pools post-governance
+// upgrades that extend module_state or actions.
+// TODO: pull from protocol parameters once Acropolis is wired.
+const COINS_PER_UTXO_BYTE: u64 = 4310;
+
+// Per Conway ledger spec: minUtxo = (160 + serializedOutputBytes) * coinsPerUtxoByte.
+// The 160-byte constant covers the output's UTxO entry overhead (txid+ix on the
+// reference side, plus header bytes).
+fn compute_output_min_ada(output: &TransactionOutput) -> Result<u64> {
+    let mut buf = Vec::new();
+    minicbor::encode(output, &mut buf)
+        .map_err(|e| anyhow::anyhow!("encode output for min_ada: {e}"))?;
+    Ok((160u64 + buf.len() as u64) * COINS_PER_UTXO_BYTE)
+}
+
+// Floor for wallet-change outputs (ADA-only). 1 ADA comfortably exceeds
+// Conway minUtxo (~858K lovelace) for an ADA-only vkey output.
+const SCOOPER_CHANGE_MIN_ADA: u64 = 1_000_000;
+
 use crate::sundaev3::Ident;
 
 /// Result of building a multi-pool scoop transaction.
@@ -164,6 +184,13 @@ pub fn build_multi_pool_scoop_tx(
     // resolves each order's `config_token` to its `required_constraints`
     // set so the right constraint-module withdrawals can be added (PR #11).
     order_configs: &BTreeMap<Vec<u8>, std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>>,
+    // Optional wallet UTxO that funds any min-ada gap on pool outputs (datum
+    // growth from upgrades can push pool outputs above their current ada
+    // buffer). When present, the input is included and net excess flows back
+    // as a scooper change output. When None, build fails if any pool actually
+    // needs a bump — so pass Some whenever the scooper has a suitable UTxO,
+    // and None only as a "no bump expected" hint.
+    funding_input: Option<(TransactionInput, &crate::cardano_types::Value)>,
 ) -> Result<MultiPoolBuildResult> {
     // First-pass builds use the TX_FEE upper bound; the rebuild passes the
     // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
@@ -622,8 +649,12 @@ pub fn build_multi_pool_scoop_tx(
     let all_order_orefs: Vec<TransactionInput> =
         flat_orders.iter().map(|f| f.order_ref.clone()).collect();
 
+    let funding_oref_opt = funding_input.as_ref().map(|(o, _)| o.clone());
+    let funding_value_opt = funding_input.as_ref().map(|(_, v)| *v);
+
     let mut sorted_inputs: Vec<TransactionInput> = pool_orefs.iter()
         .chain(all_order_orefs.iter())
+        .chain(funding_oref_opt.iter())
         .cloned()
         .collect();
     sorted_inputs.sort_by(|a, b| {
@@ -1254,22 +1285,51 @@ pub fn build_multi_pool_scoop_tx(
         }
     }).collect();
 
-    // Pool outputs in pool_output_order (sorted by input position)
-    for &batch_idx in &pool_output_order {
+    // Pool outputs in pool_output_order (sorted by input position).
+    // After construction we walk each pool output and bump its lovelace
+    // to actual min-utxo if the current ada (preserved from the input)
+    // falls short — datum growth from governance upgrades is the typical
+    // cause. The shortfall is funded by the wallet `funding_input` and
+    // any leftover flows back via the scooper change output below.
+    let mut pool_output_bumps: Vec<u64> = vec![0; m_pools];
+    for (pos, &batch_idx) in pool_output_order.iter().enumerate() {
         let batch = &batches[batch_idx];
         let pool_datum_pd = per_pool[batch_idx].updated_datum.clone().to_plutus();
         let pool_output_value = build_pool_output_value(
             &batch.pool, &per_pool[batch_idx].final_assets_actual, pool_ada_deltas[batch_idx],
         )?;
-        outputs.push(TransactionOutput::PostAlonzo(
+        let mut out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: pool_address.clone(),
                 value: pool_output_value,
                 datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(pool_datum_pd))),
                 script_ref: None,
             },
-        ));
+        );
+        // Reach the minUtxo by recomputing from the serialized output. Adding
+        // lovelace can grow the CBOR by 1 byte (and therefore the requirement
+        // by 4310 lovelace), so iterate until stable.
+        for _ in 0..4 {
+            let needed = compute_output_min_ada(&out)?;
+            let TransactionOutput::PostAlonzo(ref body) = out else { unreachable!() };
+            let current = match &body.value {
+                ConwayValue::Coin(c) => *c,
+                ConwayValue::Multiasset(c, _) => *c,
+            };
+            if current >= needed { break; }
+            let bump = needed - current;
+            pool_output_bumps[pos] += bump;
+            let new_ada = current + bump;
+            if let TransactionOutput::PostAlonzo(b) = &mut out {
+                b.value = match &b.value {
+                    ConwayValue::Coin(_) => ConwayValue::Coin(new_ada),
+                    ConwayValue::Multiasset(_, ma) => ConwayValue::Multiasset(new_ada, ma.clone()),
+                };
+            }
+        }
+        outputs.push(out);
     }
+    let total_pool_bump: u64 = pool_output_bumps.iter().sum();
 
     // Fee split across all orders
     let per_order_fee = tx_fee / n_orders as u64;
@@ -1370,6 +1430,91 @@ pub fn build_multi_pool_scoop_tx(
                 script_ref: None,
             },
         ));
+    }
+
+    // ── Step 8.4: Scooper change output for the funding UTxO ───────────────
+    //
+    // Only emitted when a `funding_input` was provided. Its ada covers any
+    // min-ada bump we applied to pool outputs above; the remainder flows
+    // here as a vkey-locked output back to the scooper's wallet, along
+    // with any native tokens carried by the funding UTxO. If no funding
+    // was provided but a bump was needed, bail — the scooper must retry
+    // once a suitable UTxO is available.
+    if funding_value_opt.is_none() && total_pool_bump > 0 {
+        bail!(
+            "pool output min-ada bump of {total_pool_bump} lovelace needed but no funding UTxO was provided"
+        );
+    }
+    if let Some(funding_value) = funding_value_opt {
+        use num_traits::ToPrimitive;
+        use pallas_primitives::NonEmptyKeyValuePairs;
+        let ada_asset_local = AssetClass { policy: vec![], token: vec![] };
+        let funding_ada = funding_value
+            .get(&ada_asset_local)
+            .unwrap()
+            .to_u64()
+            .context("funding UTxO ada doesn't fit u64")?;
+        let change_ada = funding_ada.checked_sub(total_pool_bump)
+            .with_context(|| format!(
+                "funding UTxO ada ({funding_ada}) insufficient for pool min-ada bump ({total_pool_bump})"
+            ))?;
+        if change_ada < SCOOPER_CHANGE_MIN_ADA {
+            bail!(
+                "scooper change ({change_ada} lovelace) below min UTxO; \
+                 pick a larger funding UTxO"
+            );
+        }
+        let scooper_change_addr = {
+            let addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Key(scooper_keyhash),
+                ShelleyDelegationPart::Null,
+            );
+            PallasBytes::from(addr.to_vec())
+        };
+        // Mirror native tokens from funding into the change output.
+        let mut multiasset_pairs: Vec<(Hash<28>, NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>)> =
+            Vec::new();
+        for (policy_bytes, tokens) in &funding_value.0 {
+            if policy_bytes.is_empty() {
+                continue;
+            }
+            let policy_hash: Hash<28> = Hash::from(policy_bytes.as_slice());
+            let mut token_pairs: Vec<(PallasBytes, PositiveCoin)> = Vec::new();
+            for (name_bytes, qty) in tokens {
+                let amt = qty.clone().unwrap().to_u64().unwrap_or(0);
+                if let Ok(pc) = PositiveCoin::try_from(amt) {
+                    token_pairs.push((PallasBytes::from(name_bytes.clone()), pc));
+                }
+            }
+            if !token_pairs.is_empty() {
+                multiasset_pairs.push((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)));
+            }
+        }
+        let change_value = if multiasset_pairs.is_empty() {
+            ConwayValue::Coin(change_ada)
+        } else {
+            ConwayValue::Multiasset(change_ada, NonEmptyKeyValuePairs::Def(multiasset_pairs))
+        };
+        outputs.push(TransactionOutput::PostAlonzo(
+            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+                address: scooper_change_addr,
+                value: change_value,
+                datum_option: None,
+                script_ref: None,
+            },
+        ));
+        // Non-fatal: warn if pallas wouldn't have accepted this change output
+        // (e.g. funding UTxO carried a lot of tokens and 1 ADA isn't enough
+        // for their minUtxo). Bail rather than ship an invalid tx.
+        let needed_for_change =
+            compute_output_min_ada(outputs.last().unwrap())?;
+        if change_ada < needed_for_change {
+            bail!(
+                "scooper change ({change_ada} lovelace) below min UTxO for its size \
+                 ({needed_for_change}); funding UTxO needs more ada or fewer tokens"
+            );
+        }
     }
 
     // ── Step 8.5: LP mint/burn for deposits and withdraws ──────────────────
@@ -1589,6 +1734,25 @@ pub fn build_multi_pool_scoop_tx(
             });
         }
     }
+    // Funding UTxO — vkey-locked, so it doesn't trigger a script during eval
+    // but must still appear in resolved_inputs so the evaluator can resolve it.
+    if let (Some(funding_oref), Some(funding_value)) = (funding_oref_opt.as_ref(), funding_value_opt) {
+        let scooper_addr = ShelleyAddress::new(
+            Network::Testnet,
+            ShelleyPaymentPart::Key(scooper_keyhash),
+            ShelleyDelegationPart::Null,
+        );
+        resolved_inputs.insert(
+            crate::cardano_types::TransactionInput(funding_oref.clone()),
+            ResolvedTxOut {
+                address: scooper_addr.to_vec(),
+                value: funding_value.clone(),
+                datum: DatumOption::None,
+                script_ref: None,
+            },
+        );
+    }
+
     // Build resolved reference inputs
     let mut resolved_ref_inputs = BTreeMap::new();
     for ref_input_key in all_ref_inputs.iter() {

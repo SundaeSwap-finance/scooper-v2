@@ -63,6 +63,8 @@ pub(crate) mod test_harness {
         pub language_views: Vec<u8>,
         pub collateral_utxo: TransactionInput,
         pub collateral_value: Value,
+        pub funding_utxo: TransactionInput,
+        pub funding_value: Value,
     }
 
     impl TestEnv {
@@ -156,6 +158,15 @@ pub(crate) mod test_harness {
             let mut collateral_value = Value::default();
             collateral_value.insert(&ada(), BigInt::from(100_000_000i64));
 
+            // Funding UTxO: covers pool-output min-ada bumps and recycles the
+            // remainder as scooper change.
+            let funding_utxo = TransactionInput {
+                transaction_id: [0xFD; 32].into(),
+                index: 0,
+            };
+            let mut funding_value = Value::default();
+            funding_value.insert(&ada(), BigInt::from(50_000_000i64));
+
             TestEnv {
                 exec,
                 scripts,
@@ -163,6 +174,8 @@ pub(crate) mod test_harness {
                 language_views,
                 collateral_utxo,
                 collateral_value,
+                funding_utxo,
+                funding_value,
             }
         }
 
@@ -209,6 +222,7 @@ pub(crate) mod test_harness {
                 &self.ref_utxo_outputs,
                 None, // fee_override
                 &empty_order_configs,
+                Some((self.funding_utxo.clone(), &self.funding_value)),
             )?;
 
             let eval = evaluate_scoop_tx(

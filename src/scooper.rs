@@ -523,6 +523,38 @@ impl Scooper {
             }
         };
 
+        // Optional funding UTxO: covers any min-ada bump on pool outputs
+        // (post-upgrades that grow datum size) and recycles the remainder
+        // back as scooper change. Must be distinct from the collateral UTxO
+        // and carry enough ada to cover a worst-case bump plus the change
+        // floor. We pick the smallest UTxO that clears the threshold to
+        // avoid tying up large balances. If none qualify, we still try to
+        // build — pools whose datum didn't grow won't need a bump, so the
+        // build can succeed without funding; pools that do need one will
+        // fail with a clear "bump needed" error.
+        const MIN_FUNDING_ADA: u64 = 2_500_000;
+        let funding = v4_state
+            .wallet_utxos
+            .iter()
+            .filter(|(i, _)| *i != &collateral_input)
+            .filter(|(_, v)| {
+                use num_traits::ToPrimitive;
+                v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= MIN_FUNDING_ADA
+            })
+            .min_by_key(|(_, v)| {
+                use num_traits::ToPrimitive;
+                v.get(&ada_asset).unwrap().to_u64().unwrap_or(0)
+            });
+        let funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> =
+            funding.map(|(i, v)| (i.clone(), v.clone()));
+        if funding_owned.is_none() {
+            debug!(
+                min_ada = MIN_FUNDING_ADA,
+                wallet_utxos = v4_state.wallet_utxos.len(),
+                "no wallet UTxO available for funding; builds will fail if any pool needs a min-ada bump"
+            );
+        }
+
         // Filter orders: exclude in-flight and quarantined, sort oldest first
         let in_flight_inputs = self.v4_chain_tracker.in_flight_order_inputs();
         let in_flight_pools = self.v4_chain_tracker.in_flight_pools();
@@ -805,6 +837,7 @@ impl Scooper {
                 &plan, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs,
+                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -948,6 +981,7 @@ impl Scooper {
                     &diag_plan, &settings, &exec, current_slot, language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs,
+                    funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 ) {
                     Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
@@ -1046,6 +1080,7 @@ impl Scooper {
             &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             None, &v4_state.order_configs,
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -1126,6 +1161,7 @@ impl Scooper {
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
             &v4_state.order_configs,
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
         ) {
             Ok(r) => r,
             Err(e) => {
