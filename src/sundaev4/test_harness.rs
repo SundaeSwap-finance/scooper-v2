@@ -148,6 +148,7 @@ pub(crate) mod test_harness {
                 blacklisted_pools: std::collections::BTreeSet::new(),
                 cost_per_pool_lovelace: 0,
                 cost_per_step_lovelace: 0,
+                strategy_peers: Vec::new(),
             };
 
             // Collateral: deterministic UTxO with enough ADA

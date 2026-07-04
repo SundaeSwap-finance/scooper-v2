@@ -221,6 +221,11 @@ pub enum Constraint {
         offered: Vec<(AssetClass, BigInt)>,
         min_received: Vec<(AssetClass, BigInt)>,
     },
+    /// strategy_order constraint: the trade parameters arrive off-chain as a
+    /// [`SignedStrategyExecution`] posted to the strategy-intents endpoint.
+    /// Not directly batchable — the scooper pairs it with a valid intent
+    /// before it becomes scoopable.
+    Strategy { constraints: StrategyConstraints },
 }
 
 impl Constraint {
@@ -283,6 +288,26 @@ impl Constraint {
         Self::from_plutus_constraint(constraint_data)
     }
 
+    /// Like [`Constraint::from_order_datum`], but also recognises
+    /// strategy_order constraints. Strategy constraint data is a
+    /// `StrategyConstraints { auth, final_destinations }` (no dispatch tag),
+    /// so it must be selected by hash, never by ctor tag.
+    pub fn from_order_datum_with_strategy(
+        datum: &OrderDatum,
+        swap_order_hash: &[u8],
+        basic_order_hash: &[u8],
+        strategy_order_hash: &[u8],
+    ) -> anyhow::Result<Self> {
+        if !strategy_order_hash.is_empty() {
+            if let Some(data) = datum.find_constraint_by_hash(strategy_order_hash) {
+                let constraints = StrategyConstraints::from_plutus(data.clone())
+                    .map_err(|e| anyhow::anyhow!("decode StrategyConstraints: {e}"))?;
+                return Ok(Constraint::Strategy { constraints });
+            }
+        }
+        Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
+    }
+
     /// Constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Matches the
     /// `settings.order_modules` lookup key.
     pub fn tag(&self) -> u64 {
@@ -291,6 +316,9 @@ impl Constraint {
             Constraint::Withdraw { .. } => 1,
             Constraint::Swap { .. } => 2,
             Constraint::Claim { .. } => 3,
+            // Strategy constraints have no ctor-tag dispatch — they're
+            // selected by script hash. No caller should route on this.
+            Constraint::Strategy { .. } => u64::MAX,
         }
     }
 
@@ -357,8 +385,9 @@ pub struct Rational {
 
 /// Aiken `OutputReference { transaction_id, output_index }`.
 /// In PlutusV3, TxId is de-newtyped so this is Constr(0, [bytes, idx]).
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OutputRef {
+    #[serde(serialize_with = "hex_ser::bytes")]
     pub transaction_id: Vec<u8>,
     pub output_index: u64,
 }
@@ -464,6 +493,72 @@ pub struct OrderConfig {
 pub struct FairnessOrderRedeemer {
     pub settings_input_index: u64,
     pub authorized_scooper_index: u64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Strategy orders (lib/types/strategy.ak, validators/constraints/strategy_order.ak)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Aiken `IntervalBoundType` (aiken/interval): NegativeInfinity = Constr 0,
+/// Finite(t) = Constr 1 [t] (POSIX ms), PositiveInfinity = Constr 2.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum IntervalBoundType {
+    NegativeInfinity,
+    Finite(BigInt),
+    PositiveInfinity,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntervalBound {
+    pub bound_type: IntervalBoundType,
+    pub is_inclusive: bool,
+}
+
+/// Aiken `ValidityRange` = `Interval { lower_bound, upper_bound }`, in POSIX ms.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrategyValidityRange {
+    pub lower_bound: IntervalBound,
+    pub upper_bound: IntervalBound,
+}
+
+/// Aiken `StrategyExecution` (lib/types/strategy.ak). The bytes the strategy
+/// key signs are the CBOR of *this* structure alone (the on-chain validator
+/// recomputes them via `cbor.serialise(sse.execution)`).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrategyExecution {
+    /// The order UTxO this execution authorizes a scoop of.
+    pub order_ref: OutputRef,
+    /// Window (POSIX ms) the execution is valid in; the scoop tx's validity
+    /// range must sit inside it.
+    pub validity_range: StrategyValidityRange,
+    /// Minimum quantities the fulfillment output must carry.
+    pub min_received: Vec<(AssetClass, BigInt)>,
+    /// Index into the strategy constraint's `final_destinations` list; `None`
+    /// = use the order datum's destination. (Named `final` in Aiken.)
+    pub final_destination: Option<BigInt>,
+    /// Opaque extension Data.
+    pub extension: PlutusData,
+}
+
+/// Aiken `SignedStrategyExecution`: the execution plus Ed25519 signatures.
+/// Each signature pair is `(verification_key, signature)` — the validator
+/// matches `blake2b_224(verification_key)` against the constraint's
+/// `auth` multisig and verifies the signature over `cbor(execution)`.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SignedStrategyExecution {
+    pub execution: StrategyExecution,
+    #[serde(serialize_with = "hex_ser::vec_bytes_pair_as_map")]
+    pub signatures: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Decoded `constraint_data` for a strategy_order constraint entry
+/// (lib/constraints/strategy.ak `StrategyConstraints`).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrategyConstraints {
+    /// Who may sign executions for this order.
+    pub auth: crate::multisig::Multisig,
+    /// Candidate destinations an execution may pick via `final_destination`.
+    pub final_destinations: Vec<Destination>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -660,6 +755,11 @@ pub struct ScooperExecution {
     /// (split entry across all hops). 0 = no limit.
     #[serde(default)]
     pub cost_per_step_lovelace: u64,
+    /// Peer scooper base URLs to gossip accepted strategy intents to
+    /// (e.g. "https://scooper-2.example.com"). Peers dedup by intent id, so
+    /// forwarding loops terminate.
+    #[serde(default)]
+    pub strategy_peers: Vec<String>,
 }
 
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }

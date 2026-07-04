@@ -27,6 +27,27 @@ impl Default for PersistenceConfig {
 pub trait Persistence: Send + Sync {
     fn indexer_dao(&self, namespace: &str) -> Box<dyn IndexerDao>;
     fn cursor_store(&self) -> CursorDao;
+    fn strategy_intent_dao(&self) -> Box<dyn StrategyIntentDao>;
+}
+
+/// A posted strategy intent, as persisted. `sse_cbor` is the wire-format
+/// SignedStrategyExecution; `hint` is the optional execution hint as JSON.
+#[derive(Debug, Clone)]
+pub struct PersistedStrategyIntent {
+    pub intent_id: Vec<u8>,
+    pub order_tx_id: Vec<u8>,
+    pub order_index: u64,
+    pub sse_cbor: Vec<u8>,
+    pub hint: Option<String>,
+    pub expiry_ms: u64,
+    pub received_at_ms: u64,
+}
+
+#[async_trait]
+pub trait StrategyIntentDao: Send + Sync + 'static {
+    async fn save_intent(&self, intent: &PersistedStrategyIntent) -> Result<()>;
+    async fn delete_intents(&self, intent_ids: &[Vec<u8>]) -> Result<()>;
+    async fn load_intents(&self) -> Result<Vec<PersistedStrategyIntent>>;
 }
 
 pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>> {

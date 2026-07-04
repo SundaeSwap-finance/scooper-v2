@@ -92,6 +92,57 @@ async fn main() -> Result<()> {
         .v4
         .as_ref()
         .and_then(|v4| v4.execution.clone());
+
+    // Strategy intent service: ingest via the admin server, execution by the
+    // scooper, hygiene via the prune loop below. Only meaningful with a v4
+    // execution config (we can't validate intents without module hashes).
+    let intents: Option<sundaev4::intents::IntentServiceHandle> = match &v4_execution {
+        Some(exec) => Some(Arc::new(
+            sundaev4::intents::IntentService::load(
+                persistence.strategy_intent_dao(),
+                exec.strategy_peers.clone(),
+            )
+            .await?,
+        )),
+        None => None,
+    };
+    if let (Some(intents), Some(v4_state)) = (intents.clone(), v4_state.clone()) {
+        let shutdown = shutdown.child_token();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                // Only trust "order not in state" as evidence of a spent
+                // order once the indexer is at the network tip — before
+                // that, the state is incomplete and pruning on it would
+                // wipe intents that are still live.
+                let (live_orders, at_tip) = {
+                    let state = v4_state.lock().await;
+                    let latest = state.latest();
+                    let at_tip = latest
+                        .network_tip_slot
+                        .map(|net| latest.tip_slot + 10 >= net)
+                        .unwrap_or(false);
+                    let live: std::collections::BTreeSet<(Vec<u8>, u64)> = latest
+                        .orders
+                        .iter()
+                        .map(|o| (o.input.0.transaction_id.as_ref().to_vec(), o.input.0.index))
+                        .collect();
+                    (live, at_tip)
+                };
+                let result = intents
+                    .prune(|key| !at_tip || live_orders.contains(key))
+                    .await;
+                if let Err(e) = result {
+                    tracing::warn!("strategy intent prune failed: {e}");
+                }
+            }
+        });
+    }
+
     let manager_handle = tokio::spawn(manager_loop(
         v3_state.clone(),
         v4_state.clone(),
@@ -132,6 +183,7 @@ async fn main() -> Result<()> {
         event_tx.clone(),
         paused.clone(),
         metrics.clone(),
+        intents.clone(),
         shutdown.child_token(),
     ));
 

@@ -69,6 +69,77 @@ impl Persistence for SqlitePersistence {
             pool: self.pool.clone(),
         }))
     }
+
+    fn strategy_intent_dao(&self) -> Box<dyn super::StrategyIntentDao> {
+        Box::new(SqliteStrategyIntentDao {
+            pool: self.pool.clone(),
+        })
+    }
+}
+
+struct SqliteStrategyIntentDao {
+    pool: Pool<Sqlite>,
+}
+
+#[async_trait]
+impl super::StrategyIntentDao for SqliteStrategyIntentDao {
+    async fn save_intent(&self, intent: &super::PersistedStrategyIntent) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO sundae_v4_strategy_intents \
+             (intent_id, order_tx_id, order_index, sse_cbor, hint, expiry_ms, received_at_ms) \
+             VALUES (?,?,?,?,?,?,?);",
+        )
+        .bind(&intent.intent_id)
+        .bind(&intent.order_tx_id)
+        .bind(intent.order_index as i64)
+        .bind(&intent.sse_cbor)
+        .bind(&intent.hint)
+        .bind(intent.expiry_ms as i64)
+        .bind(intent.received_at_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_intents(&self, intent_ids: &[Vec<u8>]) -> Result<()> {
+        if intent_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = vec!["?"; intent_ids.len()].join(",");
+        let query = format!(
+            "DELETE FROM sundae_v4_strategy_intents WHERE intent_id IN ({placeholders});"
+        );
+        let mut q = sqlx::query(&query);
+        for id in intent_ids {
+            q = q.bind(id);
+        }
+        q.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn load_intents(&self) -> Result<Vec<super::PersistedStrategyIntent>> {
+        let rows = sqlx::query(
+            "SELECT intent_id, order_tx_id, order_index, sse_cbor, hint, expiry_ms, received_at_ms \
+             FROM sundae_v4_strategy_intents;",
+        )
+        .try_map(|row: SqliteRow| {
+            let order_index: i64 = row.try_get("order_index")?;
+            let expiry_ms: i64 = row.try_get("expiry_ms")?;
+            let received_at_ms: i64 = row.try_get("received_at_ms")?;
+            Ok(super::PersistedStrategyIntent {
+                intent_id: row.try_get("intent_id")?,
+                order_tx_id: row.try_get("order_tx_id")?,
+                order_index: order_index as u64,
+                sse_cbor: row.try_get("sse_cbor")?,
+                hint: row.try_get("hint")?,
+                expiry_ms: expiry_ms as u64,
+                received_at_ms: received_at_ms as u64,
+            })
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 pub struct SqliteIndexerDao {

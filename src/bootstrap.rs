@@ -1567,13 +1567,21 @@ async fn bootstrap_v4(
                 .and_then(|e| e.module_scripts.basic_order.as_ref())
                 .map(|s| s.hash.as_ref().to_vec())
                 .unwrap_or_default();
+            let strategy_order_hash: Vec<u8> = protocol
+                .execution
+                .as_ref()
+                .and_then(|e| e.module_scripts.strategy_order.as_ref())
+                .map(|s| s.hash.as_ref().to_vec())
+                .unwrap_or_default();
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
                 .and_then(|data| {
                     sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
                 })
                 .and_then(|datum| {
-                    sundaev4::Constraint::from_order_datum(&datum, &swap_order_hash, &basic_order_hash)
+                    sundaev4::Constraint::from_order_datum_with_strategy(
+                        &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                    )
                         .map(|constraint| (datum, constraint))
                         .map_err(|e| format!("{e}"))
                 }) {

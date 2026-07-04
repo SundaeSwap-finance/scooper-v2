@@ -236,6 +236,12 @@ impl SundaeV4Indexer {
             .and_then(|e| e.module_scripts.basic_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
+        let strategy_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.strategy_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
         {
             use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, ConcentratedLiquidityConfig, FeeSplitConfig};
             let mut cache = self.module_configs.lock().await;
@@ -305,8 +311,8 @@ impl SundaeV4Indexer {
                 "order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_order_datum(
-                                &datum, &swap_order_hash, &basic_order_hash,
+                            crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                                &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                             )
                                 .map(|c| (datum, c))
                                 .map_err(|e| format!("constraint decode: {e}"))
@@ -334,8 +340,8 @@ impl SundaeV4Indexer {
                 "invalid_order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_order_datum(
-                                &datum, &swap_order_hash, &basic_order_hash,
+                            crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                                &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                             )
                                 .map(|c| (datum, c))
                                 .map_err(|e| format!("constraint decode: {e}"))
@@ -434,8 +440,8 @@ impl SundaeV4Indexer {
                 "order" => {
                     if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums) {
                         if let Ok(constraint) =
-                            crate::sundaev4::Constraint::from_order_datum(
-                                &od, &swap_order_hash, &basic_order_hash,
+                            crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                                &od, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                             )
                         {
                             state.spent_orders.push(SpentOrder {
@@ -866,6 +872,12 @@ impl ChainIndex for SundaeV4Indexer {
             .and_then(|e| e.module_scripts.basic_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
+        let strategy_order_hash: Vec<u8> = self.protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.strategy_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
         let cs_module_hash_bytes: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -1039,8 +1051,8 @@ impl ChainIndex for SundaeV4Indexer {
                 let tx_out = cardano_types::convert_txo(output);
                 match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                     .and_then(|datum| {
-                        crate::sundaev4::Constraint::from_order_datum(
-                            &datum, &swap_order_hash, &basic_order_hash,
+                        crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                            &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                         )
                             .map(|c| (datum, c))
                             .map_err(|e| format!("constraint decode: {e}"))

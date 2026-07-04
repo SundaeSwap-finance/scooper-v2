@@ -133,6 +133,7 @@ pub async fn admin_server(
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     shutdown: CancellationToken,
 ) {
     let v4_module_preimages = Arc::new(v4_module_preimages);
@@ -166,6 +167,7 @@ pub async fn admin_server(
         let v4_module_preimages = v4_module_preimages.clone();
         let paused = paused.clone();
         let metrics = metrics.clone();
+        let intents = intents.clone();
         let tls_acceptor = tls_acceptor.clone();
 
         let child = shutdown.child_token();
@@ -180,12 +182,12 @@ pub async fn admin_server(
                 };
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics) => {}
+                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics, intents) => {}
                 }
             } else {
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics) => {}
+                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics, intents) => {}
                 }
             }
         });
@@ -202,6 +204,7 @@ async fn handle_request(
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
 ) {
     let io = TokioIo::new(stream);
 
@@ -214,6 +217,7 @@ async fn handle_request(
         event_tx,
         paused,
         metrics,
+        intents,
     };
     if let Err(err) = http1::Builder::new()
         .serve_connection(io, admin_server)
@@ -233,6 +237,7 @@ struct AdminServer {
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
+    intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -281,10 +286,147 @@ impl AdminServer {
             .unwrap()
     }
 
-    async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
-        let path = req.uri().path();
+    fn error_response(status: hyper::StatusCode, message: impl Into<String>) -> Response<ResponseBody> {
+        let body = serde_json::json!({ "error": message.into() }).to_string();
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Either::Left(Full::new(Bytes::from(body))))
+            .unwrap()
+    }
 
-        match path {
+    /// POST /v4/strategy-intents
+    ///
+    /// Body: `{"signed_execution": "<SignedStrategyExecution cbor hex>",
+    ///         "hint": {"type": "claim", "pool": "<ident hex>"}?}`.
+    /// The signed CBOR travels verbatim — the Ed25519 signature covers the
+    /// exact bytes of the execution, so no JSON re-encoding of it exists.
+    async fn post_strategy_intent(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
+        use http_body_util::BodyExt;
+
+        let Some(intents) = self.intents.clone() else {
+            return Self::error_response(
+                hyper::StatusCode::NOT_IMPLEMENTED,
+                "strategy intents require a configured v4 execution",
+            );
+        };
+        let Some(v4_state) = self.v4_state.clone() else {
+            return Self::error_response(
+                hyper::StatusCode::NOT_IMPLEMENTED,
+                "v4 protocol not configured",
+            );
+        };
+
+        // Bound the body read: an SSE is small; 64KB is generous.
+        const MAX_BODY: usize = 64 * 1024;
+        let body = match req.into_body().collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                return Self::error_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    format!("failed to read body: {e}"),
+                );
+            }
+        };
+        if body.len() > MAX_BODY {
+            return Self::error_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+        }
+
+        #[derive(Deserialize)]
+        struct PostIntentBody {
+            signed_execution: String,
+            #[serde(default)]
+            hint: Option<crate::sundaev4::intents::ExecutionHint>,
+        }
+        let parsed: PostIntentBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                return Self::error_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    format!("invalid JSON body: {e}"),
+                );
+            }
+        };
+        let sse_cbor = match hex::decode(parsed.signed_execution.trim()) {
+            Ok(b) => b,
+            Err(e) => {
+                return Self::error_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    format!("signed_execution is not valid hex: {e}"),
+                );
+            }
+        };
+
+        // Snapshot current orders so validation doesn't hold the state lock.
+        let orders: Vec<Arc<crate::sundaev4::SundaeV4Order>> = {
+            let state = v4_state.lock().await;
+            state.latest().orders.clone()
+        };
+        let find_order = |key: &crate::sundaev4::intents::OrderKey| {
+            orders
+                .iter()
+                .find(|o| {
+                    o.input.0.transaction_id.as_ref() == key.0.as_slice()
+                        && o.input.0.index == key.1
+                })
+                .cloned()
+        };
+
+        match intents.submit(sse_cbor, parsed.hint, find_order).await {
+            Ok(outcome) => Self::json_response(serde_json::to_string(&outcome).unwrap()),
+            Err(e) => Self::error_response(hyper::StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
+    /// GET /v4/strategy-intents — observability listing.
+    async fn list_strategy_intents(self) -> Response<ResponseBody> {
+        let Some(intents) = self.intents.clone() else {
+            return Self::error_response(
+                hyper::StatusCode::NOT_IMPLEMENTED,
+                "strategy intents require a configured v4 execution",
+            );
+        };
+        let store = intents.store.lock().await;
+        let now = crate::sundaev4::intents::now_ms();
+        let listing: Vec<serde_json::Value> = store
+            .all()
+            .map(|i| {
+                serde_json::json!({
+                    "intent_id": hex::encode(&i.intent_id),
+                    "order": format!(
+                        "{}#{}",
+                        hex::encode(&i.sse.execution.order_ref.transaction_id),
+                        i.sse.execution.order_ref.output_index,
+                    ),
+                    "hint": i.hint,
+                    "expiry_ms": i.expiry_ms,
+                    "expired": i.expiry_ms <= now,
+                    "received_at_ms": i.received_at_ms,
+                    "min_received": i.sse.execution.min_received,
+                })
+            })
+            .collect();
+        Self::json_response(
+            serde_json::json!({ "count": store.len(), "intents": listing }).to_string(),
+        )
+    }
+
+    async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
+        let path = req.uri().path().to_string();
+
+        if path == "/v4/strategy-intents" {
+            return match *req.method() {
+                hyper::Method::POST => self.post_strategy_intent(req).await,
+                hyper::Method::GET => self.list_strategy_intents().await,
+                _ => Self::error_response(
+                    hyper::StatusCode::METHOD_NOT_ALLOWED,
+                    "use GET or POST",
+                ),
+            };
+        }
+
+        match path.as_str() {
             "/dashboard" => self.serve_dashboard(),
             "/events" => self.serve_sse(),
             "/status" => Self::json_response(self.serve_status().await),
@@ -301,7 +443,7 @@ impl AdminServer {
                     serde_json::to_string(&serde_json::json!({ "paused": now_paused })).unwrap(),
                 )
             }
-            _ => Self::json_response(self.route_protocol(path).await),
+            _ => Self::json_response(self.route_protocol(&path).await),
         }
     }
 
