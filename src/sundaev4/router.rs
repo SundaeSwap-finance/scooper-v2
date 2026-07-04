@@ -1070,6 +1070,7 @@ mod tests {
                     num: BigInt::from(0),
                     den: BigInt::from(1),
                 },
+                waive_fee_on_claim: false,
             },
             slot: 100,
             fee_split_config: None,

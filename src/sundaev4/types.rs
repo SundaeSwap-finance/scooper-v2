@@ -329,7 +329,7 @@ pub struct OutputRef {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PoolType {
     ConstantProduct { fee: Rational },
-    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational },
+    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational, waive_fee_on_claim: bool },
     /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
     /// bound the pool's price range (`a < b`). The validator works on
     /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
@@ -356,8 +356,13 @@ pub struct ConstantSumConfig {
     pub prices: Vec<BigInt>,
     pub fee: Rational,
     /// Quadratic rebalance bounty parameter. `(0, 1)` disables the bounty
-    /// mechanism — currently passthrough; we don't yet act on it.
+    /// mechanism.
     pub bounty_k: Rational,
+    /// When `true`, the swap portion of a `tag_claim` step is value-neutral
+    /// (`dy = dx · p_in / p_out` exactly, no fee retained) and the on-chain
+    /// validator requires `v_increase = 0`, `fee_budget = 0`,
+    /// `before_lp == after_lp`. The claim itself is bounded only by cap_b.
+    pub waive_fee_on_claim: bool,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -380,6 +385,19 @@ pub struct OrderValidatorRedeemer {
 pub struct OrderValidatorEntry {
     pub output_index: u64,
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CS operation tag constants (lib/modules/cs_check.ak)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Constant-sum swap step.
+pub const TAG_SWAP: u64 = 3;
+/// Constant-sum LP-redemption step (SUN-202).
+pub const TAG_WITHDRAW: u64 = 4;
+/// Constant-sum bounty-claim step. `operation_data` is `BountyClaim { asset, amount }`.
+pub const TAG_CLAIM: u64 = 5;
+/// Constant-sum proportional-deposit step.
+pub const TAG_DEPOSIT: u64 = 6;
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantProductRedeemer {
@@ -546,11 +564,10 @@ pub struct ScooperExecution {
     /// Default: (6, 5) i.e. 20% padding.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
-    /// Pool idents (hex) to exclude from scooping. Used to skip pools whose
-    /// on-chain config is structurally inconsistent (e.g. a CS-classified pool
-    /// with a non-zero fee_split protocol_share — cs_check requires
-    /// `before_lp == after_lp` per swap, so fee_split's cumulative
-    /// `floor(total_fee * ps_num/ps_den)` target is unsatisfiable).
+    /// Pool idents (hex) to exclude from scooping. Useful as an operator
+    /// escape hatch for pools the scooper can't currently fulfill (e.g. a
+    /// pool whose on-chain config the scooper hasn't been able to recover,
+    /// or any pool the operator wants to skip).
     #[serde(default)]
     pub blacklisted_pools: std::collections::BTreeSet<String>,
     /// Lovelace charged against an order's budget for each pool its route
@@ -984,11 +1001,13 @@ mod tests {
             prices: vec![BigInt::from(1), BigInt::from(2)],
             fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            waive_fee_on_claim: false,
         };
         let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
         // Persisted byte shape used by sqlite tests in persistence::sqlite.
         // If this changes, update those test fixtures.
-        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffff");
+        // Trailing `d87980` = Constr 0 [] (False) for waive_fee_on_claim.
+        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffd87980ff");
 
         let pd: PlutusData = minicbor::decode(&cbor).unwrap();
         let decoded: ConstantSumConfig = AsPlutus::from_plutus(pd).unwrap();
@@ -997,6 +1016,7 @@ mod tests {
         assert_eq!(decoded.fee.den, cfg.fee.den);
         assert_eq!(decoded.bounty_k.num, cfg.bounty_k.num);
         assert_eq!(decoded.bounty_k.den, cfg.bounty_k.den);
+        assert!(!decoded.waive_fee_on_claim);
     }
 
     #[test]

@@ -287,6 +287,7 @@ pub(crate) mod test_harness {
                 prices: prices.to_vec(),
                 fee: fee.clone(),
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                waive_fee_on_claim: false,
             };
             let cs_cbor = minicbor::to_vec(&cs_config.to_plutus()).unwrap();
             let cs_hash = Hasher::<256>::hash(&cs_cbor).to_vec();
@@ -513,6 +514,7 @@ pub(crate) mod test_harness {
                 prices,
                 fee,
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                waive_fee_on_claim: false,
             },
             slot: 100,
             fee_split_config: None,

@@ -270,17 +270,13 @@ pub fn build_multi_pool_scoop_tx(
     // Per-pool fee_split protocol_share. fee_split.Operate runs once per pool
     // and checks the cumulative protocol_lp captured across the transcript
     // matches `floor(total_fee * ps_num / ps_den)`. Using a global default
-    // would produce the wrong protocol_lp for any pool with a non-default share.
+    // would produce the wrong protocol_lp for any pool with a non-default
+    // share.
     //
-    // CS pools are special: their `Operate` validator asserts `before_lp ==
-    // after_lp` on every swap entry, so we must not apply per-entry protocol_lp
-    // bumps for them at all. Protocol cuts for CS flow via the bounty/claim
-    // path, not fee_split. Hard-pin ps to (0, 1) here regardless of any
-    // recovered or fallback config.
+    // CS pools now capture protocol revenue normally (post-SUN-101: the
+    // `before_lp == after_lp` invariant was removed from cs_check's swap
+    // path, so total_lp can grow each step like CP/CL).
     let per_pool_ps: Vec<(BigInt, BigInt)> = batches.iter().map(|batch| {
-        if matches!(batch.pool.pool_type, PoolType::ConstantSum { .. }) {
-            return (BigInt::from(0), BigInt::from(1));
-        }
         batch.pool.fee_split_config.as_ref()
             .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
             .unwrap_or_else(|| (
@@ -474,11 +470,14 @@ pub fn build_multi_pool_scoop_tx(
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
                 per_pool_lp_burned[batch_idx] =
                     &per_pool_lp_burned[batch_idx] + &w.lp_burned;
+                // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
+                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
+                // from asset deltas, so any sentinel tag works.
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
                     PoolType::ConstantSum { .. } => {
-                        anyhow::bail!("CS withdraw not supported on-chain");
+                        BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                 };
                 (wd_tag, BigInt::from(0))
@@ -493,8 +492,8 @@ pub fn build_multi_pool_scoop_tx(
         // cumulative-floor target and let each entry's contribution be the
         // delta; the rounding "carry" naturally lands on whichever entry tips
         // the running product across the next ps_den boundary.
-        // CS pools have ps=(0,1) (CS swaps must keep LP fixed), so the target
-        // stays at 0 and every entry contributes 0 — leaves LP untouched.
+        // Pools with ps=(0, *) (= 0/N) leave LP untouched: target stays at
+        // 0 and every entry contributes 0.
         let (ps_num_bi, ps_den_bi) = &per_pool_ps[batch_idx];
         let new_cum_gross_fb = &per_pool_cum_gross_fb[batch_idx] + &gross_fb;
         let new_cum_protocol_lp = &new_cum_gross_fb * ps_num_bi / ps_den_bi;
@@ -719,11 +718,12 @@ pub fn build_multi_pool_scoop_tx(
                     config,
                 });
             }
-            PoolType::ConstantSum { prices, fee, bounty_k } => {
+            PoolType::ConstantSum { prices, fee, bounty_k, waive_fee_on_claim } => {
                 let cs_cfg = ConstantSumConfig {
                     prices: prices.clone(),
                     fee: fee.clone(),
                     bounty_k: bounty_k.clone(),
+                    waive_fee_on_claim: *waive_fee_on_claim,
                 };
                 if let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() {
                     let cs_cred = cs_script.hash.as_ref();

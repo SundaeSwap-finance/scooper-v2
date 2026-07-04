@@ -90,21 +90,18 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> PoolAccum {
-        // CS pools must have ps=(0, 1): their Operate validator forbids LP
-        // change on swap entries; protocol cuts flow via bounty/claim. See
-        // matching note in tx_builder's per_pool_ps.
-        let ps = if matches!(effective_pool.pool_type, crate::sundaev4::types::PoolType::ConstantSum { .. }) {
-            (BigInt::from(0), BigInt::from(1))
-        } else {
-            effective_pool
-                .fee_split_config
-                .as_ref()
-                .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
-                .unwrap_or_else(|| (
-                    BigInt::from(self.protocol_share.0),
-                    BigInt::from(self.protocol_share.1),
-                ))
-        };
+        // CS pools capture protocol revenue like CP/CL post-SUN-101 (cs_check
+        // no longer forbids LP growth on swap entries). Must stay in lockstep
+        // with tx_builder's per_pool_ps or predicted pool state diverges from
+        // the built tx.
+        let ps = effective_pool
+            .fee_split_config
+            .as_ref()
+            .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
+            .unwrap_or_else(|| (
+                BigInt::from(self.protocol_share.0),
+                BigInt::from(self.protocol_share.1),
+            ));
         PoolAccum {
             pool: effective_pool.clone(),
             ident: pool_ident.clone(),

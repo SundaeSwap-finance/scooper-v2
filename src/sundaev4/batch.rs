@@ -632,12 +632,9 @@ pub fn resolve_proportional_deposit(
 /// pool keeps the floor remainder, so there is no surplus.
 ///
 /// Works for any pool type that admits proportional reserve/LP changes:
-/// CP's non-swap check, CS's check_deposit-mirrored constraint (with
-/// `delta_v < 0`), and CL's `va1·vb1·lp²` invariant all hold for
-/// proportional shrinkage by the same scale factor. CS rejects withdraw
-/// on-chain via the operation_tag dispatch — we still build the tx but
-/// the validator will reject it; that's enforced earlier in the
-/// tx_builder.
+/// CP's non-swap check, CS's `check_withdraw` (post-SUN-202 `tag_withdraw=4`)
+/// constraint, and CL's `va1·vb1·lp²` invariant all hold for proportional
+/// shrinkage by the same scale factor.
 pub fn resolve_proportional_withdraw(
     pool: &SundaeV4Pool,
     order: &Arc<SundaeV4Order>,

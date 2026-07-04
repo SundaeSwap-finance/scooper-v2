@@ -1531,6 +1531,7 @@ pub fn detect_pool_type(
                     den: BigInt::from(fee.1),
                 },
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                waive_fee_on_claim: false,
             };
         }
 
@@ -1540,6 +1541,7 @@ pub fn detect_pool_type(
                 prices: cs_config.prices.clone(),
                 fee: cs_config.fee.clone(),
                 bounty_k: cs_config.bounty_k.clone(),
+                waive_fee_on_claim: cs_config.waive_fee_on_claim,
             };
         }
 
@@ -1551,6 +1553,7 @@ pub fn detect_pool_type(
                 den: BigInt::from(exec.fee.1),
             },
             bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            waive_fee_on_claim: false,
         };
     }
 
