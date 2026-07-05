@@ -216,8 +216,11 @@ pub fn find_pool_for_simple_order(
     order: &SundaeV4Order,
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
-    let offer_asset = order.swap_offered().0;
-    let ask_asset = order.swap_min_received().0;
+    // Non-Swap constraints (Deposit/Withdraw/Claim/Strategy) simply don't
+    // match a pool here — and must not panic: this runs over *unfiltered*
+    // state orders from the server's listing endpoint.
+    let (offer_asset, _) = order.constraint.swap_offered()?;
+    let (ask_asset, _) = order.constraint.swap_min_received()?;
 
     for (ident, pool) in pools {
         let has_offer = pool.pool_datum.assets.iter().any(|(a, _)| a == offer_asset);
@@ -514,8 +517,8 @@ pub fn detect_swap_direction(
     order: &SundaeV4Order,
     assets: &[(AssetClass, BigInt)],
 ) -> Option<(usize, usize)> {
-    let offer_asset = order.swap_offered().0;
-    let ask_asset = order.swap_min_received().0;
+    let (offer_asset, _) = order.constraint.swap_offered()?;
+    let (ask_asset, _) = order.constraint.swap_min_received()?;
     let input_idx = assets.iter().position(|(a, _)| a == offer_asset)?;
     let output_idx = assets.iter().position(|(a, _)| a == ask_asset)?;
     if input_idx == output_idx {

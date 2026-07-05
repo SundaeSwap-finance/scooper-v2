@@ -70,6 +70,8 @@ pub struct Scooper {
     quarantine: BTreeMap<TransactionInput, Quarantine>,
     /// Posted strategy intents (shared with the admin server's ingest).
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
+    /// Intent ids we've already logged a match for (log once, not per cycle).
+    logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
 }
 
 impl Scooper {
@@ -101,6 +103,7 @@ impl Scooper {
             backoff_until_after_slot: None,
             quarantine: BTreeMap::new(),
             v4_intents,
+            logged_intent_matches: std::collections::BTreeSet::new(),
         })
     }
 
@@ -675,11 +678,13 @@ impl Scooper {
                     else {
                         continue;
                     };
-                    info!(
-                        order = %order.input,
-                        intent = %hex::encode(&intent.intent_id),
-                        "strategy order matched with intent; dispatching as swap",
-                    );
+                    if self.logged_intent_matches.insert(intent.intent_id.clone()) {
+                        info!(
+                            order = %order.input,
+                            intent = %hex::encode(&intent.intent_id),
+                            "strategy order matched with intent; dispatching as swap",
+                        );
+                    }
                     strategy_executions.insert(order.input.clone(), sse_pd);
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
                         input: order.input.clone(),
