@@ -195,7 +195,16 @@ impl IntentStore {
 
         let intent_id = Hasher::<256>::hash(&sse_cbor).to_vec();
         let entry = self.by_order.entry(key).or_default();
-        if entry.iter().any(|i| i.intent_id == intent_id) {
+        if let Some(existing) = entry.iter_mut().find(|i| i.intent_id == intent_id) {
+            // Duplicate bytes. A hint can still be attached or replaced —
+            // latest Some(hint) wins; None means "no opinion", keep what we
+            // have. Returning the updated intent makes the caller persist
+            // and re-gossip it, so hint updates propagate and converge.
+            if hint.is_some() && existing.hint != hint {
+                existing.hint = hint;
+                let updated = existing.clone();
+                return Ok((SubmitOutcome { intent_id, newly_stored: false }, Some(updated)));
+            }
             return Ok((SubmitOutcome { intent_id, newly_stored: false }, None));
         }
         if entry.len() >= MAX_INTENTS_PER_ORDER {
@@ -580,12 +589,27 @@ mod tests {
 
         // Same bytes again: dedup, no error, not re-stored.
         let (echo, stored2) = store
-            .submit(cbor, None, |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
             .expect("duplicate intent should be a no-op");
         assert!(!echo.newly_stored);
         assert!(stored2.is_none());
         assert_eq!(store.len(), 1);
         assert_eq!(echo.intent_id, outcome.intent_id);
+
+        // A duplicate can attach/replace a hint (latest Some wins) …
+        let new_hint = Some(ExecutionHint::Claim { pool: "beef02".into() });
+        let (echo2, updated) = store
+            .submit(cbor.clone(), new_hint.clone(), |_| Some(order.clone()), NOW_MS)
+            .expect("hint update should succeed");
+        assert!(!echo2.newly_stored);
+        assert_eq!(updated.expect("updated intent returned").hint, new_hint);
+        // … but a hint-less duplicate leaves the stored hint untouched.
+        let (_, none_update) = store
+            .submit(cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .expect("no-hint duplicate is a no-op");
+        assert!(none_update.is_none());
+        let key0 = (vec![0xAB; 32], 1u64);
+        assert_eq!(store.valid_for_order(&key0, NOW_MS)[0].hint, new_hint);
 
         // Valid-for-order sees it inside the window, not outside.
         let key = (vec![0xAB; 32], 1u64);
