@@ -97,7 +97,16 @@ fn build_tx_info(
     // reference_inputs
     let ref_inputs = match &tx_body.reference_inputs {
         Some(ref_set) => {
-            let ref_vec: Vec<_> = ref_set.iter().cloned().collect();
+            // The ledger holds reference inputs as a Set and presents them to
+            // scripts sorted by (txId, index) regardless of body encoding
+            // order — mirror that, or ref_index-style redeemers evaluate
+            // differently here than on the node.
+            let mut ref_vec: Vec<_> = ref_set.iter().cloned().collect();
+            ref_vec.sort_by(|a, b| {
+                a.transaction_id
+                    .cmp(&b.transaction_id)
+                    .then(a.index.cmp(&b.index))
+            });
             encode_tx_in_info_list(&ref_vec, resolved_ref_inputs)
         }
         None => pd_array(vec![]),

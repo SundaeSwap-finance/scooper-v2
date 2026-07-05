@@ -1039,19 +1039,18 @@ pub fn build_multi_pool_scoop_tx(
     }
     all_ref_inputs.push(settings.input.0.clone());
 
-    // Compute the canonical sort that on-chain ScriptContext.reference_inputs
-    // delivers (Cardano ledger sorts by (txId bytes, output_index)). We use
-    // this to set `ref_index` on `OrderValidatorConfig` and
-    // `FairnessOrderRedeemer.settings_input_index`.
-    let canonical_ref_order: Vec<TransactionInput> = {
-        let mut v = all_ref_inputs.clone();
-        v.sort_by(|a, b| {
-            a.transaction_id
-                .cmp(&b.transaction_id)
-                .then(a.index.cmp(&b.index))
-        });
-        v
-    };
+    // Sort the reference inputs canonically — (txId bytes, output_index) —
+    // and dedupe. The ledger treats reference_inputs as a Set and presents
+    // them to scripts in exactly this order, so keeping the body in canonical
+    // order makes the body, the on-chain ScriptContext, and every ref_index
+    // we put in redeemers agree by construction.
+    all_ref_inputs.sort_by(|a, b| {
+        a.transaction_id
+            .cmp(&b.transaction_id)
+            .then(a.index.cmp(&b.index))
+    });
+    all_ref_inputs.dedup();
+    let canonical_ref_order: Vec<TransactionInput> = all_ref_inputs.clone();
     let canonical_index_of = |input: &TransactionInput| -> u64 {
         canonical_ref_order
             .iter()
@@ -1076,6 +1075,30 @@ pub fn build_multi_pool_scoop_tx(
             }
         })
         .collect();
+    // Temp diagnostic — log canonical ref ordering vs the OrderConfig
+    // resolutions so we can see if ref_index points at the right UTxO.
+    tracing::info!("DBG canonical ref_inputs order:");
+    for (i, r) in canonical_ref_order.iter().enumerate() {
+        tracing::info!(
+            "  [{}] {}#{}",
+            i,
+            hex::encode(r.transaction_id.as_ref()),
+            r.index,
+        );
+    }
+    for (token, oc) in &unique_order_configs {
+        tracing::info!(
+            "DBG OrderConfig token={} resolves to ref [{}] {}#{}",
+            hex::encode(token),
+            canonical_index_of(&oc.input.0),
+            hex::encode(oc.input.0.transaction_id.as_ref()),
+            oc.input.0.index,
+        );
+    }
+    tracing::info!(
+        "DBG settings.input canonical idx = {} (= settings_input_index)",
+        settings_input_index,
+    );
     let order_validator_redeemer = OrderValidatorRedeemer {
         configs: order_validator_configs,
         entries: order_validator_redeemer.entries,
