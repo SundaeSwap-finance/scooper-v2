@@ -563,11 +563,19 @@ mod tests {
         let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
         let mut store = IntentStore::default();
 
+        let hint = Some(ExecutionHint::Claim { pool: "cafe01".into() });
         let (outcome, stored) = store
-            .submit(cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), hint.clone(), |_| Some(order.clone()), NOW_MS)
             .expect("valid intent should be accepted");
         assert!(outcome.newly_stored);
-        assert!(stored.is_some());
+        let stored = stored.expect("stored intent returned");
+        assert_eq!(stored.hint, hint);
+        // Hint survives the persisted round-trip (JSON in the sqlite row).
+        let persisted = to_persisted(&stored);
+        assert_eq!(
+            persisted.hint.as_deref(),
+            Some(r#"{"type":"claim","pool":"cafe01"}"#),
+        );
         assert_eq!(store.len(), 1);
 
         // Same bytes again: dedup, no error, not re-stored.
