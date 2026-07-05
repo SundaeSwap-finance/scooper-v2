@@ -128,6 +128,9 @@ pub enum BatchOp {
     Continuation(usize),
     Deposit(usize),
     Withdraw(usize),
+    /// Index into `batch.claims`. Phase 1: a claim is always the only op in
+    /// its batch (dedicated single-order batches, no transcript mixing).
+    Claim(usize),
 }
 
 /// Cross-batch pointer to an op for the global topological walk. `op_idx`
@@ -159,6 +162,9 @@ pub struct Batch {
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<ResolvedDeposit>,
     pub withdraws: Vec<ResolvedWithdraw>,
+    /// CS rebalance-bounty claims (tag 5, waived mode). Phase 1: at most one,
+    /// and never mixed with other ops in the same batch.
+    pub claims: Vec<ResolvedClaim>,
     /// The interleaved order of swaps, continuations, and deposits as they
     /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
@@ -167,6 +173,45 @@ pub struct Batch {
     /// Total LP after applying protocol share. Used in accumulator comparison tests.
     #[allow(dead_code)]
     pub final_total_lp: BigInt,
+}
+
+/// A resolved CS rebalance-bounty claim (cs_check tag 5, waived-fee mode):
+/// a value-neutral swap of `dx` in / `dy` out plus `claim` more of the
+/// output asset extracted as bounty, bounded by cap_b (see
+/// [`crate::sundaev4::claims::plan_waived_claim`]).
+#[derive(Clone)]
+pub struct ResolvedClaim {
+    pub order: Arc<SundaeV4Order>,
+    /// Index of the swap-input asset in the pool's asset list.
+    pub in_idx: usize,
+    /// Index of the swap-output / claimed asset in the pool's asset list.
+    pub out_idx: usize,
+    pub dx: BigInt,
+    pub dy: BigInt,
+    pub claim: BigInt,
+}
+
+/// Build a dedicated single-claim batch. The claim entry's `state_after`
+/// comes from the claim plan; LP is untouched (waived mode).
+pub fn build_claim_batch(
+    pool: &Arc<SundaeV4Pool>,
+    order: Arc<SundaeV4Order>,
+    resolved: ResolvedClaim,
+    final_assets: Vec<(AssetClass, BigInt)>,
+) -> Batch {
+    let _ = order; // the order also lives inside `resolved`
+    Batch {
+        pool: pool.clone(),
+        pool_ident: pool.pool_datum.identifier.clone(),
+        swaps: Vec::new(),
+        continuations: Vec::new(),
+        deposits: Vec::new(),
+        withdraws: Vec::new(),
+        claims: vec![resolved],
+        ops_order: vec![BatchOp::Claim(0)],
+        final_assets,
+        final_total_lp: pool.pool_datum.total_lp.clone(),
+    }
 }
 
 /// Safety cap on total orders per transaction.
@@ -370,6 +415,7 @@ pub fn assemble_batch(
         continuations: Vec::new(),
         deposits: Vec::new(),
         withdraws: Vec::new(),
+        claims: Vec::new(),
         ops_order,
         final_assets: running_assets,
         final_total_lp,

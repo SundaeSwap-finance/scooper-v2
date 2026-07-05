@@ -1849,6 +1849,29 @@ async fn bootstrap_v4(
             });
         }
 
+        // OrderConfig settings entries must survive restarts: the live
+        // indexer persists them as "order_config" txos, and load() rebuilds
+        // state.order_configs from those rows — without this, a restart
+        // after bootstrap silently drops every config and all scoops fail
+        // the order validator's config resolution.
+        for oc in order_configs.values() {
+            let settings_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(protocol.settings_script_hash),
+                ShelleyDelegationPart::Null,
+            ).to_vec();
+            let datum_bytes = oc.config.clone().to_plutus_bytes();
+            persisted_txos.push(PersistedTxo {
+                txo_id: oc.input.clone(),
+                txo_type: "order_config".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&settings_addr, &oc.value, Some(&datum_bytes)),
+                address: settings_addr,
+                datum: None,
+            });
+        }
+
         for (input, value) in &wallet_utxos {
             persisted_txos.push(PersistedTxo {
                 txo_id: input.clone(),

@@ -383,6 +383,9 @@ pub fn build_multi_pool_scoop_tx(
         let prev_assets = running_assets.clone();
 
         let (operation_tag, gross_fb) = match op {
+            crate::sundaev4::batch::BatchOp::Claim(_) => {
+                anyhow::bail!("claim transcript entries not yet implemented");
+            }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
                 let s = &batch.swaps[*i];
                 // dx is fixed by the order (direct) or by the route's entry

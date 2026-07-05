@@ -545,6 +545,7 @@ impl Accumulator {
                 continuations: accum.continuations,
                 deposits: accum.deposits,
                 withdraws: accum.withdraws,
+                claims: Vec::new(),
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,
