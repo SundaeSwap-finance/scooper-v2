@@ -299,6 +299,86 @@ pub fn order_key(sse: &SignedStrategyExecution) -> OrderKey {
     )
 }
 
+/// Whether the execution's validity window contains the whole tx window
+/// `[start_ms, end_ms]`. The on-chain check is `interval.includes(strategy_
+/// range, tx_range)` — the *execution* window must contain the *tx*
+/// validity range, so a scoop is only safe when the full window fits.
+pub fn window_covers(sse: &SignedStrategyExecution, start_ms: u64, end_ms: u64) -> bool {
+    let lower_ok = match &sse.execution.validity_range.lower_bound.bound_type {
+        IntervalBoundType::NegativeInfinity => true,
+        IntervalBoundType::Finite(t) => big_to_u64(t).map(|t| t <= start_ms).unwrap_or(false),
+        IntervalBoundType::PositiveInfinity => false,
+    };
+    let upper_ok = match &sse.execution.validity_range.upper_bound.bound_type {
+        IntervalBoundType::PositiveInfinity => true,
+        IntervalBoundType::Finite(t) => big_to_u64(t).map(|t| end_ms <= t).unwrap_or(false),
+        IntervalBoundType::NegativeInfinity => false,
+    };
+    lower_ok && upper_ok
+}
+
+/// Synthesize a swap-shaped [`Constraint`] for a strategy order from an
+/// authorized execution, so the ordinary batching/routing pipeline can
+/// handle it. Phase 1 supports the common shape: the order offers a single
+/// non-ADA asset; the execution's `min_received` optionally pins a leftover
+/// of that asset (unconsumed offer) plus what must be received in exchange.
+///
+/// Returns `None` when the shape isn't (yet) supported: ADA-only or
+/// multi-asset offers, nothing consumable, or nothing to receive.
+pub fn synthesize_swap_constraint(
+    order: &SundaeV4Order,
+    sse: &SignedStrategyExecution,
+) -> Option<crate::sundaev4::types::Constraint> {
+    use num_traits::Signed;
+
+    // The offered asset: exactly one non-ADA asset in the order's value.
+    let mut offered: Option<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = None;
+    for (policy, tokens) in &order.value.0 {
+        if policy.is_empty() {
+            continue;
+        }
+        for (name, qty) in tokens {
+            if !qty.is_positive() {
+                continue;
+            }
+            if offered.is_some() {
+                return None; // multi-asset offer: not yet supported
+            }
+            offered = Some((
+                crate::cardano_types::AssetClass { policy: policy.clone(), token: name.clone() },
+                qty.clone(),
+            ));
+        }
+    }
+    let (offer_asset, balance) = offered?;
+
+    // Split min_received into "leftover of the offer" (not consumed) and
+    // the actual receive targets.
+    let mut leftover = crate::bigint::BigInt::from(0);
+    let mut swap_min: Vec<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = Vec::new();
+    for (asset, amount) in &sse.execution.min_received {
+        if *asset == offer_asset {
+            leftover = amount.clone();
+        } else {
+            swap_min.push((asset.clone(), amount.clone()));
+        }
+    }
+    if swap_min.is_empty() {
+        return None; // nothing to receive — nothing for a swap to do
+    }
+    let consumable = &balance - &leftover;
+    if !consumable.is_positive() {
+        return None; // whole offer pinned as leftover
+    }
+
+    Some(crate::sundaev4::types::Constraint::Swap {
+        offered: offer_asset,
+        original_offered: consumable.clone(),
+        remaining_offered: consumable,
+        min_received: swap_min,
+    })
+}
+
 /// Whether the execution's validity window contains `now_ms`.
 fn window_open_at(sse: &SignedStrategyExecution, now_ms: u64) -> Option<bool> {
     let lower_ok = match &sse.execution.validity_range.lower_bound.bound_type {
@@ -662,6 +742,57 @@ mod tests {
         let fine = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
         assert!(store.submit(fine, None, |_| None, NOW_MS).is_err());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn synthesizes_swap_from_execution() {
+        let sk = key();
+        let mut order = strategy_order(&sk);
+        let offer_asset = AssetClass { policy: vec![0xDD; 28], token: b"TOKENA".to_vec() };
+        {
+            let o = std::sync::Arc::get_mut(&mut order).unwrap();
+            o.value.insert(&offer_asset, BigInt::from(5_000_000));
+        }
+
+        // Leftover entry pins 2M of the offer: consumable = 3M.
+        let mut exec = test_execution(NOW_MS + 60_000);
+        exec.min_received.push((offer_asset.clone(), BigInt::from(2_000_000)));
+        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let c = synthesize_swap_constraint(&order, &sse).expect("synthesizable");
+        match c {
+            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+                assert_eq!(offered, offer_asset);
+                assert_eq!(original_offered, BigInt::from(3_000_000));
+                assert_eq!(remaining_offered, BigInt::from(3_000_000));
+                assert_eq!(min_received.len(), 1); // leftover entry stripped
+                assert_ne!(min_received[0].0, offer_asset);
+            }
+            other => panic!("expected Swap, got {other:?}"),
+        }
+
+        // Whole offer pinned → nothing consumable → not synthesizable.
+        let mut exec = test_execution(NOW_MS + 60_000);
+        exec.min_received.push((offer_asset.clone(), BigInt::from(5_000_000)));
+        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        assert!(synthesize_swap_constraint(&order, &sse).is_none());
+
+        // Only-leftover min_received (nothing to receive) → None.
+        let mut exec = test_execution(NOW_MS + 60_000);
+        exec.min_received = vec![(offer_asset.clone(), BigInt::from(1))];
+        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        assert!(synthesize_swap_constraint(&order, &sse).is_none());
+    }
+
+    #[test]
+    fn window_covers_requires_full_containment() {
+        let exec = test_execution(NOW_MS + 60_000); // lower = NOW-1000 (finite)
+        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        // Fully inside.
+        assert!(window_covers(&sse, NOW_MS, NOW_MS + 30_000));
+        // End pokes past the upper bound.
+        assert!(!window_covers(&sse, NOW_MS, NOW_MS + 60_001));
+        // Start before the lower bound.
+        assert!(!window_covers(&sse, NOW_MS - 5_000, NOW_MS + 30_000));
     }
 
     #[test]

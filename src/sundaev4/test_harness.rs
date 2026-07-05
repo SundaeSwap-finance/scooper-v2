@@ -223,6 +223,7 @@ pub(crate) mod test_harness {
                 &self.ref_utxo_outputs,
                 None, // fee_override
                 &empty_order_configs,
+                &std::collections::BTreeMap::new(), // strategy_executions
                 Some((self.funding_utxo.clone(), &self.funding_value)),
             )?;
 

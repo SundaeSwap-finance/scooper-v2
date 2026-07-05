@@ -68,6 +68,8 @@ pub struct Scooper {
     backoff_until_after_slot: Option<u64>,
     /// Orders quarantined due to structural failure or suspected spent inputs.
     quarantine: BTreeMap<TransactionInput, Quarantine>,
+    /// Posted strategy intents (shared with the admin server's ingest).
+    v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
 }
 
 impl Scooper {
@@ -79,6 +81,7 @@ impl Scooper {
         v4_execution: Option<ScooperExecution>,
         paused: Arc<AtomicBool>,
         metrics: Arc<Metrics>,
+        v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -97,6 +100,7 @@ impl Scooper {
             metrics,
             backoff_until_after_slot: None,
             quarantine: BTreeMap::new(),
+            v4_intents,
         })
     }
 
@@ -598,6 +602,96 @@ impl Scooper {
             })
             .cloned()
             .collect();
+
+        // Strategy orders become scoopable when a posted intent authorizes
+        // an execution. Synthesize a swap-shaped view of each matched order
+        // so the ordinary routing/batching/fee pipeline handles it; the SSE
+        // itself rides to the tx_builder as the strategy_order withdrawal
+        // redeemer (in canonical input order).
+        let mut strategy_executions: BTreeMap<
+            TransactionInput,
+            pallas_primitives::PlutusData,
+        > = BTreeMap::new();
+        if let Some(intents) = &self.v4_intents {
+            use crate::sundaev4::intents;
+            // The on-chain check is interval.includes(execution, tx_range):
+            // the intent's window must contain the tx's whole validity range.
+            let tx_start_ms = exec.slot_config.slot_to_posix_ms(current_slot);
+            let tx_end_ms = exec
+                .slot_config
+                .slot_to_posix_ms(current_slot + crate::sundaev4::tx_builder::VALIDITY_RANGE);
+            let store = intents.store.lock().await;
+            let now = intents::now_ms();
+            for order in v4_state.orders.iter() {
+                if !matches!(order.constraint, crate::sundaev4::Constraint::Strategy { .. }) {
+                    continue;
+                }
+                if in_flight_inputs.contains(&order.input)
+                    || self.is_quarantined(&order.input, current_slot)
+                {
+                    continue;
+                }
+                let key = (
+                    order.input.0.transaction_id.as_ref().to_vec(),
+                    order.input.0.index,
+                );
+                for intent in store.valid_for_order(&key, now) {
+                    if let Some(hint) = &intent.hint {
+                        // Claim-hinted intents need the CS claim transcript
+                        // path, which isn't built yet.
+                        trace!(
+                            order = %order.input,
+                            ?hint,
+                            "strategy intent hinted for unsupported execution mode; skipping",
+                        );
+                        continue;
+                    }
+                    if intent.sse.execution.final_destination.is_some() {
+                        debug!(
+                            order = %order.input,
+                            "strategy intent picks a final destination; not yet supported",
+                        );
+                        continue;
+                    }
+                    if !intents::window_covers(&intent.sse, tx_start_ms, tx_end_ms) {
+                        trace!(
+                            order = %order.input,
+                            "strategy intent window doesn't cover the tx validity range",
+                        );
+                        continue;
+                    }
+                    let Some(constraint) =
+                        intents::synthesize_swap_constraint(order, &intent.sse)
+                    else {
+                        debug!(
+                            order = %order.input,
+                            "strategy intent shape not yet supported (ADA-only/multi-asset \
+                             offer, or nothing to swap)",
+                        );
+                        continue;
+                    };
+                    let Ok(sse_pd) =
+                        minicbor::decode::<pallas_primitives::PlutusData>(&intent.sse_cbor)
+                    else {
+                        continue;
+                    };
+                    info!(
+                        order = %order.input,
+                        intent = %hex::encode(&intent.intent_id),
+                        "strategy order matched with intent; dispatching as swap",
+                    );
+                    strategy_executions.insert(order.input.clone(), sse_pd);
+                    candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
+                        input: order.input.clone(),
+                        value: order.value.clone(),
+                        datum: order.datum.clone(),
+                        constraint,
+                        slot: order.slot,
+                    }));
+                    break;
+                }
+            }
+        }
         candidates.sort_by_key(|o| o.slot);
 
         // Apply any permanent quarantines deferred from the filter chain
@@ -836,7 +930,7 @@ impl Scooper {
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &plan, &settings, &exec, current_slot, language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                None, &v4_state.order_configs,
+                None, &v4_state.order_configs, &strategy_executions,
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
             ) {
                 Ok(r) => r,
@@ -980,7 +1074,7 @@ impl Scooper {
                     match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                     &diag_plan, &settings, &exec, current_slot, language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                    None, &v4_state.order_configs,
+                    None, &v4_state.order_configs, &strategy_executions,
                     funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 ) {
                     Err(e) => (Some(format!("build: {e}")), None),
@@ -1079,7 +1173,7 @@ impl Scooper {
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-            None, &v4_state.order_configs,
+            None, &v4_state.order_configs, &strategy_executions,
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
         ) {
             Ok(r) => r,
@@ -1169,6 +1263,7 @@ impl Scooper {
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
             &v4_state.order_configs,
+            &strategy_executions,
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
         ) {
             Ok(r) => r,

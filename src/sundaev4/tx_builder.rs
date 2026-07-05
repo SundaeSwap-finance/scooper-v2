@@ -119,7 +119,7 @@ pub fn compute_tx_fee(
     size_fee + mem_fee + step_fee + ref_fee
 }
 const POOL_MIN_ADA: u64 = 2_000_000;
-const VALIDITY_RANGE: u64 = 180;
+pub const VALIDITY_RANGE: u64 = 180;
 
 // Conway-era coinsPerUtxoByte (preview/mainnet, stable). Used to compute
 // minUtxo for outputs whose datum size varies — e.g. pools post-governance
@@ -184,6 +184,11 @@ pub fn build_multi_pool_scoop_tx(
     // resolves each order's `config_token` to its `required_constraints`
     // set so the right constraint-module withdrawals can be added (PR #11).
     order_configs: &BTreeMap<Vec<u8>, std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>>,
+    // SignedStrategyExecutions (as decoded PlutusData) keyed by the order
+    // input they authorize. Every order in the plan whose datum carries the
+    // strategy_order constraint must have an entry; the strategy_order
+    // withdrawal redeemer is the list of these in canonical input order.
+    strategy_executions: &BTreeMap<crate::cardano_types::TransactionInput, pallas_primitives::PlutusData>,
     // Optional wallet UTxO that funds any min-ada gap on pool outputs (datum
     // growth from upgrades can push pool outputs above their current ada
     // buffer). When present, the input is included and net excess flows back
@@ -885,6 +890,15 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Withdraw(i) => batch.withdraws[*i].order.datum.config_token.clone(),
         }
     };
+    let flat_order_ref_and_datum = |flat_idx: usize| -> (&TransactionInput, &crate::sundaev4::OrderDatum) {
+        let flat = &flat_orders[flat_idx];
+        let batch = &batches[flat.batch_idx];
+        match &flat.kind {
+            FlatOrderKind::Swap(i) => (&flat.order_ref, &batch.swaps[*i].order.datum),
+            FlatOrderKind::Deposit(i) => (&flat.order_ref, &batch.deposits[*i].order.datum),
+            FlatOrderKind::Withdraw(i) => (&flat.order_ref, &batch.withdraws[*i].order.datum),
+        }
+    };
     let mut unique_config_tokens: Vec<Vec<u8>> = Vec::new();
     let mut order_config_indices: Vec<u64> = Vec::with_capacity(n_orders);
     for &flat_idx in &input_sorted_order {
@@ -1214,8 +1228,30 @@ pub fn build_multi_pool_scoop_tx(
                 }.to_plutus()
             }
             Some("strategy_order") => {
-                tracing::warn!("scoop: strategy_order required but ingestion not yet implemented");
-                continue;
+                // List<SignedStrategyExecution>, consumed positionally by the
+                // validator as it walks order inputs (canonical order) whose
+                // datum carries the strategy constraint — so: one SSE per
+                // such order, in input_sorted_order.
+                let mut sses: Vec<pallas_primitives::PlutusData> = Vec::new();
+                for &flat_idx in &input_sorted_order {
+                    let (oref, datum) = flat_order_ref_and_datum(flat_idx);
+                    if datum.find_constraint_by_hash(h).is_none() {
+                        continue;
+                    }
+                    match strategy_executions
+                        .get(&crate::cardano_types::TransactionInput(oref.clone()))
+                    {
+                        Some(pd) => sses.push(pd.clone()),
+                        None => bail!(
+                            "strategy order {}#{} in plan without a signed execution",
+                            hex::encode(oref.transaction_id.as_ref()),
+                            oref.index,
+                        ),
+                    }
+                }
+                pallas_primitives::PlutusData::Array(
+                    pallas_codec::utils::MaybeIndefArray::Indef(sses),
+                )
             }
             None => {
                 tracing::warn!(

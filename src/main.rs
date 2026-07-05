@@ -170,6 +170,7 @@ async fn main() -> Result<()> {
             v4_execution,
             paused.clone(),
             metrics.clone(),
+            intents.clone(),
         )?
         .run(shutdown.child_token()),
     );
