@@ -1,6 +1,7 @@
 pub mod accumulator;
 pub mod batch;
 pub mod chain_tracker;
+pub mod claims;
 pub mod evaluator;
 mod indexer;
 pub mod intents;

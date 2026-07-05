@@ -561,6 +561,15 @@ pub struct StrategyConstraints {
     pub final_destinations: Vec<Destination>,
 }
 
+/// `BountyClaim` — the `operation_data` of a CS `tag_claim` (5) transcript
+/// entry (lib/modules/cs_check.ak). `amount` units of `asset` are extracted
+/// from the pool as a rebalance bounty, on top of the entry's swap portion.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BountyClaim {
+    pub asset: AssetClass,
+    pub amount: BigInt,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // CS operation tag constants (lib/modules/cs_check.ak)
 // ──────────────────────────────────────────────────────────────────────────────
