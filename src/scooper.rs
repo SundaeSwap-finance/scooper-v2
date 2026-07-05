@@ -738,15 +738,6 @@ impl Scooper {
         }
         self.sync_quarantine_metrics();
 
-        if pending_claim_plan.is_some() {
-            let claim_plan = pending_claim_plan.take().unwrap();
-            return self.build_and_submit_plan(
-                claim_plan, &settings, &exec, &v4_state, &language_views,
-                &collateral_input, &collateral_value, &funding_owned,
-                &strategy_executions,
-            ).await;
-        }
-
         if candidates.is_empty() {
             if n_in_flight_orders > 0 || n_quarantined > 0 {
                 debug!(
@@ -775,6 +766,19 @@ impl Scooper {
             }
         }
         let script_store = self.v4_script_store.as_ref().unwrap();
+
+        // Claim-hinted intents execute as a dedicated single-order plan,
+        // short-circuiting accumulation. Must sit AFTER the lazy script-store
+        // initialisation above — a fresh process can match a claim on its
+        // very first cycle.
+        if pending_claim_plan.is_some() {
+            let claim_plan = pending_claim_plan.take().unwrap();
+            return self.build_and_submit_plan(
+                claim_plan, &settings, &exec, &v4_state, &language_views,
+                &collateral_input, &collateral_value, &funding_owned,
+                &strategy_executions,
+            ).await;
+        }
 
         // ── Phase 1: Accumulate valid orders (cheap, no tx eval) ──────────
         //
