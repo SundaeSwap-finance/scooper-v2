@@ -206,7 +206,8 @@ pub fn build_multi_pool_scoop_tx(
     let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
     let n_withdraw_orders: usize = batches.iter().map(|b| b.withdraws.len()).sum();
-    let n_orders: usize = n_swap_orders + n_deposit_orders + n_withdraw_orders;
+    let n_claim_orders: usize = batches.iter().map(|b| b.claims.len()).sum();
+    let n_orders: usize = n_swap_orders + n_deposit_orders + n_withdraw_orders + n_claim_orders;
     if m_pools == 0 || n_orders == 0 {
         bail!("no batches or no swaps");
     }
@@ -382,9 +383,33 @@ pub fn build_multi_pool_scoop_tx(
 
         let prev_assets = running_assets.clone();
 
+        // Claims carry a BountyClaim as operation_data; everything else
+        // uses the void placeholder.
+        let mut op_data_override: Option<pallas_primitives::PlutusData> = None;
         let (operation_tag, gross_fb) = match op {
-            crate::sundaev4::batch::BatchOp::Claim(_) => {
-                anyhow::bail!("claim transcript entries not yet implemented");
+            crate::sundaev4::batch::BatchOp::Claim(i) => {
+                // Waived-mode CS bounty claim (cs_check tag 5): value-neutral
+                // swap of dx in / dy out plus `claim` more of the output
+                // asset; no fee retained, LP untouched.
+                let c = &batch.claims[*i];
+                running_assets[c.in_idx].1 = &running_assets[c.in_idx].1 + &c.dx;
+                running_assets[c.out_idx].1 =
+                    &running_assets[c.out_idx].1 - &(&c.dy + &c.claim);
+                op_data_override = Some(
+                    crate::sundaev4::types::BountyClaim {
+                        asset: batch.pool.pool_datum.assets[c.out_idx].0.clone(),
+                        amount: c.claim.clone(),
+                    }
+                    .to_plutus(),
+                );
+                tracing::info!(
+                    walk = "op-claim",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    dx = %c.dx, dy = %c.dy, claim = %c.claim,
+                    "streaming walk: claim op",
+                );
+                (BigInt::from(crate::sundaev4::types::TAG_CLAIM), BigInt::from(0))
             }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
                 let s = &batch.swaps[*i];
@@ -552,7 +577,8 @@ pub fn build_multi_pool_scoop_tx(
             },
             fee_budget: submitted_fee_budget,
             operation_tag,
-            operation_data: void_pool_state.clone().to_plutus(),
+            operation_data: op_data_override
+                .unwrap_or_else(|| void_pool_state.clone().to_plutus()),
         });
     }
 
@@ -629,6 +655,7 @@ pub fn build_multi_pool_scoop_tx(
         Swap(usize),     // index into batch.swaps
         Deposit(usize),  // index into batch.deposits
         Withdraw(usize), // index into batch.withdraws
+        Claim(usize),    // index into batch.claims
     }
     #[derive(Clone)]
     struct FlatOrder {
@@ -652,7 +679,12 @@ pub fn build_multi_pool_scoop_tx(
             kind: FlatOrderKind::Withdraw(wi),
             order_ref: w.order.input.0.clone(),
         });
-        swaps.chain(deps).chain(wds)
+        let cls = b.claims.iter().enumerate().map(move |(ci, c)| FlatOrder {
+            batch_idx: bi,
+            kind: FlatOrderKind::Claim(ci),
+            order_ref: c.order.input.0.clone(),
+        });
+        swaps.chain(deps).chain(wds).chain(cls)
     }).collect();
     let all_order_orefs: Vec<TransactionInput> =
         flat_orders.iter().map(|f| f.order_ref.clone()).collect();
@@ -891,6 +923,7 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Swap(i) => batch.swaps[*i].order.datum.config_token.clone(),
             FlatOrderKind::Deposit(i) => batch.deposits[*i].order.datum.config_token.clone(),
             FlatOrderKind::Withdraw(i) => batch.withdraws[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Claim(i) => batch.claims[*i].order.datum.config_token.clone(),
         }
     };
     let flat_order_ref_and_datum = |flat_idx: usize| -> (&TransactionInput, &crate::sundaev4::OrderDatum) {
@@ -900,6 +933,7 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Swap(i) => (&flat.order_ref, &batch.swaps[*i].order.datum),
             FlatOrderKind::Deposit(i) => (&flat.order_ref, &batch.deposits[*i].order.datum),
             FlatOrderKind::Withdraw(i) => (&flat.order_ref, &batch.withdraws[*i].order.datum),
+            FlatOrderKind::Claim(i) => (&flat.order_ref, &batch.claims[*i].order.datum),
         }
     };
     let mut unique_config_tokens: Vec<Vec<u8>> = Vec::new();
@@ -1411,6 +1445,7 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Swap(i) => &batch.swaps[*i].order,
             FlatOrderKind::Deposit(i) => &batch.deposits[*i].order,
             FlatOrderKind::Withdraw(i) => &batch.withdraws[*i].order,
+            FlatOrderKind::Claim(i) => &batch.claims[*i].order,
         };
         let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
 
@@ -1480,6 +1515,23 @@ pub fn build_multi_pool_scoop_tx(
                     &wd.dy,
                     &lp_asset,
                     &wd.lp_burned,
+                    actual_fee,
+                )?
+            }
+            FlatOrderKind::Claim(i) => {
+                // Fulfillment = order − dx(in asset) − fee + (dy + claim)(out
+                // asset): identical in shape to a swap fulfillment, with the
+                // bounty riding on top of the swap output.
+                let c = &batch.claims[*i];
+                let in_asset = &batch.pool.pool_datum.assets[c.in_idx].0;
+                let out_asset = &batch.pool.pool_datum.assets[c.out_idx].0;
+                let total_out = &c.dy + &c.claim;
+                build_fulfillment_value_from_order(
+                    &c.order.value,
+                    in_asset,
+                    &c.dx,
+                    out_asset,
+                    &total_out,
                     actual_fee,
                 )?
             }
@@ -1792,6 +1844,14 @@ pub fn build_multi_pool_scoop_tx(
                 address: order_addr_bytes.clone(),
                 value: wd.order.value.clone(),
                 datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
+                script_ref: None,
+            });
+        }
+        for c in &batch.claims {
+            resolved_inputs.insert(c.order.input.clone(), ResolvedTxOut {
+                address: order_addr_bytes.clone(),
+                value: c.order.value.clone(),
+                datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                 script_ref: None,
             });
         }

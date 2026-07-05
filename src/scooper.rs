@@ -480,7 +480,7 @@ impl Scooper {
             );
             self.v4_language_views = Some(lv);
         }
-        let language_views = self.v4_language_views.as_ref().unwrap();
+        let language_views = self.v4_language_views.clone().unwrap();
 
         // Snapshot state
         let v4_state = match &self.v4_state {
@@ -615,6 +615,9 @@ impl Scooper {
             TransactionInput,
             pallas_primitives::PlutusData,
         > = BTreeMap::new();
+        // A claim-hinted intent that matched: executes as a dedicated
+        // single-order plan, short-circuiting the normal accumulation cycle.
+        let mut pending_claim_plan: Option<crate::sundaev4::batch::ScoopPlan> = None;
         if let Some(intents) = &self.v4_intents {
             use crate::sundaev4::intents;
             // The on-chain check is interval.includes(execution, tx_range):
@@ -640,14 +643,30 @@ impl Scooper {
                 );
                 for intent in store.valid_for_order(&key, now) {
                     if let Some(hint) = &intent.hint {
-                        // Claim-hinted intents need the CS claim transcript
-                        // path, which isn't built yet.
-                        trace!(
-                            order = %order.input,
-                            ?hint,
-                            "strategy intent hinted for unsupported execution mode; skipping",
-                        );
-                        continue;
+                        let crate::sundaev4::intents::ExecutionHint::Claim { pool: pool_hex } =
+                            hint;
+                        if pending_claim_plan.is_some()
+                            || intent.sse.execution.final_destination.is_some()
+                            || !intents::window_covers(&intent.sse, tx_start_ms, tx_end_ms)
+                        {
+                            continue;
+                        }
+                        match self.plan_claim_for_intent(
+                            order, intent, pool_hex, &v4_state, &in_flight_pools, &exec,
+                        ) {
+                            Some((plan, sse_pd)) => {
+                                info!(
+                                    order = %order.input,
+                                    intent = %hex::encode(&intent.intent_id),
+                                    pool = %pool_hex,
+                                    "claim intent matched; dispatching dedicated claim scoop",
+                                );
+                                strategy_executions.insert(order.input.clone(), sse_pd);
+                                pending_claim_plan = Some(plan);
+                                break;
+                            }
+                            None => continue,
+                        }
                     }
                     if intent.sse.execution.final_destination.is_some() {
                         debug!(
@@ -718,6 +737,15 @@ impl Scooper {
             }
         }
         self.sync_quarantine_metrics();
+
+        if pending_claim_plan.is_some() {
+            let claim_plan = pending_claim_plan.take().unwrap();
+            return self.build_and_submit_plan(
+                claim_plan, &settings, &exec, &v4_state, &language_views,
+                &collateral_input, &collateral_value, &funding_owned,
+                &strategy_executions,
+            ).await;
+        }
 
         if candidates.is_empty() {
             if n_in_flight_orders > 0 || n_quarantined > 0 {
@@ -933,7 +961,7 @@ impl Scooper {
         let within_limits = |accum: &Accumulator| -> Fitness {
             let plan = accum.clone().into_plan();
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                &plan, &settings, &exec, current_slot, language_views,
+                &plan, &settings, &exec, current_slot, &language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs, &strategy_executions,
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
@@ -961,7 +989,7 @@ impl Scooper {
                 &build.redeemers,
                 &build.resolved_inputs,
                 &build.resolved_ref_inputs,
-                script_store,
+                self.v4_script_store.as_ref().unwrap(),
                 &exec.plutus_v3_cost_model,
                 build.tx_hash,
                 &exec.slot_config,
@@ -1077,7 +1105,7 @@ impl Scooper {
                 let diag_plan = diag.clone().into_plan();
                 let (quarantine_reason, eval_bug_reason): (Option<String>, Option<String>) =
                     match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                    &diag_plan, &settings, &exec, current_slot, language_views,
+                    &diag_plan, &settings, &exec, current_slot, &language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs, &strategy_executions,
                     funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
@@ -1168,12 +1196,50 @@ impl Scooper {
             return false;
         }
 
+        // Build → evaluate → submit. Shared with the claim path.
+        let final_plan = accum.clone().into_plan();
+        self.build_and_submit_plan(
+            final_plan, &settings, &exec, &v4_state, &language_views,
+            &collateral_input, &collateral_value, &funding_owned,
+            &strategy_executions,
+        ).await
+    }
+
+    /// Build the tx for `final_plan`, evaluate, compute the exact fee,
+    /// rebuild, sign, submit, and record the outcome. Shared by the
+    /// normal accumulation path and the dedicated claim path.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_and_submit_plan(
+        &mut self,
+        final_plan: crate::sundaev4::batch::ScoopPlan,
+        settings: &std::sync::Arc<crate::sundaev4::SundaeV4Settings>,
+        exec: &ScooperExecution,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        language_views: &[u8],
+        collateral_input: &TransactionInput,
+        collateral_value: &crate::cardano_types::Value,
+        funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
+        strategy_executions: &BTreeMap<TransactionInput, pallas_primitives::PlutusData>,
+    ) -> bool {
+        let n_orders: usize = final_plan.batches.iter()
+            .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.claims.len())
+            .sum();
+        let n_pools = final_plan.batches.len();
+        let pool_idents: Vec<crate::sundaev3::Ident> =
+            final_plan.batches.iter().map(|b| b.pool_ident.clone()).collect();
+        let plan_order_inputs: Vec<TransactionInput> = final_plan.batches.iter()
+            .flat_map(|b| {
+                b.swaps.iter().map(|o| o.order.input.clone())
+                    .chain(b.deposits.iter().map(|o| o.order.input.clone()))
+                    .chain(b.withdraws.iter().map(|o| o.order.input.clone()))
+                    .chain(b.claims.iter().map(|o| o.order.input.clone()))
+            })
+            .collect();
         // Refresh current_slot — the binary search phase may have taken many
         // seconds, so the slot captured at the start of the cycle could be stale.
         let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
 
         // Build → evaluate → rebuild with exact budgets.
-        let final_plan = accum.clone().into_plan();
 
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_plan, &settings, &exec, current_slot, language_views,
@@ -1199,7 +1265,7 @@ impl Scooper {
                 &first_pass.redeemers,
                 &first_pass.resolved_inputs,
                 &first_pass.resolved_ref_inputs,
-                script_store,
+                self.v4_script_store.as_ref().unwrap(),
                 &exec.plutus_v3_cost_model,
                 first_pass.tx_hash,
                 &exec.slot_config,
@@ -1279,9 +1345,7 @@ impl Scooper {
             }
         };
 
-        let n_orders = accum.order_count();
-        let n_pools = accum.pools.len();
-        let pool_idents: Vec<_> = accum.pools.keys().cloned().collect();
+
 
         let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
         let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
@@ -1392,7 +1456,7 @@ impl Scooper {
                     // Parse bad inputs from the error and quarantine only those
                     let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
                     let bad_refs = parse_bad_inputs(&msg);
-                    let order_inputs = accum.order_inputs();
+                    let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
                     if bad_refs.is_empty() {
                         // Couldn't parse — quarantine all orders as fallback
                         info!(n_orders = order_inputs.len(), until_slot, "temporarily quarantining all batch orders (unparseable error)");
@@ -1443,6 +1507,157 @@ impl Scooper {
                 false
             }
         }
+    }
+
+
+    /// Resolve a claim-hinted intent into a dedicated single-order claim
+    /// plan (waived-fee CS bounty, cs_check tag 5). Returns the plan plus
+    /// the SSE PlutusData for the strategy_order withdrawal redeemer.
+    ///
+    /// Phase-1 shape requirements (all silently skipped otherwise):
+    /// - hinted pool exists, is not in-flight, is CS with bounty enabled
+    ///   (`bounty_k > 0`) and `waive_fee_on_claim = true`
+    /// - the order offers exactly one non-ADA asset that's in the pool
+    /// - the intent's receive asset is a different pool asset
+    /// - the claim + swap output clears the intent's min_received floor
+    fn plan_claim_for_intent(
+        &self,
+        order: &Arc<crate::sundaev4::SundaeV4Order>,
+        intent: &crate::sundaev4::intents::StoredIntent,
+        pool_hex: &str,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        in_flight_pools: &[Ident],
+        exec: &ScooperExecution,
+    ) -> Option<(crate::sundaev4::batch::ScoopPlan, pallas_primitives::PlutusData)> {
+        use crate::sundaev4::{batch, claims};
+        use crate::sundaev4::PoolType;
+        use num_traits::Signed;
+
+        let (ident, pool) = v4_state
+            .pools
+            .iter()
+            .find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)?;
+        if in_flight_pools.contains(ident)
+            || exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes()))
+        {
+            return None;
+        }
+        let PoolType::ConstantSum { prices, bounty_k, waive_fee_on_claim, .. } =
+            &pool.pool_type
+        else {
+            debug!(pool = %pool_hex, "claim hint targets a non-CS pool; skipping");
+            return None;
+        };
+        if !waive_fee_on_claim {
+            debug!(
+                pool = %pool_hex,
+                "claim hint targets a fee-paying-claims pool; only waived mode is supported",
+            );
+            return None;
+        }
+
+        // The order's offered asset: its single non-ADA asset.
+        let mut offered: Option<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = None;
+        for (policy, tokens) in &order.value.0 {
+            if policy.is_empty() {
+                continue;
+            }
+            for (name, qty) in tokens {
+                if !qty.is_positive() {
+                    continue;
+                }
+                if offered.is_some() {
+                    return None;
+                }
+                offered = Some((
+                    crate::cardano_types::AssetClass {
+                        policy: policy.clone(),
+                        token: name.clone(),
+                    },
+                    qty.clone(),
+                ));
+            }
+        }
+        let (in_asset, balance) = offered?;
+
+        let assets = &pool.pool_datum.assets;
+        let in_idx = assets.iter().position(|(a, _)| *a == in_asset)?;
+
+        // Receive asset + floor from the execution's min_received; the
+        // in-asset entry (if present) is the leftover pin.
+        let mut leftover = crate::bigint::BigInt::from(0);
+        let mut receive: Option<(usize, crate::bigint::BigInt)> = None;
+        for (asset, amount) in &intent.sse.execution.min_received {
+            if *asset == in_asset {
+                leftover = amount.clone();
+            } else if receive.is_none() {
+                let idx = assets.iter().position(|(a, _)| a == asset)?;
+                receive = Some((idx, amount.clone()));
+            } else {
+                return None; // multi-receive not supported
+            }
+        }
+        let (out_idx, min_recv) = receive?;
+
+        let consumable = &balance - &leftover;
+        if !consumable.is_positive() {
+            return None;
+        }
+
+        // dx sizing is load-bearing: overshooting balance shrinks the
+        // admissible claim. Aim for the in-asset's deficit (the perfectly
+        // rebalancing amount), clamped to what the order authorizes.
+        let n_big = crate::bigint::BigInt::from(assets.len() as u64);
+        let v: crate::bigint::BigInt = assets
+            .iter()
+            .zip(prices)
+            .fold(crate::bigint::BigInt::from(0), |acc, ((_, r), p)| acc + &(r * p));
+        let p_in = &prices[in_idx];
+        let deficit = &(&v - &(&(&n_big * p_in) * &assets[in_idx].1)) / &(&n_big * p_in);
+        if !deficit.is_positive() {
+            debug!(pool = %pool_hex, "claim hint: in-asset is not scarce; no bounty available");
+            return None;
+        }
+        let dx = if consumable < deficit { consumable } else { deficit };
+
+        let plan = claims::plan_waived_claim(
+            assets,
+            prices,
+            (&bounty_k.num, &bounty_k.den),
+            in_idx,
+            out_idx,
+            &dx,
+        )?;
+        let total_out = &plan.dy + &plan.claim;
+        if total_out < min_recv {
+            debug!(
+                order = %order.input,
+                total_out = %total_out,
+                min_recv = %min_recv,
+                "claim plan doesn't clear the intent's min_received floor",
+            );
+            return None;
+        }
+
+        let sse_pd: pallas_primitives::PlutusData =
+            minicbor::decode(&intent.sse_cbor).ok()?;
+
+        let resolved = batch::ResolvedClaim {
+            order: order.clone(),
+            in_idx,
+            out_idx,
+            dx: plan.dx.clone(),
+            dy: plan.dy.clone(),
+            claim: plan.claim.clone(),
+        };
+        let claim_batch =
+            batch::build_claim_batch(pool, order.clone(), resolved, plan.final_assets);
+        let scoop_plan = crate::sundaev4::batch::ScoopPlan {
+            batches: vec![claim_batch],
+            routes: Vec::new(),
+            global_seq: vec![crate::sundaev4::batch::GlobalOp { batch_idx: 0, op_idx: 0 }],
+        };
+        Some((scoop_plan, sse_pd))
     }
 
     fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
