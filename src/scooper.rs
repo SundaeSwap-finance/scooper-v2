@@ -738,7 +738,7 @@ impl Scooper {
         }
         self.sync_quarantine_metrics();
 
-        if candidates.is_empty() {
+        if candidates.is_empty() && pending_claim_plan.is_none() {
             if n_in_flight_orders > 0 || n_quarantined > 0 {
                 debug!(
                     n_in_flight_orders,
