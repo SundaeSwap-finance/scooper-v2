@@ -1447,7 +1447,26 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Withdraw(i) => &batch.withdraws[*i].order,
             FlatOrderKind::Claim(i) => &batch.claims[*i].order,
         };
-        let dest_address = resolve_destination(&order.datum.destination, &order.datum.owner)?;
+        // Self destinations return the fulfillment to the order address with
+        // the *identical* datum (check_destination's Self arm) — a standing
+        // order that survives its own execution and can be executed again by
+        // a fresh intent. Fixed destinations pay the given address, with the
+        // destination's optional datum pinned inline when present.
+        let (dest_address, dest_datum): (Vec<u8>, Option<pallas_primitives::PlutusData>) =
+            match &order.datum.destination {
+                crate::sundaev4::Destination::SelfDestination => {
+                    let order_addr = ShelleyAddress::new(
+                        Network::Testnet,
+                        ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                        ShelleyDelegationPart::Null,
+                    );
+                    (order_addr.to_vec(), Some(order.datum.clone().to_plutus()))
+                }
+                crate::sundaev4::Destination::Fixed(_, maybe_datum) => (
+                    resolve_destination(&order.datum.destination, &order.datum.owner)?,
+                    maybe_datum.clone(),
+                ),
+            };
 
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
         // Take the full per_order share. The contract's
@@ -1540,7 +1559,8 @@ pub fn build_multi_pool_scoop_tx(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
                 value: fulfillment_value,
-                datum_option: None,
+                datum_option: dest_datum
+                    .map(|d| conway::PseudoDatumOption::Data(CborWrap(d))),
                 script_ref: None,
             },
         ));
