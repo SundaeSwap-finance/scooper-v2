@@ -634,7 +634,7 @@
 
   function updateStats() {
     const v3s = document.getElementById('v3-stats');
-    renderStrategyIntents(data.strategy_intents);
+    renderStrategyIntents(data.v4 && data.v4.strategy_intents);
     const v4s = document.getElementById('v4-stats');
     const v3 = status.v3 || {};
     const v4 = status.v4 || {};
