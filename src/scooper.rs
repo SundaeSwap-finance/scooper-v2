@@ -1254,6 +1254,20 @@ impl Scooper {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx build failed");
+                // Under-funded orders can never execute (a UTxO's ada is
+                // immutable), so quarantine permanently instead of retrying
+                // every cycle.
+                if e.to_string().contains("under-funded") {
+                    for input in &plan_order_inputs {
+                        self.quarantine.insert(
+                            input.clone(),
+                            Quarantine::Permanent {
+                                reason: "under-funded: fulfillment can't retain min-UTxO".into(),
+                            },
+                        );
+                    }
+                    self.sync_quarantine_metrics();
+                }
                 return false;
             }
         };

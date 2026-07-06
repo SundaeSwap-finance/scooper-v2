@@ -55,6 +55,27 @@ pub(crate) mod test_harness {
     const SCOOPER_SECRET_KEY: &str =
         "0101010101010101010101010101010101010101010101010101010101010101";
 
+    /// Constraint-module hashes from the loaded blueprint, published so the
+    /// free-standing order constructors (`make_order` & co) can build real
+    /// PR#11 constraint lists without threading `TestEnv` through 30 call
+    /// sites. Set once per process by `TestEnv::from_blueprint_file`; all
+    /// tests load the same fixture.
+    pub struct TestConstraintCtx {
+        pub swap_order: Vec<u8>,
+        pub basic_order: Vec<u8>,
+        pub route_order: Vec<u8>,
+        pub fairness_order: Vec<u8>,
+        pub strategy_order: Vec<u8>,
+        pub settings_mint: Vec<u8>,
+    }
+    pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> =
+        std::sync::OnceLock::new();
+
+    /// OrderConfig token names used by the harness (mirroring the CLI roles).
+    pub const CFG_SWAP: &[u8] = b"cfg-swap";
+    pub const CFG_BASIC: &[u8] = b"cfg-basic";
+    pub const CFG_STRATEGY: &[u8] = b"cfg-strategy";
+
     /// Complete test environment for building and evaluating scoop transactions.
     pub struct TestEnv {
         pub exec: ScooperExecution,
@@ -65,11 +86,20 @@ pub(crate) mod test_harness {
         pub collateral_value: Value,
         pub funding_utxo: TransactionInput,
         pub funding_value: Value,
+        pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
     }
 
     impl TestEnv {
         /// Load from a blueprint fixture file.
         pub fn from_blueprint_file(path: &str) -> Self {
+            // Surface evaluator traces in test output (RUST_LOG to widen).
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
+                )
+                .with_test_writer()
+                .try_init();
             let data = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("failed to read blueprint fixture {path}: {e}"));
             let blueprint: Blueprint = serde_json::from_str(&data)
@@ -126,6 +156,84 @@ pub(crate) mod test_harness {
                 }
             }
 
+            // PR#11 constraint context + synthetic OrderConfig settings
+            // entries. Only present when the blueprint carries the modular
+            // constraint validators (post-PR#11 fixtures).
+            let settings_mint = blueprint
+                .validators
+                .iter()
+                .find(|v| v.title == "settingsMint" || v.title.contains("settings_mint"))
+                .map(|v| hex::decode(&v.hash).expect("settingsMint hash hex"));
+            let ctx = match (
+                &module_scripts.swap_order,
+                &module_scripts.basic_order,
+                &module_scripts.route_order,
+                &module_scripts.fairness_order,
+                &module_scripts.strategy_order,
+                settings_mint,
+            ) {
+                (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
+                    Some(TestConstraintCtx {
+                        swap_order: sw.hash.as_ref().to_vec(),
+                        basic_order: ba.hash.as_ref().to_vec(),
+                        route_order: ro.hash.as_ref().to_vec(),
+                        fairness_order: fo.hash.as_ref().to_vec(),
+                        strategy_order: st.hash.as_ref().to_vec(),
+                        settings_mint: sm,
+                    })
+                }
+                _ => None,
+            };
+            let mut order_configs: BTreeMap<
+                Vec<u8>,
+                Arc<crate::sundaev4::SundaeV4OrderConfig>,
+            > = BTreeMap::new();
+            if let Some(ctx) = &ctx {
+                // Mirrors the CLI's mint-order-config presets.
+                let entries: [(&[u8], Vec<Vec<u8>>); 3] = [
+                    (CFG_SWAP, vec![
+                        ctx.swap_order.clone(),
+                        ctx.route_order.clone(),
+                        ctx.fairness_order.clone(),
+                    ]),
+                    (CFG_BASIC, vec![
+                        ctx.basic_order.clone(),
+                        ctx.fairness_order.clone(),
+                    ]),
+                    (CFG_STRATEGY, vec![
+                        ctx.strategy_order.clone(),
+                        ctx.route_order.clone(),
+                        ctx.fairness_order.clone(),
+                    ]),
+                ];
+                for (i, (token, required)) in entries.into_iter().enumerate() {
+                    let token = token.to_vec();
+                    let mut value = Value::default();
+                    value.insert(&ada(), BigInt::from(2_000_000i64));
+                    value.insert(
+                        &AssetClass { policy: ctx.settings_mint.clone(), token: token.clone() },
+                        BigInt::from(1i64),
+                    );
+                    order_configs.insert(
+                        token.clone(),
+                        Arc::new(crate::sundaev4::SundaeV4OrderConfig {
+                            input: crate::cardano_types::TransactionInput::new(
+                                [0xE1; 32].into(),
+                                i as u64,
+                            ),
+                            value,
+                            token_name: token.clone(),
+                            config: crate::sundaev4::types::OrderConfig {
+                                label: token,
+                                required_constraints: required,
+                            },
+                            slot: 1,
+                        }),
+                    );
+                }
+            }
+            let _ = TEST_CTX.set(ctx);
+
             let exec = ScooperExecution {
                 scooper_secret_key: SCOOPER_SECRET_KEY.to_string(),
                 scooper_secret_key_file: None,
@@ -177,6 +285,7 @@ pub(crate) mod test_harness {
                 collateral_value,
                 funding_utxo,
                 funding_value,
+                order_configs,
             }
         }
 
@@ -207,10 +316,7 @@ pub(crate) mod test_harness {
             settings: &SundaeV4Settings,
             slot: u64,
         ) -> anyhow::Result<(MultiPoolBuildResult, EvalResult)> {
-            let empty_order_configs: std::collections::BTreeMap<
-                Vec<u8>,
-                std::sync::Arc<crate::sundaev4::SundaeV4OrderConfig>,
-            > = std::collections::BTreeMap::new();
+
             let build = build_multi_pool_scoop_tx(
                 plan,
                 settings,
@@ -222,7 +328,7 @@ pub(crate) mod test_harness {
                 None, // no ex_units → default budgets
                 &self.ref_utxo_outputs,
                 None, // fee_override
-                &empty_order_configs,
+                &self.order_configs,
                 &std::collections::BTreeMap::new(), // strategy_executions
                 Some((self.funding_utxo.clone(), &self.funding_value)),
             )?;
@@ -555,7 +661,10 @@ pub(crate) mod test_harness {
         slot: u64,
     ) -> Arc<SundaeV4Order> {
         let mut value = Value::default();
-        value.insert(&ada(), BigInt::from(2_000_000i64)); // min UTxO for order
+        // Production orders carry 5 ADA (CLI default: 2 min-UTxO + 3 budget);
+        // the no-subsidy guard rejects orders that can't retain min-UTxO
+        // after their fee share.
+        value.insert(&ada(), BigInt::from(5_000_000i64));
         value.insert(&offer_tok, BigInt::from(offer_amount));
 
         // Use slot in tx hash for uniqueness
@@ -563,16 +672,81 @@ pub(crate) mod test_harness {
         tx_hash[0] = 0xD0;
         tx_hash[1..9].copy_from_slice(&slot.to_be_bytes());
 
-        Arc::new(SundaeV4Order::test_swap_order(
+        let order = SundaeV4Order::test_swap_order(
             crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
             value,
             Multisig::Signature(vec![0xAA; 28]),
-            Destination::SelfDestination,
+            // Full-consume fills must pay a non-self destination: PR#11's
+            // swap module treats an output at the order address as a
+            // continuation (partial fill), which requires remaining_offered
+            // to stay positive — a full fill to Self is unsatisfiable.
+            Destination::Fixed(
+                crate::sundaev3::PlutusAddress {
+                    payment_credential: crate::sundaev3::Credential::VerificationKey(
+                        [0xAA; 28].into(),
+                    ),
+                    stake_credential: None,
+                },
+                None,
+            ),
             (offer_tok, BigInt::from(offer_amount)),
             (want_tok, BigInt::from(min_want)),
             BigInt::from(1_500_000i64),
             slot,
-        ))
+        );
+        Arc::new(with_real_constraints(order, CFG_SWAP))
+    }
+
+    /// Rewrite a test order's datum to the PR#11 modular shape using the
+    /// real constraint hashes from the loaded blueprint (when available):
+    /// the module-specific payload keeps its slot, route gets an empty pool
+    /// whitelist, fairness gets void — mirroring the CLI's constraint list
+    /// builders. No-op on pre-PR#11 fixtures.
+    pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> SundaeV4Order {
+        let Some(Some(ctx)) = TEST_CTX.get() else {
+            return order;
+        };
+        let payload = order
+            .datum
+            .constraints
+            .first()
+            .map(|(_, d)| d.clone())
+            .expect("test order carries a constraint payload");
+        let empty_list = PlutusData::Array(MaybeIndefArray::Def(vec![]));
+        let void = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 121,
+            any_constructor: None,
+            fields: MaybeIndefArray::Def(vec![]),
+        });
+        let required: &[Vec<u8>] = match cfg_token {
+            t if t == CFG_SWAP => &[
+                ctx.swap_order.clone(),
+                ctx.route_order.clone(),
+                ctx.fairness_order.clone(),
+            ],
+            t if t == CFG_BASIC => &[ctx.basic_order.clone(), ctx.fairness_order.clone()],
+            t if t == CFG_STRATEGY => &[
+                ctx.strategy_order.clone(),
+                ctx.route_order.clone(),
+                ctx.fairness_order.clone(),
+            ],
+            _ => panic!("unknown cfg token"),
+        };
+        order.datum.config_token = cfg_token.to_vec();
+        order.datum.constraints = required
+            .iter()
+            .map(|h| {
+                let data = if *h == ctx.route_order {
+                    empty_list.clone()
+                } else if *h == ctx.fairness_order {
+                    void.clone()
+                } else {
+                    payload.clone()
+                };
+                (h.clone(), data)
+            })
+            .collect();
+        order
     }
 
     /// Build a settings UTxO from the test env's scooper keyhash.
@@ -588,7 +762,13 @@ pub(crate) mod test_harness {
         // For the test harness, we'll hardcode the devnet settingsMint policy.
         // The fairness validator looks for inputs containing this NFT policy with
         // any token name.
-        let settings_nft_policy = hex::decode("35a98a94fb936993259612746054dd4b80c6fe33f3163780db1a9e1e").unwrap();
+        let settings_nft_policy = TEST_CTX
+            .get()
+            .and_then(|c| c.as_ref())
+            .map(|c| c.settings_mint.clone())
+            .unwrap_or_else(|| {
+                hex::decode("35a98a94fb936993259612746054dd4b80c6fe33f3163780db1a9e1e").unwrap()
+            });
         let settings_nft = AssetClass {
             policy: settings_nft_policy,
             token: vec![], // empty token name

@@ -1569,32 +1569,29 @@ pub fn build_multi_pool_scoop_tx(
                 script_ref: None,
             },
         );
-        // Keep the output above the ledger's min-UTxO. The gap is paid from
-        // the funding UTxO (its change shrinks by the subsidy) — we can't
-        // reduce this order's fee take instead without also lowering
-        // tx_body.fee, which is a fixed-point computation (see note above).
-        for _ in 0..4 {
+        // The output must clear the ledger's min-UTxO on its own ada: the
+        // scooper does NOT subsidise orders (its fee take only reimburses
+        // the network fee, so any top-up is a direct loss — and a drain
+        // vector via under-funded standing orders). Such orders are
+        // unexecutable until re-funded; fail the build with a clear reason
+        // so the matcher/status can surface it.
+        {
             let needed = compute_output_min_ada(&out)?;
             let TransactionOutput::PostAlonzo(ref body) = out else { unreachable!() };
             let current = match &body.value {
                 ConwayValue::Coin(c) => *c,
                 ConwayValue::Multiasset(c, _) => *c,
             };
-            if current >= needed {
-                break;
-            }
-            let bump = needed - current;
-            total_fulfillment_subsidy += bump;
-            let new_ada = current + bump;
-            if let TransactionOutput::PostAlonzo(b) = &mut out {
-                b.value = match &b.value {
-                    ConwayValue::Coin(_) => ConwayValue::Coin(new_ada),
-                    ConwayValue::Multiasset(_, ma) => {
-                        ConwayValue::Multiasset(new_ada, ma.clone())
-                    }
-                };
+            if current < needed {
+                bail!(
+                    "fulfillment output for order {} retains {current} lovelace \
+                     after its fee share but needs {needed} (min-UTxO): order is \
+                     under-funded for execution",
+                    hex::encode(fo_meta.order_ref.transaction_id.as_ref()),
+                );
             }
         }
+        let _ = &mut total_fulfillment_subsidy;
         outputs.push(out);
     }
 
