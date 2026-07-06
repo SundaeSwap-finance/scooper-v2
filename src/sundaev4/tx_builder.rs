@@ -1435,6 +1435,11 @@ pub fn build_multi_pool_scoop_tx(
     // Deposit). The order validator iterates filtered order inputs and entries
     // in lockstep; entries' output_index values are computed from this same
     // sort, so the two stay aligned.
+    // Lovelace the funding UTxO must cover beyond pool min-ada bumps:
+    // fee contributions we waived (and output top-ups) to keep fulfillment
+    // outputs above the ledger's min-UTxO — standing (Self) orders with
+    // several assets and an inline datum need ~2.5M lovelace retained.
+    let mut total_fulfillment_subsidy: u64 = 0;
     let mut fulfillment_order: Vec<usize> = (0..n_orders).collect();
     fulfillment_order.sort_by_key(|i| order_filtered_indices[*i]);
 
@@ -1555,7 +1560,7 @@ pub fn build_multi_pool_scoop_tx(
                 )?
             }
         };
-        outputs.push(TransactionOutput::PostAlonzo(
+        let mut out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
                 value: fulfillment_value,
@@ -1563,7 +1568,34 @@ pub fn build_multi_pool_scoop_tx(
                     .map(|d| conway::PseudoDatumOption::Data(CborWrap(d))),
                 script_ref: None,
             },
-        ));
+        );
+        // Keep the output above the ledger's min-UTxO. The gap is paid from
+        // the funding UTxO (its change shrinks by the subsidy) — we can't
+        // reduce this order's fee take instead without also lowering
+        // tx_body.fee, which is a fixed-point computation (see note above).
+        for _ in 0..4 {
+            let needed = compute_output_min_ada(&out)?;
+            let TransactionOutput::PostAlonzo(ref body) = out else { unreachable!() };
+            let current = match &body.value {
+                ConwayValue::Coin(c) => *c,
+                ConwayValue::Multiasset(c, _) => *c,
+            };
+            if current >= needed {
+                break;
+            }
+            let bump = needed - current;
+            total_fulfillment_subsidy += bump;
+            let new_ada = current + bump;
+            if let TransactionOutput::PostAlonzo(b) = &mut out {
+                b.value = match &b.value {
+                    ConwayValue::Coin(_) => ConwayValue::Coin(new_ada),
+                    ConwayValue::Multiasset(_, ma) => {
+                        ConwayValue::Multiasset(new_ada, ma.clone())
+                    }
+                };
+            }
+        }
+        outputs.push(out);
     }
 
     // ── Step 8.4: Scooper change output for the funding UTxO ───────────────
@@ -1574,9 +1606,12 @@ pub fn build_multi_pool_scoop_tx(
     // with any native tokens carried by the funding UTxO. If no funding
     // was provided but a bump was needed, bail — the scooper must retry
     // once a suitable UTxO is available.
-    if funding_value_opt.is_none() && total_pool_bump > 0 {
+    let total_funding_draw = total_pool_bump + total_fulfillment_subsidy;
+    if funding_value_opt.is_none() && total_funding_draw > 0 {
         bail!(
-            "pool output min-ada bump of {total_pool_bump} lovelace needed but no funding UTxO was provided"
+            "min-ada support of {total_funding_draw} lovelace needed (pools \
+             {total_pool_bump}, fulfillments {total_fulfillment_subsidy}) but \
+             no funding UTxO was provided"
         );
     }
     if let Some(funding_value) = funding_value_opt {
@@ -1588,9 +1623,9 @@ pub fn build_multi_pool_scoop_tx(
             .unwrap()
             .to_u64()
             .context("funding UTxO ada doesn't fit u64")?;
-        let change_ada = funding_ada.checked_sub(total_pool_bump)
+        let change_ada = funding_ada.checked_sub(total_funding_draw)
             .with_context(|| format!(
-                "funding UTxO ada ({funding_ada}) insufficient for pool min-ada bump ({total_pool_bump})"
+                "funding UTxO ada ({funding_ada}) insufficient for min-ada support ({total_funding_draw})"
             ))?;
         if change_ada < SCOOPER_CHANGE_MIN_ADA {
             bail!(
