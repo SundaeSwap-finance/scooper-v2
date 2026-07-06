@@ -97,6 +97,16 @@ pub struct ServerConfig {
     pub address: SocketAddr,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// Optional second listener exposing only the PUBLIC surface: the
+    /// strategy-intent endpoints and /health. Everything operational
+    /// (dashboard, pause, resync, listings, metrics) stays private on
+    /// `address`.
+    #[serde(default)]
+    pub public_address: Option<SocketAddr>,
+    #[serde(default)]
+    pub public_tls_cert: Option<String>,
+    #[serde(default)]
+    pub public_tls_key: Option<String>,
 }
 
 fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
@@ -136,40 +146,76 @@ pub async fn admin_server(
     intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     shutdown: CancellationToken,
 ) {
-    let v4_module_preimages = Arc::new(v4_module_preimages);
-
-    let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
-        (Some(cert), Some(key)) => {
-            let acceptor = build_tls_acceptor(cert, key)
-                .expect("failed to initialize TLS");
-            tracing::info!(cert = %cert, "TLS enabled for admin server");
-            Some(acceptor)
-        }
-        (None, None) => {
-            tracing::info!("Admin server running without TLS");
-            None
-        }
-        _ => panic!("tls_cert and tls_key must both be set or both be absent"),
+    let base = AdminServer {
+        visibility: Visibility::Private,
+        v3_state,
+        v4_state,
+        v4_fee,
+        v4_module_preimages: Arc::new(v4_module_preimages),
+        resync_tx,
+        event_tx,
+        paused,
+        metrics,
+        intents,
     };
 
-    let listener = TcpListener::bind(config.address).await.unwrap();
+    let mut listeners = Vec::new();
 
+    let private_tls = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = build_tls_acceptor(cert, key).expect("failed to initialize TLS");
+            tracing::info!(cert = %cert, "TLS enabled for private admin server");
+            Some(acceptor)
+        }
+        (None, None) => None,
+        _ => panic!("tls_cert and tls_key must both be set or both be absent"),
+    };
+    listeners.push((config.address, private_tls, base.clone()));
+
+    if let Some(public_addr) = config.public_address {
+        let public_tls = match (&config.public_tls_cert, &config.public_tls_key) {
+            (Some(cert), Some(key)) => {
+                let acceptor =
+                    build_tls_acceptor(cert, key).expect("failed to initialize public TLS");
+                tracing::info!(cert = %cert, "TLS enabled for public server");
+                Some(acceptor)
+            }
+            (None, None) => None,
+            _ => panic!("public_tls_cert and public_tls_key must both be set or both be absent"),
+        };
+        let mut public = base.clone();
+        public.visibility = Visibility::Public;
+        tracing::info!(address = %public_addr, "public strategy-intent listener enabled");
+        listeners.push((public_addr, public_tls, public));
+    }
+
+    let mut handles = Vec::new();
+    for (addr, tls, server) in listeners {
+        let shutdown = shutdown.child_token();
+        handles.push(tokio::spawn(run_listener(addr, tls, server, shutdown)));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+async fn run_listener(
+    addr: SocketAddr,
+    tls_acceptor: Option<TlsAcceptor>,
+    server: AdminServer,
+    shutdown: CancellationToken,
+) {
+    let listener = TcpListener::bind(addr).await.unwrap();
     loop {
         let stream = select! {
-            res = listener.accept() => res.unwrap().0,
+            res = listener.accept() => match res {
+                Ok((s, _)) => s,
+                Err(e) => { debug!("accept failed: {e}"); continue; }
+            },
             _ = shutdown.cancelled() => { break; }
         };
-
-        let resync_tx = resync_tx.clone();
-        let event_tx = event_tx.clone();
-        let v3_state = v3_state.clone();
-        let v4_state = v4_state.clone();
-        let v4_module_preimages = v4_module_preimages.clone();
-        let paused = paused.clone();
-        let metrics = metrics.clone();
-        let intents = intents.clone();
+        let server = server.clone();
         let tls_acceptor = tls_acceptor.clone();
-
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
             if let Some(acceptor) = tls_acceptor {
@@ -182,53 +228,40 @@ pub async fn admin_server(
                 };
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(tls_stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics, intents) => {}
+                    _ = serve_connection(tls_stream, server) => {}
                 }
             } else {
                 select! {
                     _ = child.cancelled() => {},
-                    _ = handle_request(stream, v3_state, v4_state, v4_fee, v4_module_preimages, resync_tx, event_tx, paused, metrics, intents) => {}
+                    _ = serve_connection(stream, server) => {}
                 }
             }
         });
     }
 }
 
-async fn handle_request(
+async fn serve_connection(
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    v3_state: V3State,
-    v4_state: V4State,
-    v4_fee: Option<(u64, u64)>,
-    v4_module_preimages: Arc<ModuleStatePreimages>,
-    resync_tx: tokio::sync::broadcast::Sender<()>,
-    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
-    paused: Arc<AtomicBool>,
-    metrics: Arc<Metrics>,
-    intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
+    server: AdminServer,
 ) {
     let io = TokioIo::new(stream);
-
-    let admin_server = AdminServer {
-        v3_state,
-        v4_state,
-        v4_fee,
-        v4_module_preimages,
-        resync_tx,
-        event_tx,
-        paused,
-        metrics,
-        intents,
-    };
-    if let Err(err) = http1::Builder::new()
-        .serve_connection(io, admin_server)
-        .await
-    {
+    if let Err(err) = http1::Builder::new().serve_connection(io, server).await {
         debug!("Failed to serve connection: {:?}", err);
     }
 }
 
+/// Which route surface a listener serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Visibility {
+    /// Full operational surface (dashboard, pause, listings, metrics, …).
+    Private,
+    /// Strategy-intent endpoints + /health only.
+    Public,
+}
+
 #[derive(Clone)]
 struct AdminServer {
+    visibility: Visibility,
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
@@ -534,6 +567,12 @@ impl AdminServer {
     async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
         let path = req.uri().path().to_string();
 
+        if self.visibility == Visibility::Public
+            && !(path.starts_with("/v4/strategy-intents") || path == "/health")
+        {
+            return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
+        }
+
         if path == "/v4/strategy-intents" {
             return match *req.method() {
                 hyper::Method::POST => self.post_strategy_intent(req).await,
@@ -596,6 +635,10 @@ impl AdminServer {
             serde_json::json!({ "configured": false })
         };
 
+        let strategy_intents = match &self.intents {
+            Some(intents) => intents.store.lock().await.summary(),
+            None => serde_json::Value::Null,
+        };
         let in_flight = self.metrics.in_flight_snapshot();
         let quarantine = self.metrics.quarantine_snapshot();
 
@@ -612,6 +655,7 @@ impl AdminServer {
                 "tip_slot": state.tip_slot,
                 "network_tip_slot": state.network_tip_slot,
                 "sync_pct": sync_pct,
+                "strategy_intents": strategy_intents,
                 "in_flight_pools": in_flight.pool_ids,
                 "in_flight_orders": in_flight.order_refs,
                 "quarantine": quarantine,

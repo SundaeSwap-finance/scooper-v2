@@ -373,6 +373,39 @@ impl IntentStore {
         }
     }
 
+    /// Operator-facing summary: live intents (id, order, hint kind, expiry)
+    /// plus tombstone status tallies. Private-surface only — this exposes
+    /// order refs, which are strategy-sensitive.
+    pub fn summary(&self) -> serde_json::Value {
+        let live: Vec<serde_json::Value> = self
+            .by_order
+            .iter()
+            .flat_map(|(key, intents)| {
+                let key = key.clone();
+                intents.iter().map(move |i| {
+                    serde_json::json!({
+                        "intent_id": hex::encode(&i.intent_id),
+                        "order": format!("{}#{}", hex::encode(&key.0), key.1),
+                        "hint": i.hint.as_ref().map(|h| match h {
+                            ExecutionHint::Claim { pool } =>
+                                format!("claim:{}", &pool[..12.min(pool.len())]),
+                        }),
+                        "expiry_ms": i.expiry_ms,
+                        "received_at_ms": i.received_at_ms,
+                    })
+                })
+            })
+            .collect();
+        let mut tallies: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for t in self.tombstones.values() {
+            *tallies.entry(t.status).or_default() += 1;
+        }
+        serde_json::json!({
+            "live": live,
+            "terminal": tallies,
+        })
+    }
+
     /// Look up an intent by id: live entry or tombstone.
     pub fn find(&self, intent_id: &[u8]) -> Option<IntentLookup<'_>> {
         for intents in self.by_order.values() {

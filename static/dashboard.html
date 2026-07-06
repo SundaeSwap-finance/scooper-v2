@@ -364,6 +364,12 @@
       <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Status</th><th>Detail</th></tr></thead>
       <tbody id="v4-orders-body"></tbody>
     </table>
+    <div class="section-title">Strategy Intents</div>
+    <div class="stats" id="v4-intent-stats"></div>
+    <table id="v4-intents-table">
+      <thead><tr><th>Intent</th><th>Order</th><th>Hint</th><th>Expires</th><th>Received</th></tr></thead>
+      <tbody id="v4-intents-body"></tbody>
+    </table>
     <div class="section-title">Spent Orders</div>
     <div class="search-bar"><input type="text" data-filter="v4-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v4-spent-orders-table">
@@ -523,6 +529,34 @@
   // --- Status / sync bar ---
   let status = {};
 
+  function renderStrategyIntents(si) {
+    const stats = document.getElementById('v4-intent-stats');
+    const body = document.getElementById('v4-intents-body');
+    if (!si || !stats || !body) return;
+    const terminal = si.terminal || {};
+    const cards = [
+      ['Live', (si.live || []).length],
+      ['Executed', terminal.executed || 0],
+      ['Expired', terminal.expired || 0],
+      ['Order gone', terminal['order-gone'] || 0],
+    ];
+    stats.innerHTML = cards.map(function(c) {
+      return '<div class="stat-card"><div class="stat-value">' + c[1] +
+             '</div><div class="stat-label">' + c[0] + ' intents</div></div>';
+    }).join('');
+    const MAXU = '18446744073709551615';
+    body.innerHTML = (si.live || []).map(function(i) {
+      const exp = String(i.expiry_ms) === MAXU
+        ? 'never'
+        : new Date(Number(i.expiry_ms)).toISOString().replace('T', ' ').slice(0, 19);
+      const rcv = new Date(Number(i.received_at_ms)).toISOString().replace('T', ' ').slice(0, 19);
+      return '<tr><td class="mono">' + i.intent_id.slice(0, 16) + '…</td>' +
+             '<td class="mono">' + i.order.slice(0, 20) + '…</td>' +
+             '<td>' + (i.hint || 'swap') + '</td>' +
+             '<td>' + exp + '</td><td>' + rcv + '</td></tr>';
+    }).join('') || '<tr><td colspan="5" style="opacity:.5">none</td></tr>';
+  }
+
   async function fetchStatus() {
     try {
       const res = await fetch('/status');
@@ -600,6 +634,7 @@
 
   function updateStats() {
     const v3s = document.getElementById('v3-stats');
+    renderStrategyIntents(data.strategy_intents);
     const v4s = document.getElementById('v4-stats');
     const v3 = status.v3 || {};
     const v4 = status.v4 || {};
