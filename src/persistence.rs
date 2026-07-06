@@ -41,6 +41,10 @@ pub struct PersistedStrategyIntent {
     pub hint: Option<String>,
     pub expiry_ms: u64,
     pub received_at_ms: u64,
+    /// Terminal status ("executed" / "expired" / "order-gone"); None = live.
+    pub status: Option<String>,
+    /// For "executed": the spending tx hash.
+    pub status_tx: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -48,6 +52,14 @@ pub trait StrategyIntentDao: Send + Sync + 'static {
     async fn save_intent(&self, intent: &PersistedStrategyIntent) -> Result<()>;
     async fn delete_intents(&self, intent_ids: &[Vec<u8>]) -> Result<()>;
     async fn load_intents(&self) -> Result<Vec<PersistedStrategyIntent>>;
+    /// Mark intents terminal: set status (+ optional tx) and blank the SSE
+    /// bytes — the tombstone only answers status queries.
+    async fn mark_terminal(
+        &self,
+        intent_ids: &[Vec<u8>],
+        status: &str,
+        status_tx: Option<&[u8]>,
+    ) -> Result<()>;
 }
 
 pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>> {

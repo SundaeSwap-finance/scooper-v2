@@ -379,7 +379,11 @@ impl AdminServer {
         }
     }
 
-    /// GET /v4/strategy-intents — observability listing.
+    /// GET /v4/strategy-intents — count only. Intent contents are trading
+    /// strategy (front-runnable), so the listing exposes no details; use
+    /// GET /v4/strategy-intents/<intent_id> with the id returned at POST
+    /// time. The id is blake2b-256 of the signed execution bytes — a
+    /// capability only the submitter can derive.
     async fn list_strategy_intents(self) -> Response<ResponseBody> {
         let Some(intents) = self.intents.clone() else {
             return Self::error_response(
@@ -388,28 +392,176 @@ impl AdminServer {
             );
         };
         let store = intents.store.lock().await;
-        let now = crate::sundaev4::intents::now_ms();
-        let listing: Vec<serde_json::Value> = store
-            .all()
-            .map(|i| {
+        Self::json_response(serde_json::json!({ "count": store.len() }).to_string())
+    }
+
+    /// GET /v4/strategy-intents/<intent_id hex> — status for one intent.
+    /// Live intents also get a dispatchability probe against current pools.
+    async fn strategy_intent_status(self, id_hex: &str) -> Response<ResponseBody> {
+        use crate::sundaev4::intents::{IntentLookup, now_ms};
+
+        let Some(intents) = self.intents.clone() else {
+            return Self::error_response(
+                hyper::StatusCode::NOT_IMPLEMENTED,
+                "strategy intents require a configured v4 execution",
+            );
+        };
+        let Ok(id) = hex::decode(id_hex.trim()) else {
+            return Self::error_response(hyper::StatusCode::BAD_REQUEST, "intent id must be hex");
+        };
+
+        // Pool + order snapshots for the probe (before taking the store lock).
+        let (pools, orders) = match &self.v4_state {
+            Some(v4) => {
+                let state = v4.lock().await;
+                let latest = state.latest();
+                (latest.pools.clone(), latest.orders.clone())
+            }
+            None => (Default::default(), Vec::new()),
+        };
+
+        let store = intents.store.lock().await;
+        let body = match store.find(&id) {
+            None => {
+                return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown intent");
+            }
+            Some(IntentLookup::Terminal(t)) => serde_json::json!({
+                "status": t.status,
+                "tx_hash": t.tx_hash.as_ref().map(hex::encode),
+            }),
+            Some(IntentLookup::Live(i)) => {
+                let key = crate::sundaev4::intents::order_key(&i.sse);
+                let order = orders.iter().find(|o| {
+                    o.input.0.transaction_id.as_ref() == key.0.as_slice()
+                        && o.input.0.index == key.1
+                });
+                let probe: serde_json::Value = match (order, &i.hint) {
+                    (None, _) => serde_json::json!("order-not-indexed"),
+                    (Some(order), Some(crate::sundaev4::intents::ExecutionHint::Claim {
+                        pool,
+                    })) => Self::probe_claim(order, i, pool, &pools),
+                    (Some(order), None) => Self::probe_swap(order, i, &pools),
+                };
                 serde_json::json!({
-                    "intent_id": hex::encode(&i.intent_id),
-                    "order": format!(
-                        "{}#{}",
-                        hex::encode(&i.sse.execution.order_ref.transaction_id),
-                        i.sse.execution.order_ref.output_index,
-                    ),
-                    "hint": i.hint,
+                    "status": "pending",
                     "expiry_ms": i.expiry_ms,
-                    "expired": i.expiry_ms <= now,
                     "received_at_ms": i.received_at_ms,
-                    "min_received": i.sse.execution.min_received,
+                    "dispatch": probe,
                 })
-            })
-            .collect();
-        Self::json_response(
-            serde_json::json!({ "count": store.len(), "intents": listing }).to_string(),
-        )
+            }
+        };
+        Self::json_response(body.to_string())
+    }
+
+    /// Would this swap intent route right now?
+    fn probe_swap(
+        order: &crate::sundaev4::SundaeV4Order,
+        intent: &crate::sundaev4::intents::StoredIntent,
+        pools: &BTreeMap<crate::sundaev3::Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
+    ) -> serde_json::Value {
+        use crate::sundaev4::{intents, router};
+        let Some(constraint) = intents::synthesize_swap_constraint(order, &intent.sse) else {
+            return serde_json::json!("shape-unsupported");
+        };
+        let Some((offered, amount)) = constraint.swap_offered() else {
+            return serde_json::json!("shape-unsupported");
+        };
+        let Some((receive, _)) = constraint.swap_min_received() else {
+            return serde_json::json!("shape-unsupported");
+        };
+        match router::find_optimal_route(
+            pools,
+            offered,
+            receive,
+            amount,
+            router::RoutingLimits::unlimited(),
+        ) {
+            Some(_) => serde_json::json!("dispatchable"),
+            None => serde_json::json!("no-route"),
+        }
+    }
+
+    /// Would this claim intent execute right now, and for how much?
+    fn probe_claim(
+        order: &crate::sundaev4::SundaeV4Order,
+        intent: &crate::sundaev4::intents::StoredIntent,
+        pool_hex: &str,
+        pools: &BTreeMap<crate::sundaev3::Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
+    ) -> serde_json::Value {
+        use crate::sundaev4::claims;
+        use crate::sundaev4::PoolType;
+        use num_traits::Signed;
+
+        let Some(pool) = pools
+            .iter()
+            .find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)
+            .map(|(_, p)| p)
+        else {
+            return serde_json::json!("pool-not-found");
+        };
+        let PoolType::ConstantSum { prices, bounty_k, waive_fee_on_claim: true, .. } =
+            &pool.pool_type
+        else {
+            return serde_json::json!("pool-not-claimable");
+        };
+        // Mirror the matcher's shape resolution (single non-ADA offer,
+        // single receive, deficit-clamped dx).
+        let mut offered: Option<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = None;
+        for (policy, tokens) in &order.value.0 {
+            if policy.is_empty() { continue; }
+            for (name, qty) in tokens {
+                if !qty.is_positive() { continue; }
+                if offered.is_some() { return serde_json::json!("shape-unsupported"); }
+                offered = Some((crate::cardano_types::AssetClass {
+                    policy: policy.clone(), token: name.clone(),
+                }, qty.clone()));
+            }
+        }
+        let Some((in_asset, balance)) = offered else {
+            return serde_json::json!("shape-unsupported");
+        };
+        let assets = &pool.pool_datum.assets;
+        let Some(in_idx) = assets.iter().position(|(a, _)| *a == in_asset) else {
+            return serde_json::json!("shape-unsupported");
+        };
+        let mut leftover = crate::bigint::BigInt::from(0);
+        let mut receive: Option<(usize, crate::bigint::BigInt)> = None;
+        for (asset, amount) in &intent.sse.execution.min_received {
+            if *asset == in_asset {
+                leftover = amount.clone();
+            } else if receive.is_none() {
+                match assets.iter().position(|(a, _)| a == asset) {
+                    Some(idx) => receive = Some((idx, amount.clone())),
+                    None => return serde_json::json!("shape-unsupported"),
+                }
+            } else {
+                return serde_json::json!("shape-unsupported");
+            }
+        }
+        let Some((out_idx, min_recv)) = receive else {
+            return serde_json::json!("shape-unsupported");
+        };
+        let consumable = &balance - &leftover;
+        if !consumable.is_positive() {
+            return serde_json::json!("shape-unsupported");
+        }
+        let n_big = crate::bigint::BigInt::from(assets.len() as u64);
+        let v = claims::compute_v(assets, prices);
+        let p_in = &prices[in_idx];
+        let deficit = &(&v - &(&(&n_big * p_in) * &assets[in_idx].1)) / &(&n_big * p_in);
+        if !deficit.is_positive() {
+            return serde_json::json!("awaiting-imbalance");
+        }
+        let dx = if consumable < deficit { consumable } else { deficit };
+        match claims::plan_waived_claim(
+            assets, prices, (&bounty_k.num, &bounty_k.den), in_idx, out_idx, &dx,
+        ) {
+            Some(plan) if &plan.dy + &plan.claim >= min_recv => serde_json::json!({
+                "claimable": plan.claim.to_string(),
+            }),
+            Some(_) => serde_json::json!("below-floor"),
+            None => serde_json::json!("awaiting-imbalance"),
+        }
     }
 
     async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
@@ -424,6 +576,10 @@ impl AdminServer {
                     "use GET or POST",
                 ),
             };
+        }
+        if let Some(id_hex) = path.strip_prefix("/v4/strategy-intents/") {
+            let id_hex = id_hex.to_string();
+            return self.strategy_intent_status(&id_hex).await;
         }
 
         match path.as_str() {

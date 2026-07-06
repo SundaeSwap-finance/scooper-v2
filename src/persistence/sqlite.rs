@@ -119,7 +119,8 @@ impl super::StrategyIntentDao for SqliteStrategyIntentDao {
 
     async fn load_intents(&self) -> Result<Vec<super::PersistedStrategyIntent>> {
         let rows = sqlx::query(
-            "SELECT intent_id, order_tx_id, order_index, sse_cbor, hint, expiry_ms, received_at_ms \
+            "SELECT intent_id, order_tx_id, order_index, sse_cbor, hint, expiry_ms, \
+             received_at_ms, status, status_tx \
              FROM sundae_v4_strategy_intents;",
         )
         .try_map(|row: SqliteRow| {
@@ -134,11 +135,36 @@ impl super::StrategyIntentDao for SqliteStrategyIntentDao {
                 hint: row.try_get("hint")?,
                 expiry_ms: expiry_ms as u64,
                 received_at_ms: received_at_ms as u64,
+                status: row.try_get("status")?,
+                status_tx: row.try_get("status_tx")?,
             })
         })
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn mark_terminal(
+        &self,
+        intent_ids: &[Vec<u8>],
+        status: &str,
+        status_tx: Option<&[u8]>,
+    ) -> Result<()> {
+        if intent_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = vec!["?"; intent_ids.len()].join(",");
+        let query = format!(
+            "UPDATE sundae_v4_strategy_intents \
+             SET status = ?, status_tx = ?, sse_cbor = X'' \
+             WHERE intent_id IN ({placeholders});"
+        );
+        let mut q = sqlx::query(&query).bind(status).bind(status_tx);
+        for id in intent_ids {
+            q = q.bind(id);
+        }
+        q.execute(&self.pool).await?;
+        Ok(())
     }
 }
 

@@ -75,10 +75,30 @@ fn hex_id<S: serde::Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&hex::encode(v))
 }
 
+/// Terminal outcome of an intent, retained (small) after the live entry is
+/// gone so the submitter can still query it by intent id. The intent id is
+/// the capability: it's blake2b-256 of the signed execution bytes, so only
+/// someone holding those bytes (the submitter) can derive it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntentTombstone {
+    /// "executed" | "expired" | "order-gone"
+    pub status: &'static str,
+    /// For "executed": the spending tx hash (any scooper's — read from chain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<Vec<u8>>,
+    /// When the tombstone itself can be deep-cleaned.
+    pub cleanup_after_ms: u64,
+}
+
+/// How long a terminal status stays queryable.
+const TOMBSTONE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
 #[derive(Default)]
 pub struct IntentStore {
     /// Intents keyed by target order, each order's list ordered by arrival.
     by_order: BTreeMap<OrderKey, Vec<StoredIntent>>,
+    /// Terminal statuses by intent id.
+    tombstones: BTreeMap<Vec<u8>, IntentTombstone>,
     total: usize,
 }
 
@@ -88,7 +108,35 @@ impl IntentStore {
         let mut store = Self::default();
         let mut dead: Vec<Vec<u8>> = Vec::new();
         for p in dao.load_intents().await? {
+            if let Some(status) = p.status.as_deref() {
+                let status_static: &'static str = match status {
+                    "executed" => "executed",
+                    "order-gone" => "order-gone",
+                    _ => "expired",
+                };
+                store.tombstones.insert(
+                    p.intent_id.clone(),
+                    IntentTombstone {
+                        status: status_static,
+                        tx_hash: p.status_tx.clone(),
+                        cleanup_after_ms: p.expiry_ms.saturating_add(TOMBSTONE_TTL_MS),
+                    },
+                );
+                if now_ms > p.expiry_ms.saturating_add(TOMBSTONE_TTL_MS) {
+                    store.tombstones.remove(&p.intent_id);
+                    dead.push(p.intent_id);
+                }
+                continue;
+            }
             if p.expiry_ms <= now_ms {
+                store.tombstones.insert(
+                    p.intent_id.clone(),
+                    IntentTombstone {
+                        status: "expired",
+                        tx_hash: None,
+                        cleanup_after_ms: p.expiry_ms.saturating_add(TOMBSTONE_TTL_MS),
+                    },
+                );
                 dead.push(p.intent_id);
                 continue;
             }
@@ -256,14 +304,23 @@ impl IntentStore {
         self.total == 0
     }
 
-    /// Drop expired intents; returns the removed ids so the caller can also
-    /// delete them from persistence.
-    pub fn prune_expired(&mut self, now_ms: u64) -> Vec<Vec<u8>> {
-        let mut removed = Vec::new();
+    /// Expire live intents past their window; returns the transitioned ids
+    /// so the caller persists the terminal status. Also deep-cleans stale
+    /// tombstones (returned separately for deletion).
+    pub fn prune_expired(&mut self, now_ms: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut expired = Vec::new();
         self.by_order.retain(|_, intents| {
             intents.retain(|i| {
                 if i.expiry_ms <= now_ms {
-                    removed.push(i.intent_id.clone());
+                    self.tombstones.insert(
+                        i.intent_id.clone(),
+                        IntentTombstone {
+                            status: "expired",
+                            tx_hash: None,
+                            cleanup_after_ms: i.expiry_ms.saturating_add(TOMBSTONE_TTL_MS),
+                        },
+                    );
+                    expired.push(i.intent_id.clone());
                     false
                 } else {
                     true
@@ -271,20 +328,65 @@ impl IntentStore {
             });
             !intents.is_empty()
         });
-        self.total -= removed.len();
-        removed
+        self.total -= expired.len();
+        let mut cleaned = Vec::new();
+        self.tombstones.retain(|id, t| {
+            if now_ms > t.cleanup_after_ms {
+                cleaned.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        (expired, cleaned)
     }
 
-    /// Drop all intents targeting a spent order; returns removed ids.
-    pub fn on_order_spent(&mut self, key: &OrderKey) -> Vec<Vec<u8>> {
+    /// Transition all intents targeting a spent/gone order. `tx_hash` is the
+    /// spending tx when known (status "executed"), else "order-gone".
+    pub fn on_order_spent(
+        &mut self,
+        key: &OrderKey,
+        tx_hash: Option<Vec<u8>>,
+        now_ms: u64,
+    ) -> Vec<Vec<u8>> {
         match self.by_order.remove(key) {
             Some(intents) => {
                 self.total -= intents.len();
-                intents.into_iter().map(|i| i.intent_id).collect()
+                let status: &'static str =
+                    if tx_hash.is_some() { "executed" } else { "order-gone" };
+                intents
+                    .into_iter()
+                    .map(|i| {
+                        self.tombstones.insert(
+                            i.intent_id.clone(),
+                            IntentTombstone {
+                                status,
+                                tx_hash: tx_hash.clone(),
+                                cleanup_after_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
+                            },
+                        );
+                        i.intent_id
+                    })
+                    .collect()
             }
             None => Vec::new(),
         }
     }
+
+    /// Look up an intent by id: live entry or tombstone.
+    pub fn find(&self, intent_id: &[u8]) -> Option<IntentLookup<'_>> {
+        for intents in self.by_order.values() {
+            if let Some(i) = intents.iter().find(|i| i.intent_id == intent_id) {
+                return Some(IntentLookup::Live(i));
+            }
+        }
+        self.tombstones.get(intent_id).map(IntentLookup::Terminal)
+    }
+}
+
+pub enum IntentLookup<'a> {
+    Live(&'a StoredIntent),
+    Terminal(&'a IntentTombstone),
 }
 
 fn big_to_u64(t: &crate::bigint::BigInt) -> Option<u64> {
@@ -512,30 +614,58 @@ impl IntentService {
         }
     }
 
-    /// Drop expired intents and intents whose target order is gone (spent or
-    /// never re-indexed). `order_exists` checks current indexed state.
-    pub async fn prune(&self, order_exists: impl Fn(&OrderKey) -> bool) -> Result<usize> {
-        let removed: Vec<Vec<u8>> = {
+    /// Transition intents whose window expired or whose target order is
+    /// gone, keeping queryable tombstones; deep-clean stale tombstones.
+    /// `disposition` reports each order's fate from current indexed state.
+    pub async fn prune(
+        &self,
+        disposition: impl Fn(&OrderKey) -> OrderDisposition,
+    ) -> Result<usize> {
+        let now = now_ms();
+        let (expired, cleaned, executed, gone) = {
             let mut store = self.store.lock().await;
-            let mut removed = store.prune_expired(now_ms());
-            let dead_orders: Vec<OrderKey> = store
-                .by_order
-                .keys()
-                .filter(|k| !order_exists(k))
-                .cloned()
-                .collect();
-            for key in &dead_orders {
-                removed.extend(store.on_order_spent(key));
+            let (expired, cleaned) = store.prune_expired(now);
+            let mut executed: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let mut gone: Vec<Vec<u8>> = Vec::new();
+            let keys: Vec<OrderKey> = store.by_order.keys().cloned().collect();
+            for key in keys {
+                match disposition(&key) {
+                    OrderDisposition::Live => {}
+                    OrderDisposition::Spent(Some(tx)) => {
+                        let ids = store.on_order_spent(&key, Some(tx.clone()), now);
+                        if !ids.is_empty() {
+                            executed.push((tx, ids));
+                        }
+                    }
+                    OrderDisposition::Spent(None) => {
+                        gone.extend(store.on_order_spent(&key, None, now));
+                    }
+                }
             }
-            removed
+            (expired, cleaned, executed, gone)
         };
-        let n = removed.len();
+        let mut n = expired.len() + gone.len();
+        self.dao.mark_terminal(&expired, "expired", None).await?;
+        self.dao.mark_terminal(&gone, "order-gone", None).await?;
+        for (tx, ids) in executed {
+            n += ids.len();
+            self.dao.mark_terminal(&ids, "executed", Some(&tx)).await?;
+        }
+        if !cleaned.is_empty() {
+            self.dao.delete_intents(&cleaned).await?;
+        }
         if n > 0 {
-            self.dao.delete_intents(&removed).await?;
-            tracing::info!(pruned = n, "pruned dead strategy intents");
+            tracing::info!(transitioned = n, "strategy intents moved to terminal status");
         }
         Ok(n)
     }
+}
+
+/// What became of an intent's target order, per current indexed state.
+pub enum OrderDisposition {
+    Live,
+    /// Order is gone; the spending tx hash when the indexer still knows it.
+    Spent(Option<Vec<u8>>),
 }
 
 /// Convert a stored intent to its persisted form.
@@ -552,6 +682,8 @@ pub fn to_persisted(intent: &StoredIntent) -> PersistedStrategyIntent {
             .and_then(|h| serde_json::to_string(h).ok()),
         expiry_ms: intent.expiry_ms,
         received_at_ms: intent.received_at_ms,
+        status: None,
+        status_tx: None,
     }
 }
 
@@ -810,16 +942,34 @@ mod tests {
         assert!(store.submit(over, None, |_| Some(order.clone()), NOW_MS).is_err());
         assert_eq!(store.len(), MAX_INTENTS_PER_ORDER);
 
-        // Everything expires by NOW + 60s + cap.
-        let removed = store.prune_expired(NOW_MS + 120_000);
-        assert_eq!(removed.len(), MAX_INTENTS_PER_ORDER);
+        // Everything expires by NOW + 60s + cap — and leaves tombstones.
+        let (expired, cleaned) = store.prune_expired(NOW_MS + 120_000);
+        assert_eq!(expired.len(), MAX_INTENTS_PER_ORDER);
+        assert!(cleaned.is_empty());
         assert!(store.is_empty());
+        assert!(matches!(
+            store.find(&expired[0]),
+            Some(IntentLookup::Terminal(t)) if t.status == "expired"
+        ));
 
-        // Spent-order pruning drops the whole bucket.
+        // Spent-order pruning drops the bucket and records execution.
         let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
         store.submit(cbor, None, |_| Some(order.clone()), NOW_MS).unwrap();
-        let removed = store.on_order_spent(&(vec![0xAB; 32], 1));
+        let removed = store.on_order_spent(&(vec![0xAB; 32], 1), Some(vec![0x77; 32]), NOW_MS);
         assert_eq!(removed.len(), 1);
         assert!(store.is_empty());
+        assert!(matches!(
+            store.find(&removed[0]),
+            Some(IntentLookup::Terminal(t))
+                if t.status == "executed" && t.tx_hash == Some(vec![0x77; 32])
+        ));
+
+        // Tombstones deep-clean after their TTL.
+        // Note: the re-submitted intent reuses the i=0 execution bytes, so
+        // its executed tombstone overwrote that expired tombstone — the
+        // store holds MAX_INTENTS_PER_ORDER unique ids, not +1.
+        let (_, cleaned) = store.prune_expired(NOW_MS + TOMBSTONE_TTL_MS + 200_000);
+        assert_eq!(cleaned.len(), MAX_INTENTS_PER_ORDER);
+        assert!(store.find(&removed[0]).is_none());
     }
 }

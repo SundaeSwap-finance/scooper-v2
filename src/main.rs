@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
                 // order once the indexer is at the network tip — before
                 // that, the state is incomplete and pruning on it would
                 // wipe intents that are still live.
-                let (live_orders, at_tip) = {
+                let (live_orders, spent_orders, at_tip) = {
                     let state = v4_state.lock().await;
                     let latest = state.latest();
                     let at_tip = latest
@@ -131,10 +131,33 @@ async fn main() -> Result<()> {
                         .iter()
                         .map(|o| (o.input.0.transaction_id.as_ref().to_vec(), o.input.0.index))
                         .collect();
-                    (live, at_tip)
+                    // Spending tx per recently-spent order — lets the intent
+                    // status report "executed by tx T" (whoever scooped it).
+                    let spent: std::collections::BTreeMap<(Vec<u8>, u64), Vec<u8>> = latest
+                        .spent_orders
+                        .iter()
+                        .filter_map(|so| {
+                            let tx = hex::decode(&so.tx_id).ok()?;
+                            Some((
+                                (
+                                    so.order.input.0.transaction_id.as_ref().to_vec(),
+                                    so.order.input.0.index,
+                                ),
+                                tx,
+                            ))
+                        })
+                        .collect();
+                    (live, spent, at_tip)
                 };
+                use sundaev4::intents::OrderDisposition;
                 let result = intents
-                    .prune(|key| !at_tip || live_orders.contains(key))
+                    .prune(|key| {
+                        if !at_tip || live_orders.contains(key) {
+                            OrderDisposition::Live
+                        } else {
+                            OrderDisposition::Spent(spent_orders.get(key).cloned())
+                        }
+                    })
                     .await;
                 if let Err(e) = result {
                     tracing::warn!("strategy intent prune failed: {e}");
