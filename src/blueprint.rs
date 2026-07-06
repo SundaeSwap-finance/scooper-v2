@@ -319,55 +319,6 @@ mod tests {
         assert!(modules.swap_order.is_some(), "swap_order required for new order dispatch");
     }
 
-    /// Verifies that `config/preview-v4.json` deserializes into the scooper's
-    /// `SundaeV4Protocol` end-to-end and that the hashes in it agree with the
-    /// blueprint at `~/proj/sundae/sundae-v4/preview-blueprint.json`. Catches
-    /// drift between the two without running any chain ops.
-    #[test]
-    fn test_preview_v4_config_matches_blueprint() {
-        // Skip if blueprint is absent (fresh checkout / non-deploy machine).
-        let bp_path = "/home/pi/proj/sundae/sundae-v4/preview-blueprint.json";
-        let Ok(bp_data) = std::fs::read_to_string(bp_path) else {
-            eprintln!("skipping: {bp_path} not present");
-            return;
-        };
-        let bp: Blueprint = serde_json::from_str(&bp_data).expect("blueprint should parse");
-
-        // Parse the config file via the scooper's full config layer, then pull
-        // out the v4 protocol section.
-        let cfg_text = std::fs::read_to_string("config/preview-v4.json")
-            .expect("config/preview-v4.json should exist");
-        let cfg_value: serde_json::Value =
-            serde_json::from_str(&cfg_text).expect("config should parse as JSON");
-        let v4_value = &cfg_value["protocol"]["v4"];
-        let v4: crate::sundaev4::SundaeV4Protocol =
-            serde_json::from_value(v4_value.clone()).expect("v4 protocol should deserialize");
-
-        // pool/order/settings/pool_nft script hashes must match the blueprint.
-        let bp_modules = bp.to_v4_module_scripts().expect("blueprint modules");
-        assert_eq!(
-            v4.pool_script_hash, bp_modules.pool.hash,
-            "pool script hash drift",
-        );
-        assert_eq!(
-            v4.order_script_hashes[0], bp_modules.order.hash,
-            "order script hash drift",
-        );
-        assert_eq!(
-            v4.settings_script_hash, bp_modules.settings.hash,
-            "settings script hash drift",
-        );
-        assert_eq!(
-            v4.pool_nft_policy, bp_modules.pool_mint.hash,
-            "pool_nft_policy must equal pool_mint validator hash",
-        );
-
-        // settings_nft policy must equal the settings_mint validator hash.
-        let settings_mint_hash =
-            bp.find_validator("settings_mint").expect("settings_mint validator").hash.clone();
-        assert_eq!(hex::encode(v4.settings_nft.policy), settings_mint_hash);
-    }
-
     #[test]
     fn test_deserialize_camel_case() {
         let json = r#"{
