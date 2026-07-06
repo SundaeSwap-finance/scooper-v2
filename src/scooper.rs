@@ -1588,6 +1588,23 @@ impl Scooper {
             return None;
         };
         let (in_idx, out_idx, dx) = (shape.in_idx, shape.out_idx, shape.dx.clone());
+        if let Some(min_ada) = &shape.min_ada {
+            use num_traits::ToPrimitive;
+            let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+            let order_ada = order.value.get(&ada).unwrap().to_u64().unwrap_or(0);
+            let floor = min_ada.clone().unwrap().to_u64().unwrap_or(u64::MAX);
+            // Conservative fee cushion — the exact fee is only known after
+            // the build; the on-chain check is authoritative either way.
+            const FEE_CUSHION: u64 = 2_500_000;
+            if order_ada.saturating_sub(FEE_CUSHION) < floor {
+                debug!(
+                    order = %order.input,
+                    order_ada, floor,
+                    "claim intent's ada floor leaves no room for the fee share",
+                );
+                return None;
+            }
+        }
 
         let plan = claims::plan_waived_claim(
             &pool.pool_datum.assets,

@@ -157,6 +157,10 @@ pub struct ClaimShape {
     /// How much of the receive asset the order already holds (counts toward
     /// the floor — min_received bounds the whole fulfillment output).
     pub already_held: crate::bigint::BigInt,
+    /// Optional lovelace floor from an ADA min_received entry — the signer's
+    /// cap on cumulative fee takes from a standing order. The fulfillment
+    /// must retain at least this much ada.
+    pub min_ada: Option<crate::bigint::BigInt>,
 }
 
 /// Resolve which trade a claim intent implies against `reserves`/`prices`.
@@ -191,12 +195,23 @@ pub fn resolve_claim_shape(
             .unwrap_or_else(|| BigInt::from(0))
     };
 
-    // Receive asset: the min_received entry naming a pool asset the order
-    // isn't spending into the pool. Phase 2 shape: exactly one such entry.
+    // Partition min_received: pool assets act as receive floors / spend
+    // pins; non-pool assets are "carry floors" — the fulfillment carries the
+    // order's holdings through unchanged, so they're satisfiable iff already
+    // held. An ADA entry is the signer's floor on retained lovelace (a cap
+    // on cumulative fee takes), recorded for the caller to enforce.
     let mut receive: Option<(usize, BigInt)> = None;
+    let mut min_ada: Option<BigInt> = None;
     for (asset, amount) in min_received {
         let Some(idx) = reserves.iter().position(|(a, _)| a == asset) else {
-            return None; // floor on a non-pool asset: can't be a claim target
+            if asset.policy.is_empty() && asset.token.is_empty() {
+                min_ada = Some(amount.clone());
+                continue;
+            }
+            if holding(asset) >= *amount {
+                continue; // carried through untouched — floor already met
+            }
+            return None; // floor on an asset this pool can't produce
         };
         // An entry can be a leftover pin (asset the order holds and might
         // spend) or the receive floor. Treat the entry with the largest
@@ -242,7 +257,7 @@ pub fn resolve_claim_shape(
     let (in_idx, dx, _) = best?;
     let already_held = holding(&reserves[out_idx].0);
 
-    Some(ClaimShape { in_idx, out_idx, dx, min_recv, already_held })
+    Some(ClaimShape { in_idx, out_idx, dx, min_recv, already_held, min_ada })
 }
 
 #[cfg(test)]
