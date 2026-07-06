@@ -146,6 +146,105 @@ pub fn plan_waived_claim(
     Some(ClaimPlan { dx: dx.clone(), dy, claim, final_assets })
 }
 
+/// Resolved trade shape for a claim intent against a specific pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimShape {
+    pub in_idx: usize,
+    pub out_idx: usize,
+    pub dx: crate::bigint::BigInt,
+    /// The receive asset's floor from the execution's min_received.
+    pub min_recv: crate::bigint::BigInt,
+    /// How much of the receive asset the order already holds (counts toward
+    /// the floor — min_received bounds the whole fulfillment output).
+    pub already_held: crate::bigint::BigInt,
+}
+
+/// Resolve which trade a claim intent implies against `reserves`/`prices`.
+///
+/// Orders may hold several assets (a wallet's mixed holdings ride along
+/// untouched into the fulfillment). The receive asset is the min_received
+/// entry; the swap input is chosen as the order-held pool asset (≠ receive)
+/// with the LARGEST positive deficit — the most rebalancing, and therefore
+/// most claimable, direction. Explicit min_received pins on held assets cap
+/// how much of them may be consumed.
+pub fn resolve_claim_shape(
+    order_value: &crate::cardano_types::Value,
+    min_received: &[(AssetClass, BigInt)],
+    reserves: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+) -> Option<ClaimShape> {
+    use num_traits::Signed;
+
+    let holding = |asset: &AssetClass| -> BigInt {
+        order_value
+            .0
+            .get(&asset.policy)
+            .and_then(|tokens| tokens.get(&asset.token))
+            .cloned()
+            .unwrap_or_else(|| BigInt::from(0))
+    };
+    let pin = |asset: &AssetClass| -> BigInt {
+        min_received
+            .iter()
+            .find(|(a, _)| a == asset)
+            .map(|(_, m)| m.clone())
+            .unwrap_or_else(|| BigInt::from(0))
+    };
+
+    // Receive asset: the min_received entry naming a pool asset the order
+    // isn't spending into the pool. Phase 2 shape: exactly one such entry.
+    let mut receive: Option<(usize, BigInt)> = None;
+    for (asset, amount) in min_received {
+        let Some(idx) = reserves.iter().position(|(a, _)| a == asset) else {
+            return None; // floor on a non-pool asset: can't be a claim target
+        };
+        // An entry can be a leftover pin (asset the order holds and might
+        // spend) or the receive floor. Treat the entry with the largest
+        // shortfall vs current holdings as the receive target.
+        let short = amount - &holding(asset);
+        if short.is_positive() {
+            if receive.is_some() {
+                return None; // multiple receive targets: not yet supported
+            }
+            receive = Some((idx, amount.clone()));
+        }
+    }
+    let (out_idx, min_recv) = receive?;
+
+    let n_big = BigInt::from(reserves.len() as u64);
+    let v = compute_v(reserves, prices);
+
+    // Swap input: order-held pool asset (≠ receive) with the largest
+    // positive deficit.
+    let mut best: Option<(usize, BigInt, BigInt)> = None; // (idx, dx, deficit)
+    for (idx, (asset, reserve)) in reserves.iter().enumerate() {
+        if idx == out_idx {
+            continue;
+        }
+        let spendable = &holding(asset) - &pin(asset);
+        if !spendable.is_positive() {
+            continue;
+        }
+        let p = &prices[idx];
+        let deficit = &(&v - &(&(&n_big * p) * reserve)) / &(&n_big * p);
+        if !deficit.is_positive() {
+            continue;
+        }
+        let dx = if spendable < deficit { spendable } else { deficit.clone() };
+        let better = match &best {
+            Some((_, _, bd)) => &deficit > bd,
+            None => true,
+        };
+        if better {
+            best = Some((idx, dx, deficit));
+        }
+    }
+    let (in_idx, dx, _) = best?;
+    let already_held = holding(&reserves[out_idx].0);
+
+    Some(ClaimShape { in_idx, out_idx, dx, min_recv, already_held })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

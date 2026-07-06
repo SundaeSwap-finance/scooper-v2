@@ -1560,84 +1560,35 @@ impl Scooper {
             return None;
         }
 
-        // The order's offered asset: its single non-ADA asset.
-        let mut offered: Option<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = None;
-        for (policy, tokens) in &order.value.0 {
-            if policy.is_empty() {
-                continue;
-            }
-            for (name, qty) in tokens {
-                if !qty.is_positive() {
-                    continue;
-                }
-                if offered.is_some() {
-                    return None;
-                }
-                offered = Some((
-                    crate::cardano_types::AssetClass {
-                        policy: policy.clone(),
-                        token: name.clone(),
-                    },
-                    qty.clone(),
-                ));
-            }
-        }
-        let (in_asset, balance) = offered?;
-
-        let assets = &pool.pool_datum.assets;
-        let in_idx = assets.iter().position(|(a, _)| *a == in_asset)?;
-
-        // Receive asset + floor from the execution's min_received; the
-        // in-asset entry (if present) is the leftover pin.
-        let mut leftover = crate::bigint::BigInt::from(0);
-        let mut receive: Option<(usize, crate::bigint::BigInt)> = None;
-        for (asset, amount) in &intent.sse.execution.min_received {
-            if *asset == in_asset {
-                leftover = amount.clone();
-            } else if receive.is_none() {
-                let idx = assets.iter().position(|(a, _)| a == asset)?;
-                receive = Some((idx, amount.clone()));
-            } else {
-                return None; // multi-receive not supported
-            }
-        }
-        let (out_idx, min_recv) = receive?;
-
-        let consumable = &balance - &leftover;
-        if !consumable.is_positive() {
+        let Some(shape) = claims::resolve_claim_shape(
+            &order.value,
+            &intent.sse.execution.min_received,
+            &pool.pool_datum.assets,
+            prices,
+        ) else {
+            debug!(
+                order = %order.input,
+                "claim intent shape unresolvable (no receive target or no \
+                 rebalancing asset held)",
+            );
             return None;
-        }
-
-        // dx sizing is load-bearing: overshooting balance shrinks the
-        // admissible claim. Aim for the in-asset's deficit (the perfectly
-        // rebalancing amount), clamped to what the order authorizes.
-        let n_big = crate::bigint::BigInt::from(assets.len() as u64);
-        let v: crate::bigint::BigInt = assets
-            .iter()
-            .zip(prices)
-            .fold(crate::bigint::BigInt::from(0), |acc, ((_, r), p)| acc + &(r * p));
-        let p_in = &prices[in_idx];
-        let deficit = &(&v - &(&(&n_big * p_in) * &assets[in_idx].1)) / &(&n_big * p_in);
-        if !deficit.is_positive() {
-            debug!(pool = %pool_hex, "claim hint: in-asset is not scarce; no bounty available");
-            return None;
-        }
-        let dx = if consumable < deficit { consumable } else { deficit };
+        };
+        let (in_idx, out_idx, dx) = (shape.in_idx, shape.out_idx, shape.dx.clone());
 
         let plan = claims::plan_waived_claim(
-            assets,
+            &pool.pool_datum.assets,
             prices,
             (&bounty_k.num, &bounty_k.den),
             in_idx,
             out_idx,
             &dx,
         )?;
-        let total_out = &plan.dy + &plan.claim;
-        if total_out < min_recv {
+        let total_out = &(&plan.dy + &plan.claim) + &shape.already_held;
+        if total_out < shape.min_recv {
             debug!(
                 order = %order.input,
                 total_out = %total_out,
-                min_recv = %min_recv,
+                min_recv = %shape.min_recv,
                 "claim plan doesn't clear the intent's min_received floor",
             );
             return None;

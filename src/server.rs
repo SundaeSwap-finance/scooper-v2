@@ -504,61 +504,28 @@ impl AdminServer {
         else {
             return serde_json::json!("pool-not-claimable");
         };
-        // Mirror the matcher's shape resolution (single non-ADA offer,
-        // single receive, deficit-clamped dx).
-        let mut offered: Option<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = None;
-        for (policy, tokens) in &order.value.0 {
-            if policy.is_empty() { continue; }
-            for (name, qty) in tokens {
-                if !qty.is_positive() { continue; }
-                if offered.is_some() { return serde_json::json!("shape-unsupported"); }
-                offered = Some((crate::cardano_types::AssetClass {
-                    policy: policy.clone(), token: name.clone(),
-                }, qty.clone()));
-            }
-        }
-        let Some((in_asset, balance)) = offered else {
-            return serde_json::json!("shape-unsupported");
-        };
         let assets = &pool.pool_datum.assets;
-        let Some(in_idx) = assets.iter().position(|(a, _)| *a == in_asset) else {
+        let Some(shape) = claims::resolve_claim_shape(
+            &order.value,
+            &intent.sse.execution.min_received,
+            assets,
+            prices,
+        ) else {
             return serde_json::json!("shape-unsupported");
         };
-        let mut leftover = crate::bigint::BigInt::from(0);
-        let mut receive: Option<(usize, crate::bigint::BigInt)> = None;
-        for (asset, amount) in &intent.sse.execution.min_received {
-            if *asset == in_asset {
-                leftover = amount.clone();
-            } else if receive.is_none() {
-                match assets.iter().position(|(a, _)| a == asset) {
-                    Some(idx) => receive = Some((idx, amount.clone())),
-                    None => return serde_json::json!("shape-unsupported"),
-                }
-            } else {
-                return serde_json::json!("shape-unsupported");
-            }
-        }
-        let Some((out_idx, min_recv)) = receive else {
-            return serde_json::json!("shape-unsupported");
-        };
-        let consumable = &balance - &leftover;
-        if !consumable.is_positive() {
-            return serde_json::json!("shape-unsupported");
-        }
-        let n_big = crate::bigint::BigInt::from(assets.len() as u64);
-        let v = claims::compute_v(assets, prices);
-        let p_in = &prices[in_idx];
-        let deficit = &(&v - &(&(&n_big * p_in) * &assets[in_idx].1)) / &(&n_big * p_in);
-        if !deficit.is_positive() {
-            return serde_json::json!("awaiting-imbalance");
-        }
-        let dx = if consumable < deficit { consumable } else { deficit };
         match claims::plan_waived_claim(
-            assets, prices, (&bounty_k.num, &bounty_k.den), in_idx, out_idx, &dx,
+            assets,
+            prices,
+            (&bounty_k.num, &bounty_k.den),
+            shape.in_idx,
+            shape.out_idx,
+            &shape.dx,
         ) {
-            Some(plan) if &plan.dy + &plan.claim >= min_recv => serde_json::json!({
-                "claimable": plan.claim.to_string(),
-            }),
+            Some(plan)
+                if &(&plan.dy + &plan.claim) + &shape.already_held >= shape.min_recv =>
+            {
+                serde_json::json!({ "claimable": plan.claim.to_string() })
+            }
             Some(_) => serde_json::json!("below-floor"),
             None => serde_json::json!("awaiting-imbalance"),
         }
@@ -599,7 +566,13 @@ impl AdminServer {
                     serde_json::to_string(&serde_json::json!({ "paused": now_paused })).unwrap(),
                 )
             }
-            _ => Self::json_response(self.route_protocol(&path).await),
+            _ => {
+                let body = self.route_protocol(&path).await;
+                if body == "unknown" {
+                    return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
+                }
+                Self::json_response(body)
+            }
         }
     }
 
