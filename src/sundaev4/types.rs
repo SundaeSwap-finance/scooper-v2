@@ -956,7 +956,13 @@ impl SundaeV4Order {
             owner,
             destination,
             budget,
-            share_batcher: BigInt::from(0),
+            // Production orders set share_batcher = 10000 (full surplus to
+            // the batcher), making the fee allowance ~= budget. With 0, the
+            // allowance is exactly fee/n and the scooper's last-order-absorbs
+            // -remainder fee split violates it whenever fee % n != 0.
+            // TODO: teach the fee split to respect per-order allowances so
+            // low-share orders are also batchable.
+            share_batcher: BigInt::from(10_000),
             config_token: Vec::new(),
             constraints,
             extension: unit,
