@@ -210,6 +210,7 @@
   .badge-accent { background: rgba(108,92,231,0.15); color: var(--accent); }
   .badge-in-flight { background: rgba(253,203,110,0.10); color: var(--yellow); font-size: 13px; }
   .badge-quarantine { background: rgba(225,112,85,0.10); color: var(--red); font-size: 13px; }
+  .badge-strategy { background: rgba(162,155,254,0.15); color: var(--purple, #a29bfe); }
   tr.our-row td { background: rgba(108,92,231,0.06); }
 
   .event-log {
@@ -529,10 +530,17 @@
   // --- Status / sync bar ---
   let status = {};
 
+  // order ref ("txid#idx") -> live intent count, for the orders table.
+  var strategyIntentLive = {};
+
   function renderStrategyIntents(si) {
     const stats = document.getElementById('v4-intent-stats');
     const body = document.getElementById('v4-intents-body');
     if (!si || !stats || !body) return;
+    strategyIntentLive = {};
+    (si.live || []).forEach(function(i) {
+      strategyIntentLive[i.order] = (strategyIntentLive[i.order] || 0) + 1;
+    });
     const terminal = si.terminal || {};
     const cards = [
       ['Live', (si.live || []).length],
@@ -544,9 +552,10 @@
       return '<div class="stat-card"><div class="stat-value">' + c[1] +
              '</div><div class="stat-label">' + c[0] + ' intents</div></div>';
     }).join('');
-    const MAXU = '18446744073709551615';
+    // u64::MAX means "no upper bound"; anything past ~year 33k is "never"
+    // (the exact MAX loses precision through JSON number parsing).
     body.innerHTML = (si.live || []).map(function(i) {
-      const exp = String(i.expiry_ms) === MAXU
+      const exp = Number(i.expiry_ms) > 1e15
         ? 'never'
         : new Date(Number(i.expiry_ms)).toISOString().replace('T', ' ').slice(0, 19);
       const rcv = new Date(Number(i.received_at_ms)).toISOString().replace('T', ' ').slice(0, 19);
@@ -634,7 +643,7 @@
 
   function updateStats() {
     const v3s = document.getElementById('v3-stats');
-    renderStrategyIntents(data.v4 && data.v4.strategy_intents);
+    renderStrategyIntents(status.v4 && status.v4.strategy_intents);
     const v4s = document.getElementById('v4-stats');
     const v3 = status.v3 || {};
     const v4 = status.v4 || {};
@@ -887,6 +896,12 @@
         } else if (isQuarantined) {
           statusBadge = '<span class="badge badge-quarantine" title="Order quarantined">\u26d4 quarantined</span>';
           detail = 'skipped — see quarantine';
+        } else if (!info && e.order.constraint && e.order.constraint.Strategy) {
+          var liveCount = strategyIntentLive[orderRef] || 0;
+          statusBadge = '<span class="badge badge-strategy" title="Executes only via signed strategy intents">strategy</span>';
+          detail = liveCount
+            ? liveCount + ' live intent' + (liveCount > 1 ? 's' : '')
+            : 'awaiting intent';
         } else if (!info) {
           statusBadge = '<span class="badge badge-yellow">unknown</span>';
           detail = '';
