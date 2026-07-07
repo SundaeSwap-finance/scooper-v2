@@ -559,8 +559,8 @@
         ? 'never'
         : new Date(Number(i.expiry_ms)).toISOString().replace('T', ' ').slice(0, 19);
       const rcv = new Date(Number(i.received_at_ms)).toISOString().replace('T', ' ').slice(0, 19);
-      return '<tr><td class="mono">' + i.intent_id.slice(0, 16) + '…</td>' +
-             '<td class="mono">' + i.order.slice(0, 20) + '…</td>' +
+      return '<tr><td class="mono">' + copyable(truncate(i.intent_id, 16), i.intent_id) + '</td>' +
+             '<td class="mono">' + copyable(truncate(i.order, 20), i.order) + '</td>' +
              '<td>' + (i.hint || 'swap') + '</td>' +
              '<td>' + exp + '</td><td>' + rcv + '</td></tr>';
     }).join('') || '<tr><td colspan="5" style="opacity:.5">none</td></tr>';
