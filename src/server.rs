@@ -652,19 +652,21 @@ impl AdminServer {
             "spend".into(),
             serde_json::json!({
                 "asset": assets[shape.in_idx].0,
-                "max_dx": shape.dx.to_string(),
+                "spendable": shape.spendable.to_string(),
             }),
         );
 
-        match claims::plan_waived_claim(
+        match claims::plan_claim_meeting_floor(
             assets,
             prices,
             (&bounty_k.num, &bounty_k.den),
             shape.in_idx,
             shape.out_idx,
-            &shape.dx,
+            &shape.spendable,
+            &needed,
         ) {
-            Some(plan) => {
+            Some(search) => {
+                let plan = &search.plan;
                 let total = &plan.dy + &plan.claim;
                 obj.insert(
                     "achievable".into(),
@@ -675,7 +677,7 @@ impl AdminServer {
                         "total": total.to_string(),
                     }),
                 );
-                if &total + &shape.already_held >= shape.min_recv {
+                if search.meets_floor {
                     obj.insert("state".into(), "claimable".into());
                 } else {
                     obj.insert("state".into(), "below-floor".into());
@@ -685,8 +687,8 @@ impl AdminServer {
                     );
                     obj.insert(
                         "detail".into(),
-                        "the pool's current imbalance funds a smaller bounty \
-                         than the intent's floor requires"
+                        "even spending the order's full input budget, the \
+                         achievable swap + bounty is under the intent's floor"
                             .into(),
                     );
                 }

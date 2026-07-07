@@ -1585,7 +1585,7 @@ impl Scooper {
                 return None;
             }
         };
-        let (in_idx, out_idx, dx) = (shape.in_idx, shape.out_idx, shape.dx.clone());
+        let (in_idx, out_idx) = (shape.in_idx, shape.out_idx);
         if let Some(min_ada) = &shape.min_ada {
             use num_traits::ToPrimitive;
             let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
@@ -1604,24 +1604,26 @@ impl Scooper {
             }
         }
 
-        let plan = claims::plan_waived_claim(
+        let needed = &shape.min_recv - &shape.already_held;
+        let search = claims::plan_claim_meeting_floor(
             &pool.pool_datum.assets,
             prices,
             (&bounty_k.num, &bounty_k.den),
             in_idx,
             out_idx,
-            &dx,
+            &shape.spendable,
+            &needed,
         )?;
-        let total_out = &(&plan.dy + &plan.claim) + &shape.already_held;
-        if total_out < shape.min_recv {
+        if !search.meets_floor {
             debug!(
                 order = %order.input,
-                total_out = %total_out,
-                min_recv = %shape.min_recv,
-                "claim plan doesn't clear the intent's min_received floor",
+                best_total = %(&search.plan.dy + &search.plan.claim),
+                needed = %needed,
+                "best achievable claim doesn't clear the intent's min_received floor",
             );
             return None;
         }
+        let plan = search.plan;
 
         let sse_pd: pallas_primitives::PlutusData =
             minicbor::decode(&intent.sse_cbor).ok()?;

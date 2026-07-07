@@ -146,12 +146,137 @@ pub fn plan_waived_claim(
     Some(ClaimPlan { dx: dx.clone(), dy, claim, final_assets })
 }
 
+/// Result of searching for a claim that satisfies an intent's floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimSearch {
+    pub plan: ClaimPlan,
+    /// True when `plan.dy + plan.claim >= needed_out`; false means the plan
+    /// is the best achievable total (for status reporting), not enough.
+    pub meets_floor: bool,
+}
+
+fn gcd(mut a: BigInt, mut b: BigInt) -> BigInt {
+    use num_traits::Zero;
+    while !b.is_zero() {
+        let r = &a % &b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Find the smallest `dx ≤ spendable` whose value-neutral swap plus maximal
+/// claim yields at least `needed_out` of the receive asset.
+///
+/// The swap portion is fee-waived and value-neutral (`dy·p_out = dx·p_in`),
+/// so dx is NOT bounded by the pool's deficit of the input asset: the
+/// contract admits any dx that leaves the pool no more imbalanced than it
+/// started (cap_b with claim ≥ 1). The binding limits are the order's
+/// spendable holdings, the pool's reserve of the receive asset, and cap_b
+/// feasibility itself.
+///
+/// The total `dy + max_claim` grows with dx (dy 1:1 in value, the claim
+/// shrinking only slowly), while the claim — the order's actual value
+/// profit — shrinks. The smallest floor-meeting dx is therefore also the
+/// most profitable one. When no dx meets the floor, returns the plan with
+/// the highest total so callers can report how close the intent is.
+pub fn plan_claim_meeting_floor(
+    reserves: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+    bounty_k: (&BigInt, &BigInt),
+    in_idx: usize,
+    out_idx: usize,
+    spendable: &BigInt,
+    needed_out: &BigInt,
+) -> Option<ClaimSearch> {
+    use num_traits::Signed;
+
+    if !spendable.is_positive() {
+        return None;
+    }
+    let p_in = &prices[in_idx];
+    let p_out = &prices[out_idx];
+
+    // dy must divide exactly: dx must be a multiple of p_out/gcd(p_in,p_out).
+    let step = p_out / &gcd(p_in.clone(), p_out.clone());
+    let in_steps = |dx: &BigInt| -> BigInt { &(dx / &step) * &step };
+
+    // Upper bound: spendable, and dy ≤ reserve_out.
+    let dx_reserve_cap = &(&reserves[out_idx].1 * p_out) / p_in;
+    let hi_raw = if spendable < &dx_reserve_cap { spendable.clone() } else { dx_reserve_cap };
+    let mut hi = in_steps(&hi_raw);
+    if !hi.is_positive() {
+        return None;
+    }
+
+    let plan_at = |dx: &BigInt| -> Option<ClaimPlan> {
+        plan_waived_claim(reserves, prices, bounty_k, in_idx, out_idx, dx)
+    };
+    let total = |p: &ClaimPlan| -> BigInt { &p.dy + &p.claim };
+
+    // cap_b feasibility (claim ≥ 1) holds on an interval of dx: too small
+    // and the rebalancing can't fund a 1-unit claim, too large (overshot
+    // past mirror-imbalance) and the pool ends worse than it started. If
+    // `hi` overshoots, walk the upper edge back by bisection using the
+    // rebalancing point (the input-asset deficit) as a known-good anchor.
+    if plan_at(&hi).is_none() {
+        let v = compute_v(reserves, prices);
+        let n_big = BigInt::from(reserves.len() as u64);
+        let np = &n_big * p_in;
+        let deficit = &(&v - &(&np * &reserves[in_idx].1)) / &np;
+        let anchor = in_steps(&if deficit < hi { deficit } else { hi.clone() });
+        if !anchor.is_positive() || plan_at(&anchor).is_none() {
+            return None;
+        }
+        let mut lo = anchor;
+        while &hi - &lo > step {
+            let mid = in_steps(&(&(&lo + &hi) / &BigInt::from(2)));
+            let mid = if mid <= lo { &lo + &step } else { mid };
+            if plan_at(&mid).is_some() {
+                lo = mid;
+            } else {
+                hi = &mid - &step;
+            }
+        }
+        if plan_at(&hi).is_none() {
+            hi = lo;
+        }
+    }
+    let best = plan_at(&hi)?;
+    if &total(&best) < needed_out {
+        return Some(ClaimSearch { plan: best, meets_floor: false });
+    }
+
+    // Floor is reachable: bisect the smallest dx whose total meets it.
+    // (Total is monotone in dx over the feasible range; infeasible small
+    // dx counts as "too small".)
+    let mut lo = BigInt::from(0);
+    let mut hi_dx = hi;
+    while &hi_dx - &lo > step {
+        let mid = in_steps(&(&(&lo + &hi_dx) / &BigInt::from(2)));
+        let mid = if mid <= lo { &lo + &step } else { mid };
+        let meets = plan_at(&mid).map(|p| &total(&p) >= needed_out).unwrap_or(false);
+        if meets {
+            hi_dx = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let plan = plan_at(&hi_dx)?;
+    let meets_floor = &total(&plan) >= needed_out;
+    Some(ClaimSearch { plan, meets_floor })
+}
+
 /// Resolved trade shape for a claim intent against a specific pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimShape {
     pub in_idx: usize,
     pub out_idx: usize,
-    pub dx: crate::bigint::BigInt,
+    /// How much of the input asset the order may spend: holdings minus any
+    /// explicit min_received pin. The dx actually used is chosen by
+    /// `plan_claim_meeting_floor` — the deficit is only a direction signal,
+    /// not a cap (overshooting it is legal while cap_b holds).
+    pub spendable: crate::bigint::BigInt,
     /// The receive asset's floor from the execution's min_received.
     pub min_recv: crate::bigint::BigInt,
     /// How much of the receive asset the order already holds (counts toward
@@ -253,16 +378,15 @@ pub fn resolve_claim_shape(
         if !deficit.is_positive() {
             continue;
         }
-        let dx = if spendable < deficit { spendable } else { deficit.clone() };
         let better = match &best {
             Some((_, _, bd)) => &deficit > bd,
             None => true,
         };
         if better {
-            best = Some((idx, dx, deficit));
+            best = Some((idx, spendable, deficit));
         }
     }
-    let Some((in_idx, dx, _)) = best else {
+    let Some((in_idx, spendable, _)) = best else {
         return Err(
             "no rebalancing input: the order holds no spendable pool asset \
              the pool is currently short of",
@@ -270,7 +394,7 @@ pub fn resolve_claim_shape(
     };
     let already_held = holding(&reserves[out_idx].0);
 
-    Ok(ClaimShape { in_idx, out_idx, dx, min_recv, already_held, min_ada })
+    Ok(ClaimShape { in_idx, out_idx, spendable, min_recv, already_held, min_ada })
 }
 
 #[cfg(test)]
@@ -383,5 +507,48 @@ mod tests {
         let plan =
             plan_waived_claim(&before, &prices, (&k.0, &k.1), 0, 1, &BigInt::from(50_000_000));
         assert!(plan.is_none());
+    }
+
+    /// Regression: preview intent ce8b83b0… (2026-07-07). The pool was
+    /// drained to a single unit of the input asset; the intent's floor
+    /// needed ~5.3M more than the deficit-capped dx could deliver. The
+    /// floor IS reachable — dx may overshoot the input-asset deficit
+    /// because the waived swap is value-neutral; cap_b (not the deficit)
+    /// is the real bound. The old `dx = min(spendable, deficit)` heuristic
+    /// reported below-floor here.
+    #[test]
+    fn floor_meeting_dx_overshoots_the_deficit() {
+        let reserves = pool(&[1, 1_252_230_053, 619_516_058]);
+        let prices = ones(3);
+        let k = (BigInt::from(9), BigInt::from(4000));
+        let needed = BigInt::from(629_252_486u64);
+        let spendable = BigInt::from(1_000_000_000_000u64);
+
+        let search = plan_claim_meeting_floor(
+            &reserves, &prices, (&k.0, &k.1), 0, 1, &spendable, &needed,
+        )
+        .expect("claim must be feasible");
+        assert!(search.meets_floor, "floor is reachable by overshooting the deficit");
+        let total = &search.plan.dy + &search.plan.claim;
+        assert!(total >= needed);
+        // Minimal dx: barely past the floor, not the full budget.
+        assert!(search.plan.dx < BigInt::from(630_000_000u64), "dx = {}", search.plan.dx);
+        assert!(
+            search.plan.dx > BigInt::from(623_915_369u64),
+            "dx must exceed the input-asset deficit (old cap): {}",
+            search.plan.dx,
+        );
+        // The exact contract inequality accepts the plan.
+        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), &search.plan, 0, 1));
+
+        // And when the floor is genuinely out of reach, the best plan is
+        // reported without meets_floor.
+        let too_much = BigInt::from(3_000_000_000u64);
+        let search = plan_claim_meeting_floor(
+            &reserves, &prices, (&k.0, &k.1), 0, 1, &spendable, &too_much,
+        )
+        .expect("still feasible");
+        assert!(!search.meets_floor);
+        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), &search.plan, 0, 1));
     }
 }
