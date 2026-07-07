@@ -431,7 +431,7 @@ impl AdminServer {
     /// GET /v4/strategy-intents/<intent_id hex> — status for one intent.
     /// Live intents also get a dispatchability probe against current pools.
     async fn strategy_intent_status(self, id_hex: &str) -> Response<ResponseBody> {
-        use crate::sundaev4::intents::{IntentLookup, now_ms};
+        use crate::sundaev4::intents::IntentLookup;
 
         let Some(intents) = self.intents.clone() else {
             return Self::error_response(
@@ -486,7 +486,9 @@ impl AdminServer {
         Self::json_response(body.to_string())
     }
 
-    /// Would this swap intent route right now?
+    /// Would this swap intent route right now? Reports the numbers behind
+    /// the verdict: what's offered, the floor, the best achievable output,
+    /// and the gap when it falls short.
     fn probe_swap(
         order: &crate::sundaev4::SundaeV4Order,
         intent: &crate::sundaev4::intents::StoredIntent,
@@ -494,14 +496,26 @@ impl AdminServer {
     ) -> serde_json::Value {
         use crate::sundaev4::{intents, router};
         let Some(constraint) = intents::synthesize_swap_constraint(order, &intent.sse) else {
-            return serde_json::json!("shape-unsupported");
+            return serde_json::json!({
+                "state": "shape-unsupported",
+                "detail": "intent does not reduce to a single-asset swap \
+                           against the order's holdings",
+            });
         };
-        let Some((offered, amount)) = constraint.swap_offered() else {
-            return serde_json::json!("shape-unsupported");
+        let (Some((offered, amount)), Some((receive, floor))) =
+            (constraint.swap_offered(), constraint.swap_min_received())
+        else {
+            return serde_json::json!({
+                "state": "shape-unsupported",
+                "detail": "synthesized constraint is missing an offered or \
+                           min_received side",
+            });
         };
-        let Some((receive, _)) = constraint.swap_min_received() else {
-            return serde_json::json!("shape-unsupported");
-        };
+        let mut body = serde_json::json!({
+            "offered": { "asset": offered, "amount": amount.to_string() },
+            "receive": { "asset": receive, "floor": floor.to_string() },
+        });
+        let obj = body.as_object_mut().unwrap();
         match router::find_optimal_route(
             pools,
             offered,
@@ -509,43 +523,139 @@ impl AdminServer {
             amount,
             router::RoutingLimits::unlimited(),
         ) {
-            Some(_) => serde_json::json!("dispatchable"),
-            None => serde_json::json!("no-route"),
+            Some(plan) if &plan.total_output >= floor => {
+                obj.insert("state".into(), "dispatchable".into());
+                obj.insert(
+                    "expected_output".into(),
+                    plan.total_output.to_string().into(),
+                );
+                obj.insert(
+                    "surplus".into(),
+                    (&plan.total_output - floor).to_string().into(),
+                );
+                obj.insert("hops".into(), plan.hops.len().into());
+            }
+            Some(plan) => {
+                obj.insert("state".into(), "below-floor".into());
+                obj.insert(
+                    "expected_output".into(),
+                    plan.total_output.to_string().into(),
+                );
+                obj.insert(
+                    "shortfall".into(),
+                    (floor - &plan.total_output).to_string().into(),
+                );
+                obj.insert(
+                    "detail".into(),
+                    "the best route's output is under the intent's \
+                     min_received floor"
+                        .into(),
+                );
+            }
+            None => {
+                obj.insert("state".into(), "no-route".into());
+                obj.insert(
+                    "detail".into(),
+                    "no pool path currently connects the offered asset to \
+                     the receive asset"
+                        .into(),
+                );
+            }
         }
+        body
     }
 
     /// Would this claim intent execute right now, and for how much?
+    /// Reports the receive floor vs holdings, the achievable swap + bounty,
+    /// the gap when short, and the pool's per-asset value deviation so the
+    /// submitter can see which side the pool is off and by how much.
     fn probe_claim(
         order: &crate::sundaev4::SundaeV4Order,
         intent: &crate::sundaev4::intents::StoredIntent,
         pool_hex: &str,
         pools: &BTreeMap<crate::sundaev3::Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
     ) -> serde_json::Value {
+        use crate::bigint::BigInt;
         use crate::sundaev4::claims;
         use crate::sundaev4::PoolType;
-        use num_traits::Signed;
 
         let Some(pool) = pools
             .iter()
             .find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)
             .map(|(_, p)| p)
         else {
-            return serde_json::json!("pool-not-found");
+            return serde_json::json!({
+                "state": "pool-not-found",
+                "pool": pool_hex,
+                "detail": "the hinted pool ident is not in the indexed pool set",
+            });
         };
         let PoolType::ConstantSum { prices, bounty_k, waive_fee_on_claim: true, .. } =
             &pool.pool_type
         else {
-            return serde_json::json!("pool-not-claimable");
+            return serde_json::json!({
+                "state": "pool-not-claimable",
+                "pool": pool_hex,
+                "detail": "claims are only supported against waived-fee \
+                           constant-sum pools",
+            });
         };
         let assets = &pool.pool_datum.assets;
-        let Some(shape) = claims::resolve_claim_shape(
+
+        // Per-asset value deviation: n·p_i·r_i − V. Positive means the pool
+        // holds a surplus of that asset (a claim can drain it); negative
+        // means a deficit (a claim must top it up). All in V's value units.
+        let v = claims::compute_v(assets, prices);
+        let n_big = BigInt::from(assets.len() as u64);
+        let deviation: Vec<serde_json::Value> = assets
+            .iter()
+            .zip(prices.iter())
+            .map(|((asset, reserve), price)| {
+                serde_json::json!({
+                    "asset": asset,
+                    "value_deviation": (&(&(&n_big * price) * reserve) - &v).to_string(),
+                })
+            })
+            .collect();
+
+        let mut body = serde_json::json!({
+            "pool": pool_hex,
+            "pool_deviation": deviation,
+        });
+        let obj = body.as_object_mut().unwrap();
+
+        let shape = match claims::resolve_claim_shape(
             &order.value,
             &intent.sse.execution.min_received,
             assets,
             prices,
-        ) else {
-            return serde_json::json!("shape-unsupported");
+        ) {
+            Ok(shape) => shape,
+            Err(reason) => {
+                obj.insert("state".into(), "shape-unsupported".into());
+                obj.insert("detail".into(), reason.into());
+                return body;
+            }
         };
+
+        let needed = &shape.min_recv - &shape.already_held;
+        obj.insert(
+            "receive".into(),
+            serde_json::json!({
+                "asset": assets[shape.out_idx].0,
+                "floor": shape.min_recv.to_string(),
+                "already_held": shape.already_held.to_string(),
+                "needed": needed.to_string(),
+            }),
+        );
+        obj.insert(
+            "spend".into(),
+            serde_json::json!({
+                "asset": assets[shape.in_idx].0,
+                "max_dx": shape.dx.to_string(),
+            }),
+        );
+
         match claims::plan_waived_claim(
             assets,
             prices,
@@ -554,14 +664,45 @@ impl AdminServer {
             shape.out_idx,
             &shape.dx,
         ) {
-            Some(plan)
-                if &(&plan.dy + &plan.claim) + &shape.already_held >= shape.min_recv =>
-            {
-                serde_json::json!({ "claimable": plan.claim.to_string() })
+            Some(plan) => {
+                let total = &plan.dy + &plan.claim;
+                obj.insert(
+                    "achievable".into(),
+                    serde_json::json!({
+                        "dx": plan.dx.to_string(),
+                        "dy": plan.dy.to_string(),
+                        "claim": plan.claim.to_string(),
+                        "total": total.to_string(),
+                    }),
+                );
+                if &total + &shape.already_held >= shape.min_recv {
+                    obj.insert("state".into(), "claimable".into());
+                } else {
+                    obj.insert("state".into(), "below-floor".into());
+                    obj.insert(
+                        "shortfall".into(),
+                        (&needed - &total).to_string().into(),
+                    );
+                    obj.insert(
+                        "detail".into(),
+                        "the pool's current imbalance funds a smaller bounty \
+                         than the intent's floor requires"
+                            .into(),
+                    );
+                }
             }
-            Some(_) => serde_json::json!("below-floor"),
-            None => serde_json::json!("awaiting-imbalance"),
+            None => {
+                obj.insert("state".into(), "awaiting-imbalance".into());
+                obj.insert(
+                    "detail".into(),
+                    "no positive bounty in this direction at current \
+                     reserves — see pool_deviation for which side the pool \
+                     is off"
+                        .into(),
+                );
+            }
         }
+        body
     }
 
     async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {

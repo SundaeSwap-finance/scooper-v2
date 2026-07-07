@@ -176,7 +176,7 @@ pub fn resolve_claim_shape(
     min_received: &[(AssetClass, BigInt)],
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
-) -> Option<ClaimShape> {
+) -> Result<ClaimShape, &'static str> {
     use num_traits::Signed;
 
     let holding = |asset: &AssetClass| -> BigInt {
@@ -211,7 +211,10 @@ pub fn resolve_claim_shape(
             if holding(asset) >= *amount {
                 continue; // carried through untouched — floor already met
             }
-            return None; // floor on an asset this pool can't produce
+            return Err(
+                "min_received floors an asset this pool can't produce and the \
+                 order doesn't hold enough of to carry through",
+            );
         };
         // An entry can be a leftover pin (asset the order holds and might
         // spend) or the receive floor. Treat the entry with the largest
@@ -219,12 +222,17 @@ pub fn resolve_claim_shape(
         let short = amount - &holding(asset);
         if short.is_positive() {
             if receive.is_some() {
-                return None; // multiple receive targets: not yet supported
+                return Err("multiple receive targets are not yet supported");
             }
             receive = Some((idx, amount.clone()));
         }
     }
-    let (out_idx, min_recv) = receive?;
+    let Some((out_idx, min_recv)) = receive else {
+        return Err(
+            "no receive target: every min_received floor is already met by \
+             the order's current holdings",
+        );
+    };
 
     let n_big = BigInt::from(reserves.len() as u64);
     let v = compute_v(reserves, prices);
@@ -254,10 +262,15 @@ pub fn resolve_claim_shape(
             best = Some((idx, dx, deficit));
         }
     }
-    let (in_idx, dx, _) = best?;
+    let Some((in_idx, dx, _)) = best else {
+        return Err(
+            "no rebalancing input: the order holds no spendable pool asset \
+             the pool is currently short of",
+        );
+    };
     let already_held = holding(&reserves[out_idx].0);
 
-    Some(ClaimShape { in_idx, out_idx, dx, min_recv, already_held, min_ada })
+    Ok(ClaimShape { in_idx, out_idx, dx, min_recv, already_held, min_ada })
 }
 
 #[cfg(test)]

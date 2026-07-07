@@ -1549,7 +1549,6 @@ impl Scooper {
     ) -> Option<(crate::sundaev4::batch::ScoopPlan, pallas_primitives::PlutusData)> {
         use crate::sundaev4::{batch, claims};
         use crate::sundaev4::PoolType;
-        use num_traits::Signed;
 
         let (ident, pool) = v4_state
             .pools
@@ -1574,18 +1573,17 @@ impl Scooper {
             return None;
         }
 
-        let Some(shape) = claims::resolve_claim_shape(
+        let shape = match claims::resolve_claim_shape(
             &order.value,
             &intent.sse.execution.min_received,
             &pool.pool_datum.assets,
             prices,
-        ) else {
-            debug!(
-                order = %order.input,
-                "claim intent shape unresolvable (no receive target or no \
-                 rebalancing asset held)",
-            );
-            return None;
+        ) {
+            Ok(shape) => shape,
+            Err(reason) => {
+                debug!(order = %order.input, reason, "claim intent shape unresolvable");
+                return None;
+            }
         };
         let (in_idx, out_idx, dx) = (shape.in_idx, shape.out_idx, shape.dx.clone());
         if let Some(min_ada) = &shape.min_ada {
