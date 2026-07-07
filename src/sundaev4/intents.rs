@@ -30,7 +30,13 @@ use crate::sundaev4::types::{
 const MAX_TOTAL_INTENTS: usize = 10_000;
 /// Hard cap per target order. An order can only be scooped once per intent
 /// window, so there is no legitimate reason to hold many candidates.
-const MAX_INTENTS_PER_ORDER: usize = 4;
+// One live intent per order: a new (valid) intent replaces the previous
+// one. The winner is deterministic in the intent *content* — max by
+// (validity lower bound, expiry, intent_id) — so peers converge on the same
+// intent no matter what order gossip delivers them in. The lower bound acts
+// as the signing timestamp: a replacement signed later carries a later
+// valid-from (the CLI signs valid-from ≈ now), so it beats the standing
+// intent even when both are open-ended.
 
 /// Optional client-provided hint about how to execute an intent. Extensible
 /// by adding variants; unknown `type` values are rejected at the API boundary
@@ -69,6 +75,15 @@ pub struct SubmitOutcome {
     /// False if we already held this exact intent (gossip echo) — callers
     /// should only re-gossip when true.
     pub newly_stored: bool,
+    /// True when this intent lost to a live intent for the same order with
+    /// a later validity window (or was previously replaced by one): it was
+    /// not stored and will not execute.
+    pub superseded: bool,
+    /// Previously-live intents for the same order this submission replaced.
+    /// The caller marks them terminal in persistence. Not serialized:
+    /// intent ids are query capabilities.
+    #[serde(skip)]
+    pub replaced: Vec<Vec<u8>>,
 }
 
 fn hex_id<S: serde::Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
@@ -81,7 +96,7 @@ fn hex_id<S: serde::Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
 /// someone holding those bytes (the submitter) can derive it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IntentTombstone {
-    /// "executed" | "expired" | "order-gone"
+    /// "executed" | "expired" | "order-gone" | "replaced"
     pub status: &'static str,
     /// For "executed": the spending tx hash (any scooper's — read from chain).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +127,7 @@ impl IntentStore {
                 let status_static: &'static str = match status {
                     "executed" => "executed",
                     "order-gone" => "order-gone",
+                    "replaced" => "replaced",
                     _ => "expired",
                 };
                 store.tombstones.insert(
@@ -174,6 +190,19 @@ impl IntentStore {
     ///
     /// Does NOT persist — the caller persists on `newly_stored` (persistence
     /// is async and the store sits behind a sync mutex).
+    /// Replacement rank of an intent: (validity lower bound, expiry, id).
+    /// Later-signed intents (later valid-from) win; the id breaks exact ties
+    /// deterministically across gossiping peers.
+    fn replacement_rank(sse: &SignedStrategyExecution, expiry_ms: u64, id: &[u8])
+        -> (u64, u64, Vec<u8>)
+    {
+        let lower_ms = match &sse.execution.validity_range.lower_bound.bound_type {
+            IntervalBoundType::Finite(t) => big_to_u64(t).unwrap_or(0),
+            _ => 0,
+        };
+        (lower_ms, expiry_ms, id.to_vec())
+    }
+
     pub fn submit(
         &mut self,
         sse_cbor: Vec<u8>,
@@ -242,6 +271,17 @@ impl IntentStore {
         }
 
         let intent_id = Hasher::<256>::hash(&sse_cbor).to_vec();
+
+        // Already terminal (executed / expired / replaced / order-gone):
+        // gossip echoes of dead intents must not resurrect them.
+        if let Some(t) = self.tombstones.get(&intent_id) {
+            let superseded = t.status == "replaced";
+            return Ok((
+                SubmitOutcome { intent_id, newly_stored: false, superseded, replaced: vec![] },
+                None,
+            ));
+        }
+
         let entry = self.by_order.entry(key).or_default();
         if let Some(existing) = entry.iter_mut().find(|i| i.intent_id == intent_id) {
             // Duplicate bytes. A hint can still be attached or replaced —
@@ -251,15 +291,74 @@ impl IntentStore {
             if hint.is_some() && existing.hint != hint {
                 existing.hint = hint;
                 let updated = existing.clone();
-                return Ok((SubmitOutcome { intent_id, newly_stored: false }, Some(updated)));
+                return Ok((
+                    SubmitOutcome {
+                        intent_id,
+                        newly_stored: false,
+                        superseded: false,
+                        replaced: vec![],
+                    },
+                    Some(updated),
+                ));
             }
-            return Ok((SubmitOutcome { intent_id, newly_stored: false }, None));
+            return Ok((
+                SubmitOutcome {
+                    intent_id,
+                    newly_stored: false,
+                    superseded: false,
+                    replaced: vec![],
+                },
+                None,
+            ));
         }
-        if entry.len() >= MAX_INTENTS_PER_ORDER {
-            bail!("too many pending intents for this order (max {MAX_INTENTS_PER_ORDER})");
+
+        // One live intent per order — see replacement_rank for who wins.
+        let new_rank = Self::replacement_rank(&sse, expiry_ms, &intent_id);
+        if let Some(best) = entry
+            .iter()
+            .map(|i| Self::replacement_rank(&i.sse, i.expiry_ms, &i.intent_id))
+            .max()
+        {
+            if best > new_rank {
+                // The incoming intent loses: tombstone it in memory so echoes
+                // die quickly, but don't disturb the winner.
+                self.tombstones.insert(
+                    intent_id.clone(),
+                    IntentTombstone {
+                        status: "replaced",
+                        tx_hash: None,
+                        cleanup_after_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
+                    },
+                );
+                return Ok((
+                    SubmitOutcome {
+                        intent_id,
+                        newly_stored: false,
+                        superseded: true,
+                        replaced: vec![],
+                    },
+                    None,
+                ));
+            }
         }
+
         if self.total >= MAX_TOTAL_INTENTS {
             bail!("intent store is full (max {MAX_TOTAL_INTENTS})");
+        }
+
+        // The incoming intent wins: replace whatever was live for this order.
+        let mut replaced = Vec::new();
+        for old in entry.drain(..) {
+            self.tombstones.insert(
+                old.intent_id.clone(),
+                IntentTombstone {
+                    status: "replaced",
+                    tx_hash: None,
+                    cleanup_after_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
+                },
+            );
+            replaced.push(old.intent_id);
+            self.total -= 1;
         }
 
         let stored = StoredIntent {
@@ -272,7 +371,10 @@ impl IntentStore {
         };
         entry.push(stored.clone());
         self.total += 1;
-        Ok((SubmitOutcome { intent_id, newly_stored: true }, Some(stored)))
+        Ok((
+            SubmitOutcome { intent_id, newly_stored: true, superseded: false, replaced },
+            Some(stored),
+        ))
     }
 
     /// Intents currently valid for `key`: window open at `now_ms`. Callers
@@ -614,6 +716,9 @@ impl IntentService {
             let mut store = self.store.lock().await;
             store.submit(sse_cbor, hint, find_order, now_ms())?
         };
+        if !outcome.replaced.is_empty() {
+            self.dao.mark_terminal(&outcome.replaced, "replaced", None).await?;
+        }
         if let Some(stored) = stored {
             self.dao.save_intent(&to_persisted(&stored)).await?;
             self.gossip(stored);
@@ -961,32 +1066,104 @@ mod tests {
     }
 
     #[test]
-    fn per_order_cap_and_pruning() {
+    fn standing_intent_replaced_by_later_valid_from() {
         let sk = key();
         let order = strategy_order(&sk);
         let mut store = IntentStore::default();
-        for i in 0..MAX_INTENTS_PER_ORDER as u64 {
-            let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000 + i));
-            store
-                .submit(cbor, None, |_| Some(order.clone()), NOW_MS)
-                .expect("under cap should be accepted");
-        }
-        let over = signed_sse_cbor(&sk, test_execution(NOW_MS + 999_999));
-        assert!(store.submit(over, None, |_| Some(order.clone()), NOW_MS).is_err());
-        assert_eq!(store.len(), MAX_INTENTS_PER_ORDER);
 
-        // Everything expires by NOW + 60s + cap — and leaves tombstones.
+        // Two open-ended (no expiry) intents; only the valid-from differs.
+        // The fresher signature must win regardless of arrival order — the
+        // lower bound is the freshness signal when upper bounds tie.
+        let unbounded = |lower: u64| {
+            let mut e = test_execution(0);
+            e.validity_range.lower_bound = finite(lower);
+            e.validity_range.upper_bound = IntervalBound {
+                bound_type: IntervalBoundType::PositiveInfinity,
+                is_inclusive: true,
+            };
+            e
+        };
+        let old_cbor = signed_sse_cbor(&sk, unbounded(NOW_MS - 10_000));
+        let new_cbor = signed_sse_cbor(&sk, unbounded(NOW_MS));
+
+        let (o1, _) = store
+            .submit(old_cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .unwrap();
+        let (o2, _) = store
+            .submit(new_cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .unwrap();
+        assert!(o2.newly_stored, "later valid-from replaces the standing intent");
+        assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
+        assert_eq!(store.len(), 1);
+
+        // Reversed arrival order converges on the same winner.
+        let mut store2 = IntentStore::default();
+        let (r2, _) = store2
+            .submit(new_cbor, None, |_| Some(order.clone()), NOW_MS)
+            .unwrap();
+        let (r1, _) = store2
+            .submit(old_cbor, None, |_| Some(order.clone()), NOW_MS)
+            .unwrap();
+        assert!(r2.newly_stored);
+        assert!(r1.superseded);
+        assert_eq!(store2.len(), 1);
+        assert_eq!(r2.intent_id, o2.intent_id);
+    }
+
+    #[test]
+    fn replacement_and_pruning() {
+        let sk = key();
+        let order = strategy_order(&sk);
+        let mut store = IntentStore::default();
+
+        // A newer intent (later expiry) replaces the standing one.
+        let first = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
+        let (o1, _) = store.submit(first.clone(), None, |_| Some(order.clone()), NOW_MS).unwrap();
+        assert!(o1.newly_stored);
+        let second = signed_sse_cbor(&sk, test_execution(NOW_MS + 90_000));
+        let (o2, _) = store.submit(second, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        assert!(o2.newly_stored);
+        assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
+        assert_eq!(store.len(), 1);
+        assert!(matches!(
+            store.find(&o1.intent_id),
+            Some(IntentLookup::Terminal(t)) if t.status == "replaced"
+        ));
+
+        // A gossip echo of the replaced intent loses deterministically:
+        // not stored, flagged superseded, winner untouched.
+        let (echo, stored) = store.submit(first, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        assert!(!echo.newly_stored);
+        assert!(echo.superseded);
+        assert!(stored.is_none());
+        assert_eq!(store.len(), 1);
+
+        // An older intent arriving *after* the winner also loses, even
+        // without a tombstone (deterministic (expiry, id) ranking).
+        let stale = signed_sse_cbor(&sk, test_execution(NOW_MS + 70_000));
+        let (o3, stored) = store.submit(stale, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        assert!(!o3.newly_stored);
+        assert!(o3.superseded);
+        assert!(stored.is_none());
+        assert_eq!(store.len(), 1);
+        assert!(matches!(
+            store.find(&o3.intent_id),
+            Some(IntentLookup::Terminal(t)) if t.status == "replaced"
+        ));
+
+        // The winner expires and leaves a tombstone.
         let (expired, cleaned) = store.prune_expired(NOW_MS + 120_000);
-        assert_eq!(expired.len(), MAX_INTENTS_PER_ORDER);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], o2.intent_id);
         assert!(cleaned.is_empty());
         assert!(store.is_empty());
         assert!(matches!(
-            store.find(&expired[0]),
+            store.find(&o2.intent_id),
             Some(IntentLookup::Terminal(t)) if t.status == "expired"
         ));
 
         // Spent-order pruning drops the bucket and records execution.
-        let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
+        let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 200_000));
         store.submit(cbor, None, |_| Some(order.clone()), NOW_MS).unwrap();
         let removed = store.on_order_spent(&(vec![0xAB; 32], 1), Some(vec![0x77; 32]), NOW_MS);
         assert_eq!(removed.len(), 1);
@@ -997,12 +1174,10 @@ mod tests {
                 if t.status == "executed" && t.tx_hash == Some(vec![0x77; 32])
         ));
 
-        // Tombstones deep-clean after their TTL.
-        // Note: the re-submitted intent reuses the i=0 execution bytes, so
-        // its executed tombstone overwrote that expired tombstone — the
-        // store holds MAX_INTENTS_PER_ORDER unique ids, not +1.
-        let (_, cleaned) = store.prune_expired(NOW_MS + TOMBSTONE_TTL_MS + 200_000);
-        assert_eq!(cleaned.len(), MAX_INTENTS_PER_ORDER);
+        // Tombstones deep-clean after their TTL: the two replaced, the one
+        // expired, and the one executed.
+        let (_, cleaned) = store.prune_expired(NOW_MS + TOMBSTONE_TTL_MS + 300_000);
+        assert_eq!(cleaned.len(), 4);
         assert!(store.find(&removed[0]).is_none());
     }
 }
