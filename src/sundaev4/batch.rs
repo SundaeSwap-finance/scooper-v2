@@ -175,19 +175,20 @@ pub struct Batch {
     pub final_total_lp: BigInt,
 }
 
-/// A resolved CS rebalance-bounty claim (cs_check tag 5, waived-fee mode):
-/// a value-neutral swap of `dx` in / `dy` out plus `claim` more of the
-/// output asset extracted as bounty, bounded by cap_b (see
-/// [`crate::sundaev4::claims::plan_waived_claim`]).
+/// A resolved CS rebalance-bounty claim (cs_check tag 5, waived-fee mode).
+/// Covers both shapes: the pair-wise claim (dx of one asset in, dy + bounty
+/// out) and the single-op multi-receive rebalance — both are just a vector
+/// of reserve deltas plus a bounty on one asset, bounded by cap_b.
 #[derive(Clone)]
 pub struct ResolvedClaim {
     pub order: Arc<SundaeV4Order>,
-    /// Index of the swap-input asset in the pool's asset list.
-    pub in_idx: usize,
-    /// Index of the swap-output / claimed asset in the pool's asset list.
-    pub out_idx: usize,
-    pub dx: BigInt,
-    pub dy: BigInt,
+    /// Per pool asset (pool asset order): delta applied to the POOL's
+    /// reserve. Positive = the order pays in, negative = the pool pays out.
+    /// Net of the claim. The order's fulfillment moves by the negation.
+    pub pool_deltas: Vec<BigInt>,
+    /// Index of the pool asset carrying the bounty claim, and the amount —
+    /// the transcript entry's BountyClaim operation_data.
+    pub claim_idx: usize,
     pub claim: BigInt,
 }
 

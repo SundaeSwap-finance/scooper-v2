@@ -630,13 +630,57 @@ impl AdminServer {
             assets,
             prices,
         ) {
-            Ok(shape) => shape,
+            Ok(claims::ResolvedShape::Pair(shape)) => shape,
+            Ok(claims::ResolvedShape::Rebalance(r)) => {
+                obj.insert("mode".into(), "rebalance".into());
+                let legs: Vec<serde_json::Value> = assets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (asset, _))| {
+                        serde_json::json!({
+                            "asset": asset,
+                            "held": r.held[i].to_string(),
+                            "target": r.targets[i].to_string(),
+                        })
+                    })
+                    .collect();
+                obj.insert("legs".into(), legs.into());
+                match claims::plan_rebalance_claim(
+                    assets,
+                    prices,
+                    (&bounty_k.num, &bounty_k.den),
+                    &r.held,
+                    &r.targets,
+                ) {
+                    Ok(plan) => {
+                        obj.insert("state".into(), "claimable".into());
+                        obj.insert(
+                            "achievable".into(),
+                            serde_json::json!({
+                                "claim_asset": assets[plan.claim_idx].0,
+                                "claim": plan.claim.to_string(),
+                            }),
+                        );
+                    }
+                    Err(reason) => {
+                        let state = if reason.contains("cap_b") {
+                            "awaiting-imbalance"
+                        } else {
+                            "shape-unsupported"
+                        };
+                        obj.insert("state".into(), state.into());
+                        obj.insert("detail".into(), reason.into());
+                    }
+                }
+                return body;
+            }
             Err(reason) => {
                 obj.insert("state".into(), "shape-unsupported".into());
                 obj.insert("detail".into(), reason.into());
                 return body;
             }
         };
+        obj.insert("mode".into(), "pair".into());
 
         let needed = &shape.min_recv - &shape.already_held;
         obj.insert(

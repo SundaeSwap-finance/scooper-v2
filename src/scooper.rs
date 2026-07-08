@@ -1573,7 +1573,7 @@ impl Scooper {
             return None;
         }
 
-        let shape = match claims::resolve_claim_shape(
+        let resolved_shape = match claims::resolve_claim_shape(
             &order.value,
             &intent.sse.execution.min_received,
             &pool.pool_datum.assets,
@@ -1585,8 +1585,11 @@ impl Scooper {
                 return None;
             }
         };
-        let (in_idx, out_idx) = (shape.in_idx, shape.out_idx);
-        if let Some(min_ada) = &shape.min_ada {
+        let min_ada_floor = match &resolved_shape {
+            claims::ResolvedShape::Pair(s) => s.min_ada.clone(),
+            claims::ResolvedShape::Rebalance(r) => r.min_ada.clone(),
+        };
+        if let Some(min_ada) = &min_ada_floor {
             use num_traits::ToPrimitive;
             let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
             let order_ada = order.value.get(&ada).unwrap().to_u64().unwrap_or(0);
@@ -1604,40 +1607,77 @@ impl Scooper {
             }
         }
 
-        let needed = &shape.min_recv - &shape.already_held;
-        let search = claims::plan_claim_meeting_floor(
-            &pool.pool_datum.assets,
-            prices,
-            (&bounty_k.num, &bounty_k.den),
-            in_idx,
-            out_idx,
-            &shape.spendable,
-            &needed,
-        )?;
-        if !search.meets_floor {
-            debug!(
-                order = %order.input,
-                best_total = %(&search.plan.dy + &search.plan.claim),
-                needed = %needed,
-                "best achievable claim doesn't clear the intent's min_received floor",
-            );
-            return None;
-        }
-        let plan = search.plan;
+        let n_assets = pool.pool_datum.assets.len();
+        let (resolved, final_assets) = match resolved_shape {
+            claims::ResolvedShape::Pair(shape) => {
+                let needed = &shape.min_recv - &shape.already_held;
+                let search = claims::plan_claim_meeting_floor(
+                    &pool.pool_datum.assets,
+                    prices,
+                    (&bounty_k.num, &bounty_k.den),
+                    shape.in_idx,
+                    shape.out_idx,
+                    &shape.spendable,
+                    &needed,
+                )?;
+                if !search.meets_floor {
+                    debug!(
+                        order = %order.input,
+                        best_total = %(&search.plan.dy + &search.plan.claim),
+                        needed = %needed,
+                        "best achievable claim doesn't clear the intent's min_received floor",
+                    );
+                    return None;
+                }
+                let plan = search.plan;
+                let mut deltas = vec![crate::bigint::BigInt::from(0); n_assets];
+                deltas[shape.in_idx] = plan.dx.clone();
+                deltas[shape.out_idx] = -(&plan.dy + &plan.claim);
+                (
+                    batch::ResolvedClaim {
+                        order: order.clone(),
+                        pool_deltas: deltas,
+                        claim_idx: shape.out_idx,
+                        claim: plan.claim.clone(),
+                    },
+                    plan.final_assets,
+                )
+            }
+            claims::ResolvedShape::Rebalance(r) => {
+                let plan = match claims::plan_rebalance_claim(
+                    &pool.pool_datum.assets,
+                    prices,
+                    (&bounty_k.num, &bounty_k.den),
+                    &r.held,
+                    &r.targets,
+                ) {
+                    Ok(plan) => plan,
+                    Err(reason) => {
+                        debug!(
+                            order = %order.input,
+                            reason,
+                            "rebalance claim not currently plannable",
+                        );
+                        return None;
+                    }
+                };
+                (
+                    batch::ResolvedClaim {
+                        order: order.clone(),
+                        pool_deltas: plan.deltas,
+                        claim_idx: plan.claim_idx,
+                        claim: plan.claim,
+                    },
+                    plan.final_assets,
+                )
+            }
+        };
 
         let sse_pd: pallas_primitives::PlutusData =
             minicbor::decode(&intent.sse_cbor).ok()?;
 
-        let resolved = batch::ResolvedClaim {
-            order: order.clone(),
-            in_idx,
-            out_idx,
-            dx: plan.dx.clone(),
-            dy: plan.dy.clone(),
-            claim: plan.claim.clone(),
-        };
         let claim_batch =
-            batch::build_claim_batch(pool, order.clone(), resolved, plan.final_assets);
+            batch::build_claim_batch(pool, order.clone(), resolved, final_assets);
         let scoop_plan = crate::sundaev4::batch::ScoopPlan {
             batches: vec![claim_batch],
             routes: Vec::new(),

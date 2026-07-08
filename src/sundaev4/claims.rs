@@ -267,6 +267,147 @@ pub fn plan_claim_meeting_floor(
     Some(ClaimSearch { plan, meets_floor })
 }
 
+/// A planned single-op rebalance claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalancePlan {
+    /// Per pool asset: the delta applied to the POOL's reserve
+    /// (positive = the order pays in, negative = the pool pays out).
+    /// Net of the claim.
+    pub deltas: Vec<BigInt>,
+    /// Which pool asset carries the bounty claim, and how much.
+    pub claim_idx: usize,
+    pub claim: BigInt,
+    /// Pool reserves after the op, in pool asset order.
+    pub final_assets: Vec<(AssetClass, BigInt)>,
+}
+
+/// Plan a single-op multi-receive rebalance claim (CLI parity: sundae-v4
+/// commit 8ba6491). The order contributes ALL its pool-asset holdings and
+/// takes back exactly `targets`; the pool moves to `before + held − target`
+/// per asset. The order's net value gain `c = Σ(target−held)·p` must be
+/// positive and is accounted as a bounty claim on one receive asset (price
+/// divides the claim value, reserve covers it; deepest reserve preferred).
+/// The op portion (claim restored) must move ≥1 reserve up and ≥1 down, and
+/// cap_b must admit the claim on the aggregate imbalance improvement.
+pub fn plan_rebalance_claim(
+    reserves: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+    bounty_k: (&BigInt, &BigInt),
+    held: &[BigInt],
+    targets: &[BigInt],
+) -> Result<RebalancePlan, &'static str> {
+    use num_traits::{Signed, Zero};
+
+    let (k_num, k_den) = bounty_k;
+    if !k_num.is_positive() {
+        return Err("claims are disabled on this pool (bounty_k ≤ 0)");
+    }
+    let n = reserves.len();
+    if prices.len() != n || held.len() != n || targets.len() != n {
+        return Err("rebalance shape arity mismatch");
+    }
+
+    let after: Vec<BigInt> = (0..n)
+        .map(|i| &(&reserves[i].1 + &held[i]) - &targets[i])
+        .collect();
+    if after.iter().any(|a| a.is_negative()) {
+        return Err("pool reserve would go negative (insufficient liquidity)");
+    }
+
+    // The order's net value gain — the claim, in value units.
+    let c_value: BigInt = (0..n)
+        .map(|i| &(&targets[i] - &held[i]) * &prices[i])
+        .fold(BigInt::from(0), |acc, d| acc + d);
+    if !c_value.is_positive() {
+        return Err(
+            "rebalance nets the order no value gain: not representable as a \
+             waived claim (claim must be > 0)",
+        );
+    }
+
+    // Claim asset: a receive target whose price divides the claim value and
+    // whose reserve covers the claim amount; deepest reserve first.
+    let mut candidates: Vec<usize> = (0..n)
+        .filter(|&i| {
+            targets[i] > held[i]
+                && (&c_value % &prices[i]).is_zero()
+                && reserves[i].1 >= &c_value / &prices[i]
+        })
+        .collect();
+    candidates.sort_by(|&a, &b| reserves[b].1.cmp(&reserves[a].1));
+    let Some(&claim_idx) = candidates.first() else {
+        return Err(
+            "no receive asset can carry the claim (its price must divide the \
+             claim value and its reserve must cover it)",
+        );
+    };
+    let claim = &c_value / &prices[claim_idx];
+
+    // Op-portion shape: with the claim restored, ≥1 reserve up and ≥1 down.
+    let has_inc = (0..n).any(|i| {
+        let restored = if i == claim_idx { &after[i] + &claim } else { after[i].clone() };
+        restored > reserves[i].1
+    });
+    let has_dec = (0..n).any(|i| {
+        let restored = if i == claim_idx { &after[i] + &claim } else { after[i].clone() };
+        restored < reserves[i].1
+    });
+    if !has_inc || !has_dec {
+        return Err("rebalance op portion must move at least one reserve each way");
+    }
+
+    // cap_b on the aggregate imbalance improvement.
+    let v_b = compute_v(reserves, prices);
+    let q_b = compute_q(reserves, prices, &v_b);
+    let after_assets: Vec<(AssetClass, BigInt)> = reserves
+        .iter()
+        .zip(after.iter())
+        .map(|((a, _), amt)| (a.clone(), amt.clone()))
+        .collect();
+    let v_a = compute_v(&after_assets, prices);
+    if !v_a.is_positive() {
+        return Err("pool value after the rebalance would be non-positive");
+    }
+    let q_a = compute_q(&after_assets, prices, &v_a);
+    let n_big = BigInt::from(n as u64);
+    let lhs = k_num * &(&(&v_a * &q_b) - &(&v_b * &q_a));
+    let rhs = &(&(&c_value * k_den) * &(&n_big * &n_big)) * &(&v_a * &v_b);
+    if lhs < rhs {
+        return Err(
+            "the pool isn't imbalanced enough to fund the requested net gain \
+             (cap_b rejects the claim)",
+        );
+    }
+
+    let deltas: Vec<BigInt> = (0..n).map(|i| &held[i] - &targets[i]).collect();
+    Ok(RebalancePlan { deltas, claim_idx, claim, final_assets: after_assets })
+}
+
+/// What kind of claim an intent's min_received implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedShape {
+    /// One receive target: a pair-wise claim (dx of one asset in, dy + bounty
+    /// of another out), dx chosen by [`plan_claim_meeting_floor`].
+    Pair(ClaimShape),
+    /// Several receive targets: a single-op rebalance. min_received is the
+    /// order's exact desired final holdings per pool asset (0 when unpinned
+    /// — those holdings are forfeit to the pool), and the net value gain is
+    /// captured as one bounty claim. See [`plan_rebalance_claim`].
+    Rebalance(RebalanceShape),
+}
+
+/// Inputs for a single-op multi-receive rebalance claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalanceShape {
+    /// Order holdings per pool asset, in pool asset order.
+    pub held: Vec<crate::bigint::BigInt>,
+    /// Desired final holdings per pool asset (the min_received pin, 0 when
+    /// absent), in pool asset order.
+    pub targets: Vec<crate::bigint::BigInt>,
+    /// Optional lovelace floor from an ADA min_received entry.
+    pub min_ada: Option<crate::bigint::BigInt>,
+}
+
 /// Resolved trade shape for a claim intent against a specific pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimShape {
@@ -301,7 +442,7 @@ pub fn resolve_claim_shape(
     min_received: &[(AssetClass, BigInt)],
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
-) -> Result<ClaimShape, &'static str> {
+) -> Result<ResolvedShape, &'static str> {
     use num_traits::Signed;
 
     let holding = |asset: &AssetClass| -> BigInt {
@@ -325,7 +466,7 @@ pub fn resolve_claim_shape(
     // order's holdings through unchanged, so they're satisfiable iff already
     // held. An ADA entry is the signer's floor on retained lovelace (a cap
     // on cumulative fee takes), recorded for the caller to enforce.
-    let mut receive: Option<(usize, BigInt)> = None;
+    let mut receives: Vec<(usize, BigInt)> = Vec::new();
     let mut min_ada: Option<BigInt> = None;
     for (asset, amount) in min_received {
         let Some(idx) = reserves.iter().position(|(a, _)| a == asset) else {
@@ -342,22 +483,39 @@ pub fn resolve_claim_shape(
             );
         };
         // An entry can be a leftover pin (asset the order holds and might
-        // spend) or the receive floor. Treat the entry with the largest
-        // shortfall vs current holdings as the receive target.
+        // spend) or a receive floor. Entries with a shortfall vs current
+        // holdings are receive targets.
         let short = amount - &holding(asset);
         if short.is_positive() {
-            if receive.is_some() {
-                return Err("multiple receive targets are not yet supported");
-            }
-            receive = Some((idx, amount.clone()));
+            receives.push((idx, amount.clone()));
         }
     }
-    let Some((out_idx, min_recv)) = receive else {
+    if receives.is_empty() {
         return Err(
             "no receive target: every min_received floor is already met by \
              the order's current holdings",
         );
-    };
+    }
+
+    // Single-op rebalance when the trade can't be expressed as one pair:
+    // several receive targets, or several offer-capable assets (pool assets
+    // with spendable holdings beyond their pin). min_received then acts as
+    // the exact desired final holdings vector — unpinned pool assets are
+    // forfeit to the pool, per the signed execution.
+    let receive_idxs: Vec<usize> = receives.iter().map(|(i, _)| *i).collect();
+    let offer_capable = reserves
+        .iter()
+        .enumerate()
+        .filter(|(i, (a, _))| {
+            !receive_idxs.contains(i) && (&holding(a) - &pin(a)).is_positive()
+        })
+        .count();
+    if receives.len() > 1 || offer_capable > 1 {
+        let held: Vec<BigInt> = reserves.iter().map(|(a, _)| holding(a)).collect();
+        let targets: Vec<BigInt> = reserves.iter().map(|(a, _)| pin(a)).collect();
+        return Ok(ResolvedShape::Rebalance(RebalanceShape { held, targets, min_ada }));
+    }
+    let (out_idx, min_recv) = receives.into_iter().next().expect("len == 1");
 
     let n_big = BigInt::from(reserves.len() as u64);
     let v = compute_v(reserves, prices);
@@ -394,7 +552,14 @@ pub fn resolve_claim_shape(
     };
     let already_held = holding(&reserves[out_idx].0);
 
-    Ok(ClaimShape { in_idx, out_idx, spendable, min_recv, already_held, min_ada })
+    Ok(ResolvedShape::Pair(ClaimShape {
+        in_idx,
+        out_idx,
+        spendable,
+        min_recv,
+        already_held,
+        min_ada,
+    }))
 }
 
 #[cfg(test)]
@@ -507,6 +672,60 @@ mod tests {
         let plan =
             plan_waived_claim(&before, &prices, (&k.0, &k.1), 0, 1, &BigInt::from(50_000_000));
         assert!(plan.is_none());
+    }
+
+    /// Regression: preview scoop 7a66bd76… (2026-07-07) — the multi-offer
+    /// single-op rebalance our scooper couldn't dispatch (built manually via
+    /// the CLI's audit-fixes-bounty-cli branch, commit 8ba6491 semantics).
+    /// The order pushes BOTH deficit assets in one tag_claim op: 623,915,369
+    /// USDCx + 4,399,312 USDM in, 629,252,486 USDr out, claim 937,805.
+    #[test]
+    fn rebalance_claim_matches_manual_scoop_7a66bd76() {
+        let reserves = pool(&[1, 1_252_230_053, 619_516_058]); // USDCx, USDr, USDM
+        let prices = ones(3);
+        let k = (BigInt::from(9), BigInt::from(4000));
+        let held = vec![
+            BigInt::from(1_000_002_662_691u64), // USDCx
+            BigInt::from(1_000_003_130_080u64), // USDr
+            BigInt::from(999_996_073_613u64),   // USDM
+        ];
+        let targets = vec![
+            BigInt::from(999_378_747_322u64),   // USDCx pin
+            BigInt::from(1_000_632_382_566u64), // USDr floor (receive)
+            BigInt::from(999_991_674_301u64),   // USDM pin
+        ];
+
+        let plan = plan_rebalance_claim(&reserves, &prices, (&k.0, &k.1), &held, &targets)
+            .expect("the manual scoop's shape must plan");
+        assert_eq!(plan.claim_idx, 1, "claim carried on USDr");
+        assert_eq!(plan.claim, BigInt::from(937_805));
+        assert_eq!(plan.deltas[0], BigInt::from(623_915_369)); // USDCx in
+        assert_eq!(plan.deltas[1], BigInt::from(-629_252_486i64)); // USDr out
+        assert_eq!(plan.deltas[2], BigInt::from(4_399_312)); // USDM in
+        // Pool after-state matches the on-chain result of 7a66bd76.
+        assert_eq!(plan.final_assets[0].1, BigInt::from(623_915_370u64));
+        assert_eq!(plan.final_assets[1].1, BigInt::from(622_977_567u64));
+        assert_eq!(plan.final_assets[2].1, BigInt::from(623_915_370u64));
+
+        // And the shape resolver routes this order to the rebalance path.
+        let mut value = crate::cardano_types::Value::default();
+        for (i, (asset, _)) in reserves.iter().enumerate() {
+            value.insert(asset, held[i].clone());
+        }
+        let min_received: Vec<(AssetClass, BigInt)> = reserves
+            .iter()
+            .enumerate()
+            .map(|(i, (a, _))| (a.clone(), targets[i].clone()))
+            .collect();
+        let shape = resolve_claim_shape(&value, &min_received, &reserves, &prices)
+            .expect("shape must resolve");
+        match shape {
+            ResolvedShape::Rebalance(r) => {
+                assert_eq!(r.held, held);
+                assert_eq!(r.targets, targets);
+            }
+            ResolvedShape::Pair(_) => panic!("expected rebalance shape"),
+        }
     }
 
     /// Regression: preview intent ce8b83b0… (2026-07-07). The pool was

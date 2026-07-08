@@ -388,16 +388,18 @@ pub fn build_multi_pool_scoop_tx(
         let mut op_data_override: Option<pallas_primitives::PlutusData> = None;
         let (operation_tag, gross_fb) = match op {
             crate::sundaev4::batch::BatchOp::Claim(i) => {
-                // Waived-mode CS bounty claim (cs_check tag 5): value-neutral
-                // swap of dx in / dy out plus `claim` more of the output
-                // asset; no fee retained, LP untouched.
+                // Waived-mode CS bounty claim (cs_check tag 5): the reserve
+                // vector moves by the resolved deltas (a pair-wise swap or a
+                // multi-receive rebalance — same shape either way), with the
+                // bounty named in operation_data; no fee retained, LP
+                // untouched.
                 let c = &batch.claims[*i];
-                running_assets[c.in_idx].1 = &running_assets[c.in_idx].1 + &c.dx;
-                running_assets[c.out_idx].1 =
-                    &running_assets[c.out_idx].1 - &(&c.dy + &c.claim);
+                for (idx, delta) in c.pool_deltas.iter().enumerate() {
+                    running_assets[idx].1 = &running_assets[idx].1 + delta;
+                }
                 op_data_override = Some(
                     crate::sundaev4::types::BountyClaim {
-                        asset: batch.pool.pool_datum.assets[c.out_idx].0.clone(),
+                        asset: batch.pool.pool_datum.assets[c.claim_idx].0.clone(),
                         amount: c.claim.clone(),
                     }
                     .to_plutus(),
@@ -406,7 +408,8 @@ pub fn build_multi_pool_scoop_tx(
                     walk = "op-claim",
                     batch_idx,
                     pool = %batch.pool_ident,
-                    dx = %c.dx, dy = %c.dy, claim = %c.claim,
+                    deltas = ?c.pool_deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    claim = %c.claim,
                     "streaming walk: claim op",
                 );
                 (BigInt::from(crate::sundaev4::types::TAG_CLAIM), BigInt::from(0))
@@ -1543,21 +1546,20 @@ pub fn build_multi_pool_scoop_tx(
                 )?
             }
             FlatOrderKind::Claim(i) => {
-                // Fulfillment = order − dx(in asset) − fee + (dy + claim)(out
-                // asset): identical in shape to a swap fulfillment, with the
-                // bounty riding on top of the swap output.
+                // Fulfillment = order value moved by the NEGATED pool deltas
+                // (what the pool gains, the order loses, and vice versa),
+                // minus the fee share. Covers pair-wise and multi-receive
+                // claims uniformly.
                 let c = &batch.claims[*i];
-                let in_asset = &batch.pool.pool_datum.assets[c.in_idx].0;
-                let out_asset = &batch.pool.pool_datum.assets[c.out_idx].0;
-                let total_out = &c.dy + &c.claim;
-                build_fulfillment_value_from_order(
-                    &c.order.value,
-                    in_asset,
-                    &c.dx,
-                    out_asset,
-                    &total_out,
-                    actual_fee,
-                )?
+                let moves: Vec<(&AssetClass, BigInt)> = batch
+                    .pool
+                    .pool_datum
+                    .assets
+                    .iter()
+                    .zip(c.pool_deltas.iter())
+                    .map(|((asset, _), delta)| (asset, -delta.clone()))
+                    .collect();
+                build_fulfillment_value_with_moves(&c.order.value, &moves, actual_fee)?
             }
         };
         let mut out = TransactionOutput::PostAlonzo(
@@ -2409,34 +2411,13 @@ fn build_withdraw_fulfillment_value(
 
 /// Build fulfillment output value from first principles:
 /// fulfillment = order_value - offer - fee + swap_result
-fn build_fulfillment_value_from_order(
-    order_value: &crate::cardano_types::Value,
-    offer_asset: &AssetClass,
-    offer_amount: &BigInt,
-    output_asset: &AssetClass,
-    dy: &BigInt,
-    fee: u64,
-) -> Result<ConwayValue> {
+/// Convert an internal Value to a ConwayValue, dropping zero/negative
+/// token quantities and requiring the lovelace to fit u64.
+fn value_to_conway(result: &crate::cardano_types::Value) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
 
     let ada_asset = AssetClass { policy: vec![], token: vec![] };
-
-    // Start with the order's input value as a working copy
-    let mut result = order_value.clone();
-
-    // Subtract the offered asset
-    let cur_offer = result.get(offer_asset);
-    result.insert(offer_asset, &cur_offer - offer_amount);
-
-    // Subtract the protocol fee (always ADA)
-    let cur_ada = result.get(&ada_asset);
-    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
-
-    // Add the swap result
-    let cur_out = result.get(output_asset);
-    result.insert(output_asset, &cur_out + dy);
-
     // Convert to ConwayValue
     let lovelace = result.get(&ada_asset)
         .clone()
@@ -2490,6 +2471,53 @@ fn build_fulfillment_value_from_order(
         lovelace,
         NonEmptyKeyValuePairs::Def(multiasset_pairs),
     ))
+}
+
+/// Fulfillment = order value + each signed move − fee. A generalization of
+/// [`build_fulfillment_value_from_order`] for ops that touch several assets
+/// at once (multi-receive claims).
+fn build_fulfillment_value_with_moves(
+    order_value: &crate::cardano_types::Value,
+    moves: &[(&AssetClass, BigInt)],
+    fee: u64,
+) -> Result<ConwayValue> {
+    let mut result = order_value.clone();
+    for (asset, delta) in moves {
+        let cur = result.get(asset);
+        result.insert(asset, &cur + delta);
+    }
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let cur_ada = result.get(&ada_asset);
+    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
+    value_to_conway(&result)
+}
+
+fn build_fulfillment_value_from_order(
+    order_value: &crate::cardano_types::Value,
+    offer_asset: &AssetClass,
+    offer_amount: &BigInt,
+    output_asset: &AssetClass,
+    dy: &BigInt,
+    fee: u64,
+) -> Result<ConwayValue> {
+    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+
+    // Start with the order's input value as a working copy
+    let mut result = order_value.clone();
+
+    // Subtract the offered asset
+    let cur_offer = result.get(offer_asset);
+    result.insert(offer_asset, &cur_offer - offer_amount);
+
+    // Subtract the protocol fee (always ADA)
+    let cur_ada = result.get(&ada_asset);
+    result.insert(&ada_asset, &cur_ada - &BigInt::from(fee as i64));
+
+    // Add the swap result
+    let cur_out = result.get(output_asset);
+    result.insert(output_asset, &cur_out + dy);
+
+    value_to_conway(&result)
 }
 
 /// Resolve the order destination to a raw address byte vector.
