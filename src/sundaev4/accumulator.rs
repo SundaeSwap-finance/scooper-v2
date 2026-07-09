@@ -396,6 +396,27 @@ impl Accumulator {
         primary: bool,
         enforce_min: bool,
     ) -> Result<BigInt, String> {
+        // Conversion legs are pushed onto self.conversions during the walk;
+        // unlike pool state they aren't trial-buffered, so roll them back on
+        // any failure — a leaked leg from a failed attempt produced
+        // DUPLICATE butane withdrawals in a later successful tx (malformed:
+        // duplicate map keys; validators read the wrong redeemer).
+        let conv_mark = self.conversions.len();
+        let result = self.add_route_branch_inner(order, route, pools, primary, enforce_min);
+        if result.is_err() {
+            self.conversions.truncate(conv_mark);
+        }
+        result
+    }
+
+    fn add_route_branch_inner(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        route: &RoutingPlan,
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+        primary: bool,
+        enforce_min: bool,
+    ) -> Result<BigInt, String> {
         use num_traits::Signed;
 
         // Clone pool accums for trial execution; only committed on full success.

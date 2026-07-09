@@ -1485,11 +1485,30 @@ pub fn build_multi_pool_scoop_tx(
     // `has_swap_orders` retained for tests that still gate on this flag.
     let _ = has_swap_orders;
 
-    for p in &butane_pieces {
-        for (hash, redeemer, _version) in &p.withdrawals {
+    {
+        // One withdrawal per butane validator regardless of leg count;
+        // identical redeemers merge, conflicting ones (multiple synthetics
+        // in one tx) are unsupported until the aux redeemer grows a list.
+        let mut seen: std::collections::BTreeMap<Vec<u8>, pallas_primitives::PlutusData> =
+            Default::default();
+        for p in &butane_pieces {
+            for (hash, redeemer, _version) in &p.withdrawals {
+                match seen.get(hash) {
+                    None => {
+                        seen.insert(hash.clone(), redeemer.clone());
+                    }
+                    Some(prev) if prev == redeemer => {}
+                    Some(_) => bail!(
+                        "conflicting butane withdrawal redeemers (multiple \
+                         synthetics in one tx isn't supported yet)"
+                    ),
+                }
+            }
+        }
+        for (hash, redeemer) in seen {
             let h: pallas_primitives::Hash<28> = hash.as_slice().try_into()
                 .expect("verified 28-byte script hash");
-            withdrawals.push((reward_account(&h), redeemer.clone()));
+            withdrawals.push((reward_account(&h), redeemer));
         }
     }
     withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
