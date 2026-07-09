@@ -1294,8 +1294,18 @@ impl Scooper {
                         ) {
                             Err(e) => {
                                 // Eval failure on the minimal batch — definitely a
-                                // scooper bug. Dump context + bail; don't penalise
-                                // the order.
+                                // scooper bug. Dump the full tx CBOR (shareable
+                                // with partner teams) + context + bail; don't
+                                // penalise the order.
+                                let tx_dump = format!(
+                                    "/tmp/eval-fail-{}.cbor",
+                                    hex::encode(build.tx_hash.as_ref()),
+                                );
+                                if let Err(werr) = std::fs::write(&tx_dump, &build.cbor) {
+                                    warn!(%werr, "couldn't write eval-fail tx dump");
+                                } else {
+                                    warn!(dump = %tx_dump, "eval-fail tx CBOR dumped");
+                                }
                                 if let Some(cap) = failure {
                                     let ctx_dump = format!(
                                         "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
