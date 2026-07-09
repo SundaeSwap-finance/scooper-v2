@@ -284,6 +284,67 @@ impl Accumulator {
         route: &RoutingPlan,
         pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
     ) -> Result<(), String> {
+        self.add_route_branch(order, route, pools, true)?;
+        Ok(())
+    }
+
+    /// Add a blended (multi-branch) route for one order. Branch 0's entry
+    /// split carries the order (the primary swap); every other split of
+    /// every branch is a continuation. Branches are pool-disjoint by
+    /// construction (see `router::find_blended_route`), so their walks
+    /// don't interact. min_received is enforced on the SUM of the branch
+    /// outputs — the fulfillment carries all of them to the destination.
+    pub fn try_add_blended_order(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        blend: &crate::sundaev4::router::BlendedRoute,
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    ) -> Result<(), String> {
+        // Snapshot for rollback: each branch commits incrementally.
+        let saved_pools = self.pools.clone();
+        let saved_routes = self.routes.len();
+        let saved_seq = self.global_seq_raw.len();
+        let mut total_out = crate::bigint::BigInt::from(0);
+        let mut result = Ok(());
+        for (b, branch) in blend.branches.iter().enumerate() {
+            match self.add_route_branch(order, branch, pools, b == 0) {
+                Ok(out) => total_out = &total_out + &out,
+                Err(e) => {
+                    result = Err(format!("blended branch {b}: {e}"));
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            let (ask_asset, min_qty) = order.swap_min_received();
+            let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
+            if final_asset.as_ref() == Some(ask_asset) && &total_out < min_qty {
+                result = Err(format!(
+                    "blended output {total_out} below min_received {min_qty}"
+                ));
+            }
+        }
+        if result.is_err() {
+            self.pools = saved_pools;
+            self.routes.truncate(saved_routes);
+            self.global_seq_raw.truncate(saved_seq);
+        }
+        result
+    }
+
+    /// Walk one route (one branch of a possibly-blended plan) into the
+    /// accumulator. When `primary`, the entry hop's first split is the
+    /// ResolvedSwap that owns the order and drives its fulfillment; the
+    /// per-route min_received check only applies to primary single-branch
+    /// adds (blended callers check the branch sum instead). Returns the
+    /// route's final-hop output.
+    fn add_route_branch(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        route: &RoutingPlan,
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+        primary: bool,
+    ) -> Result<BigInt, String> {
         use num_traits::Signed;
 
         // Clone pool accums for trial execution; only committed on full success.
@@ -412,7 +473,7 @@ impl Accumulator {
                 // others are continuations with route metadata for tx-time
                 // cascade reconstruction.
                 let op_idx_in_pool = accum.ops_order.len();
-                if is_entry_hop && split_idx == 0 {
+                if primary && is_entry_hop && split_idx == 0 {
                     let idx = accum.swaps.len();
                     accum.swaps.push(ResolvedSwap {
                         order: order.clone(),
@@ -439,13 +500,18 @@ impl Accumulator {
             prev_hop_output = this_hop_output;
         }
 
-        // Check min_received against the final routed output
-        let (ask_asset, min_qty) = order.swap_min_received();
-        if final_output_asset.as_ref() == Some(ask_asset) && &final_output_amount < min_qty {
-            return Err(format!(
-                "routed output {} below min_received {}",
-                final_output_amount, min_qty
-            ));
+        // Check min_received against the final routed output. Blended
+        // branches are checked as a sum by the caller instead.
+        if primary {
+            let (ask_asset, min_qty) = order.swap_min_received();
+            if final_output_asset.as_ref() == Some(ask_asset)
+                && &final_output_amount < min_qty
+            {
+                return Err(format!(
+                    "routed output {} below min_received {}",
+                    final_output_amount, min_qty
+                ));
+            }
         }
 
         let route_info = RouteInfo {
@@ -460,7 +526,7 @@ impl Accumulator {
         self.routes.push(route_info);
         self.global_seq_raw.extend(trial_global_seq);
 
-        Ok(())
+        Ok(final_output_amount)
     }
 
     /// Find which pool asset indices correspond to the given input/output tokens.

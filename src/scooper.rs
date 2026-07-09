@@ -901,7 +901,22 @@ impl Scooper {
                         exec.cost_per_pool_lovelace,
                         exec.cost_per_step_lovelace,
                     );
-                    let Some(route) = router::find_optimal_route(
+                    // Orders carrying the route constraint module are held
+                    // to what the deployed module can validate: a linear
+                    // full-flow chain. Plain swap-constraint orders may
+                    // blend across parallel paths (min_received is their
+                    // only on-chain output check).
+                    let has_route_module = exec
+                        .module_scripts
+                        .route_order
+                        .as_ref()
+                        .map(|m| {
+                            order.datum.constraints.iter().any(|(h, _)| {
+                                h.as_slice() == m.hash.as_ref()
+                            })
+                        })
+                        .unwrap_or(false);
+                    let Some(blend) = router::find_blended_route(
                         &pool_view,
                         &conversion_edges,
                         offer_asset,
@@ -913,15 +928,47 @@ impl Scooper {
                         skip_no_route += 1;
                         continue;
                     };
+                    let blend = if has_route_module && blend.as_single().is_none() {
+                        // Fall back to the best single path for route-
+                        // constrained orders.
+                        match router::find_optimal_route(
+                            &pool_view,
+                            &conversion_edges,
+                            offer_asset,
+                            ask_asset,
+                            offer_amount,
+                            limits,
+                        ) {
+                            Some(single) => crate::sundaev4::router::BlendedRoute {
+                                total_input: single.total_input.clone(),
+                                total_output: single.total_output.clone(),
+                                branches: vec![single],
+                            },
+                            None => {
+                                skip_no_route += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        blend
+                    };
                     tracing::info!(
                         order = %order.input,
                         kind = "swap",
-                        hops = route.hops.len(),
-                        splits_per_hop = ?route.hops.iter().map(|h| h.splits.len()).collect::<Vec<_>>(),
-                        total_output = %route.total_output,
+                        branches = blend.branches.len(),
+                        hops_per_branch = ?blend
+                            .branches
+                            .iter()
+                            .map(|b| b.hops.len())
+                            .collect::<Vec<_>>(),
+                        total_output = %blend.total_output,
                         "order dispatch",
                     );
-                    match candidate.try_add_routed_order(order, &route, &pool_view) {
+                    let add_result = match blend.as_single() {
+                        Some(single) => candidate.try_add_routed_order(order, single, &pool_view),
+                        None => candidate.try_add_blended_order(order, &blend, &pool_view),
+                    };
+                    match add_result {
                         Ok(_) => true,
                         Err(e) => {
                             skip_route_failed += 1;

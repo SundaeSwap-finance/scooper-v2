@@ -1500,8 +1500,18 @@ pub fn build_multi_pool_scoop_tx(
                 let (output_asset, dy_owned);
                 let (output_asset_ref, dy_ref): (&AssetClass, &BigInt) = match &swap.route {
                     Some(rref) => {
+                        // Blended orders own several routes (one per
+                        // branch); the fulfillment carries the sum of their
+                        // final outputs. Single-route orders sum over one.
                         let rs = &route_states[rref.route_idx];
-                        (&rs.final_output_asset, &rs.final_output)
+                        dy_owned = routes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.order.input == swap.order.input)
+                            .fold(BigInt::from(0), |acc, (ri, _)| {
+                                &acc + &route_states[ri].final_output
+                            });
+                        (&rs.final_output_asset, &dy_owned)
                     }
                     None => {
                         output_asset =
