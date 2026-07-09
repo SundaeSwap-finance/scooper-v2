@@ -518,6 +518,7 @@ impl AdminServer {
         let obj = body.as_object_mut().unwrap();
         match router::find_optimal_route(
             pools,
+            &[],
             offered,
             receive,
             amount,

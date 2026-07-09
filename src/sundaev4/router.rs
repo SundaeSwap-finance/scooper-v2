@@ -21,6 +21,18 @@ use crate::sundaev4::types::SundaeV4Pool;
 #[derive(Clone, Debug)]
 pub enum PoolViewType {
     ConstantProduct,
+    /// Off-protocol conversion edge (Butane ADAb mint, staking wrappers, …):
+    /// a linear rate with no price impact — `out = in_eff·num/den`, where
+    /// in_eff applies the edge's input-side fee via `fee_num/fee_den`.
+    /// `reserve_out` on the view carries the edge's remaining output depth
+    /// (u64::MAX-scale sentinel when unlimited); `reserve_in` is unused.
+    Conversion {
+        rate_num: BigInt,
+        rate_den: BigInt,
+        /// Config key of the edge ("butane:ADAb:mint") — identifies the
+        /// mechanism for plan materialization and logging.
+        key: String,
+    },
     ConstantSum {
         /// Price of the input asset in this direction.
         price_in: BigInt,
@@ -136,6 +148,13 @@ pub struct RoutingPlan {
 fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
     match &pool.view_type {
         PoolViewType::ConstantProduct => true,
+        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+            // Depth-limited by the view's reserve_out (output units).
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            let dx_eff = dx - &(dx * &fee_num / &fee_den);
+            &dx_eff * rate_num / rate_den <= pool.reserve_out
+        }
         PoolViewType::ConstantSum { .. } => {
             // CS can in principle absorb arbitrary dx but its dy may exceed
             // reserve_out for large inputs. TODO: add a tight cap analogous to
@@ -171,6 +190,12 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
     let raw = match &pool.view_type {
         PoolViewType::ConstantProduct => {
             swap_math::cp_swap_result(&pool.reserve_in, &pool.reserve_out, dx, pool.fee_num, pool.fee_den)
+        }
+        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            let dx_eff = dx - &(dx * &fee_num / &fee_den);
+            &dx_eff * rate_num / rate_den
         }
         PoolViewType::ConstantSum { price_in, price_out } => {
             let fee_num = BigInt::from(pool.fee_num);
@@ -238,6 +263,12 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             // CS marginal is constant: dy/dx = price_in * fee_mult / (price_out * fee_den)
             let _ = raw_allocated;
             &fee_mult * price_in * &scale() / &(price_out * &fee_den)
+        }
+        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+            // Linear edge: constant marginal, same shape as CS with the rate
+            // in place of the price ratio.
+            let _ = raw_allocated;
+            &fee_mult * rate_num * &scale() / &(rate_den * &fee_den)
         }
         PoolViewType::ConcentratedLiquidity {
             is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
@@ -316,6 +347,17 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         // Can absorb up to the full output reserve
                         // max_raw = reserve_out * price_out * fee_den / (price_in * fee_mult)
                         &pool.reserve_out * price_out * &fee_den / &(price_in * &fee_mult)
+                    } else {
+                        BigInt::from(0)
+                    }
+                }
+                PoolViewType::Conversion { rate_num, rate_den, .. } => {
+                    // Same all-or-nothing shape as CS: constant marginal,
+                    // absorb up to the depth limit when the edge's rate beats
+                    // lambda.
+                    let marginal = &fee_mult * rate_num * &sc / &(rate_den * &fee_den);
+                    if lambda <= &marginal {
+                        &pool.reserve_out * rate_den * &fee_den / &(rate_num * &fee_mult)
                     } else {
                         BigInt::from(0)
                     }
@@ -517,8 +559,16 @@ type PoolGraph = BTreeMap<AssetClass, BTreeMap<AssetClass, Vec<PoolView>>>;
 ///
 /// For CP pools with assets [A, B]: creates edges A→B and B→A.
 /// For CS pools with N assets: creates edges for all (i, j) pairs.
+/// Synthetic router ident for a conversion edge — keeps SplitEntry/pool
+/// counting uniform. Derived from the edge key, so it's stable across runs
+/// and cannot collide with real 28-byte pool idents (different length).
+pub fn conversion_ident(key: &str) -> Ident {
+    Ident::new(format!("conv:{key}").as_bytes())
+}
+
 fn build_graph(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    conversions: &[crate::sundaev4::conversions::ConversionEdge],
 ) -> PoolGraph {
     use crate::sundaev4::types::PoolType;
     use num_traits::ToPrimitive;
@@ -584,6 +634,38 @@ fn build_graph(
                     });
             }
         }
+    }
+
+    for edge in conversions {
+        // Unlimited depth = a sentinel big enough that no order hits it but
+        // small enough to keep the bisection's integer math cheap.
+        let depth = edge
+            .max_input
+            .as_ref()
+            .map(|mi| {
+                let fee_num = BigInt::from(edge.fee_bps);
+                let fee_den = BigInt::from(10_000u64);
+                let eff = mi - &(mi * &fee_num / &fee_den);
+                &eff * &edge.rate_num / &edge.rate_den
+            })
+            .unwrap_or_else(|| BigInt::from(u64::MAX));
+        graph
+            .entry(edge.from.clone())
+            .or_default()
+            .entry(edge.to.clone())
+            .or_default()
+            .push(PoolView {
+                ident: conversion_ident(&edge.key),
+                reserve_in: BigInt::from(0),
+                reserve_out: depth,
+                fee_num: edge.fee_bps,
+                fee_den: 10_000,
+                view_type: PoolViewType::Conversion {
+                    rate_num: edge.rate_num.clone(),
+                    rate_den: edge.rate_den.clone(),
+                    key: edge.key.clone(),
+                },
+            });
     }
 
     graph
@@ -756,12 +838,13 @@ fn evaluate_path(
 /// direct pool, no multi-hop, no split).
 pub fn find_optimal_route(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    conversions: &[crate::sundaev4::conversions::ConversionEdge],
     input_token: &AssetClass,
     output_token: &AssetClass,
     amount: &BigInt,
     limits: RoutingLimits,
 ) -> Option<RoutingPlan> {
-    let graph = build_graph(pools);
+    let graph = build_graph(pools, conversions);
     // Each hop adds at least 1 pool and at least 1 step to the route, so
     // capping search depth at `min(max_pools, max_steps, 4)` discards paths
     // we'd reject anyway and saves the optimization work.
@@ -900,6 +983,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
@@ -923,6 +1007,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1_000_000),
@@ -948,6 +1033,7 @@ mod tests {
         // Swap TOKENA → TOKENB (no direct pool, must go via ADA)
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
@@ -971,6 +1057,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &ada(),
             &token(0xAA),
             &BigInt::from(10_000_000),
@@ -994,6 +1081,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(5_000_000),
@@ -1020,6 +1108,7 @@ mod tests {
         // A → D through 3 hops
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xDD),
             &BigInt::from(1000),
@@ -1092,6 +1181,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
@@ -1122,6 +1212,7 @@ mod tests {
         // dy = (2000 - 6) / 1 = 1994
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
@@ -1153,6 +1244,7 @@ mod tests {
         // CS should absorb ~33.4k (exhausting its 100k BB reserve at 3:1), rest to CP.
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(100_000),
@@ -1189,6 +1281,7 @@ mod tests {
         // dy = (300 - 0) / 3 = 100
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xCC),
             &BigInt::from(300),
@@ -1217,6 +1310,7 @@ mod tests {
         // Swap A → B via ADA (CP then CS)
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(10_000),
@@ -1247,6 +1341,7 @@ mod tests {
 
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xAA),
             &token(0xBB),
             &BigInt::from(1000),
@@ -1270,6 +1365,7 @@ mod tests {
         // Try to route between two tokens with no path
         let route = find_optimal_route(
             &pools,
+            &[],
             &token(0xBB),
             &token(0xCC),
             &BigInt::from(1000),
@@ -1284,11 +1380,151 @@ mod tests {
         let pools = BTreeMap::new();
         let route = find_optimal_route(
             &pools,
+            &[],
             &ada(),
             &token(0xAA),
             &BigInt::from(1000),
             RoutingLimits::unlimited(),
         );
         assert!(route.is_none());
+    }
+
+    fn adab() -> AssetClass {
+        AssetClass { policy: vec![0xBB; 28], token: b"ADAb".to_vec() }
+    }
+
+    fn mint_edge(max_input: Option<i64>) -> crate::sundaev4::conversions::ConversionEdge {
+        crate::sundaev4::conversions::ConversionEdge {
+            key: "butane:ADAb:mint".into(),
+            from: ada(),
+            to: adab(),
+            rate_num: BigInt::from(1),
+            rate_den: BigInt::from(1),
+            fee_bps: 0,
+            max_input: max_input.map(BigInt::from),
+        }
+    }
+
+    /// The motivating scenario: swapping ADA→NIGHT where the deeper
+    /// liquidity sits in an ADAb/NIGHT pool reachable through the free 1:1
+    /// mint edge. The router must discover ADA→ADAb→NIGHT and prefer it
+    /// when it beats the direct pool.
+    ///
+    /// NOTE: today the router picks the best single *path* and only splits
+    /// within a hop (across pools quoting the same pair). Blending two
+    /// different paths — e.g. 70% direct + 30% via the mint edge — needs a
+    /// DAG-shaped plan, which collides with the pending route-redeemer
+    /// contract redesign. When symmetric pools tie, the router returns the
+    /// direct route; the blend upside is future work.
+    #[test]
+    fn test_conversion_edge_path_wins_when_deeper() {
+        let night = token(9);
+        // Direct pool is shallow; ADAb pool is 10x deeper.
+        let (i1, p1) = make_pool(1, ada(), 400_000_000, night.clone(), 400_000_000);
+        let (i2, p2) = make_pool(2, adab(), 4_000_000_000, night.clone(), 4_000_000_000);
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
+            [(i1, p1), (i2, p2)].into_iter().collect();
+
+        let amount = BigInt::from(100_000_000);
+        let direct_only = find_optimal_route(
+            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .expect("direct route exists");
+
+        let with_edge = find_optimal_route(
+            &pools,
+            &[mint_edge(None)],
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
+        )
+        .expect("edge route exists");
+
+        assert!(
+            with_edge.total_output > direct_only.total_output,
+            "the mint-edge path must beat the shallow direct pool: {} vs {}",
+            with_edge.total_output,
+            direct_only.total_output,
+        );
+        // The winning plan actually routes through the conversion edge.
+        let conv_ident = conversion_ident("butane:ADAb:mint");
+        let uses_edge = with_edge
+            .hops
+            .iter()
+            .any(|h| h.splits.iter().any(|sp| sp.pool.ident == conv_ident));
+        assert!(uses_edge, "plan should route through the conversion edge");
+        // Value conservation through the free 1:1 edge: hop 1 output equals
+        // hop 2 input allocation.
+        assert_eq!(with_edge.hops.len(), 2);
+        assert_eq!(with_edge.hops[0].total_output, with_edge.hops[1].splits[0].input_amount);
+    }
+
+    /// A 1:1 zero-fee edge into a deeper pool: value is conserved through
+    /// the conversion (output only shaved by pool fee/slippage, never by
+    /// the edge itself).
+    #[test]
+    fn test_conversion_edge_output_math() {
+        let view = PoolView {
+            ident: conversion_ident("x"),
+            reserve_in: BigInt::from(0),
+            reserve_out: BigInt::from(u64::MAX),
+            fee_num: 0,
+            fee_den: 10_000,
+            view_type: PoolViewType::Conversion {
+                rate_num: BigInt::from(1),
+                rate_den: BigInt::from(1),
+                key: "x".into(),
+            },
+        };
+        assert_eq!(pool_output(&view, &BigInt::from(123_456_789)), BigInt::from(123_456_789));
+        // 1% input fee
+        let feed = PoolView { fee_num: 100, ..view.clone() };
+        assert_eq!(pool_output(&feed, &BigInt::from(1_000_000)), BigInt::from(990_000));
+        // 2:1 rate
+        let two = PoolView {
+            view_type: PoolViewType::Conversion {
+                rate_num: BigInt::from(2),
+                rate_den: BigInt::from(1),
+                key: "x".into(),
+            },
+            ..view
+        };
+        assert_eq!(pool_output(&two, &BigInt::from(5)), BigInt::from(10));
+    }
+
+    /// Depth-capped edge: the router must not push more through the edge
+    /// than its max_input allows.
+    #[test]
+    fn test_conversion_edge_depth_cap() {
+        let night = token(9);
+        let (i1, p1) = make_pool(1, ada(), 1_000_000_000, night.clone(), 1_000_000_000);
+        let (i2, p2) = make_pool(2, adab(), 1_000_000_000, night.clone(), 1_000_000_000);
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
+            [(i1, p1), (i2, p2)].into_iter().collect();
+
+        let cap = 10_000_000i64;
+        let plan = find_optimal_route(
+            &pools,
+            &[mint_edge(Some(cap))],
+            &ada(),
+            &night,
+            &BigInt::from(100_000_000),
+            RoutingLimits::unlimited(),
+        )
+        .expect("route exists");
+
+        let conv_ident = conversion_ident("butane:ADAb:mint");
+        for hop in &plan.hops {
+            for sp in &hop.splits {
+                if sp.pool.ident == conv_ident {
+                    assert!(
+                        sp.input_amount <= BigInt::from(cap),
+                        "edge allocation {} exceeds cap {cap}",
+                        sp.input_amount,
+                    );
+                }
+            }
+        }
     }
 }

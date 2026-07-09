@@ -769,6 +769,12 @@ pub struct ScooperExecution {
     /// forwarding loops terminate.
     #[serde(default)]
     pub strategy_peers: Vec<String>,
+    /// Off-protocol conversion edges the router may consider (Butane ADAb
+    /// mint, staking wrappers, …). Each edge must be enabled AND have its
+    /// tx composition implemented before the router will use it — see
+    /// `conversions::routable_edges`.
+    #[serde(default)]
+    pub conversions: Vec<crate::sundaev4::conversions::ConversionEdgeConfig>,
 }
 
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }

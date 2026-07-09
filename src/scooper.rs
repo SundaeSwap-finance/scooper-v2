@@ -815,6 +815,8 @@ impl Scooper {
         let mut skip_no_route = 0u32;
         let mut skip_route_failed = 0u32;
 
+        let conversion_edges =
+            crate::sundaev4::conversions::routable_edges(&exec.conversions);
         for order in &candidates {
             if accum.order_count() >= self.v4_batch_limits.max_orders {
                 break;
@@ -900,7 +902,12 @@ impl Scooper {
                         exec.cost_per_step_lovelace,
                     );
                     let Some(route) = router::find_optimal_route(
-                        &pool_view, offer_asset, ask_asset, offer_amount, limits,
+                        &pool_view,
+                        &conversion_edges,
+                        offer_asset,
+                        ask_asset,
+                        offer_amount,
+                        limits,
                     ) else {
                         tracing::info!(order = %order.input, "order dispatch: swap, no route");
                         skip_no_route += 1;
