@@ -69,6 +69,11 @@ echo "==> Copying binary, config, and unit file to $HOST"
 scp -q "$BINARY"        "$HOST:$REMOTE_DIR/scooper-v2.new"
 scp -q "$TMP_CONFIG"    "$HOST:$REMOTE_DIR/config.json.new"
 scp -q "$LOCAL_UNIT"    "$HOST:/tmp/scooper-v2.service.new"
+# Partner-protocol deployment artifacts referenced by the config (relative
+# paths resolve against the remote working dir).
+if [ -f config/butane-v2.deployment.preview.json ]; then
+  scp -q config/butane-v2.deployment.preview.json "$HOST:$REMOTE_DIR/"
+fi
 
 echo "==> Deploying on $HOST (wipe_db=$WIPE_DB)"
 ssh "$HOST" WIPE_DB="$WIPE_DB" bash -s <<'REMOTE'
