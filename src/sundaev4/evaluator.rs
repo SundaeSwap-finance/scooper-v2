@@ -230,7 +230,7 @@ pub fn evaluate_scoop_tx(
 }
 
 /// Determine which script hash to evaluate and build the ScriptPurpose.
-fn resolve_script_and_purpose(
+pub(crate) fn resolve_script_and_purpose(
     key: &RedeemersKey,
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,

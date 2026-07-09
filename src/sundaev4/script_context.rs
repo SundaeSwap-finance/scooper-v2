@@ -76,6 +76,206 @@ pub fn build_script_context(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// PlutusV2 context builder
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Build a PlutusV2 ScriptContext: `Constr 0 [tx_info_v2, purpose_v2]`.
+/// Unlike V3, the redeemer is NOT embedded — V2 scripts take it as a
+/// separate argument (2 args for mint/withdraw, 3 for spend).
+///
+/// V2 vs V3 encoding deltas handled here:
+/// - TxInfo is 12 fields (no votes/proposals/treasury)
+/// - `fee` is a Value (ada map), not a bare integer
+/// - `mint` carries the zero-ADA stub entry
+/// - TxId is newtyped: `Constr 0 [bytes]` — in `id` AND inside every outref
+/// - wdrl keys / Rewarding purpose wrap creds in StakingCredential (Constr 0)
+pub fn build_script_context_v2(
+    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    redeemers: &[(RedeemersKey, PlutusData)],
+    resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    tx_hash: Hash<32>,
+    script_purpose: &ScriptPurpose,
+    slot_config: &SlotConfig,
+) -> Vec<u8> {
+    let tx_info = build_tx_info_v2(
+        tx_body, redeemers, resolved_inputs, resolved_ref_inputs, tx_hash, slot_config,
+    );
+    let purpose = encode_purpose_v2(script_purpose);
+    let context = constr(0, vec![tx_info, purpose]);
+    minicbor::to_vec(&context).expect("CBOR encode V2 ScriptContext")
+}
+
+fn encode_output_reference_v2(oref: &OutputReference) -> PlutusData {
+    constr(0, vec![
+        constr(0, vec![PlutusData::BoundedBytes(
+            oref.tx_hash.to_vec().into(),
+        )]),
+        pd_int(oref.index as i64),
+    ])
+}
+
+fn encode_tx_in_info_list_v2(
+    inputs: &[conway::TransactionInput],
+    resolved: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+) -> PlutusData {
+    let mut sorted: Vec<_> = inputs.to_vec();
+    sorted.sort_by(|a, b| {
+        a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
+    });
+    pd_array(
+        sorted
+            .iter()
+            .map(|input| {
+                let key = cardano_types::TransactionInput(input.clone());
+                let out = resolved
+                    .get(&key)
+                    .map(encode_resolved_tx_out)
+                    .unwrap_or_else(|| {
+                        constr(0, vec![
+                            encode_address_bytes(&[]),
+                            encode_empty_value(),
+                            constr(0, vec![]),
+                            constr(1, vec![]),
+                        ])
+                    });
+                constr(0, vec![
+                    encode_output_reference_v2(&OutputReference {
+                        tx_hash: input.transaction_id,
+                        index: input.index,
+                    }),
+                    out,
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// StakingCredential = Constr 0 [Credential] (the StakingHash variant).
+fn encode_staking_credential_v2(cred: PlutusData) -> PlutusData {
+    constr(0, vec![cred])
+}
+
+fn encode_purpose_v2(purpose: &ScriptPurpose) -> PlutusData {
+    match purpose {
+        ScriptPurpose::Minting(policy) => constr(0, vec![PlutusData::BoundedBytes(
+            policy.to_vec().into(),
+        )]),
+        ScriptPurpose::Spending(oref, _) => {
+            constr(1, vec![encode_output_reference_v2(oref)])
+        }
+        ScriptPurpose::Rewarding(cred) => constr(2, vec![encode_staking_credential_v2(
+            encode_credential(cred),
+        )]),
+    }
+}
+
+/// TxInfo V2 = Constr 0 [inputs, ref_inputs, outputs, fee(Value),
+///   mint(Value with ada-0), dcert, wdrl(Map<StakingCredential, Int>),
+///   valid_range, signatories, redeemers(Map), data(Map), id(TxId)]
+fn build_tx_info_v2(
+    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    redeemers: &[(RedeemersKey, PlutusData)],
+    resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    tx_hash: Hash<32>,
+    slot_config: &SlotConfig,
+) -> PlutusData {
+    let input_vec: Vec<_> = tx_body.inputs.iter().cloned().collect();
+    let inputs = encode_tx_in_info_list_v2(&input_vec, resolved_inputs);
+
+    let ref_inputs = match &tx_body.reference_inputs {
+        Some(ref_set) => {
+            let ref_vec: Vec<_> = ref_set.iter().cloned().collect();
+            encode_tx_in_info_list_v2(&ref_vec, resolved_ref_inputs)
+        }
+        None => pd_array(vec![]),
+    };
+
+    let outputs = pd_array(tx_body.outputs.iter().map(encode_tx_out).collect());
+
+    // fee: Value {"": {"": fee}}
+    let fee = pd_map(vec![(
+        PlutusData::BoundedBytes(vec![].into()),
+        pd_map(vec![(
+            PlutusData::BoundedBytes(vec![].into()),
+            pd_int(tx_body.fee as i64),
+        )]),
+    )]);
+
+    // mint: Value INCLUDING the zero-ada stub entry (V2 quirk).
+    let mint = {
+        let inner = encode_mint(tx_body.mint.as_ref());
+        let PlutusData::Map(pairs) = inner else { unreachable!("encode_mint returns a map") };
+        let mut all: Vec<(PlutusData, PlutusData)> = vec![(
+            PlutusData::BoundedBytes(vec![].into()),
+            pd_map(vec![(PlutusData::BoundedBytes(vec![].into()), pd_int(0))]),
+        )];
+        all.extend(pairs.iter().map(|(k, v)| (k.clone(), v.clone())));
+        pd_map(all)
+    };
+
+    let tx_certs = pd_array(vec![]);
+
+    let wdrl = match &tx_body.withdrawals {
+        Some(kvps) => pd_map(
+            kvps.iter()
+                .map(|(account, coin)| {
+                    (
+                        encode_staking_credential_v2(
+                            encode_reward_account_credential(account),
+                        ),
+                        pd_int(*coin as i64),
+                    )
+                })
+                .collect(),
+        ),
+        None => pd_map(vec![]),
+    };
+
+    let valid_range = encode_validity_range(
+        tx_body.validity_interval_start,
+        tx_body.ttl,
+        slot_config,
+    );
+
+    let signatories = match &tx_body.required_signers {
+        Some(signers) => pd_array(
+            signers
+                .iter()
+                .map(|hash| PlutusData::BoundedBytes(hash.to_vec().into()))
+                .collect(),
+        ),
+        None => pd_array(vec![]),
+    };
+
+    // redeemers: Map<ScriptPurpose_v2, Redeemer>
+    let redeemers_pd = {
+        let mut pairs = Vec::new();
+        for (key, data) in redeemers {
+            if let Ok((_, purpose)) =
+                crate::sundaev4::evaluator::resolve_script_and_purpose(
+                    key, tx_body, resolved_inputs,
+                )
+            {
+                pairs.push((encode_purpose_v2(&purpose), data.clone()));
+            }
+        }
+        pd_map(pairs)
+    };
+
+    let data = pd_map(vec![]);
+
+    // id: TxId = Constr 0 [bytes] (newtyped in V2).
+    let id = constr(0, vec![PlutusData::BoundedBytes(tx_hash.to_vec().into())]);
+
+    constr(0, vec![
+        inputs, ref_inputs, outputs, fee, mint, tx_certs, wdrl,
+        valid_range, signatories, redeemers_pd, data, id,
+    ])
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // TxInfo builder
 // ──────────────────────────────────────────────────────────────────────────────
 
