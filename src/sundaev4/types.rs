@@ -827,6 +827,10 @@ pub struct ScooperExecution {
     /// `conversions::routable_edges`.
     #[serde(default)]
     pub conversions: Vec<crate::sundaev4::conversions::ConversionEdgeConfig>,
+    /// Butane v2 integration (mint synthetics via the underlying window as
+    /// router conversion edges). Absent/broken config degrades to disabled.
+    #[serde(default)]
+    pub butane: Option<crate::sundaev4::butane::ButaneConfig>,
 }
 
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }

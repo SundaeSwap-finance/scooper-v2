@@ -258,6 +258,7 @@ pub(crate) mod test_harness {
                 cost_per_step_lovelace: 0,
                 strategy_peers: Vec::new(),
                 conversions: Vec::new(),
+                butane: None,
             };
 
             // Collateral: deterministic UTxO with enough ADA
