@@ -346,10 +346,31 @@ impl Accumulator {
         if result.is_ok() {
             let (ask_asset, min_qty) = order.swap_min_received();
             let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
-            if final_asset.as_ref() == Some(ask_asset) && &total_out < min_qty {
-                result = Err(format!(
-                    "blended output {total_out} below min_received {min_qty}"
-                ));
+            if final_asset.as_ref() == Some(ask_asset) {
+                let (_, remaining) = order.swap_offered();
+                let total_in = blend
+                    .branches
+                    .iter()
+                    .fold(crate::bigint::BigInt::from(0), |acc, b| &acc + &b.total_input);
+                // Partial fills: the contract's exact pro-rata check,
+                // received·original ≥ min·fill.
+                let ok = if &total_in < remaining {
+                    if let crate::sundaev4::Constraint::Swap { original_offered, .. } =
+                        &order.constraint
+                    {
+                        &total_out * original_offered >= min_qty * &total_in
+                    } else {
+                        false
+                    }
+                } else {
+                    &total_out >= min_qty
+                };
+                if !ok {
+                    result = Err(format!(
+                        "blended output {total_out} below min_received {min_qty} \
+                         (fill {total_in} of {remaining})"
+                    ));
+                }
             }
         }
         if result.is_err() {
