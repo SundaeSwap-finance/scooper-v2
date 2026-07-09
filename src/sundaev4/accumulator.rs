@@ -383,6 +383,10 @@ impl Accumulator {
 
         let mut final_output_asset: Option<AssetClass> = None;
         let mut final_output_amount = BigInt::from(0);
+        // The order attaches to the FIRST pool split of the walk — routes
+        // may open with conversion legs (ADA→ADAb mint first), which can't
+        // carry an order (no pool transcript to anchor it).
+        let mut primary_placed = false;
 
         // Track actual output from previous hop so subsequent hops use the
         // real dy (not the router's estimate).  This ensures ADA flows cancel
@@ -414,16 +418,6 @@ impl Accumulator {
                     rate_num, rate_den, key,
                 } = &split.pool.view_type
                 {
-                    if primary && is_entry_hop && split_idx == 0 {
-                        // The primary slot must be a pool swap: the order's
-                        // fulfillment/fee accounting hangs off a ResolvedSwap.
-                        // The router never emits conversion-only plans for
-                        // orders (the final hop is always a pool), but guard
-                        // against a conversion landing in slot zero.
-                        return Err(
-                            "conversion leg cannot be the primary entry split".into(),
-                        );
-                    }
                     let dx = if is_entry_hop {
                         split.input_amount.clone()
                     } else if hop.splits.len() == 1 {
@@ -552,7 +546,8 @@ impl Accumulator {
                 // others are continuations with route metadata for tx-time
                 // cascade reconstruction.
                 let op_idx_in_pool = accum.ops_order.len();
-                if primary && is_entry_hop && split_idx == 0 {
+                if primary && !primary_placed {
+                    primary_placed = true;
                     let idx = accum.swaps.len();
                     accum.swaps.push(ResolvedSwap {
                         order: order.clone(),
@@ -593,6 +588,13 @@ impl Accumulator {
             }
         }
 
+        if primary && !primary_placed {
+            return Err(
+                "route has no pool split to carry the order (pure-conversion \
+                 orders aren't supported yet)"
+                    .into(),
+            );
+        }
         let route_info = RouteInfo {
             order: order.clone(),
             hops: hops_info,
