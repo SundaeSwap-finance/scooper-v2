@@ -909,6 +909,208 @@ pub fn find_optimal_route(
 
 /// Check whether a route is "interesting" (multi-hop or split).
 /// Returns true if the route has >1 hop or any hop has >1 split.
+/// A portfolio of parallel routes for one order: the input splits across
+/// pool-disjoint paths (e.g. 70% ADA→NIGHT direct, 30% ADA→ADAb→NIGHT via a
+/// conversion edge). Every branch is a complete RoutingPlan for its
+/// allocation; branches share no pools or edges, so their evaluations are
+/// independent and the merged plan's per-pool flows are exact.
+#[derive(Clone, Debug)]
+pub struct BlendedRoute {
+    /// Branches with positive allocation, best-output first.
+    pub branches: Vec<RoutingPlan>,
+    pub total_input: BigInt,
+    pub total_output: BigInt,
+}
+
+impl BlendedRoute {
+    /// The plan is a plain single path — the shape every downstream consumer
+    /// already understands.
+    pub fn as_single(&self) -> Option<&RoutingPlan> {
+        match self.branches.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// The distinct pool/edge idents a path's hops could touch (candidate set —
+/// conservative: `optimize_split` may end up allocating 0 to some of them).
+fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {
+    path.iter()
+        .flat_map(|h| h.pools.iter().map(|p| p.ident.clone()))
+        .collect()
+}
+
+/// Find the optimal allocation of `amount` across parallel routes over the
+/// whole edge graph (pools + conversion edges).
+///
+/// Path-level generalization of `optimize_split`: enumerate paths, keep a
+/// pool-disjoint set of the strongest candidates, then water-fill the input
+/// across them in chunks, always feeding the path with the best marginal
+/// output. Path output curves are concave (compositions and sums of concave
+/// hop curves), so chunked greedy is optimal to chunk granularity — and
+/// all-in-one-path is itself a chunked allocation, so the blend can only
+/// match or beat `find_optimal_route`'s winner-take-all answer. Falls back
+/// to that single-path answer whenever blending is infeasible (shared
+/// pools, budget limits) or doesn't help.
+pub fn find_blended_route(
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    conversions: &[crate::sundaev4::conversions::ConversionEdge],
+    input_token: &AssetClass,
+    output_token: &AssetClass,
+    amount: &BigInt,
+    limits: RoutingLimits,
+) -> Option<BlendedRoute> {
+    /// Cap on parallel branches: each costs pool touches, transcript
+    /// entries, and ex-units; past a few the marginal gain is noise.
+    const MAX_BRANCHES: usize = 4;
+    /// Allocation granularity. 64 chunks ≈ 1.6% resolution — comfortably
+    /// finer than pool fees; doubling it doubles evaluate_path calls.
+    const CHUNKS: u64 = 64;
+
+    // The winner-take-all answer is both our fallback and our baseline.
+    let single = find_optimal_route(
+        pools, conversions, input_token, output_token, amount, limits,
+    )?;
+    let single_plan = |plan: RoutingPlan| -> BlendedRoute {
+        BlendedRoute {
+            total_input: plan.total_input.clone(),
+            total_output: plan.total_output.clone(),
+            branches: vec![plan],
+        }
+    };
+
+    let graph = build_graph(pools, conversions);
+    let max_depth = 4
+        .min(limits.max_pools.max(1))
+        .min(limits.max_steps.max(1));
+    let paths = find_paths(&graph, input_token, output_token, max_depth);
+    if paths.len() < 2 {
+        return Some(single_plan(single));
+    }
+
+    // Rank paths by standalone output at the full amount, then greedily keep
+    // the strongest pairwise pool-disjoint ones. Disjointness is what makes
+    // branch evaluations independent (a shared pool would let both branches
+    // count the same depth twice).
+    let mut ranked: Vec<(usize, BigInt)> = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| {
+            let hops = evaluate_path(path, amount, &limits);
+            let out = hops.last().map(|h| h.total_output.clone())?;
+            out.is_positive().then_some((i, out))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut used_idents: std::collections::BTreeSet<Ident> = Default::default();
+    for (i, _) in &ranked {
+        if chosen.len() >= MAX_BRANCHES {
+            break;
+        }
+        let idents = path_ident_set(&paths[*i]);
+        if idents.is_disjoint(&used_idents) {
+            used_idents.extend(idents);
+            chosen.push(*i);
+        }
+    }
+    if chosen.len() < 2 {
+        return Some(single_plan(single));
+    }
+
+    // Water-fill `amount` across the chosen paths chunk by chunk.
+    let chunk = amount / &BigInt::from(CHUNKS);
+    if !chunk.is_positive() {
+        return Some(single_plan(single));
+    }
+    let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
+        if !alloc.is_positive() {
+            return BigInt::from(0);
+        }
+        evaluate_path(&paths[path_idx], alloc, &limits)
+            .last()
+            .map(|h| h.total_output.clone())
+            .unwrap_or_else(|| BigInt::from(0))
+    };
+    let mut alloc: Vec<BigInt> = chosen.iter().map(|_| BigInt::from(0)).collect();
+    let mut cur_out: Vec<BigInt> = alloc.clone();
+    let mut remaining = amount.clone();
+    for step in 0..CHUNKS {
+        // Last chunk absorbs the division remainder so value is conserved.
+        let this_chunk = if step == CHUNKS - 1 { remaining.clone() } else { chunk.clone() };
+        let mut best: Option<(usize, BigInt, BigInt)> = None; // (idx, new_out, gain)
+        for (ci, path_idx) in chosen.iter().enumerate() {
+            let trial = &alloc[ci] + &this_chunk;
+            let new_out = out_at(*path_idx, &trial);
+            let gain = &new_out - &cur_out[ci];
+            let better = match &best {
+                Some((_, _, bg)) => &gain > bg,
+                None => true,
+            };
+            if better {
+                best = Some((ci, new_out, gain));
+            }
+        }
+        let (ci, new_out, _) = best.expect("chosen is non-empty");
+        alloc[ci] = &alloc[ci] + &this_chunk;
+        cur_out[ci] = new_out;
+        remaining = &remaining - &this_chunk;
+    }
+
+    // Materialize branches with positive allocation.
+    let mut branches: Vec<RoutingPlan> = Vec::new();
+    for (ci, path_idx) in chosen.iter().enumerate() {
+        if !alloc[ci].is_positive() {
+            continue;
+        }
+        let hops = evaluate_path(&paths[*path_idx], &alloc[ci], &limits);
+        let Some(out) = hops.last().map(|h| h.total_output.clone()) else {
+            // A branch that evaluated fine during allocation must still
+            // evaluate at its final size; if not, play it safe.
+            return Some(single_plan(single));
+        };
+        branches.push(RoutingPlan {
+            hops,
+            total_input: alloc[ci].clone(),
+            total_output: out,
+            naive_output: BigInt::from(0),
+        });
+    }
+    branches.sort_by(|a, b| b.total_output.cmp(&a.total_output));
+
+    // Aggregate budget check across branches (disjoint ⇒ sums are exact).
+    let distinct_pools: std::collections::BTreeSet<Ident> = branches
+        .iter()
+        .flat_map(|b| b.hops.iter())
+        .flat_map(|h| h.splits.iter().map(|sp| sp.pool.ident.clone()))
+        .collect();
+    let total_steps: usize = branches
+        .iter()
+        .flat_map(|b| b.hops.iter())
+        .map(|h| h.splits.len())
+        .sum();
+    if distinct_pools.len() > limits.max_pools || total_steps > limits.max_steps {
+        return Some(single_plan(single));
+    }
+
+    let total_output: BigInt = branches
+        .iter()
+        .fold(BigInt::from(0), |a, b| &a + &b.total_output);
+    // Paranoia: integer flooring at chunk boundaries could in principle land
+    // a hair under the all-in answer; never return a worse blend.
+    if branches.len() < 2 || total_output <= single.total_output {
+        return Some(single_plan(single));
+    }
+
+    Some(BlendedRoute {
+        total_input: amount.clone(),
+        total_output,
+        branches,
+    })
+}
+
 pub fn is_routed(plan: &RoutingPlan) -> bool {
     if plan.hops.len() > 1 {
         return true;
@@ -1526,5 +1728,106 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The blend the single-path router can't express: two equal-depth
+    /// disjoint routes tie at ~90.66M each all-in; splitting ~50/50 yields
+    /// ~94.97M. find_blended_route must find it.
+    #[test]
+    fn test_blended_route_beats_winner_take_all() {
+        let night = token(9);
+        let (i1, p1) = make_pool(1, ada(), 1_000_000_000, night.clone(), 1_000_000_000);
+        let (i2, p2) = make_pool(2, adab(), 1_000_000_000, night.clone(), 1_000_000_000);
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
+            [(i1, p1), (i2, p2)].into_iter().collect();
+        let edges = [mint_edge(None)];
+        let amount = BigInt::from(100_000_000);
+
+        let single = find_optimal_route(
+            &pools, &edges, &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .unwrap();
+        let blended = find_blended_route(
+            &pools, &edges, &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .unwrap();
+
+        assert_eq!(blended.branches.len(), 2, "should split across both routes");
+        assert!(
+            blended.total_output > single.total_output,
+            "blend {} must beat single {}",
+            blended.total_output,
+            single.total_output,
+        );
+        // ~50/50 on symmetric routes (chunk granularity: within ~2 chunks).
+        let a0 = &blended.branches[0].total_input;
+        let a1 = &blended.branches[1].total_input;
+        assert_eq!(&(a0 + a1), &amount, "allocations must conserve the input");
+        let diff = if a0 > a1 { a0 - a1 } else { a1 - a0 };
+        assert!(
+            diff <= BigInt::from(100_000_000u64 * 4 / 64),
+            "symmetric routes should split near-evenly, diff {diff}",
+        );
+        // And the theoretical blend value for this shape.
+        assert!(
+            blended.total_output > BigInt::from(94_500_000),
+            "expected ≈94.97M, got {}",
+            blended.total_output,
+        );
+    }
+
+    /// One viable route → identical to the single-path answer.
+    #[test]
+    fn test_blended_route_single_path_fallback() {
+        let night = token(9);
+        let (i1, p1) = make_pool(1, ada(), 1_000_000_000, night.clone(), 1_000_000_000);
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> = [(i1, p1)].into_iter().collect();
+        let amount = BigInt::from(50_000_000);
+
+        let single = find_optimal_route(
+            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .unwrap();
+        let blended = find_blended_route(
+            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(blended.branches.len(), 1);
+        assert!(blended.as_single().is_some());
+        assert_eq!(blended.total_output, single.total_output);
+    }
+
+    /// Paths that share a pool must not blend (their evaluations would
+    /// double-count the shared depth): a 3-asset CS pool quotes both
+    /// ADA→NIGHT and MID→NIGHT, and a CP pool provides ADA→MID. The
+    /// two-hop path overlaps the direct path on the CS pool → fall back
+    /// to the single best.
+    #[test]
+    fn test_blended_route_rejects_shared_pools() {
+        let night = token(9);
+        let mid = token(5);
+        let (i1, p1) = make_cs_pool(
+            1,
+            vec![
+                (ada(), 1_000_000_000),
+                (mid.clone(), 1_000_000_000),
+                (night.clone(), 1_000_000_000),
+            ],
+            vec![1, 1, 1],
+        );
+        let (i2, p2) = make_pool(2, ada(), 500_000_000, mid.clone(), 500_000_000);
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
+            [(i1, p1), (i2, p2)].into_iter().collect();
+        let amount = BigInt::from(50_000_000);
+
+        let blended = find_blended_route(
+            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            blended.branches.len(),
+            1,
+            "overlapping paths must not blend",
+        );
     }
 }
