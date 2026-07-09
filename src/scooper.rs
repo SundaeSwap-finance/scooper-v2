@@ -952,6 +952,27 @@ impl Scooper {
                     } else {
                         blend
                     };
+                    // The deployed route module validates only a strictly
+                    // serial chain: each hop's positive delta must negate the
+                    // next hop's negative delta (route_lib.check_intermediate_flow).
+                    // A hop that fans out across parallel pools is unrepresentable
+                    // in that redeemer, so hold route-constrained orders to a
+                    // single-split-per-hop path. Plain swap-constraint orders are
+                    // unaffected (min_received is their only on-chain check).
+                    if has_route_module {
+                        let serial = blend
+                            .as_single()
+                            .map(|p| p.hops.iter().all(|h| h.splits.len() == 1))
+                            .unwrap_or(false);
+                        if !serial {
+                            tracing::info!(
+                                order = %order.input,
+                                "order dispatch: swap, route-module order has no serial single-split path; skipping",
+                            );
+                            skip_no_route += 1;
+                            continue;
+                        }
+                    }
                     tracing::info!(
                         order = %order.input,
                         kind = "swap",

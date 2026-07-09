@@ -1242,38 +1242,113 @@ pub fn build_multi_pool_scoop_tx(
         else { None }
     };
     // Precompute the route_order redeemer if needed. It's a per-order
-    // List<List<RouteStep>>, one inner list for each order whose OrderConfig
-    // includes route_order — in canonical input-sort order. Each step is
-    // (pool_input_index, transcript_step_index). For unrouted single-pool
-    // scoops every order has one step at its assigned batch's pool.
+    // List<List<RouteStep>>, one inner list for EVERY base order entry — in
+    // canonical input-sort order — because the on-chain `validate_route_entries`
+    // walks entries/inputs/routes in lockstep and `expect`s a `route` for each
+    // entry (see route.ak). Non-route orders get `[]`; a route order gets one
+    // RouteStep = (pool_input_index, transcript_step_index) per pool it flows
+    // through, in hop (flow) order.
     let route_order_hash = exec.module_scripts.route_order.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let route_redeemer = || -> pallas_primitives::PlutusData {
-        let route_steps: Vec<pallas_primitives::PlutusData> = input_sorted_order.iter().filter_map(|&flat_idx| {
-            let config_token = order_config_token(flat_idx);
-            let oc = order_configs.get(&config_token)?;
-            let route_hash = route_order_hash.as_ref()?;
-            if !oc.config.required_constraints.iter().any(|h| h == route_hash) {
-                return None;
+
+    // Per route (indexed by RouteRef.route_idx), the ordered list of
+    // (pool_input_index, transcript_step_index). We gate to serial routes
+    // upstream (one split per hop), so sorting a route's ops by
+    // (hop_idx, split_idx) yields the serial chain. `transcript_step_index` is
+    // the op's position in its pool's `ops_order` (== the pool's transcript
+    // index). `swap_op_idx` lets a direct (single-pool) swap emit its true
+    // transcript index instead of a hardcoded 0.
+    let mut per_route_keyed: Vec<Vec<((usize, usize), u64, u64)>> =
+        vec![Vec::new(); routes.len()];
+    let mut swap_op_idx: std::collections::HashMap<(usize, usize), u64> =
+        std::collections::HashMap::new();
+    for (bi, b) in batches.iter().enumerate() {
+        let pool_input_idx = pool_sorted_indices[bi] as u64;
+        for (op_idx, op) in b.ops_order.iter().enumerate() {
+            let rr = match op {
+                crate::sundaev4::batch::BatchOp::Swap(i) => {
+                    swap_op_idx.insert((bi, *i), op_idx as u64);
+                    b.swaps[*i].route.as_ref()
+                }
+                crate::sundaev4::batch::BatchOp::Continuation(i) => {
+                    Some(&b.continuations[*i].route)
+                }
+                _ => None,
+            };
+            if let Some(rr) = rr {
+                per_route_keyed[rr.route_idx].push((
+                    (rr.hop_idx, rr.split_idx),
+                    pool_input_idx,
+                    op_idx as u64,
+                ));
             }
-            let batch_idx = flat_orders[flat_idx].batch_idx;
-            let pool_input_idx = pool_sorted_indices[batch_idx] as u64;
-            // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
-            let step = pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+        }
+    }
+    let per_route: Vec<Vec<(u64, u64)>> = per_route_keyed
+        .into_iter()
+        .map(|mut keyed| {
+            keyed.sort_by_key(|(k, _, _)| *k);
+            keyed.into_iter().map(|(_, pin, tsi)| (pin, tsi)).collect()
+        })
+        .collect();
+
+    let route_redeemer = || -> pallas_primitives::PlutusData {
+        // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
+        let make_step = |pin: u64, tsi: u64| -> pallas_primitives::PlutusData {
+            pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
                 tag: 121,
                 any_constructor: None,
                 fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
                     pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
-                        (pool_input_idx as i128).try_into().unwrap_or_else(|_| 0i64.into()),
+                        (pin as i128).try_into().unwrap_or_else(|_| 0i64.into()),
                     )),
-                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(0i64.into())),
+                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                        (tsi as i128).try_into().unwrap_or_else(|_| 0i64.into()),
+                    )),
                 ]),
-            });
-            // Inner list = [single step] for this order.
-            Some(pallas_primitives::PlutusData::Array(
-                pallas_codec::utils::MaybeIndefArray::Indef(vec![step]),
-            ))
-        }).collect();
-        pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(route_steps))
+            })
+        };
+        let route_lists: Vec<pallas_primitives::PlutusData> = input_sorted_order
+            .iter()
+            .map(|&flat_idx| {
+                let is_route = route_order_hash
+                    .as_ref()
+                    .and_then(|route_hash| {
+                        let oc = order_configs.get(&order_config_token(flat_idx))?;
+                        oc.config
+                            .required_constraints
+                            .iter()
+                            .any(|h| h == route_hash)
+                            .then_some(())
+                    })
+                    .is_some();
+                let steps: Vec<(u64, u64)> = if !is_route {
+                    Vec::new()
+                } else {
+                    let flat = &flat_orders[flat_idx];
+                    let bi = flat.batch_idx;
+                    match &flat.kind {
+                        FlatOrderKind::Swap(si) => match &batches[bi].swaps[*si].route {
+                            // Routed order: full serial hop chain.
+                            Some(rr) => per_route[rr.route_idx].clone(),
+                            // Direct single-pool swap: one step at its pool.
+                            None => vec![(
+                                pool_sorted_indices[bi] as u64,
+                                *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
+                            )],
+                        },
+                        // Non-swap orders don't carry a route constraint in
+                        // phase 1; emit a single step to stay 1:1 with entries.
+                        _ => vec![(pool_sorted_indices[bi] as u64, 0)],
+                    }
+                };
+                let step_data: Vec<pallas_primitives::PlutusData> =
+                    steps.iter().map(|(pin, tsi)| make_step(*pin, *tsi)).collect();
+                pallas_primitives::PlutusData::Array(
+                    pallas_codec::utils::MaybeIndefArray::Indef(step_data),
+                )
+            })
+            .collect();
+        pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(route_lists))
     };
     for h in required_constraint_hashes.iter() {
         let class = classify_hash(h);
