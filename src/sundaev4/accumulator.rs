@@ -286,7 +286,7 @@ impl Accumulator {
         route: &RoutingPlan,
         pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
     ) -> Result<(), String> {
-        self.add_route_branch(order, route, pools, true)?;
+        self.add_route_branch(order, route, pools, true, true)?;
         Ok(())
     }
 
@@ -333,7 +333,9 @@ impl Accumulator {
             // (see add_route_branch).
             .unwrap_or(0);
         for (b, branch) in blend.branches.iter().enumerate() {
-            match self.add_route_branch(order, branch, pools, b == primary_idx) {
+            // Per-branch min checks are meaningless under blending — the
+            // SUM is checked below.
+            match self.add_route_branch(order, branch, pools, b == primary_idx, false) {
                 Ok(out) => total_out = &total_out + &out,
                 Err(e) => {
                     result = Err(format!("blended branch {b}: {e}"));
@@ -371,6 +373,7 @@ impl Accumulator {
         route: &RoutingPlan,
         pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
         primary: bool,
+        enforce_min: bool,
     ) -> Result<BigInt, String> {
         use num_traits::Signed;
 
@@ -579,7 +582,7 @@ impl Accumulator {
 
         // Check min_received against the final routed output. Blended
         // branches are checked as a sum by the caller instead.
-        if primary {
+        if enforce_min {
             let (ask_asset, min_qty) = order.swap_min_received();
             if final_output_asset.as_ref() == Some(ask_asset)
                 && &final_output_amount < min_qty
