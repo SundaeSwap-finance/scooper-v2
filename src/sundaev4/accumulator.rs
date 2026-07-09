@@ -581,16 +581,33 @@ impl Accumulator {
         }
 
         // Check min_received against the final routed output. Blended
-        // branches are checked as a sum by the caller instead.
+        // branches are checked as a sum by the caller instead. Partial fills
+        // (route input below remaining_offered) use the contract's exact
+        // pro-rata cross-multiplication:
+        //   received · original_offered ≥ min · offered_this_fill
         if enforce_min {
             let (ask_asset, min_qty) = order.swap_min_received();
-            if final_output_asset.as_ref() == Some(ask_asset)
-                && &final_output_amount < min_qty
-            {
-                return Err(format!(
-                    "routed output {} below min_received {}",
-                    final_output_amount, min_qty
-                ));
+            if final_output_asset.as_ref() == Some(ask_asset) {
+                let (_, remaining) = order.swap_offered();
+                let ok = if &route.total_input < remaining {
+                    if let crate::sundaev4::Constraint::Swap {
+                        original_offered, ..
+                    } = &order.constraint
+                    {
+                        &final_output_amount * original_offered
+                            >= min_qty * &route.total_input
+                    } else {
+                        false // partial fills only exist for swap constraints
+                    }
+                } else {
+                    &final_output_amount >= min_qty
+                };
+                if !ok {
+                    return Err(format!(
+                        "routed output {} below min_received {} (fill {} of {})",
+                        final_output_amount, min_qty, route.total_input, remaining
+                    ));
+                }
             }
         }
 

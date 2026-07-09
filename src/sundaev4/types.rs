@@ -228,6 +228,35 @@ pub enum Constraint {
     Strategy { constraints: StrategyConstraints },
 }
 
+impl OrderDatum {
+    /// Continuation datum for a partial fill: byte-identical except the
+    /// swap constraint entry's `remaining_offered` (field 2 of the tag-2
+    /// constr) becomes `new_remaining`. Mirrors swap.ak's
+    /// check_swap_continuation, which demands the whole datum equal except
+    /// that one replaced constraint entry.
+    pub fn with_swap_remaining(
+        &self,
+        swap_hash: &[u8],
+        new_remaining: &BigInt,
+    ) -> anyhow::Result<OrderDatum> {
+        use plutus_parser::AsPlutus;
+        let mut datum = self.clone();
+        let entry = datum
+            .constraints
+            .iter_mut()
+            .find(|(h, _)| h.as_slice() == swap_hash)
+            .ok_or_else(|| anyhow::anyhow!("order carries no swap constraint entry"))?;
+        let PlutusData::Constr(c) = &mut entry.1 else {
+            anyhow::bail!("swap constraint data is not a Constr");
+        };
+        let mut fields: Vec<PlutusData> = c.fields.clone().to_vec();
+        anyhow::ensure!(fields.len() == 4, "swap constraint must have 4 fields");
+        fields[2] = new_remaining.clone().to_plutus();
+        c.fields = pallas_primitives::MaybeIndefArray::Def(fields);
+        Ok(datum)
+    }
+}
+
 impl Constraint {
     /// Decode a `Constr`-tagged constraint payload. Returns the unrecognised tag
     /// in the error case so the caller can decide how to surface it.
@@ -836,6 +865,21 @@ pub struct ScooperExecution {
     /// router conversion edges). Absent/broken config degrades to disabled.
     #[serde(default)]
     pub butane: Option<crate::sundaev4::butane::ButaneConfig>,
+    /// Enable partial fills with this profitability margin (num, den): a
+    /// partial fill must cover at least margin × the scooper's per-order fee
+    /// share in pro-rata allowance. None (default) = partial fills disabled.
+    /// swap.ak caps each fill's fee at allowance·fill/original, so the fill
+    /// fraction must clear margin·fee_share/allowance to be worth a scoop.
+    #[serde(default)]
+    pub partial_fill_margin: Option<(u64, u64)>,
+    /// Estimated per-order fee share used by the partial-fill floor
+    /// (conservative; the real fee is known only after building).
+    #[serde(default = "default_partial_fill_fee_estimate")]
+    pub partial_fill_fee_estimate: u64,
+}
+
+fn default_partial_fill_fee_estimate() -> u64 {
+    2_500_000
 }
 
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }

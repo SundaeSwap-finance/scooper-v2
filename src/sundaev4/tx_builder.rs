@@ -1617,12 +1617,66 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Claim(i) => &batches[fo_meta.batch_idx].claims[*i].order,
             FlatOrderKind::Conversion(i) => &plan.conversions[*i].order,
         };
+        // Partial fill detection (swap-module orders only): the fill size
+        // is the route's hop-0 input (routed) or the resolved swap's dx
+        // (direct). Below remaining_offered → continuation at the order
+        // address with remaining decremented (swap.ak's continuation arm);
+        // the received tokens accumulate ON the continuation.
+        let swap_fill: Option<crate::bigint::BigInt> = match &fo_meta.kind {
+            FlatOrderKind::Swap(i) => {
+                let swap = &batches[fo_meta.batch_idx].swaps[*i];
+                Some(match &swap.route {
+                    Some(rref) => routes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| r.order.input == swap.order.input)
+                        .fold(BigInt::from(0), |acc, (ri, _)| {
+                            let hop0 = routes[ri]
+                                .hops
+                                .first()
+                                .map(|h| h.hop_total_at_route_time.clone())
+                                .unwrap_or_else(|| BigInt::from(0));
+                            let _ = rref;
+                            &acc + &hop0
+                        }),
+                    None => swap.dx.clone(),
+                })
+            }
+            _ => None,
+        };
+        let partial_continuation: Option<pallas_primitives::PlutusData> = match &swap_fill {
+            Some(fill) if fill < order.swap_offered().1 => {
+                let (_, remaining) = order.swap_offered();
+                let new_remaining = remaining - fill;
+                let swap_hash = exec
+                    .module_scripts
+                    .swap_order
+                    .as_ref()
+                    .context("partial fill requires the swap_order module config")?
+                    .hash;
+                let datum = order
+                    .datum
+                    .with_swap_remaining(swap_hash.as_ref(), &new_remaining)?;
+                Some(datum.to_plutus())
+            }
+            _ => None,
+        };
+
         // Self destinations return the fulfillment to the order address with
         // the *identical* datum (check_destination's Self arm) — a standing
         // order that survives its own execution and can be executed again by
         // a fresh intent. Fixed destinations pay the given address, with the
-        // destination's optional datum pinned inline when present.
+        // destination's optional datum pinned inline when present. Partial
+        // fills override both: the output IS the continuation.
         let (dest_address, dest_datum): (Vec<u8>, Option<pallas_primitives::PlutusData>) =
+            if let Some(cont_datum) = &partial_continuation {
+                let order_addr = ShelleyAddress::new(
+                    Network::Testnet,
+                    ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                    ShelleyDelegationPart::Null,
+                );
+                (order_addr.to_vec(), Some(cont_datum.clone()))
+            } else {
             match &order.datum.destination {
                 crate::sundaev4::Destination::SelfDestination => {
                     let order_addr = ShelleyAddress::new(
@@ -1636,6 +1690,7 @@ pub fn build_multi_pool_scoop_tx(
                     resolve_destination(&order.datum.destination, &order.datum.owner)?,
                     maybe_datum.clone(),
                 ),
+            }
             };
 
         let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
@@ -1684,10 +1739,33 @@ pub fn build_multi_pool_scoop_tx(
                     }
                 };
                 let (offer_asset, offer_amount) = swap.order.swap_offered();
+                let spend_amount = swap_fill.as_ref().unwrap_or(offer_amount);
+                // Contract fee cap for partials: fee ≤ allowance·fill/original.
+                if spend_amount < offer_amount {
+                    if let crate::sundaev4::Constraint::Swap { original_offered, .. } =
+                        &swap.order.constraint
+                    {
+                        use num_traits::ToPrimitive;
+                        let allowance = {
+                            let fee_share = BigInt::from(actual_fee);
+                            let share = &swap.order.datum.share_batcher;
+                            let surplus = &swap.order.datum.budget - &fee_share;
+                            &fee_share + &(&(share * &surplus) / &BigInt::from(10_000u64))
+                        };
+                        let cap = &(&allowance * spend_amount) / original_offered;
+                        let cap_u64 = cap.clone().unwrap().to_u64().unwrap_or(0);
+                        if actual_fee > cap_u64 {
+                            bail!(
+                                "partial fill fee {actual_fee} exceeds pro-rata cap \
+                                 {cap_u64} (fill {spend_amount} of {original_offered})",
+                            );
+                        }
+                    }
+                }
                 build_fulfillment_value_from_order(
                     &swap.order.value,
                     offer_asset,
-                    offer_amount,
+                    spend_amount,
                     output_asset_ref,
                     dy_ref,
                     actual_fee,

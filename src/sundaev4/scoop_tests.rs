@@ -569,6 +569,96 @@ mod tests {
         assert!(build.tx_body.outputs.len() >= 3);
     }
 
+    /// Partial fill through the real validators: an order too large for
+    /// the pool fills partially — the output is a CONTINUATION at the order
+    /// address (same datum, remaining_offered decremented, received tokens
+    /// accumulated on it), fee capped pro-rata, min checked by the
+    /// contract's exact cross-multiplication.
+    #[test]
+    fn swap_partial_fill_continuation() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+
+        // 400M offered against a 200M pool; min 0.6/unit pro-rata. A full
+        // fill averages ~0.33 — impossible; a 100M fill averages ~0.66 ✓.
+        // Budget 8 ADA: a 25% fill's pro-rata fee cap (2 ADA) covers the
+        // fee share — the user literally buys partial-fill granularity.
+        let order = make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
+        let fill = BigInt::from(100_000_000u64);
+
+        let route = router::find_optimal_route(
+            &pool_map, &[], &token_a(), &token_b(), &fill,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("partial route exists");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_routed_order(&order, &route, &pool_map)
+            .expect("partial fill should pass the pro-rata min check");
+        let plan = accum.into_plan();
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("partial fill must build and evaluate");
+        assert!(!eval.budgets.is_empty());
+
+        // The continuation output sits at the order address, carries the
+        // leftover offer + the received tokens, and its datum decrements
+        // remaining_offered by the fill.
+        let order_addr = {
+            use pallas_addresses::{ShelleyAddress, ShelleyPaymentPart, ShelleyDelegationPart, Network};
+            ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(env.exec.module_scripts.order.hash),
+                ShelleyDelegationPart::Null,
+            )
+            .to_vec()
+        };
+        let cont = build
+            .tx_body
+            .outputs
+            .iter()
+            .find_map(|o| match o {
+                pallas_primitives::conway::TransactionOutput::PostAlonzo(b)
+                    if b.address.to_vec() == order_addr =>
+                {
+                    Some(b)
+                }
+                _ => None,
+            })
+            .expect("continuation output at the order address");
+        let datum_cbor = match &cont.datum_option {
+            Some(pallas_primitives::conway::PseudoDatumOption::Data(d)) => {
+                minicbor::to_vec(&d.0).unwrap()
+            }
+            _ => panic!("continuation must carry an inline datum"),
+        };
+        let datum: pallas_primitives::PlutusData = minicbor::decode(&datum_cbor).unwrap();
+        use plutus_parser::AsPlutus;
+        let parsed = <crate::sundaev4::OrderDatum as AsPlutus>::from_plutus(datum).unwrap();
+        let c = crate::sundaev4::Constraint::from_order_datum(
+            &parsed,
+            env.exec.module_scripts.swap_order.as_ref().unwrap().hash.as_ref(),
+            env.exec.module_scripts.basic_order.as_ref().unwrap().hash.as_ref(),
+        )
+        .unwrap();
+        match c {
+            crate::sundaev4::Constraint::Swap { original_offered, remaining_offered, .. } => {
+                assert_eq!(original_offered, BigInt::from(400_000_000u64));
+                assert_eq!(remaining_offered, BigInt::from(300_000_000u64));
+            }
+            other => panic!("expected swap constraint, got {other:?}"),
+        }
+    }
+
     /// Single-pool basic swap: the degenerate case must also evaluate.
     #[test]
     fn basic_swap_direct() {

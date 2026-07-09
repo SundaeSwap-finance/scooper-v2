@@ -808,7 +808,11 @@
             }
           ],
           "registry-utxo-cbor": "82583900fe6c4b876cd886c5d745653a74693bab1b88cb155660cd9e860e90030acbf9e8a3e38520c208d2fa3a34ac0f25895bbf42c8fbfdee25c767821a00130196a1581c8137010c1908095a4e484ed91b4f8ff222cb5968afc802258a24acdea1581c04156db9a24fefa2091ba48ab0cd64e3bf90f9c83028b9906e3d670b01"
-        }
+        },
+        "partial-fill-margin": [
+          3,
+          2
+        ]
       }
     }
   },

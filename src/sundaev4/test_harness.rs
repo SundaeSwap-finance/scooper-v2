@@ -262,6 +262,8 @@ pub(crate) mod test_harness {
                 conversions: Vec::new(),
                 butane: None,
                 plutus_v2_cost_model: None,
+                partial_fill_margin: None,
+                partial_fill_fee_estimate: 2_500_000,
             };
 
             // Collateral: deterministic UTxO with enough ADA
@@ -717,6 +719,19 @@ pub(crate) mod test_harness {
         min_want: i64,
         slot: u64,
     ) -> Arc<SundaeV4Order> {
+        make_order_with_budget(offer_tok, offer_amount, want_tok, min_want, slot, 1_500_000)
+    }
+
+    /// make_order with an explicit fee budget — partial-fill tests need
+    /// budgets large enough that the pro-rata fee cap covers a fee share.
+    pub fn make_order_with_budget(
+        offer_tok: AssetClass,
+        offer_amount: i64,
+        want_tok: AssetClass,
+        min_want: i64,
+        slot: u64,
+        budget: i64,
+    ) -> Arc<SundaeV4Order> {
         let mut value = Value::default();
         // Production orders carry 5 ADA (CLI default: 2 min-UTxO + 3 budget);
         // the no-subsidy guard rejects orders that can't retain min-UTxO
@@ -748,7 +763,7 @@ pub(crate) mod test_harness {
             ),
             (offer_tok, BigInt::from(offer_amount)),
             (want_tok, BigInt::from(min_want)),
-            BigInt::from(1_500_000i64),
+            BigInt::from(budget),
             slot,
         );
         Arc::new(with_real_constraints(order, CFG_SWAP))

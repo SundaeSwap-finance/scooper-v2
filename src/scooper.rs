@@ -1013,10 +1013,62 @@ impl Scooper {
                         total_output = %blend.total_output,
                         "order dispatch",
                     );
-                    let add_result = match blend.as_single() {
+                    let mut add_result = match blend.as_single() {
                         Some(single) => candidate.try_add_routed_order(order, single, &pool_view),
                         None => candidate.try_add_blended_order(order, &blend, &pool_view),
                     };
+                    // Full fill misses the floor → try a partial fill, if
+                    // enabled and the order is swap-module (basic orders
+                    // have no continuation mechanism). The economic floor:
+                    // fill_fraction ≥ margin · fee_share / fee_allowance —
+                    // swap.ak pays fees pro-rata, so smaller fills don't
+                    // cover the scoop cost.
+                    if let Err(e) = &add_result {
+                        let is_swap_module = exec
+                            .module_scripts
+                            .swap_order
+                            .as_ref()
+                            .map(|m| {
+                                order.datum.constraints.iter().any(|(h, _)| {
+                                    h.as_slice() == m.hash.as_ref()
+                                })
+                            })
+                            .unwrap_or(false);
+                        if e.contains("below min_received")
+                            && is_swap_module
+                            && exec.partial_fill_margin.is_some()
+                        {
+                            if let Some(dx) = self.find_partial_fill_dx(
+                                order,
+                                &pool_view,
+                                &conversion_edges,
+                                &exec,
+                                limits,
+                            ) {
+                                if let Some(pblend) = router::find_blended_route(
+                                    &pool_view,
+                                    &conversion_edges,
+                                    offer_asset,
+                                    ask_asset,
+                                    &dx,
+                                    limits,
+                                ) {
+                                    tracing::info!(
+                                        order = %order.input,
+                                        fill = %dx,
+                                        remaining = %order.swap_offered().1,
+                                        "partial fill dispatch",
+                                    );
+                                    add_result = match pblend.as_single() {
+                                        Some(single) => candidate
+                                            .try_add_routed_order(order, single, &pool_view),
+                                        None => candidate
+                                            .try_add_blended_order(order, &pblend, &pool_view),
+                                    };
+                                }
+                            }
+                        }
+                    }
                     match add_result {
                         Ok(_) => true,
                         Err(e) => {
@@ -1814,6 +1866,82 @@ impl Scooper {
             conversions: Vec::new(),
         };
         Some((scoop_plan, sse_pd))
+    }
+
+    /// Largest fill size that clears the pro-rata min_received floor, if it
+    /// also clears the economic floor. Binary search on the (monotone-
+    /// decreasing) average price: output(dx)·original ≥ min·dx.
+    fn find_partial_fill_dx(
+        &self,
+        order: &Arc<crate::sundaev4::SundaeV4Order>,
+        pool_view: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            Arc<crate::sundaev4::SundaeV4Pool>,
+        >,
+        conversion_edges: &[crate::sundaev4::conversions::ConversionEdge],
+        exec: &ScooperExecution,
+        limits: crate::sundaev4::router::RoutingLimits,
+    ) -> Option<crate::bigint::BigInt> {
+        use crate::bigint::BigInt;
+        use crate::sundaev4::router;
+        use num_traits::{Signed, ToPrimitive};
+
+        let (margin_num, margin_den) = exec.partial_fill_margin?;
+        let crate::sundaev4::Constraint::Swap {
+            ref original_offered, ..
+        } = order.constraint
+        else {
+            return None;
+        };
+        let (offer_asset, remaining) = order.swap_offered();
+        let (ask_asset, min_qty) = order.swap_min_received();
+
+        // Economic floor: fill ≥ original · margin · fee_est / allowance.
+        let fee_est = BigInt::from(exec.partial_fill_fee_estimate);
+        let surplus = &order.datum.budget - &fee_est;
+        let allowance = &fee_est
+            + &(&(&order.datum.share_batcher * &surplus) / &BigInt::from(10_000u64));
+        if !allowance.is_positive() {
+            return None;
+        }
+        let floor_dx = &(&(original_offered * &BigInt::from(margin_num)) * &fee_est)
+            / &(&allowance * &BigInt::from(margin_den));
+        if &floor_dx >= remaining {
+            return None; // even the minimum viable fill exceeds what's left
+        }
+
+        let meets = |dx: &BigInt| -> bool {
+            router::find_blended_route(
+                pool_view,
+                conversion_edges,
+                offer_asset,
+                ask_asset,
+                dx,
+                limits,
+            )
+            .map(|b| &(&b.total_output * original_offered) >= &(min_qty * dx))
+            .unwrap_or(false)
+        };
+
+        let mut lo = floor_dx.clone().max(BigInt::from(1));
+        if !meets(&lo) {
+            return None; // pools can't clear the floor even at the minimum
+        }
+        let mut hi = remaining.clone();
+        // hi (full fill) is known to fail; bisect the largest passing dx.
+        for _ in 0..12 {
+            let mid = &(&lo + &hi) / &BigInt::from(2u64);
+            if mid == lo || mid == hi {
+                break;
+            }
+            if meets(&mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let _ = lo.clone().unwrap().to_u64(); // sanity: fits practical range
+        Some(lo)
     }
 
     fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
