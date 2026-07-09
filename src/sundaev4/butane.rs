@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
+use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway;
 use serde::Deserialize;
 
@@ -243,6 +244,147 @@ impl ButaneRuntime {
     }
 }
 
+// ─── Deposit composition ────────────────────────────────────────────────────
+
+/// The tx-level pieces of one underlying deposit, ready for the tx builder
+/// to merge: a pot output, the mint entries under the butane policy, the
+/// four zero-withdrawals (with each validator's Plutus version, for
+/// language views), the mint redeemer, and the reference inputs.
+#[derive(Clone, Debug)]
+pub struct DepositPieces {
+    pub pot_output: conway::TransactionOutput,
+    /// (asset name, amount) under the butane mint policy.
+    pub mint_assets: Vec<(Vec<u8>, i64)>,
+    pub mint_policy: Vec<u8>,
+    /// Mint redeemer for the butane policy: int 0.
+    pub mint_redeemer: pallas_primitives::PlutusData,
+    /// (script hash, redeemer, plutus version) per zero-withdrawal.
+    pub withdrawals: Vec<(Vec<u8>, pallas_primitives::PlutusData, u8)>,
+    /// params UTxO + registry UTxO + executed validators' ref-script UTxOs.
+    pub ref_inputs: Vec<TransactionInput>,
+}
+
+fn constr(tag_idx: u64, fields: Vec<pallas_primitives::PlutusData>) -> pallas_primitives::PlutusData {
+    let tag = if tag_idx < 7 { 121 + tag_idx } else { 1280 + (tag_idx - 7) };
+    pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+        tag,
+        any_constructor: None,
+        fields: pallas_primitives::MaybeIndefArray::Def(fields),
+    })
+}
+
+impl ButaneRuntime {
+    /// Compose the pieces for depositing `deposit_lovelace` and minting
+    /// `minted` of `synthetic`. Network id 0 = testnet.
+    pub fn deposit_pieces(
+        &self,
+        synthetic: &str,
+        deposit_lovelace: u64,
+        minted: u64,
+        network_id: u8,
+    ) -> Result<DepositPieces> {
+        use pallas_primitives::PlutusData;
+        let cfg = self
+            .synthetic_config(synthetic)
+            .with_context(|| format!("synthetic {synthetic:?} not configured"))?;
+        let spend = self.script("spend");
+        let mint = self.script("mint");
+        let synthetics = self.script("synthetics");
+        let synthetics_aux = self.script("synthetics-aux");
+        let underlying = self.script("external-underlying");
+        let upgradable = self.script("upgradable");
+
+        // Pot address: base address, script payment (spend) + script staking
+        // (mint policy). Header type 0b0011 | network.
+        let mut addr = Vec::with_capacity(57);
+        addr.push(0x30 | (network_id & 0x0f));
+        addr.extend_from_slice(&spend.hash);
+        addr.extend_from_slice(&mint.hash);
+
+        // Pot value: the locked lovelace + 1 treas marker (minted here).
+        let treas: (Vec<u8>, i64) = (b"treas".to_vec(), 1);
+        let pot_value = conway::Value::Multiasset(
+            deposit_lovelace,
+            pallas_primitives::NonEmptyKeyValuePairs::Def(vec![(
+                pallas_crypto::hash::Hash::<28>::from(mint.hash.as_slice()),
+                pallas_primitives::NonEmptyKeyValuePairs::Def(vec![(
+                    pallas_primitives::Bytes::from(treas.0.clone()),
+                    pallas_primitives::PositiveCoin::try_from(1i64 as u64).unwrap(),
+                )]),
+            )]),
+        );
+        // Pot datum: Constr 6 [synthetic name, credit].
+        let datum = constr(6, vec![
+            PlutusData::BoundedBytes(synthetic.as_bytes().to_vec().into()),
+            PlutusData::BigInt(pallas_primitives::BigInt::Int((minted as i64).into())),
+        ]);
+        let pot_output = conway::TransactionOutput::PostAlonzo(
+            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+                address: pallas_primitives::Bytes::from(addr),
+                value: pot_value,
+                datum_option: Some(conway::PseudoDatumOption::Data(
+                    CborWrap(datum),
+                )),
+                script_ref: None,
+            },
+        );
+
+        // Withdraw redeemers (fixture dissection, seq 16):
+        //   synthetics     → Constr 1 []
+        //   syntheticsAux  → Constr 16 [synthetic name]
+        //   underlying     → bytes(syntheticsAux hash)
+        //   upgradable     → Constr 0 [Constr 0 [registry txid], registry idx]
+        let withdrawals = vec![
+            (synthetics.hash.clone(), constr(1, vec![]), synthetics.plutus_version),
+            (
+                synthetics_aux.hash.clone(),
+                constr(16, vec![PlutusData::BoundedBytes(
+                    synthetic.as_bytes().to_vec().into(),
+                )]),
+                synthetics_aux.plutus_version,
+            ),
+            (
+                underlying.hash.clone(),
+                PlutusData::BoundedBytes(synthetics_aux.hash.clone().into()),
+                underlying.plutus_version,
+            ),
+            (
+                upgradable.hash.clone(),
+                constr(0, vec![
+                    constr(0, vec![PlutusData::BoundedBytes(
+                        self.registry_utxo.0.transaction_id.as_ref().to_vec().into(),
+                    )]),
+                    PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                        (self.registry_utxo.0.index as i64).into(),
+                    )),
+                ]),
+                upgradable.plutus_version,
+            ),
+        ];
+
+        let params_utxo = parse_outref(&cfg.params_utxo)?;
+        let mut ref_inputs = vec![
+            params_utxo,
+            self.registry_utxo.clone(),
+            mint.ref_input.clone(),
+            synthetics.ref_input.clone(),
+            synthetics_aux.ref_input.clone(),
+            underlying.ref_input.clone(),
+            upgradable.ref_input.clone(),
+        ];
+        ref_inputs.dedup();
+
+        Ok(DepositPieces {
+            pot_output,
+            mint_assets: vec![(synthetic.as_bytes().to_vec(), minted as i64), treas],
+            mint_policy: mint.hash.clone(),
+            mint_redeemer: PlutusData::BigInt(pallas_primitives::BigInt::Int(0.into())),
+            withdrawals,
+            ref_inputs,
+        })
+    }
+}
+
 /// Load the runtime from optional config, degrading to None (with a clear
 /// warning) on any problem — a scooper with a broken butane section must
 /// still scoop.
@@ -333,6 +475,38 @@ mod tests {
         cfg.script_hashes
             .insert("mint".into(), "ab".repeat(28));
         assert!(ButaneRuntime::load(&cfg).is_err());
+    }
+
+    /// Deposit pieces match the fixture dissection's tx anatomy.
+    #[test]
+    fn deposit_pieces_shape() {
+        if !std::path::Path::new(PREVIEW_ARTIFACT).exists() {
+            eprintln!("skipping: {PREVIEW_ARTIFACT} not present");
+            return;
+        }
+        let rt = ButaneRuntime::load(&preview_config()).unwrap();
+        let p = rt.deposit_pieces("ADAb", 40_000_000, 40_000_000, 0).unwrap();
+
+        // Pot address: type-3 base (script/script), spend + mint creds.
+        let conway::TransactionOutput::PostAlonzo(body) = &p.pot_output else {
+            panic!("expected post-alonzo pot output");
+        };
+        let addr: Vec<u8> = body.address.clone().into();
+        assert_eq!(addr[0], 0x30);
+        assert_eq!(&addr[1..29], rt.script("spend").hash.as_slice());
+        assert_eq!(&addr[29..57], rt.script("mint").hash.as_slice());
+
+        // Mint: synthetic + treas under the mint policy, redeemer int 0.
+        assert_eq!(p.mint_policy, rt.script("mint").hash);
+        assert_eq!(p.mint_assets, vec![(b"ADAb".to_vec(), 40_000_000i64), (b"treas".to_vec(), 1)]);
+
+        // Four withdrawals with the on-chain language mix (V3/V3/V3/V2).
+        assert_eq!(p.withdrawals.len(), 4);
+        let versions: Vec<u8> = p.withdrawals.iter().map(|(_, _, v)| *v).collect();
+        assert_eq!(versions, vec![3, 3, 3, 2], "synthetics/aux/underlying V3, upgradable V2");
+
+        // Ref inputs: params, registry, and 5 distinct ref-script UTxOs.
+        assert_eq!(p.ref_inputs.len(), 7);
     }
 
     /// Absent config degrades to None without complaint.
