@@ -68,6 +68,8 @@ pub struct Scooper {
     backoff_until_after_slot: Option<u64>,
     /// Orders quarantined due to structural failure or suspected spent inputs.
     quarantine: BTreeMap<TransactionInput, Quarantine>,
+    /// Loaded + verified Butane runtime (None = integration disabled).
+    v4_butane: Option<crate::sundaev4::butane::ButaneRuntime>,
     /// Posted strategy intents (shared with the admin server's ingest).
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
@@ -88,6 +90,9 @@ impl Scooper {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
         }
+        let v4_butane = v4_execution
+            .as_ref()
+            .and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
         Ok(Self {
             event_rx,
             v3_state,
@@ -102,6 +107,7 @@ impl Scooper {
             metrics,
             backoff_until_after_slot: None,
             quarantine: BTreeMap::new(),
+            v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
         })
@@ -756,7 +762,19 @@ impl Scooper {
             match crate::sundaev4::evaluator::ScriptStore::from_ref_utxos(
                 &v4_state.ref_utxo_outputs,
             ) {
-                Ok(s) => {
+                Ok(mut s) => {
+                    if let Some(rt) = &self.v4_butane {
+                        for (role, ds) in &rt.scripts {
+                            match s.insert_with_version(&ds.script_bytes, ds.plutus_version) {
+                                Ok(h) => tracing::debug!(
+                                    role, hash = %hex::encode(h), "butane script in store",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    role, "butane script unusable: {e:#}",
+                                ),
+                            }
+                        }
+                    }
                     self.v4_script_store = Some(s);
                 }
                 Err(e) => {
@@ -815,8 +833,18 @@ impl Scooper {
         let mut skip_no_route = 0u32;
         let mut skip_route_failed = 0u32;
 
-        let conversion_edges =
+        let mut conversion_edges =
             crate::sundaev4::conversions::routable_edges(&exec.conversions);
+        if let Some(rt) = &self.v4_butane {
+            if exec.plutus_v2_cost_model.is_some() {
+                conversion_edges.extend(rt.edges());
+            } else {
+                tracing::warn!(
+                    "butane runtime loaded but plutus-v2-cost-model is not \
+                     configured — edges disabled",
+                );
+            }
+        }
         for order in &candidates {
             if accum.order_count() >= self.v4_batch_limits.max_orders {
                 break;
@@ -1043,8 +1071,7 @@ impl Scooper {
                 &plan, &settings, &exec, current_slot, &language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs, &strategy_executions,
-                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-             None) {
+                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
                 Ok(r) => r,
                 Err(e) => {
                     // Build failures here mean the tx couldn't be assembled
@@ -1202,8 +1229,7 @@ impl Scooper {
                     &diag_plan, &settings, &exec, current_slot, &language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs, &strategy_executions,
-                    funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-                 None) {
+                    funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
                     Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
                         let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
@@ -1353,8 +1379,7 @@ impl Scooper {
             &final_plan, &settings, &exec, current_slot, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             None, &v4_state.order_configs, &strategy_executions,
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-         None) {
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx build failed");
@@ -1458,8 +1483,7 @@ impl Scooper {
             Some(computed_fee),
             &v4_state.order_configs,
             &strategy_executions,
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-         None) {
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx rebuild failed");
