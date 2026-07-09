@@ -401,6 +401,96 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 2);
     }
 
+    /// A swap expressed via the BASIC constraint module routes — and
+    /// BLENDS across two disjoint paths — through the real validators.
+    /// Pools: direct A/B (1B/1B) plus A/E and E/B (1B each), so the blend
+    /// splits between the direct pool and the 2-hop path. The basic module
+    /// checks only aggregate consumption and floors, so the branched
+    /// execution must evaluate cleanly with no route module involved.
+    #[test]
+    fn basic_swap_blends_across_paths() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let direct = make_pool(&env, 0xA1, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let leg1 = make_pool(&env, 0xA2, token_a(), 1_000_000_000, token_e(), 1_000_000_000);
+        let leg2 = make_pool(&env, 0xA3, token_e(), 1_000_000_000, token_b(), 1_000_000_000);
+
+        let mut pool_map = BTreeMap::new();
+        for p in [&direct, &leg1, &leg2] {
+            pool_map.insert(p.pool_datum.identifier.clone(), (*p).clone());
+        }
+
+        let order = make_basic_swap_order(token_a(), 100_000_000, token_b(), 1, 1);
+        assert!(
+            matches!(order.constraint, crate::sundaev4::Constraint::Swap { .. }),
+            "basic tag-2 order must present as a swap to the dispatcher",
+        );
+
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("blend must exist");
+        assert_eq!(blend.branches.len(), 2, "direct + 2-hop path should both carry flow");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("blended basic swap should accumulate");
+
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 3, "blend touches all three pools");
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("blended basic swap build_and_eval should succeed");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 3);
+    }
+
+    /// Single-pool basic swap: the degenerate case must also evaluate.
+    #[test]
+    fn basic_swap_direct() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xA4, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+
+        let order = make_basic_swap_order(token_a(), 10_000_000, token_b(), 1, 1);
+        let route = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("direct route");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_routed_order(&order, &route, &pool_map)
+            .expect("basic swap should accumulate");
+        let plan = accum.into_plan();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("basic swap build_and_eval should succeed");
+        assert!(!eval.budgets.is_empty());
+    }
+
     #[test]
     fn routed_through_two_cs_pools() {
         use std::collections::BTreeMap;

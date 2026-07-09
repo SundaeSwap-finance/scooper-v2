@@ -268,24 +268,76 @@ impl Constraint {
         })
     }
 
+    /// Decode a basic_order constraint payload. The basic module's data is
+    /// always `(offered: List<(AssetClass, Int)>, min_received: List<…>)`
+    /// regardless of ctor tag — on-chain, `extract_basic_fields` ignores the
+    /// tag entirely and enforces only aggregate consumption/floors. The tag
+    /// is scooper-side dispatch metadata: Deposit=0, Withdraw=1, Swap=2,
+    /// Claim=3. A tag-2 basic entry with a single offered asset maps onto
+    /// `Constraint::Swap` so the whole routing/blending dispatch applies;
+    /// the aggregate on-chain check is satisfied by any execution shape the
+    /// router produces.
+    pub fn from_basic_plutus_constraint(pd: &PlutusData) -> anyhow::Result<Self> {
+        let PlutusData::Constr(c) = pd else {
+            anyhow::bail!("constraint must be a Constr");
+        };
+        let tag = if c.tag >= 121 && c.tag <= 127 {
+            (c.tag - 121) as u64
+        } else if c.tag >= 1280 {
+            (c.tag - 1280 + 7) as u64
+        } else {
+            c.tag as u64
+        };
+        let fields: Vec<PlutusData> = c.fields.clone().to_vec();
+        let list_pair = |i: usize| -> anyhow::Result<Vec<(AssetClass, BigInt)>> {
+            let f = fields
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("basic constraint missing field {i}"))?;
+            <Vec<(AssetClass, BigInt)>>::from_plutus(f.clone())
+                .map_err(|e| anyhow::anyhow!("decode list pair: {e}"))
+        };
+        Ok(match tag {
+            0 => Constraint::Deposit { offered: list_pair(0)?, min_received: list_pair(1)? },
+            1 => Constraint::Withdraw { offered: list_pair(0)?, min_received: list_pair(1)? },
+            2 => {
+                let offered = list_pair(0)?;
+                let min_received = list_pair(1)?;
+                match offered.as_slice() {
+                    [(asset, amount)] => Constraint::Swap {
+                        offered: asset.clone(),
+                        original_offered: amount.clone(),
+                        remaining_offered: amount.clone(),
+                        min_received,
+                    },
+                    _ => anyhow::bail!(
+                        "basic swap (tag 2) must offer exactly one asset to be \
+                         routable (got {})",
+                        offered.len()
+                    ),
+                }
+            }
+            3 => Constraint::Claim { offered: list_pair(0)?, min_received: list_pair(1)? },
+            t => anyhow::bail!("unknown basic constraint tag {t}"),
+        })
+    }
+
     /// Decode the constraint of interest from an OrderDatum by walking its
     /// constraints list to find an entry under either `swap_order_hash` or
-    /// `basic_order_hash`, then decoding that inner Data. The constraint
-    /// *class* is implicit in the hash; the inner Data's ctor tag picks
-    /// the variant (Swap=2 for swap_order; Deposit=0 / Withdraw=1 /
-    /// Claim=3 for basic_order).
+    /// `basic_order_hash`, then decoding that inner Data with the matching
+    /// class's field shapes (the two modules encode different layouts for
+    /// tag 2).
     pub fn from_order_datum(
         datum: &OrderDatum,
         swap_order_hash: &[u8],
         basic_order_hash: &[u8],
     ) -> anyhow::Result<Self> {
-        let constraint_data = datum
-            .find_constraint_by_hash(swap_order_hash)
-            .or_else(|| datum.find_constraint_by_hash(basic_order_hash))
-            .ok_or_else(|| {
-                anyhow::anyhow!("order has neither swap_order nor basic_order constraint")
-            })?;
-        Self::from_plutus_constraint(constraint_data)
+        if let Some(data) = datum.find_constraint_by_hash(swap_order_hash) {
+            return Self::from_plutus_constraint(data);
+        }
+        if let Some(data) = datum.find_constraint_by_hash(basic_order_hash) {
+            return Self::from_basic_plutus_constraint(data);
+        }
+        anyhow::bail!("order has neither swap_order nor basic_order constraint")
     }
 
     /// Like [`Constraint::from_order_datum`], but also recognises
@@ -1015,6 +1067,47 @@ pub struct SundaeV4Protocol {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn basic_tag2_decodes_as_swap() {
+        use super::*;
+        use plutus_parser::AsPlutus;
+        let asset = AssetClass { policy: vec![0xAA; 28], token: b"IN".to_vec() };
+        let want = AssetClass { policy: vec![0xBB; 28], token: b"OUT".to_vec() };
+        let offered: Vec<(AssetClass, BigInt)> = vec![(asset.clone(), BigInt::from(100))];
+        let mins: Vec<(AssetClass, BigInt)> = vec![(want.clone(), BigInt::from(95))];
+        let pd = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 123, // ctor 2
+            any_constructor: None,
+            fields: pallas_primitives::MaybeIndefArray::Def(vec![
+                offered.to_plutus(),
+                mins.clone().to_plutus(),
+            ]),
+        });
+        let c = Constraint::from_basic_plutus_constraint(&pd).unwrap();
+        match c {
+            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+                assert_eq!(offered, asset);
+                assert_eq!(original_offered, BigInt::from(100));
+                assert_eq!(remaining_offered, BigInt::from(100));
+                assert_eq!(min_received, mins);
+            }
+            other => panic!("expected Swap, got {other:?}"),
+        }
+
+        // Multi-asset offered is not routable — must error, not misparse.
+        let offered2: Vec<(AssetClass, BigInt)> =
+            vec![(asset, BigInt::from(1)), (want.clone(), BigInt::from(1))];
+        let pd2 = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 123,
+            any_constructor: None,
+            fields: pallas_primitives::MaybeIndefArray::Def(vec![
+                offered2.to_plutus(),
+                Vec::<(AssetClass, BigInt)>::new().to_plutus(),
+            ]),
+        });
+        assert!(Constraint::from_basic_plutus_constraint(&pd2).is_err());
+    }
+
     use super::*;
 
     #[test]

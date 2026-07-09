@@ -698,6 +698,63 @@ pub(crate) mod test_harness {
         Arc::new(with_real_constraints(order, CFG_SWAP))
     }
 
+    /// A swap expressed through the BASIC constraint module (tag 2 under the
+    /// basic hash, fields `(offered list, min_received list)`). The basic
+    /// validator only checks aggregate consumption/floors, so these orders
+    /// may be routed, split, and blended freely — there's no route module in
+    /// the CFG_BASIC preset and no swap-module full-fill semantics.
+    pub fn make_basic_swap_order(
+        offer_tok: AssetClass,
+        offer_amount: i64,
+        want_tok: AssetClass,
+        min_want: i64,
+        slot: u64,
+    ) -> Arc<SundaeV4Order> {
+        use plutus_parser::AsPlutus;
+
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(5_000_000i64));
+        value.insert(&offer_tok, BigInt::from(offer_amount));
+        let mut tx_hash = [0u8; 32];
+        tx_hash[0] = 0xD1; // distinct namespace from make_order's 0xD0
+        tx_hash[1..9].copy_from_slice(&slot.to_be_bytes());
+
+        let order = SundaeV4Order::test_swap_order(
+            crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+            value,
+            Multisig::Signature(vec![0xAA; 28]),
+            Destination::Fixed(
+                crate::sundaev3::PlutusAddress {
+                    payment_credential: crate::sundaev3::Credential::VerificationKey(
+                        [0xAA; 28].into(),
+                    ),
+                    stake_credential: None,
+                },
+                None,
+            ),
+            (offer_tok.clone(), BigInt::from(offer_amount)),
+            (want_tok.clone(), BigInt::from(min_want)),
+            BigInt::from(1_500_000i64),
+            slot,
+        );
+        // Re-encode the constraint payload in the basic module's layout:
+        // ctor 2 with (offered list, min_received list).
+        let offered: Vec<(AssetClass, BigInt)> =
+            vec![(offer_tok, BigInt::from(offer_amount))];
+        let min_received: Vec<(AssetClass, BigInt)> =
+            vec![(want_tok, BigInt::from(min_want))];
+        let payload = PlutusData::Constr(pallas_primitives::Constr {
+            tag: 123, // ctor 2 (121 + 2): scooper-side "swap" dispatch tag
+            any_constructor: None,
+            fields: pallas_primitives::MaybeIndefArray::Def(vec![
+                offered.to_plutus(),
+                min_received.to_plutus(),
+            ]),
+        });
+        let order = with_real_constraints_payload(order, CFG_BASIC, Some(payload));
+        Arc::new(order)
+    }
+
     /// Rewrite a test order's datum to the PR#11 modular shape using the
     /// real constraint hashes from the loaded blueprint (when available):
     /// the module-specific payload keeps its slot, route gets an empty pool
@@ -754,6 +811,26 @@ pub(crate) mod test_harness {
     ///
     /// The settings value includes the settings NFT (settingsMint policy, empty token name)
     /// so that the fairness validator can find it in reference inputs.
+    /// `with_real_constraints`, but overriding the constraint payload used
+    /// for the class module (basic-swap tests re-encode the swap fields in
+    /// the basic module's layout).
+    pub fn with_real_constraints_payload(
+        order: SundaeV4Order,
+        cfg_token: &[u8],
+        payload_override: Option<PlutusData>,
+    ) -> SundaeV4Order {
+        let mut order = with_real_constraints(order, cfg_token);
+        if let Some(payload) = payload_override {
+            let Some(Some(ctx)) = TEST_CTX.get() else { return order };
+            for (h, data) in order.datum.constraints.iter_mut() {
+                if *h == ctx.basic_order || *h == ctx.swap_order {
+                    *data = payload.clone();
+                }
+            }
+        }
+        order
+    }
+
     pub fn make_settings(_env: &TestEnv, scooper_keyhash: &[u8]) -> SundaeV4Settings {
         // The settings NFT is minted by the settingsMint script.
         // We extract its policy from the settings ScriptRefInfo hash in module_scripts.
