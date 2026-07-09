@@ -80,6 +80,8 @@ pub(crate) mod test_harness {
     pub struct TestEnv {
         pub exec: ScooperExecution,
         pub scripts: ScriptStore,
+        /// Loaded Butane runtime for conversion-leg tests (repo config).
+        pub butane: Option<crate::sundaev4::butane::ButaneRuntime>,
         pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
         pub language_views: Vec<u8>,
         pub collateral_utxo: TransactionInput,
@@ -282,6 +284,7 @@ pub(crate) mod test_harness {
             TestEnv {
                 exec,
                 scripts,
+                butane: None,
                 ref_utxo_outputs,
                 language_views,
                 collateral_utxo,
@@ -314,6 +317,54 @@ pub(crate) mod test_harness {
 
         /// Build + eval from a full ScoopPlan (with routes + global_seq).
         /// Use this when testing routed orders via the accumulator.
+        /// Load the Butane runtime from the committed preview config and
+        /// admit its scripts to the eval store. Returns false (test should
+        /// skip) when the artifact isn't available.
+        pub fn enable_butane(&mut self) -> bool {
+            let Ok(raw) = std::fs::read_to_string("config/preview-v4.json") else {
+                return false;
+            };
+            let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            fn find_butane(v: &serde_json::Value) -> Option<&serde_json::Value> {
+                match v {
+                    serde_json::Value::Object(m) => {
+                        m.get("butane").or_else(|| m.values().find_map(find_butane))
+                    }
+                    _ => None,
+                }
+            }
+            let Some(section) = find_butane(&cfg) else { return false };
+            let Ok(mut parsed) =
+                serde_json::from_value::<crate::sundaev4::butane::ButaneConfig>(section.clone())
+            else {
+                return false;
+            };
+            parsed.deployment_file = "config/butane-v2.deployment.preview.json".into();
+            let Ok(rt) = crate::sundaev4::butane::ButaneRuntime::load(&parsed) else {
+                return false;
+            };
+            for ds in rt.scripts.values() {
+                self.scripts
+                    .insert_with_version(&ds.script_bytes, ds.plutus_version)
+                    .expect("butane script inserts");
+            }
+            // Preview's live V2 cost model, from the same config.
+            fn find_v2(v: &serde_json::Value) -> Option<&serde_json::Value> {
+                match v {
+                    serde_json::Value::Object(m) => m
+                        .get("plutus-v2-cost-model")
+                        .or_else(|| m.values().find_map(find_v2)),
+                    _ => None,
+                }
+            }
+            let v2: Vec<i64> = find_v2(&cfg)
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .expect("v2 cost model in preview config");
+            self.exec.plutus_v2_cost_model = Some(v2);
+            self.butane = Some(rt);
+            true
+        }
+
         pub fn build_and_eval_plan(
             &self,
             plan: &ScoopPlan,
@@ -335,7 +386,8 @@ pub(crate) mod test_harness {
                 &self.order_configs,
                 &std::collections::BTreeMap::new(), // strategy_executions
                 Some((self.funding_utxo.clone(), &self.funding_value)),
-             None)?;
+                self.butane.as_ref(),
+            )?;
 
             let eval = evaluate_scoop_tx(
                 &build.tx_body,
@@ -344,7 +396,7 @@ pub(crate) mod test_harness {
                 &build.resolved_ref_inputs,
                 &self.scripts,
                 PLUTUS_V3_COST_MODEL,
-                None,
+                self.exec.plutus_v2_cost_model.as_deref(),
                 build.tx_hash,
                 &self.exec.slot_config,
                 None,
@@ -717,8 +769,14 @@ pub(crate) mod test_harness {
         use plutus_parser::AsPlutus;
 
         let mut value = Value::default();
-        value.insert(&ada(), BigInt::from(5_000_000i64));
-        value.insert(&offer_tok, BigInt::from(offer_amount));
+        // ADA offers ride in the same asset as the budget/min-utxo buffer:
+        // sum them rather than letting the second insert clobber the first.
+        if offer_tok == ada() {
+            value.insert(&ada(), BigInt::from(5_000_000i64 + offer_amount));
+        } else {
+            value.insert(&ada(), BigInt::from(5_000_000i64));
+            value.insert(&offer_tok, BigInt::from(offer_amount));
+        }
         let mut tx_hash = [0u8; 32];
         tx_hash[0] = 0xD1; // distinct namespace from make_order's 0xD0
         tx_hash[1..9].copy_from_slice(&slot.to_be_bytes());

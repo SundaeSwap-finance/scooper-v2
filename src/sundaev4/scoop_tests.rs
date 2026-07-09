@@ -456,6 +456,66 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 3);
     }
 
+    /// THE Butane integration proof: a basic order swapping ADA blends
+    /// across a direct ADA/TOKEN pool and an ADAb/TOKEN pool reached
+    /// through the real ADA→ADAb mint edge. The built tx contains the
+    /// composed deposit (pot output, synthetic+treas mint, the four
+    /// zero-withdrawals, params/registry refs) and every script — Sundae's
+    /// V3 set plus Butane's mixed V2/V3 set — must evaluate. Skips when
+    /// the deployment artifact isn't available.
+    #[test]
+    fn basic_swap_blends_through_butane_mint() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        if !env.enable_butane() {
+            eprintln!("skipping: butane artifact/config unavailable");
+            return;
+        }
+        let rt = env.butane.as_ref().unwrap();
+        let edges = rt.edges();
+        let adab = rt.synthetic_asset("ADAb");
+
+        // Shallow direct pool, deep ADAb pool: the blend sends real flow
+        // through the mint.
+        let direct = make_pool(&env, 0xB1, ada(), 500_000_000, token_b(), 500_000_000);
+        let via = make_pool(&env, 0xB2, adab.clone(), 4_000_000_000, token_b(), 4_000_000_000);
+        let mut pool_map = BTreeMap::new();
+        for p in [&direct, &via] {
+            pool_map.insert(p.pool_datum.identifier.clone(), (*p).clone());
+        }
+
+        let order = make_basic_swap_order(ada(), 100_000_000, token_b(), 1, 1);
+        let blend = router::find_blended_route(
+            &pool_map,
+            &edges,
+            &ada(),
+            &token_b(),
+            &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("blend exists");
+        assert_eq!(blend.branches.len(), 2, "direct + via-ADAb branches");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("blended order with butane leg accumulates");
+        let plan = accum.into_plan();
+        assert_eq!(plan.conversions.len(), 1, "one ADAb mint leg");
+        assert!(plan.conversions[0].key.contains("ADAb"));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("blended butane scoop must build and evaluate");
+        assert!(!eval.budgets.is_empty());
+        // 2 pools + fulfillment + pot + change → at least 4 outputs.
+        assert!(build.tx_body.outputs.len() >= 4);
+    }
+
     /// Single-pool basic swap: the degenerate case must also evaluate.
     #[test]
     fn basic_swap_direct() {

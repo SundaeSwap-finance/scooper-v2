@@ -309,8 +309,30 @@ impl Accumulator {
         let saved_conversions = self.conversions.len();
         let mut total_out = crate::bigint::BigInt::from(0);
         let mut result = Ok(());
+        // The primary (order-owning) op must sit on a pool: pick the first
+        // branch whose entry split is a pool, not a conversion. Until the
+        // uniform-ops refactor, a blend where EVERY branch opens with a
+        // conversion can't carry an order.
+        let primary_idx = blend
+            .branches
+            .iter()
+            .position(|b| {
+                b.hops
+                    .first()
+                    .and_then(|h| h.splits.first())
+                    .map(|sp| {
+                        !matches!(
+                            sp.pool.view_type,
+                            crate::sundaev4::router::PoolViewType::Conversion { .. }
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                "no branch opens with a pool split to carry the order".to_string()
+            })?;
         for (b, branch) in blend.branches.iter().enumerate() {
-            match self.add_route_branch(order, branch, pools, b == 0) {
+            match self.add_route_branch(order, branch, pools, b == primary_idx) {
                 Ok(out) => total_out = &total_out + &out,
                 Err(e) => {
                     result = Err(format!("blended branch {b}: {e}"));
@@ -432,6 +454,8 @@ impl Accumulator {
                         dx,
                         out,
                         order_input: order.input.clone(),
+                        route_idx,
+                        hop_idx,
                     });
                     continue;
                 }

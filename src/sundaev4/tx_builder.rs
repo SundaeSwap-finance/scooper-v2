@@ -385,6 +385,18 @@ pub fn build_multi_pool_scoop_tx(
         }
     }).collect();
 
+    // Conversion legs are invisible to the pool-op walk below; credit their
+    // outputs to the route flow upfront (next hop's incoming, or the final
+    // output when the conversion ends the route).
+    for c in &plan.conversions {
+        let rs = &mut route_states[c.route_idx];
+        if c.hop_idx + 1 < rs.hop_input.len() {
+            rs.hop_input[c.hop_idx + 1] = &rs.hop_input[c.hop_idx + 1] + &c.out;
+        } else {
+            rs.final_output = &rs.final_output + &c.out;
+        }
+    }
+
     // Diagnostic: dump initial pool state so the next ValueNotConservedUTxO can be
     // reconstructed offline. Keyed by short pool ident prefix.
     for (i, b) in batches.iter().enumerate() {
@@ -1887,7 +1899,9 @@ pub fn build_multi_pool_scoop_tx(
                 av.cmp(&bv)
             });
             let policy = exec.module_scripts.pool_mint.hash;
-            let mint_redeemer_data = {
+            let mint_redeemer_data = if asset_pairs.is_empty() {
+                None
+            } else {
                 // One Mint redeemer per minting policy. With only pool_mint
                 // here, every entry shares it — but the contract reads
                 // `pool_ident` from the redeemer, so all entries must target
@@ -1907,13 +1921,13 @@ pub fn build_multi_pool_scoop_tx(
                     );
                 }
                 let r = PoolMintRedeemer::MintLP { pool_ident: pool_idents.into_iter().next().unwrap() };
-                r.to_plutus()
+                Some(r.to_plutus())
             };
             // Assemble the multi-policy mint map in sorted-policy order and
             // assign each policy's mint redeemer its map index.
             let mut policies: Vec<(pallas_primitives::Hash<28>, Vec<(PallasBytes, NonZeroInt)>, Option<pallas_primitives::PlutusData>)> = Vec::new();
             if !asset_pairs.is_empty() {
-                policies.push((policy, asset_pairs, Some(mint_redeemer_data)));
+                policies.push((policy, asset_pairs, mint_redeemer_data));
             }
             if let (Some(bp), false) = (butane_policy, butane_pairs.is_empty()) {
                 let butane_redeemer = butane_pieces
@@ -2146,6 +2160,18 @@ pub fn build_multi_pool_scoop_tx(
     if !butane_pieces.is_empty() {
         if let Some(rt) = butane {
             for (input, output) in rt.resolved_ref_outputs() {
+                if let conway::TransactionOutput::Legacy(body) = &output {
+                    resolved_ref_inputs.insert(input, ResolvedTxOut {
+                        address: body.address.to_vec(),
+                        value: legacy_value_to_internal(&body.amount),
+                        datum: match &body.datum_hash {
+                            Some(h) => DatumOption::DatumHash(*h),
+                            None => DatumOption::None,
+                        },
+                        script_ref: None,
+                    });
+                    continue;
+                }
                 let conway::TransactionOutput::PostAlonzo(body) = &output else {
                     continue;
                 };
@@ -2886,6 +2912,33 @@ fn conway_value_to_internal(v: &ConwayValue) -> crate::cardano_types::Value {
                         token: name.to_vec(),
                     };
                     out.insert(&asset, BigInt::from(u64::from(*qty)));
+                }
+            }
+        }
+    }
+    out
+}
+
+
+/// Legacy (pre-Babbage array-form) output values use signed coin maps.
+fn legacy_value_to_internal(
+    v: &pallas_primitives::alonzo::Value,
+) -> crate::cardano_types::Value {
+    let mut out = crate::cardano_types::Value::default();
+    let ada = AssetClass { policy: vec![], token: vec![] };
+    match v {
+        pallas_primitives::alonzo::Value::Coin(c) => {
+            out.insert(&ada, BigInt::from(*c));
+        }
+        pallas_primitives::alonzo::Value::Multiasset(c, ma) => {
+            out.insert(&ada, BigInt::from(*c));
+            for (policy, tokens) in ma.iter() {
+                for (name, qty) in tokens.iter() {
+                    let asset = AssetClass {
+                        policy: policy.as_ref().to_vec(),
+                        token: name.to_vec(),
+                    };
+                    out.insert(&asset, BigInt::from(*qty));
                 }
             }
         }

@@ -170,6 +170,11 @@ pub struct PlannedConversion {
     pub out: BigInt,
     /// Which order this leg belongs to (fee/attribution + tracing).
     pub order_input: crate::cardano_types::TransactionInput,
+    /// Route/hop attribution: the tx builder's streaming walk credits the
+    /// leg's output to the NEXT hop's incoming flow (or the route's final
+    /// output when the leg is last).
+    pub route_idx: usize,
+    pub hop_idx: usize,
 }
 
 /// A complete batch for one pool, ready for the tx builder.
