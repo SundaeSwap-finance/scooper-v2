@@ -168,8 +168,15 @@ pub struct PlannedConversion {
     pub to: AssetClass,
     pub dx: BigInt,
     pub out: BigInt,
+    /// The order this leg belongs to.
+    pub order: Arc<SundaeV4Order>,
     /// Which order this leg belongs to (fee/attribution + tracing).
     pub order_input: crate::cardano_types::TransactionInput,
+    /// True when this leg is the order's PRIMARY op — the order's spend,
+    /// redeemers, fee share, and fulfillment hang off it. Set for routes
+    /// with no pool split at all (pure-conversion orders); routes touching
+    /// a pool put the primary on their first pool split instead.
+    pub primary: bool,
     /// Route/hop attribution: the tx builder's streaming walk credits the
     /// leg's output to the NEXT hop's incoming flow (or the route's final
     /// output when the leg is last).

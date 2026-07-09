@@ -516,6 +516,59 @@ mod tests {
         assert!(build.tx_body.outputs.len() >= 4);
     }
 
+    /// Uniform ops: a PURE conversion order — a basic order offering ADA
+    /// with an ADAb floor, no pools anywhere in the route. The conversion
+    /// leg is the order's primary op: the tx spends the order, composes the
+    /// Butane deposit, and pays the fulfillment, with zero pool batches and
+    /// no pool modules. Users minting ADAb through Sundae order flow.
+    #[test]
+    fn basic_order_pure_adab_mint() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        if !env.enable_butane() {
+            eprintln!("skipping: butane artifact/config unavailable");
+            return;
+        }
+        let rt = env.butane.as_ref().unwrap();
+        let edges = rt.edges();
+        let adab = rt.synthetic_asset("ADAb");
+
+        let pool_map: BTreeMap<_, _> = BTreeMap::new();
+        let order = make_basic_swap_order(ada(), 50_000_000, adab.clone(), 50_000_000, 1);
+
+        let blend = router::find_blended_route(
+            &pool_map,
+            &edges,
+            &ada(),
+            &adab,
+            &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("pure conversion route exists");
+        assert_eq!(blend.branches.len(), 1);
+        assert_eq!(blend.branches[0].hops.len(), 1, "single conversion hop");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("pure-conversion order accumulates");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 0, "no pool batches");
+        assert_eq!(plan.conversions.len(), 1);
+        assert!(plan.conversions[0].primary, "the conversion owns the order");
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("pure mint order must build and evaluate");
+        assert!(!eval.budgets.is_empty());
+        // fulfillment (ADAb to the user) + pot + change.
+        assert!(build.tx_body.outputs.len() >= 3);
+    }
+
     /// Single-pool basic swap: the degenerate case must also evaluate.
     #[test]
     fn basic_swap_direct() {

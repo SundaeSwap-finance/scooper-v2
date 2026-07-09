@@ -328,9 +328,10 @@ impl Accumulator {
                     })
                     .unwrap_or(false)
             })
-            .ok_or_else(|| {
-                "no branch opens with a pool split to carry the order".to_string()
-            })?;
+            // No branch opens with a pool: pure-conversion order — branch 0
+            // carries the primary, which lands on its first conversion leg
+            // (see add_route_branch).
+            .unwrap_or(0);
         for (b, branch) in blend.branches.iter().enumerate() {
             match self.add_route_branch(order, branch, pools, b == primary_idx) {
                 Ok(out) => total_out = &total_out + &out,
@@ -447,9 +448,11 @@ impl Accumulator {
                         to: hop.output_token.clone(),
                         dx,
                         out,
+                        order: order.clone(),
                         order_input: order.input.clone(),
                         route_idx,
                         hop_idx,
+                        primary: false,
                     });
                     continue;
                 }
@@ -589,11 +592,21 @@ impl Accumulator {
         }
 
         if primary && !primary_placed {
-            return Err(
-                "route has no pool split to carry the order (pure-conversion \
-                 orders aren't supported yet)"
-                    .into(),
-            );
+            // Pure-conversion route: the order's first conversion leg is its
+            // primary op — the tx builder spends the order, emits its
+            // redeemers, and builds its fulfillment off that leg.
+            let mine = self
+                .conversions
+                .iter_mut()
+                .find(|c| c.route_idx == route_idx);
+            match mine {
+                Some(c) => c.primary = true,
+                None => {
+                    return Err(
+                        "route has neither pool splits nor conversion legs".into(),
+                    );
+                }
+            }
         }
         let route_info = RouteInfo {
             order: order.clone(),

@@ -211,9 +211,17 @@ pub fn build_multi_pool_scoop_tx(
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
     let n_withdraw_orders: usize = batches.iter().map(|b| b.withdraws.len()).sum();
     let n_claim_orders: usize = batches.iter().map(|b| b.claims.len()).sum();
-    let n_orders: usize = n_swap_orders + n_deposit_orders + n_withdraw_orders + n_claim_orders;
-    if m_pools == 0 || n_orders == 0 {
-        bail!("no batches or no swaps");
+    let n_conversion_orders: usize =
+        plan.conversions.iter().filter(|c| c.primary).count();
+    let n_orders: usize = n_swap_orders
+        + n_deposit_orders
+        + n_withdraw_orders
+        + n_claim_orders
+        + n_conversion_orders;
+    // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
+    // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
+    if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
+        bail!("no orders (or no batches and no conversions)");
     }
 
     // Synthesize a global_seq if the caller passed an empty one (legacy paths
@@ -701,6 +709,9 @@ pub fn build_multi_pool_scoop_tx(
         Deposit(usize),  // index into batch.deposits
         Withdraw(usize), // index into batch.withdraws
         Claim(usize),    // index into batch.claims
+        /// Index into plan.conversions — a conversion leg that IS the
+        /// order's primary op (pure-conversion orders; batch_idx unused).
+        Conversion(usize),
     }
     #[derive(Clone)]
     struct FlatOrder {
@@ -731,6 +742,17 @@ pub fn build_multi_pool_scoop_tx(
         });
         swaps.chain(deps).chain(wds).chain(cls)
     }).collect();
+    let mut flat_orders = flat_orders;
+    for (ci, c) in plan.conversions.iter().enumerate() {
+        if c.primary {
+            flat_orders.push(FlatOrder {
+                batch_idx: 0,
+                kind: FlatOrderKind::Conversion(ci),
+                order_ref: c.order_input.0.clone(),
+            });
+        }
+    }
+    let flat_orders = flat_orders;
     let all_order_orefs: Vec<TransactionInput> =
         flat_orders.iter().map(|f| f.order_ref.clone()).collect();
 
@@ -963,22 +985,26 @@ pub fn build_multi_pool_scoop_tx(
     // ref-input ordering is known.
     let order_config_token = |flat_idx: usize| -> Vec<u8> {
         let flat = &flat_orders[flat_idx];
-        let batch = &batches[flat.batch_idx];
         match &flat.kind {
-            FlatOrderKind::Swap(i) => batch.swaps[*i].order.datum.config_token.clone(),
-            FlatOrderKind::Deposit(i) => batch.deposits[*i].order.datum.config_token.clone(),
-            FlatOrderKind::Withdraw(i) => batch.withdraws[*i].order.datum.config_token.clone(),
-            FlatOrderKind::Claim(i) => batch.claims[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Swap(i) => batches[flat.batch_idx].swaps[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Deposit(i) => batches[flat.batch_idx].deposits[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Withdraw(i) => batches[flat.batch_idx].withdraws[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Claim(i) => batches[flat.batch_idx].claims[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Conversion(i) => {
+                plan.conversions[*i].order.datum.config_token.clone()
+            }
         }
     };
     let flat_order_ref_and_datum = |flat_idx: usize| -> (&TransactionInput, &crate::sundaev4::OrderDatum) {
         let flat = &flat_orders[flat_idx];
-        let batch = &batches[flat.batch_idx];
         match &flat.kind {
-            FlatOrderKind::Swap(i) => (&flat.order_ref, &batch.swaps[*i].order.datum),
-            FlatOrderKind::Deposit(i) => (&flat.order_ref, &batch.deposits[*i].order.datum),
-            FlatOrderKind::Withdraw(i) => (&flat.order_ref, &batch.withdraws[*i].order.datum),
-            FlatOrderKind::Claim(i) => (&flat.order_ref, &batch.claims[*i].order.datum),
+            FlatOrderKind::Swap(i) => (&flat.order_ref, &batches[flat.batch_idx].swaps[*i].order.datum),
+            FlatOrderKind::Deposit(i) => (&flat.order_ref, &batches[flat.batch_idx].deposits[*i].order.datum),
+            FlatOrderKind::Withdraw(i) => (&flat.order_ref, &batches[flat.batch_idx].withdraws[*i].order.datum),
+            FlatOrderKind::Claim(i) => (&flat.order_ref, &batches[flat.batch_idx].claims[*i].order.datum),
+            FlatOrderKind::Conversion(i) => {
+                (&flat.order_ref, &plan.conversions[*i].order.datum)
+            }
         }
     };
     let mut unique_config_tokens: Vec<Vec<u8>> = Vec::new();
@@ -1215,20 +1241,24 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // Always present: order, fee_split, fairness
-    let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![
-        (
-            reward_account(&exec.module_scripts.order.hash),
-            order_validator_redeemer.to_plutus(),
-        ),
-        (
+    let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![(
+        reward_account(&exec.module_scripts.order.hash),
+        order_validator_redeemer.to_plutus(),
+    )];
+    // fee_split and fairness are POOL action modules — the pool datum's
+    // action entry demands them. A pool-less scoop (pure-conversion orders)
+    // spends no pool, so nothing requires them and their empty-entry
+    // redeemers would just burn budget (or fail).
+    if m_pools > 0 {
+        withdrawals.push((
             reward_account(&exec.module_scripts.fee_split.hash),
             fs_redeemer.to_plutus(),
-        ),
-        (
+        ));
+        withdrawals.push((
             reward_account(&exec.module_scripts.fairness.hash),
             fairness_redeemer.to_plutus(),
-        ),
-    ];
+        ));
+    }
 
     // Conditionally add CP withdrawal
     if has_cp {
@@ -1575,12 +1605,12 @@ pub fn build_multi_pool_scoop_tx(
 
     for (out_pos, &fi) in fulfillment_order.iter().enumerate() {
         let fo_meta = &flat_orders[fi];
-        let batch = &batches[fo_meta.batch_idx];
         let order = match &fo_meta.kind {
-            FlatOrderKind::Swap(i) => &batch.swaps[*i].order,
-            FlatOrderKind::Deposit(i) => &batch.deposits[*i].order,
-            FlatOrderKind::Withdraw(i) => &batch.withdraws[*i].order,
-            FlatOrderKind::Claim(i) => &batch.claims[*i].order,
+            FlatOrderKind::Swap(i) => &batches[fo_meta.batch_idx].swaps[*i].order,
+            FlatOrderKind::Deposit(i) => &batches[fo_meta.batch_idx].deposits[*i].order,
+            FlatOrderKind::Withdraw(i) => &batches[fo_meta.batch_idx].withdraws[*i].order,
+            FlatOrderKind::Claim(i) => &batches[fo_meta.batch_idx].claims[*i].order,
+            FlatOrderKind::Conversion(i) => &plan.conversions[*i].order,
         };
         // Self destinations return the fulfillment to the order address with
         // the *identical* datum (check_destination's Self arm) — a standing
@@ -1618,7 +1648,7 @@ pub fn build_multi_pool_scoop_tx(
 
         let fulfillment_value = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => {
-                let swap = &batch.swaps[*i];
+                let swap = &batches[fo_meta.batch_idx].swaps[*i];
                 // Routed orders: fulfillment dy + output asset come from the
                 // streaming walk's accumulated final-hop output (sum across
                 // any splits of the last hop). Direct swaps use the dy we
@@ -1642,7 +1672,7 @@ pub fn build_multi_pool_scoop_tx(
                     }
                     None => {
                         output_asset =
-                            batch.pool.pool_datum.assets[swap.output_idx].0.clone();
+                            batches[fo_meta.batch_idx].pool.pool_datum.assets[swap.output_idx].0.clone();
                         dy_owned = per_pool[fo_meta.batch_idx]
                             .effective_swap_dys[*i].clone();
                         (&output_asset, &dy_owned)
@@ -1659,11 +1689,11 @@ pub fn build_multi_pool_scoop_tx(
                 )?
             }
             FlatOrderKind::Deposit(i) => {
-                let dep = &batch.deposits[*i];
-                let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+                let dep = &batches[fo_meta.batch_idx].deposits[*i];
+                let lp_asset = pool_lp_asset(exec, &batches[fo_meta.batch_idx].pool)?;
                 build_deposit_fulfillment_value(
                     &dep.order.value,
-                    &batch.pool.pool_datum.assets,
+                    &batches[fo_meta.batch_idx].pool.pool_datum.assets,
                     &dep.dx,
                     &lp_asset,
                     &dep.lp_minted,
@@ -1671,14 +1701,41 @@ pub fn build_multi_pool_scoop_tx(
                 )?
             }
             FlatOrderKind::Withdraw(i) => {
-                let wd = &batch.withdraws[*i];
-                let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+                let wd = &batches[fo_meta.batch_idx].withdraws[*i];
+                let lp_asset = pool_lp_asset(exec, &batches[fo_meta.batch_idx].pool)?;
                 build_withdraw_fulfillment_value(
                     &wd.order.value,
-                    &batch.pool.pool_datum.assets,
+                    &batches[fo_meta.batch_idx].pool.pool_datum.assets,
                     &wd.dy,
                     &lp_asset,
                     &wd.lp_burned,
+                    actual_fee,
+                )?
+            }
+            FlatOrderKind::Conversion(i) => {
+                let c = &plan.conversions[*i];
+                // The order's total output across its routes (a pure-
+                // conversion order has one route whose final output was
+                // seeded from the conversion legs).
+                let total_out = routes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.order.input == c.order.input)
+                    .fold(BigInt::from(0), |acc, (ri, _)| {
+                        &acc + &route_states[ri].final_output
+                    });
+                // Total spent of the from-asset across the order's legs.
+                let total_dx = plan
+                    .conversions
+                    .iter()
+                    .filter(|l| l.order.input == c.order.input && l.from == c.from)
+                    .fold(BigInt::from(0), |acc, l| &acc + &l.dx);
+                build_fulfillment_value_from_order(
+                    &c.order.value,
+                    &c.from,
+                    &total_dx,
+                    &c.to,
+                    &total_out,
                     actual_fee,
                 )?
             }
@@ -1687,8 +1744,8 @@ pub fn build_multi_pool_scoop_tx(
                 // (what the pool gains, the order loses, and vice versa),
                 // minus the fee share. Covers pair-wise and multi-receive
                 // claims uniformly.
-                let c = &batch.claims[*i];
-                let moves: Vec<(&AssetClass, BigInt)> = batch
+                let c = &batches[fo_meta.batch_idx].claims[*i];
+                let moves: Vec<(&AssetClass, BigInt)> = batches[fo_meta.batch_idx]
                     .pool
                     .pool_datum
                     .assets
@@ -2062,6 +2119,25 @@ pub fn build_multi_pool_scoop_tx(
     // ── Step 13: Build resolved inputs for evaluator ───────────────────────
 
     let mut resolved_inputs = BTreeMap::new();
+    {
+        // Conversion-primary orders live outside any pool batch.
+        let order_addr_bytes = {
+            let order_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                ShelleyDelegationPart::Null,
+            );
+            order_addr.to_vec()
+        };
+        for c in plan.conversions.iter().filter(|c| c.primary) {
+            resolved_inputs.insert(c.order.input.clone(), ResolvedTxOut {
+                address: order_addr_bytes.clone(),
+                value: c.order.value.clone(),
+                datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
+                script_ref: None,
+            });
+        }
+    }
     for batch in batches {
         resolved_inputs.insert(batch.pool.input.clone(), ResolvedTxOut {
             address: pool_address.to_vec(),
