@@ -494,7 +494,18 @@ pub fn compute_swap_result(
             )
         }
         PoolType::ConstantSum { prices, fee, .. } => {
-            swap_math::cs_swap_result(dx, prices, input_idx, output_idx, &fee.num, &fee.den)
+            let dy =
+                swap_math::cs_swap_result(dx, prices, input_idx, output_idx, &fee.num, &fee.den);
+            // A fill can never draw more of the output asset than the pool holds;
+            // otherwise the on-chain constant_sum check fails `amt_after >= 0`
+            // (reserve goes negative) and wedges the whole batch. Treat an
+            // over-draining fill as unfillable (dy = 0) so the order is skipped
+            // rather than baked into an invalid tx. (`amt_after == 0` is allowed,
+            // so only a strict overshoot is rejected.)
+            if dy > assets[output_idx].1 {
+                return BigInt::from(0);
+            }
+            dy
         }
         PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
             // CL pools have exactly 2 assets in positional order [A, B].

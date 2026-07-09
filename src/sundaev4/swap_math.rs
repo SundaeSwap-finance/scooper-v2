@@ -87,6 +87,54 @@ pub fn cs_swap_result(
     &numerator / price_out
 }
 
+/// Largest constant-sum input `dx` whose output `dy` does not exceed the pool's
+/// output reserve, so a fill can never drain the pool negative. Mirrors
+/// [`cl_max_dx_for_reserve`]. Returns `None` if the fee makes the swap
+/// ill-defined (`fee_den <= fee_num`) or the input price is non-positive.
+///
+/// `dy = (dx·p_in − floor(dx·p_in·fee_num/fee_den)) / p_out ≤ reserve_out`
+///   ⟺  `numerator(dx) ≤ reserve_out·p_out`.
+/// The fee floor makes the closed form a hair loose, so we clamp down until the
+/// numerator actually fits (a couple of iterations at most).
+pub fn cs_max_dx_for_reserve(
+    reserve_out: &BigInt,
+    prices: &[BigInt],
+    input_idx: usize,
+    output_idx: usize,
+    fee_num: &BigInt,
+    fee_den: &BigInt,
+) -> Option<BigInt> {
+    if !reserve_out.is_positive() {
+        return Some(BigInt::from(0));
+    }
+    let p_in = &prices[input_idx];
+    let p_out = &prices[output_idx];
+    let fee_mult = fee_den - fee_num;
+    if !fee_mult.is_positive() || !p_in.is_positive() {
+        return None;
+    }
+    let target = reserve_out * p_out; // numerator(dx) must stay <= this
+    let numerator = |dx: &BigInt| -> BigInt {
+        let iv = dx * p_in;
+        let v_inc = &iv * fee_num / fee_den;
+        &iv - &v_inc
+    };
+    let mut dx_max = &(&target * fee_den) / &(p_in * &fee_mult);
+    let one = BigInt::from(1);
+    let mut guard = 0;
+    while dx_max.is_positive() && numerator(&dx_max) > target {
+        dx_max = &dx_max - &one;
+        guard += 1;
+        if guard > 8 {
+            break;
+        }
+    }
+    if !dx_max.is_positive() {
+        return Some(BigInt::from(0));
+    }
+    Some(dx_max)
+}
+
 /// Concentrated-liquidity swap. The virtual-reserve formulas in the validator
 /// aren't symmetric in (A,B): VA always uses spb, VB always uses spa, and the
 /// denominators differ between A→B and B→A. Caller passes (a, b, lp) in pool-
@@ -364,6 +412,45 @@ mod tests {
             &BigInt::from(1000),
         );
         assert_eq!(dy, BigInt::from(9970));
+    }
+
+    #[test]
+    fn test_cs_max_dx_for_reserve() {
+        // Reproduces the preview wedge: pool USDr reserve = 622_977_567,
+        // prices [1,1], fee 12/1000. A garbage order offered ~1.5e15 USDCx,
+        // which cs_swap_result turned into a ~1.485e15 USDr `dy` — far beyond
+        // the reserve — draining the pool negative (on-chain amt_after < 0).
+        let prices = [BigInt::from(1), BigInt::from(1)];
+        let reserve_out = BigInt::from(622_977_567u64);
+        let (fee_num, fee_den) = (BigInt::from(12), BigInt::from(1000));
+
+        // The huge order overshoots the reserve → must be capped/rejected.
+        let huge = BigInt::from(1_503_764_146_505_130u64);
+        let dy_huge = cs_swap_result(&huge, &prices, 0, 1, &fee_num, &fee_den);
+        assert!(dy_huge > reserve_out, "precondition: huge fill overshoots reserve");
+
+        let cap = cs_max_dx_for_reserve(&reserve_out, &prices, 0, 1, &fee_num, &fee_den)
+            .expect("cap defined for a sane fee");
+        assert_eq!(cap, BigInt::from(630_544_096u64));
+
+        // At the cap, dy is exactly the reserve (amt_after == 0, allowed).
+        assert_eq!(
+            cs_swap_result(&cap, &prices, 0, 1, &fee_num, &fee_den),
+            reserve_out
+        );
+        // One unit past the cap overshoots.
+        let over = &cap + &BigInt::from(1);
+        assert!(cs_swap_result(&over, &prices, 0, 1, &fee_num, &fee_den) > reserve_out);
+
+        // Degenerate cases.
+        assert_eq!(
+            cs_max_dx_for_reserve(&BigInt::from(0), &prices, 0, 1, &fee_num, &fee_den),
+            Some(BigInt::from(0))
+        );
+        assert_eq!(
+            cs_max_dx_for_reserve(&reserve_out, &prices, 0, 1, &BigInt::from(1000), &BigInt::from(1000)),
+            None // fee_den == fee_num
+        );
     }
 
     #[test]
