@@ -259,6 +259,7 @@ pub(crate) mod test_harness {
                 strategy_peers: Vec::new(),
                 conversions: Vec::new(),
                 butane: None,
+                plutus_v2_cost_model: None,
             };
 
             // Collateral: deterministic UTxO with enough ADA
@@ -343,6 +344,7 @@ pub(crate) mod test_harness {
                 &build.resolved_ref_inputs,
                 &self.scripts,
                 PLUTUS_V3_COST_MODEL,
+                None,
                 build.tx_hash,
                 &self.exec.slot_config,
                 None,

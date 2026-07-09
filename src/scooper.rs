@@ -1070,6 +1070,7 @@ impl Scooper {
                 &build.resolved_ref_inputs,
                 self.v4_script_store.as_ref().unwrap(),
                 &exec.plutus_v3_cost_model,
+                exec.plutus_v2_cost_model.as_deref(),
                 build.tx_hash,
                 &exec.slot_config,
                 Some(&mut failure),
@@ -1209,6 +1210,7 @@ impl Scooper {
                         match crate::sundaev4::evaluator::evaluate_scoop_tx(
                             &build.tx_body, &build.redeemers, &build.resolved_inputs,
                             &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
+                exec.plutus_v2_cost_model.as_deref(),
                             build.tx_hash, &exec.slot_config,
                             Some(&mut failure),
                         ) {
@@ -1387,6 +1389,7 @@ impl Scooper {
                 &first_pass.resolved_ref_inputs,
                 self.v4_script_store.as_ref().unwrap(),
                 &exec.plutus_v3_cost_model,
+                exec.plutus_v2_cost_model.as_deref(),
                 first_pass.tx_hash,
                 &exec.slot_config,
                 Some(&mut failure),

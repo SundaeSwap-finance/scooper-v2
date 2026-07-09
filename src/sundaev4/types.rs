@@ -782,6 +782,11 @@ pub struct ScooperExecution {
     pub protocol_share: (u64, u64),
     pub module_scripts: ModuleScripts,
     pub plutus_v3_cost_model: Vec<i64>,
+    /// PlutusV2 cost model — required only for partner-protocol legs whose
+    /// validators are V2 (Butane's mint/spend/upgradable). Absent = V2
+    /// scripts can't be evaluated and butane edges stay disabled.
+    #[serde(default)]
+    pub plutus_v2_cost_model: Option<Vec<i64>>,
     pub slot_config: SlotConfig,
     /// Per-pool configs for pools requiring operator-provided parameters.
     /// Keyed by pool ident (hex string).

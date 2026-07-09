@@ -18,7 +18,8 @@ use crate::sundaev4::script_context::{
 
 /// Decoded FLAT script bytes keyed by script hash.
 pub struct ScriptStore {
-    scripts: BTreeMap<Hash<28>, Vec<u8>>,
+    /// hash → (FLAT bytes, plutus language version 1/2/3).
+    scripts: BTreeMap<Hash<28>, (Vec<u8>, u8)>,
 }
 
 impl ScriptStore {
@@ -46,10 +47,28 @@ impl ScriptStore {
                 // CBOR unwrap: handles both definite and indefinite-length bytestrings
                 let flat_bytes = cbor_unwrap_bytes(script_cbor)
                     .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
-                store.insert(hash, flat_bytes);
+                store.insert(hash, (flat_bytes, 3));
             }
         }
         Ok(ScriptStore { scripts: store })
+    }
+
+    /// Insert a script with an explicit language version (Butane's deployed
+    /// validators are a V2/V3 mix; their bytes come from the verified
+    /// deployment artifact, not chain-indexed ref UTxOs).
+    pub fn insert_with_version(
+        &mut self,
+        script_cbor: &[u8],
+        version: u8,
+    ) -> Result<Hash<28>> {
+        let mut preimage = Vec::with_capacity(1 + script_cbor.len());
+        preimage.push(version);
+        preimage.extend_from_slice(script_cbor);
+        let hash: Hash<28> = Hasher::<224>::hash(&preimage);
+        let flat_bytes = cbor_unwrap_bytes(script_cbor)
+            .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
+        self.scripts.insert(hash, (flat_bytes, version));
+        Ok(hash)
     }
 
     /// Build a ScriptStore from a Blueprint's compiled code.
@@ -73,14 +92,18 @@ impl ScriptStore {
                 // CBOR unwrap to get FLAT bytes
                 let flat_bytes = cbor_unwrap_bytes(&script_cbor)
                     .with_context(|| format!("CBOR unwrap failed for '{}' ({})", validator.title, hex::encode(hash)))?;
-                store.insert(hash, flat_bytes);
+                store.insert(hash, (flat_bytes, 3));
             }
         }
         Ok(ScriptStore { scripts: store })
     }
 
     pub fn get(&self, hash: &Hash<28>) -> Option<&[u8]> {
-        self.scripts.get(hash).map(|v| v.as_slice())
+        self.scripts.get(hash).map(|(v, _)| v.as_slice())
+    }
+
+    pub fn get_with_version(&self, hash: &Hash<28>) -> Option<(&[u8], u8)> {
+        self.scripts.get(hash).map(|(v, ver)| (v.as_slice(), *ver))
     }
 }
 
@@ -130,6 +153,9 @@ pub fn evaluate_scoop_tx(
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     scripts: &ScriptStore,
     cost_model: &[i64],
+    // PlutusV2 cost model — required only when the store contains V2
+    // scripts referenced by this tx's redeemers (Butane legs).
+    cost_model_v2: Option<&[i64]>,
     tx_hash: Hash<32>,
     slot_config: &crate::sundaev4::types::SlotConfig,
     failure_capture: Option<&mut Option<FailedScriptContext>>,
@@ -152,22 +178,10 @@ pub fn evaluate_scoop_tx(
         let (script_hash, purpose) =
             resolve_script_and_purpose(key, tx_body, resolved_inputs)?;
 
-        // Look up FLAT script bytes
-        let flat_bytes = scripts
-            .get(&script_hash)
+        // Look up FLAT script bytes + language
+        let (flat_bytes, version) = scripts
+            .get_with_version(&script_hash)
             .with_context(|| format!("script {} not found in store", hex::encode(script_hash)))?;
-
-        // Build ScriptContext CBOR
-        let context_cbor = script_context::build_script_context(
-            tx_body,
-            &redeemer_pairs,
-            resolved_inputs,
-            resolved_ref_inputs,
-            tx_hash,
-            &purpose,
-            redeemer_data,
-            slot_config,
-        );
 
         // Evaluate in a fresh arena (16MB stack not needed for single-threaded)
         let arena = Arena::new();
@@ -176,19 +190,70 @@ pub fn evaluate_scoop_tx(
         let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, flat_bytes)
             .map_err(|e| anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash)))?;
 
-        // Decode ScriptContext as uplc-turbo PlutusData
-        let context_pd = UplcPlutusData::from_cbor(&arena, &context_cbor)
-            .map_err(|e| anyhow::anyhow!("context CBOR decode failed: {e}"))?;
-
-        // CIP-0069: V3 validators receive a single argument (the ScriptContext)
-        let applied = program.apply(&arena, Term::data(&arena, context_pd));
-
-        // Evaluate with cost model and maximum budget
+        // Build the version-appropriate context and argument list. V3 takes
+        // one argument (the full ScriptContext, redeemer embedded); V2 takes
+        // (datum,) redeemer, context as separate arguments.
         let budget = ExBudget {
             cpu: 10_000_000_000,
             mem: 14_000_000,
         };
-        let result = applied.eval_with_params(&arena, PlutusVersion::V3, cost_model, budget);
+        let (context_cbor, result) = if version == 3 {
+            let context_cbor = script_context::build_script_context(
+                tx_body,
+                &redeemer_pairs,
+                resolved_inputs,
+                resolved_ref_inputs,
+                tx_hash,
+                &purpose,
+                redeemer_data,
+                slot_config,
+            );
+            let context_pd = UplcPlutusData::from_cbor(&arena, &context_cbor)
+                .map_err(|e| anyhow::anyhow!("context CBOR decode failed: {e}"))?;
+            // CIP-0069: V3 validators receive a single argument
+            let applied = program.apply(&arena, Term::data(&arena, context_pd));
+            let result =
+                applied.eval_with_params(&arena, PlutusVersion::V3, cost_model, budget);
+            (context_cbor, result)
+        } else if version == 2 {
+            let cm2 = cost_model_v2.with_context(|| {
+                format!(
+                    "script {} is PlutusV2 but no V2 cost model is configured \
+                     (execution.plutus-v2-cost-model)",
+                    hex::encode(script_hash),
+                )
+            })?;
+            let context_cbor = script_context::build_script_context_v2(
+                tx_body,
+                &redeemer_pairs,
+                resolved_inputs,
+                resolved_ref_inputs,
+                tx_hash,
+                &purpose,
+                slot_config,
+            );
+            let context_pd = UplcPlutusData::from_cbor(&arena, &context_cbor)
+                .map_err(|e| anyhow::anyhow!("V2 context CBOR decode failed: {e}"))?;
+            let redeemer_cbor = minicbor::to_vec(redeemer_data)
+                .expect("CBOR encode redeemer");
+            let redeemer_pd = UplcPlutusData::from_cbor(&arena, &redeemer_cbor)
+                .map_err(|e| anyhow::anyhow!("redeemer CBOR decode failed: {e}"))?;
+            // V2 argument order: [datum (spending only),] redeemer, context.
+            let mut applied = program;
+            if let script_context::ScriptPurpose::Spending(_, Some(datum)) = &purpose {
+                let datum_cbor = minicbor::to_vec(datum).expect("CBOR encode datum");
+                let datum_pd = UplcPlutusData::from_cbor(&arena, &datum_cbor)
+                    .map_err(|e| anyhow::anyhow!("datum CBOR decode failed: {e}"))?;
+                applied = applied.apply(&arena, Term::data(&arena, datum_pd));
+            }
+            let applied = applied
+                .apply(&arena, Term::data(&arena, redeemer_pd))
+                .apply(&arena, Term::data(&arena, context_pd));
+            let result = applied.eval_with_params(&arena, PlutusVersion::V2, cm2, budget);
+            (context_cbor, result)
+        } else {
+            bail!("PlutusV{version} scripts are not supported by the evaluator");
+        };
 
         match result.term {
             Ok(_) => {
