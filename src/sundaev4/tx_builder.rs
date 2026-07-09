@@ -2280,7 +2280,7 @@ pub fn build_multi_pool_scoop_tx(
             rt.scripts.values().map(|ds| ds.script_bytes.len() as u64).sum()
         })
         .unwrap_or(0);
-    let total_ref_script_bytes: u64 = butane_ref_script_bytes + all_ref_inputs.iter()
+    let sundae_ref_script_bytes: u64 = all_ref_inputs.iter()
         .filter_map(|input| {
             let ct_input = crate::cardano_types::TransactionInput(input.clone());
             let txo = ref_utxo_outputs.get(&ct_input)
@@ -2300,6 +2300,7 @@ pub fn build_multi_pool_scoop_tx(
             }
         })
         .sum();
+    let total_ref_script_bytes: u64 = butane_ref_script_bytes + sundae_ref_script_bytes;
 
     Ok(MultiPoolBuildResult {
         cbor: tx_cbor,
