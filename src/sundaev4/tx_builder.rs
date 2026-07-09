@@ -1411,8 +1411,13 @@ pub fn build_multi_pool_scoop_tx(
                                 *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
                             )],
                         },
+                        // Conversion-primary orders touch no pool: no
+                        // steps to attest (and no pool to index — a pool-
+                        // less tx panicked here).
+                        FlatOrderKind::Conversion(_) => Vec::new(),
                         // Non-swap orders don't carry a route constraint in
                         // phase 1; emit a single step to stay 1:1 with entries.
+                        _ if m_pools == 0 => Vec::new(),
                         _ => vec![(pool_sorted_indices[bi] as u64, 0)],
                     }
                 };
