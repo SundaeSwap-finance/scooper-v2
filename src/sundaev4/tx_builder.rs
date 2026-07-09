@@ -2143,6 +2143,41 @@ pub fn build_multi_pool_scoop_tx(
             });
         }
     }
+    if !butane_pieces.is_empty() {
+        if let Some(rt) = butane {
+            for (input, output) in rt.resolved_ref_outputs() {
+                let conway::TransactionOutput::PostAlonzo(body) = &output else {
+                    continue;
+                };
+                resolved_ref_inputs.insert(input, ResolvedTxOut {
+                    address: body.address.to_vec(),
+                    value: conway_value_to_internal(&body.value),
+                    datum: match &body.datum_option {
+                        Some(conway::PseudoDatumOption::Data(d)) => {
+                            let pd: pallas_primitives::PlutusData =
+                                minicbor::decode(&minicbor::to_vec(&d.0).unwrap())
+                                    .expect("re-decode inline datum");
+                            DatumOption::InlineDatum(pd)
+                        }
+                        Some(conway::PseudoDatumOption::Hash(h)) => DatumOption::DatumHash(*h),
+                        None => DatumOption::None,
+                    },
+                    script_ref: body.script_ref.as_ref().map(|sr| {
+                        let (tag, bytes): (u8, &[u8]) = match &sr.0 {
+                            conway::PseudoScript::PlutusV1Script(s) => (1, s.0.as_ref()),
+                            conway::PseudoScript::PlutusV2Script(s) => (2, s.0.as_ref()),
+                            conway::PseudoScript::PlutusV3Script(s) => (3, s.0.as_ref()),
+                            conway::PseudoScript::NativeScript(_) => (0, &[]),
+                        };
+                        let mut pre = Vec::with_capacity(1 + bytes.len());
+                        pre.push(tag);
+                        pre.extend_from_slice(bytes);
+                        Hasher::<224>::hash(&pre)
+                    }),
+                });
+            }
+        }
+    }
     resolved_ref_inputs.insert(settings.input.clone(), ResolvedTxOut {
         address: {
             let settings_addr = ShelleyAddress::new(
@@ -2831,4 +2866,29 @@ fn plutus_address_to_bytes(addr: &PlutusAddress) -> Result<Vec<u8>> {
 
     let shelley = ShelleyAddress::new(Network::Testnet, payment, delegation);
     Ok(shelley.to_vec())
+}
+
+
+/// Convert a conway ledger Value into the internal Value map form.
+fn conway_value_to_internal(v: &ConwayValue) -> crate::cardano_types::Value {
+    let mut out = crate::cardano_types::Value::default();
+    let ada = AssetClass { policy: vec![], token: vec![] };
+    match v {
+        ConwayValue::Coin(c) => {
+            out.insert(&ada, BigInt::from(*c));
+        }
+        ConwayValue::Multiasset(c, ma) => {
+            out.insert(&ada, BigInt::from(*c));
+            for (policy, tokens) in ma.iter() {
+                for (name, qty) in tokens.iter() {
+                    let asset = AssetClass {
+                        policy: policy.as_ref().to_vec(),
+                        token: name.to_vec(),
+                    };
+                    out.insert(&asset, BigInt::from(u64::from(*qty)));
+                }
+            }
+        }
+    }
+    out
 }

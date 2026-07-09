@@ -46,6 +46,11 @@ pub struct ButaneConfig {
     /// The registry UTxO the upgradable validator's redeemer points at,
     /// "txid#index".
     pub registry_utxo: String,
+    /// Hex CBOR of the registry UTxO's resolved output — needed to build
+    /// script contexts during local eval (the scooper doesn't index Butane
+    /// state). Absent = deposits can't be evaluated, edges stay closed.
+    #[serde(default)]
+    pub registry_utxo_cbor: Option<String>,
     /// Synthetics the router may mint via the underlying window.
     #[serde(default)]
     pub synthetics: Vec<ButaneSyntheticConfig>,
@@ -59,6 +64,9 @@ pub struct ButaneSyntheticConfig {
     /// The live `p_<name>` params UTxO, "txid#index" (referenced read-only
     /// by every deposit). Must be updated if governance replaces it.
     pub params_utxo: String,
+    /// Hex CBOR of the params UTxO's resolved output (see registry-utxo-cbor).
+    #[serde(default)]
+    pub params_utxo_cbor: Option<String>,
     /// Mint ratio: minted = deposited · num / den. Must match the params
     /// datum's underlying entry for the deposit asset (ADA) — the contract
     /// is the arbiter; this drives routing estimates and the built amounts.
@@ -103,6 +111,8 @@ pub struct ButaneRuntime {
     pub scripts: BTreeMap<String, DeployedScript>,
     pub registry_utxo: TransactionInput,
     pub synthetics: Vec<ButaneSyntheticConfig>,
+    /// Registry + params UTxOs resolved from config CBOR (for local eval).
+    extra_resolved: Vec<(TransactionInput, conway::TransactionOutput)>,
 }
 
 fn parse_outref(s: &str) -> Result<TransactionInput> {
@@ -201,10 +211,30 @@ impl ButaneRuntime {
             );
         }
 
+        let registry_utxo = parse_outref(&config.registry_utxo)?;
+        let mut extra_resolved = Vec::new();
+        let mut decode_output = |label: &str, hex_cbor: &str| -> Result<conway::TransactionOutput> {
+            let bytes = hex::decode(hex_cbor)
+                .with_context(|| format!("{label} output cbor not hex"))?;
+            minicbor::decode(&bytes)
+                .map_err(|e| anyhow::anyhow!("decode {label} output: {e}"))
+        };
+        if let Some(cbor) = &config.registry_utxo_cbor {
+            extra_resolved.push((registry_utxo.clone(), decode_output("registry", cbor)?));
+        }
+        for synth in &config.synthetics {
+            if let Some(cbor) = &synth.params_utxo_cbor {
+                extra_resolved.push((
+                    parse_outref(&synth.params_utxo)?,
+                    decode_output(&format!("p_{}", synth.name), cbor)?,
+                ));
+            }
+        }
         Ok(Self {
             scripts,
-            registry_utxo: parse_outref(&config.registry_utxo)?,
+            registry_utxo,
             synthetics: config.synthetics.clone(),
+            extra_resolved,
         })
     }
 
@@ -241,6 +271,24 @@ impl ButaneRuntime {
 
     pub fn synthetic_config(&self, name: &str) -> Option<&ButaneSyntheticConfig> {
         self.synthetics.iter().find(|s| s.name == name)
+    }
+
+    /// Every butane reference input with a resolvable output, for the local
+    /// evaluator's script contexts: the deployment ref-script UTxOs (from
+    /// the artifact) plus the registry and per-synthetic params UTxOs (from
+    /// config CBOR). Synthetics without params CBOR are skipped — their
+    /// deposits fail eval with a missing-resolution error rather than a
+    /// wrong context.
+    pub fn resolved_ref_outputs(
+        &self,
+    ) -> Vec<(TransactionInput, conway::TransactionOutput)> {
+        let mut out: Vec<(TransactionInput, conway::TransactionOutput)> = self
+            .scripts
+            .values()
+            .map(|ds| (ds.ref_input.clone(), ds.ref_output.clone()))
+            .collect();
+        out.extend(self.extra_resolved.iter().cloned());
+        out
     }
 }
 
@@ -430,9 +478,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             registry_utxo: format!("{}#0", "00".repeat(32)),
+            registry_utxo_cbor: None,
             synthetics: vec![ButaneSyntheticConfig {
                 name: "ADAb".into(),
                 params_utxo: format!("{}#0", "11".repeat(32)),
+                params_utxo_cbor: None,
                 rate: (1, 1),
                 max_input: None,
                 enabled: true,
