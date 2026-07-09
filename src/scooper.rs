@@ -1034,8 +1034,14 @@ impl Scooper {
                                 })
                             })
                             .unwrap_or(false);
+                        // swap.ak's compute_fee_taken demands ada_consumed
+                        // ≥ 0; an ADA-receiving continuation accumulates ADA
+                        // on the order, so such orders CANNOT partial-fill
+                        // under the current contract (flagged for module v2).
+                        let receives_ada = order.swap_min_received().0.policy.is_empty();
                         if e.contains("below min_received")
                             && is_swap_module
+                            && !receives_ada
                             && exec.partial_fill_margin.is_some()
                         {
                             if let Some(dx) = self.find_partial_fill_dx(
