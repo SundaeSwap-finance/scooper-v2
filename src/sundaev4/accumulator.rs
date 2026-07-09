@@ -68,6 +68,7 @@ pub struct PoolAccum {
 pub struct Accumulator {
     pub pools: BTreeMap<Ident, PoolAccum>,
     routes: Vec<RouteInfo>,
+    conversions: Vec<batch::PlannedConversion>,
     /// Order ops were added across all pools, stored as `(pool_ident, op_idx_in_pool)`.
     /// Resolved to `(batch_idx, op_idx)` in `into_plan` once batches are materialised.
     global_seq_raw: Vec<(Ident, usize)>,
@@ -79,6 +80,7 @@ impl Accumulator {
         Self {
             pools: BTreeMap::new(),
             routes: Vec::new(),
+            conversions: Vec::new(),
             global_seq_raw: Vec::new(),
             protocol_share,
         }
@@ -304,6 +306,7 @@ impl Accumulator {
         let saved_pools = self.pools.clone();
         let saved_routes = self.routes.len();
         let saved_seq = self.global_seq_raw.len();
+        let saved_conversions = self.conversions.len();
         let mut total_out = crate::bigint::BigInt::from(0);
         let mut result = Ok(());
         for (b, branch) in blend.branches.iter().enumerate() {
@@ -328,6 +331,7 @@ impl Accumulator {
             self.pools = saved_pools;
             self.routes.truncate(saved_routes);
             self.global_seq_raw.truncate(saved_seq);
+            self.conversions.truncate(saved_conversions);
         }
         result
     }
@@ -380,6 +384,57 @@ impl Accumulator {
             });
 
             for (split_idx, split) in hop.splits.iter().enumerate() {
+                // Off-protocol conversion legs: no pool op — record the
+                // planned leg and thread its output into the hop total. The
+                // tx builder later composes the mechanism's pieces (pot
+                // output, mint, withdrawals) from plan.conversions.
+                if let crate::sundaev4::router::PoolViewType::Conversion {
+                    rate_num, rate_den, key,
+                } = &split.pool.view_type
+                {
+                    if primary && is_entry_hop && split_idx == 0 {
+                        // The primary slot must be a pool swap: the order's
+                        // fulfillment/fee accounting hangs off a ResolvedSwap.
+                        // The router never emits conversion-only plans for
+                        // orders (the final hop is always a pool), but guard
+                        // against a conversion landing in slot zero.
+                        return Err(
+                            "conversion leg cannot be the primary entry split".into(),
+                        );
+                    }
+                    let dx = if is_entry_hop {
+                        split.input_amount.clone()
+                    } else if hop.splits.len() == 1 {
+                        prev_hop_output.clone()
+                    } else {
+                        // Mixed pool+conversion multi-split non-entry hops:
+                        // proportional like pools; keep it simple by using
+                        // the router's allocation directly (conversions are
+                        // linear, no re-quote drift).
+                        split.input_amount.clone()
+                    };
+                    let fee_num = BigInt::from(split.pool.fee_num);
+                    let fee_den = BigInt::from(split.pool.fee_den);
+                    let dx_eff = &dx - &(&dx * &fee_num / &fee_den);
+                    let out = &(&dx_eff * rate_num) / rate_den;
+                    if !out.is_positive() {
+                        return Err(format!("conversion {key} produced zero output"));
+                    }
+                    this_hop_output = &this_hop_output + &out;
+                    if hop_idx == route.hops.len() - 1 {
+                        final_output_asset = Some(hop.output_token.clone());
+                        final_output_amount = &final_output_amount + &out;
+                    }
+                    self.conversions.push(batch::PlannedConversion {
+                        key: key.clone(),
+                        from: hop.input_token.clone(),
+                        to: hop.output_token.clone(),
+                        dx,
+                        out,
+                        order_input: order.input.clone(),
+                    });
+                    continue;
+                }
                 let pool_ident = &split.pool.ident;
 
                 // Get effective pool — from trial state if already there, else from chain
@@ -582,6 +637,7 @@ impl Accumulator {
     /// router-projected — tx_builder recomputes it fresh during its streaming
     /// walk.
     pub fn into_plan(self) -> ScoopPlan {
+        let conversions = self.conversions.clone();
         let mut batches = Vec::new();
         // Map Ident → batch_idx so we can translate `global_seq_raw` (keyed by
         // pool_ident) into `GlobalOp { batch_idx, op_idx }`.
@@ -635,6 +691,7 @@ impl Accumulator {
             batches,
             routes: self.routes,
             global_seq,
+            conversions,
         };
     }
 

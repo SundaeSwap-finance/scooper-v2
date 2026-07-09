@@ -151,6 +151,25 @@ pub struct ScoopPlan {
     pub batches: Vec<Batch>,
     pub routes: Vec<RouteInfo>,
     pub global_seq: Vec<GlobalOp>,
+    /// Off-protocol conversion legs (Butane mints, …) the tx must compose
+    /// alongside the pool ops. Empty for pool-only plans.
+    pub conversions: Vec<PlannedConversion>,
+}
+
+/// One planned off-protocol conversion leg: `dx` of `from` becomes `out` of
+/// `to` via the mechanism identified by `key` (e.g. "butane:ADAb:mint").
+/// Which route/hop it belongs to is irrelevant to the tx builder — the leg
+/// contributes tx-level pieces (outputs/mints/withdrawals/refs) and its
+/// value flow is already threaded through the route's hop math.
+#[derive(Clone, Debug)]
+pub struct PlannedConversion {
+    pub key: String,
+    pub from: AssetClass,
+    pub to: AssetClass,
+    pub dx: BigInt,
+    pub out: BigInt,
+    /// Which order this leg belongs to (fee/attribution + tracing).
+    pub order_input: crate::cardano_types::TransactionInput,
 }
 
 /// A complete batch for one pool, ready for the tx builder.

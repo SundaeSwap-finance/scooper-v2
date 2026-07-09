@@ -1784,6 +1784,7 @@ impl Scooper {
             batches: vec![claim_batch],
             routes: Vec::new(),
             global_seq: vec![crate::sundaev4::batch::GlobalOp { batch_idx: 0, op_idx: 0 }],
+            conversions: Vec::new(),
         };
         Some((scoop_plan, sse_pd))
     }

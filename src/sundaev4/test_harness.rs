@@ -306,6 +306,7 @@ pub(crate) mod test_harness {
                 batches: batches.to_vec(),
                 routes: Vec::new(),
                 global_seq: Vec::new(),
+                conversions: Vec::new(),
             };
             self.build_and_eval_plan(&plan, settings, slot)
         }
