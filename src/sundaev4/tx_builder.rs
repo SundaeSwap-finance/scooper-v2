@@ -196,6 +196,10 @@ pub fn build_multi_pool_scoop_tx(
     // needs a bump — so pass Some whenever the scooper has a suitable UTxO,
     // and None only as a "no bump expected" hint.
     funding_input: Option<(TransactionInput, &crate::cardano_types::Value)>,
+    // Loaded Butane runtime — required iff plan.conversions contains
+    // butane legs. None + butane legs = build error (the router must not
+    // offer edges the builder can't compose; this is the backstop).
+    butane: Option<&crate::sundaev4::butane::ButaneRuntime>,
 ) -> Result<MultiPoolBuildResult> {
     // First-pass builds use the TX_FEE upper bound; the rebuild passes the
     // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
@@ -224,6 +228,43 @@ pub fn build_multi_pool_scoop_tx(
         &synthesized_seq
     } else {
         &plan.global_seq
+    };
+
+    // ── Butane conversion legs → deposit pieces ────────────────────────────
+    let butane_pieces: Vec<crate::sundaev4::butane::DepositPieces> = {
+        use num_traits::ToPrimitive;
+        let mut pieces = Vec::new();
+        for leg in &plan.conversions {
+            let Some(name) = leg
+                .key
+                .strip_prefix("butane:")
+                .and_then(|s| s.strip_suffix(":mint"))
+            else {
+                bail!("unknown conversion mechanism for leg {}", leg.key);
+            };
+            let rt = butane.with_context(|| {
+                format!("plan contains butane leg {} but no runtime is loaded", leg.key)
+            })?;
+            let dx = leg.dx.clone().unwrap().to_u64()
+                .context("conversion dx doesn't fit u64")?;
+            let out = leg.out.clone().unwrap().to_u64()
+                .context("conversion out doesn't fit u64")?;
+            // Network id from the scooper address config? Pot addresses are
+            // testnet on preview; derive from settings address network bit.
+            pieces.push(rt.deposit_pieces(name, dx, out, 0)?);
+        }
+        if !pieces.is_empty() {
+            // Language views currently cover PlutusV3 only; butane's mixed
+            // V2/V3 set needs V2 views in the script integrity hash. Until
+            // the evaluator work lands this tx will NOT validate on-chain —
+            // composition is exercised by structure tests only.
+            tracing::warn!(
+                legs = pieces.len(),
+                "composing butane deposits: script_data_hash lacks V2 language \
+                 views until evaluator support lands",
+            );
+        }
+        pieces
     };
 
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
@@ -1084,6 +1125,9 @@ pub fn build_multi_pool_scoop_tx(
     // them to scripts in exactly this order, so keeping the body in canonical
     // order makes the body, the on-chain ScriptContext, and every ref_index
     // we put in redeemers agree by construction.
+    for p in &butane_pieces {
+        all_ref_inputs.extend(p.ref_inputs.iter().map(|i| i.0.clone()));
+    }
     all_ref_inputs.sort_by(|a, b| {
         a.transaction_id
             .cmp(&b.transaction_id)
@@ -1405,6 +1449,13 @@ pub fn build_multi_pool_scoop_tx(
     // `has_swap_orders` retained for tests that still gate on this flag.
     let _ = has_swap_orders;
 
+    for p in &butane_pieces {
+        for (hash, redeemer, _version) in &p.withdrawals {
+            let h: pallas_primitives::Hash<28> = hash.as_slice().try_into()
+                .expect("verified 28-byte script hash");
+            withdrawals.push((reward_account(&h), redeemer.clone()));
+        }
+    }
     withdrawals.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     // Withdrawal redeemers — one per withdrawal entry
@@ -1682,6 +1733,11 @@ pub fn build_multi_pool_scoop_tx(
         outputs.push(out);
     }
 
+    // ── Step 8.35: Butane pot outputs ──────────────────────────────────────
+    for p in &butane_pieces {
+        outputs.push(p.pot_output.clone());
+    }
+
     // ── Step 8.4: Scooper change output for the funding UTxO ───────────────
     //
     // Only emitted when a `funding_input` was provided. Its ada covers any
@@ -1797,10 +1853,34 @@ pub fn build_multi_pool_scoop_tx(
                 NonZeroInt::try_from(qty).expect("net LP delta nonzero"),
             ));
         }
-        if asset_pairs.is_empty() {
+        // Butane mint entries (one policy across all legs; aggregate).
+        let mut butane_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
+        let mut butane_policy: Option<pallas_primitives::Hash<28>> = None;
+        {
+            let mut agg: std::collections::BTreeMap<Vec<u8>, i64> = Default::default();
+            for p in &butane_pieces {
+                butane_policy = Some(
+                    p.mint_policy.as_slice().try_into().expect("28-byte policy"),
+                );
+                for (name, qty) in &p.mint_assets {
+                    *agg.entry(name.clone()).or_default() += qty;
+                }
+            }
+            for (name, qty) in agg {
+                if qty != 0 {
+                    butane_pairs.push((
+                        PallasBytes::from(name),
+                        NonZeroInt::try_from(qty).expect("nonzero"),
+                    ));
+                }
+            }
+        }
+
+        if asset_pairs.is_empty() && butane_pairs.is_empty() {
             None
         } else {
-            // Single policy (pool_mint) for all LP entries; sort assets by name.
+            // Sort each policy's assets by name; policies sort in the map
+            // below (mint redeemer indices follow sorted policy order).
             asset_pairs.sort_by(|a, b| {
                 let av: Vec<u8> = a.0.clone().into();
                 let bv: Vec<u8> = b.0.clone().into();
@@ -1829,12 +1909,29 @@ pub fn build_multi_pool_scoop_tx(
                 let r = PoolMintRedeemer::MintLP { pool_ident: pool_idents.into_iter().next().unwrap() };
                 r.to_plutus()
             };
-            let mint_key = RedeemersKey { tag: RedeemerTag::Mint, index: 0 };
-            redeemer_info.push((mint_key.clone(), mint_redeemer_data, lookup_eu(&mint_key)));
-            Some(NonEmptyKeyValuePairs::Def(vec![(
-                policy,
-                NonEmptyKeyValuePairs::Def(asset_pairs),
-            )]))
+            // Assemble the multi-policy mint map in sorted-policy order and
+            // assign each policy's mint redeemer its map index.
+            let mut policies: Vec<(pallas_primitives::Hash<28>, Vec<(PallasBytes, NonZeroInt)>, Option<pallas_primitives::PlutusData>)> = Vec::new();
+            if !asset_pairs.is_empty() {
+                policies.push((policy, asset_pairs, Some(mint_redeemer_data)));
+            }
+            if let (Some(bp), false) = (butane_policy, butane_pairs.is_empty()) {
+                let butane_redeemer = butane_pieces
+                    .first()
+                    .map(|p| p.mint_redeemer.clone())
+                    .expect("butane pairs imply pieces");
+                policies.push((bp, butane_pairs, Some(butane_redeemer)));
+            }
+            policies.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+            let mut map_entries = Vec::new();
+            for (idx, (pol, pairs, redeemer)) in policies.into_iter().enumerate() {
+                if let Some(data) = redeemer {
+                    let key = RedeemersKey { tag: RedeemerTag::Mint, index: idx as u32 };
+                    redeemer_info.push((key.clone(), data, lookup_eu(&key)));
+                }
+                map_entries.push((pol, NonEmptyKeyValuePairs::Def(pairs)));
+            }
+            Some(NonEmptyKeyValuePairs::Def(map_entries))
         }
     };
 

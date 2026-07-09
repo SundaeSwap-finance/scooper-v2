@@ -1044,7 +1044,7 @@ impl Scooper {
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs, &strategy_executions,
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-            ) {
+             None) {
                 Ok(r) => r,
                 Err(e) => {
                     // Build failures here mean the tx couldn't be assembled
@@ -1202,7 +1202,7 @@ impl Scooper {
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs, &strategy_executions,
                     funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-                ) {
+                 None) {
                     Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
                         let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
@@ -1352,7 +1352,7 @@ impl Scooper {
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             None, &v4_state.order_configs, &strategy_executions,
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-        ) {
+         None) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx build failed");
@@ -1456,7 +1456,7 @@ impl Scooper {
             &v4_state.order_configs,
             &strategy_executions,
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-        ) {
+         None) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx rebuild failed");
