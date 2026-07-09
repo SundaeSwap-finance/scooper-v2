@@ -1090,54 +1090,68 @@ impl Scooper {
             if fits { Fitness::Fits } else { Fitness::Overbudget }
         };
 
-        // Binary search: find the largest checkpoint index that's within limits.
-        // checkpoints[i] has (i+1) orders.
+        // Find the largest checkpoint (prefix of accumulated orders) that builds
+        // and evaluates within limits. checkpoints[i] has (i+1) orders.
         //
-        // Three-way outcome handling:
+        // Outcome handling per probe:
         // - Fits        → best = this index; try larger
-        // - Overbudget  → try smaller
-        // - Bail        → eval failure is a scooper bug. Don't submit anything
-        //                 this cycle — log and return. Context dump is already
-        //                 written by within_limits for offline diagnosis.
-        let mut lo: usize = 0;
-        let mut hi: usize = checkpoints.len() - 1;
+        // - Overbudget  → too many ex-units / too big; try smaller
+        // - Bail        → a build/eval failure was introduced by some order.
+        //                 Rather than abort the whole cycle (which lets one bad
+        //                 order wedge the queue for everyone), treat it like
+        //                 Overbudget and search downward: this still scoops the
+        //                 valid prefix and isolates the failing suffix. If even
+        //                 the smallest (1-order) batch bails, that order is
+        //                 quarantined below so it stops blocking the queue.
         let mut best: Option<usize> = None;
-        let mut bail_reason: Option<String> = None;
+        let mut last_bail: Option<String> = None;
 
         let probe = |idx: usize| -> Fitness { within_limits(&checkpoints[idx]) };
 
-        // Quick check: try the full batch first (common case)
-        match probe(hi) {
-            Fitness::Fits => { best = Some(hi); }
-            Fitness::Overbudget => {
-                // Binary search between lo and hi
-                while lo <= hi {
-                    let mid = lo + (hi - lo) / 2;
-                    match probe(mid) {
-                        Fitness::Fits => {
-                            best = Some(mid);
-                            lo = mid + 1;
+        let top = checkpoints.len() - 1;
+        // Quick check: try the full batch first (common case).
+        match probe(top) {
+            Fitness::Fits => best = Some(top),
+            outcome => {
+                if let Fitness::Bail(reason) = outcome {
+                    last_bail = Some(reason);
+                }
+                // Full batch failed — binary search the smaller prefixes,
+                // treating Overbudget and Bail alike as "go smaller".
+                if top > 0 {
+                    let (mut lo, mut hi) = (0usize, top - 1);
+                    while lo <= hi {
+                        let mid = lo + (hi - lo) / 2;
+                        match probe(mid) {
+                            Fitness::Fits => {
+                                best = Some(mid);
+                                lo = mid + 1;
+                            }
+                            Fitness::Overbudget => {
+                                if mid == 0 { break; }
+                                hi = mid - 1;
+                            }
+                            Fitness::Bail(reason) => {
+                                last_bail = Some(reason);
+                                if mid == 0 { break; }
+                                hi = mid - 1;
+                            }
                         }
-                        Fitness::Overbudget => {
-                            if mid == 0 { break; }
-                            hi = mid - 1;
-                        }
-                        Fitness::Bail(reason) => { bail_reason = Some(reason); break; }
                     }
                 }
             }
-            Fitness::Bail(reason) => { bail_reason = Some(reason); }
         }
 
-        if let Some(reason) = bail_reason {
-            warn!(
-                reason,
-                n_candidates = checkpoints.len(),
-                "scoop cycle aborted: tx build or eval failed — likely a scooper bug; \
-                 context dump in /tmp/script-ctx-* for diagnosis",
-            );
-            self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
-            return false;
+        // If we found a valid prefix but had to drop a failing suffix, note it.
+        if let (Some(idx), Some(reason)) = (best, &last_bail) {
+            if idx + 1 < checkpoints.len() {
+                warn!(
+                    kept = idx + 1,
+                    dropped = checkpoints.len() - (idx + 1),
+                    reason = %reason,
+                    "isolated failing suffix from batch; scooping the valid prefix",
+                );
+            }
         }
 
         let had_successful_build = best.is_some();
@@ -1211,12 +1225,25 @@ impl Scooper {
                 };
 
                 if let Some(reason) = eval_bug_reason {
-                    warn!(
-                        reason,
-                        n_candidates = checkpoints.len(),
-                        "scoop cycle aborted: smallest batch fails eval — likely a scooper bug; \
-                         context dumped to /tmp/script-ctx-*",
-                    );
+                    // The smallest (1-order) batch fails eval. It's likely a
+                    // scooper bug specific to this order — but bailing every
+                    // cycle lets it wedge the whole queue. Temporarily quarantine
+                    // it (retried after ~TEMP_QUARANTINE_SLOTS, since the failure
+                    // may be pool-state-dependent) so the rest of the queue keeps
+                    // flowing, and keep the context dump for diagnosis.
+                    let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
+                    for input in diag.order_inputs() {
+                        warn!(
+                            order = %input, %reason, until_slot,
+                            "temporarily quarantining order: fails eval in isolation \
+                             (suspected scooper bug); context dumped to /tmp/script-ctx-*",
+                        );
+                        self.quarantine.insert(
+                            input.clone(),
+                            Quarantine::Temporary { reason: reason.clone(), until_slot },
+                        );
+                    }
+                    self.sync_quarantine_metrics();
                     self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                     return false;
                 }

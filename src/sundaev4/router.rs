@@ -155,14 +155,26 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
             let dx_eff = dx - &(dx * &fee_num / &fee_den);
             &dx_eff * rate_num / rate_den <= pool.reserve_out
         }
-        PoolViewType::ConstantSum { .. } => {
-            // CS can in principle absorb arbitrary dx but its dy may exceed
-            // reserve_out for large inputs. TODO: add a tight cap analogous to
-            // `cl_max_dx_for_reserve` — currently we rely on `pool_output`'s
-            // post-hoc clamp, which silently truncates and breaks value
-            // conservation if CS gets saturated.
-            let _ = dx;
-            true
+        PoolViewType::ConstantSum { price_in, price_out } => {
+            // A CS pool can only absorb `dx` if the resulting `dy` fits its
+            // output reserve; a larger fill drains the pool negative and fails
+            // the on-chain `amt_after >= 0` check. Cap it like CL rather than
+            // relying on `pool_output`'s post-hoc clamp (which breaks value
+            // conservation when CS saturates).
+            let fee_num = BigInt::from(pool.fee_num);
+            let fee_den = BigInt::from(pool.fee_den);
+            let prices = [price_in.clone(), price_out.clone()];
+            match swap_math::cs_max_dx_for_reserve(
+                &pool.reserve_out,
+                &prices,
+                0,
+                1,
+                &fee_num,
+                &fee_den,
+            ) {
+                Some(cap) => dx <= &cap,
+                None => false,
+            }
         }
         PoolViewType::ConcentratedLiquidity {
             is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
