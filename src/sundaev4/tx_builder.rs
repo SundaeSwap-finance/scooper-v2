@@ -253,17 +253,6 @@ pub fn build_multi_pool_scoop_tx(
             // testnet on preview; derive from settings address network bit.
             pieces.push(rt.deposit_pieces(name, dx, out, 0)?);
         }
-        if !pieces.is_empty() {
-            // Language views currently cover PlutusV3 only; butane's mixed
-            // V2/V3 set needs V2 views in the script integrity hash. Until
-            // the evaluator work lands this tx will NOT validate on-chain —
-            // composition is exercised by structure tests only.
-            tracing::warn!(
-                legs = pieces.len(),
-                "composing butane deposits: script_data_hash lacks V2 language \
-                 views until evaluator support lands",
-            );
-        }
         pieces
     };
 
@@ -2281,7 +2270,17 @@ pub fn build_multi_pool_scoop_tx(
 
     // Sum the raw CBOR byte size of every reference-script attached to this
     // tx, for the Conway-era tiered ref-script fee component.
-    let total_ref_script_bytes: u64 = all_ref_inputs.iter()
+    let butane_ref_script_bytes: u64 = butane_pieces
+        .first()
+        .and_then(|_| butane)
+        .map(|rt| {
+            // Every butane ref-script UTxO rides in all_ref_inputs when
+            // legs are present; their bytes pay the tiered Conway
+            // ref-script fee like any other reference script.
+            rt.scripts.values().map(|ds| ds.script_bytes.len() as u64).sum()
+        })
+        .unwrap_or(0);
+    let total_ref_script_bytes: u64 = butane_ref_script_bytes + all_ref_inputs.iter()
         .filter_map(|input| {
             let ct_input = crate::cardano_types::TransactionInput(input.clone());
             let txo = ref_utxo_outputs.get(&ct_input)
