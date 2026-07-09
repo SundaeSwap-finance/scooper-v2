@@ -126,10 +126,25 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
 
 /// Encode PlutusV3 cost model parameters as CBOR language views: `{2: [params...]}`.
 pub fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
+    encode_language_views_multi(v3_params, None)
+}
+
+/// Language views for the script integrity hash. Keys ascend (PlutusV2 = 1,
+/// PlutusV3 = 2); V2 and V3 both use the plain definite encoding (only V1
+/// has the legacy double-bagged quirk, and we never execute V1).
+pub fn encode_language_views_multi(v3_params: &[i64], v2_params: Option<&[i64]>) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(1).unwrap();
+        let n = 1 + v2_params.is_some() as u64;
+        enc.map(n).unwrap();
+        if let Some(v2) = v2_params {
+            enc.u32(1).unwrap(); // PlutusV2 = language 1
+            enc.array(v2.len() as u64).unwrap();
+            for &p in v2 {
+                enc.i64(p).unwrap();
+            }
+        }
         enc.u32(2).unwrap(); // PlutusV3 = language 2
         enc.array(v3_params.len() as u64).unwrap();
         for &p in v3_params {

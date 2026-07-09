@@ -1964,7 +1964,22 @@ pub fn build_multi_pool_scoop_tx(
         minicbor::encode(&redeemers, &mut buf).expect("encode redeemers");
         // No attached datums (we only consume inline-datum UTxOs), so the
         // datums section is omitted — see ScriptData::hash in pallas-primitives.
-        buf.extend_from_slice(language_views);
+        // Language views must cover exactly the languages this tx executes:
+        // V3 always; V2 only when butane legs are present (three of the
+        // deposit validators are V2). A V2 section on a V3-only tx — or the
+        // reverse — makes the node's script integrity hash disagree.
+        if butane_pieces.is_empty() {
+            buf.extend_from_slice(language_views);
+        } else {
+            let v2 = exec.plutus_v2_cost_model.as_deref().with_context(|| {
+                "butane legs present but plutus-v2-cost-model is not configured"
+            })?;
+            let multi = crate::sundaev4::submit::encode_language_views_multi(
+                &exec.plutus_v3_cost_model,
+                Some(v2),
+            );
+            buf.extend_from_slice(&multi);
+        }
         Hasher::<256>::hash(&buf)
     };
 
