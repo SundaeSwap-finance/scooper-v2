@@ -559,6 +559,39 @@ mod tests {
         assert_eq!(p.ref_inputs.len(), 7);
     }
 
+    /// The committed preview config must round-trip through the loader:
+    /// artifact hashes verify, registry + params CBOR decode. Catches config
+    /// drift before a deploy does.
+    #[test]
+    fn preview_repo_config_loads() {
+        let raw = std::fs::read_to_string("config/preview-v4.json")
+            .expect("repo preview config");
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        fn find_butane(v: &serde_json::Value) -> Option<&serde_json::Value> {
+            match v {
+                serde_json::Value::Object(m) => m
+                    .get("butane")
+                    .or_else(|| m.values().find_map(find_butane)),
+                _ => None,
+            }
+        }
+        let butane = find_butane(&cfg).expect("butane section in preview config");
+        let mut parsed: ButaneConfig =
+            serde_json::from_value(butane.clone()).expect("butane config parses");
+        // The artifact path in the config is relative to the deploy dir;
+        // point it at the repo copy for the test.
+        parsed.deployment_file = "config/butane-v2.deployment.preview.json".into();
+        let rt = ButaneRuntime::load(&parsed).expect("runtime loads from repo config");
+        assert_eq!(rt.edges().len(), 1, "ADAb edge enabled");
+        // Registry + params resolved outputs both present (scripts' 5-6 +2).
+        let resolved = rt.resolved_ref_outputs();
+        assert!(
+            resolved.len() >= REQUIRED_ROLES.len() + 2,
+            "expected ref-script + registry + params outputs, got {}",
+            resolved.len(),
+        );
+    }
+
     /// Absent config degrades to None without complaint.
     #[test]
     fn absent_config_degrades() {
