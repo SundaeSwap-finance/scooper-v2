@@ -47,6 +47,13 @@ pub struct InFlightTx {
     /// settle: `discard_by_provisional_parent` removes it and everything
     /// downstream. Empty for txs built purely on confirmed state.
     pub provisional_parents: BTreeSet<Vec<u8>>,
+    /// Wallet UTxOs this tx spends (the funding input). Until settlement,
+    /// collateral/funding selection must not offer these to later builds —
+    /// a second spend is rejected against mempool state.
+    pub consumed_wallet_inputs: Vec<TransactionInput>,
+    /// Wallet UTxOs this tx creates (the scooper change output). Later
+    /// chained builds may fund from these, submitting via the local node.
+    pub predicted_wallet: Vec<(TransactionInput, crate::cardano_types::Value)>,
 }
 
 impl InFlightTx {
@@ -190,6 +197,44 @@ impl ChainTracker {
         }
     }
 
+    /// Wallet UTxOs consumed by any in-flight tx. These are spent as far as
+    /// the mempool is concerned — offering them to a new build produces a
+    /// guaranteed node reject.
+    pub fn consumed_wallet_inputs(&self) -> BTreeSet<TransactionInput> {
+        let mut consumed = BTreeSet::new();
+        for chain in self.chains.values() {
+            for tx in chain {
+                consumed.extend(tx.consumed_wallet_inputs.iter().cloned());
+            }
+        }
+        consumed
+    }
+
+    /// Wallet UTxOs predicted into existence by in-flight txs (scooper
+    /// change outputs), minus any that a later in-flight tx already spends.
+    /// Valid funding sources for chained builds submitted via the local
+    /// node, where the creating tx is guaranteed visible.
+    pub fn predicted_wallet_utxos(
+        &self,
+    ) -> BTreeMap<TransactionInput, crate::cardano_types::Value> {
+        let consumed = self.consumed_wallet_inputs();
+        let mut predicted = BTreeMap::new();
+        let mut seen_tx: BTreeSet<Hash<32>> = BTreeSet::new();
+        for chain in self.chains.values() {
+            for tx in chain {
+                if !seen_tx.insert(tx.tx_hash) {
+                    continue;
+                }
+                for (input, value) in &tx.predicted_wallet {
+                    if !consumed.contains(input) {
+                        predicted.insert(input.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        predicted
+    }
+
     /// Discard every chain containing a tx that chained on the given
     /// (now evicted) mempool parent, cascading to related pools. Returns the
     /// number of pools whose chains were discarded.
@@ -328,6 +373,8 @@ mod tests {
             })],
             ttl,
             provisional_parents: BTreeSet::new(),
+            consumed_wallet_inputs: vec![],
+            predicted_wallet: vec![],
         }
     }
 
@@ -353,6 +400,8 @@ mod tests {
             predicted_pools,
             ttl,
             provisional_parents: BTreeSet::new(),
+            consumed_wallet_inputs: vec![],
+            predicted_wallet: vec![],
         }
     }
 

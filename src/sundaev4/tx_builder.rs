@@ -159,6 +159,11 @@ pub struct MultiPoolBuildResult {
     pub predicted_pools: Vec<(Ident, crate::cardano_types::TransactionInput, SundaeV4Pool)>,
     /// The TTL used for this transaction
     pub ttl: u64,
+    /// The scooper change output (index, value) when a funding UTxO was
+    /// spent — the wallet UTxO this tx predicts into existence. Lets the
+    /// next chained tx fund itself off this one instead of double-spending
+    /// the confirmed funding UTxO an in-flight tx already consumed.
+    pub wallet_change: Option<(u64, crate::cardano_types::Value)>,
 }
 
 /// Build a signed scoop transaction for M pools + N orders.
@@ -1907,6 +1912,7 @@ pub fn build_multi_pool_scoop_tx(
     // was provided but a bump was needed, bail — the scooper must retry
     // once a suitable UTxO is available.
     let total_funding_draw = total_pool_bump + total_fulfillment_subsidy;
+    let mut wallet_change: Option<(u64, crate::cardano_types::Value)> = None;
     if funding_value_opt.is_none() && total_funding_draw > 0 {
         bail!(
             "min-ada support of {total_funding_draw} lovelace needed (pools \
@@ -1984,6 +1990,12 @@ pub fn build_multi_pool_scoop_tx(
                  ({needed_for_change}); funding UTxO needs more ada or fewer tokens"
             );
         }
+        let mut change_val = funding_value.clone();
+        change_val.insert(
+            &AssetClass { policy: vec![], token: vec![] },
+            crate::bigint::BigInt::from(change_ada),
+        );
+        wallet_change = Some(((outputs.len() - 1) as u64, change_val));
     }
 
     // ── Step 8.5: LP mint/burn for deposits and withdraws ──────────────────
@@ -2491,6 +2503,7 @@ pub fn build_multi_pool_scoop_tx(
         redeemers: redeemer_info,
         predicted_pools,
         ttl,
+        wallet_change,
     })
 }
 

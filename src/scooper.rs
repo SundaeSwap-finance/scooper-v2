@@ -544,11 +544,17 @@ impl Scooper {
         // the rebuild writes the real fee via fee_override — and a too-small
         // collateral input makes collateral_return drop below min_utxo.
         let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        // Wallet UTxOs already spent by in-flight txs are gone as far as the
+        // mempool is concerned — offering them to this build would produce a
+        // guaranteed node reject (this is how chained tx f0fc5876… died:
+        // its funding input was the previous scoop's funding input).
+        let consumed_wallet = self.v4_chain_tracker.consumed_wallet_inputs();
         let min_collateral_ada =
             crate::sundaev4::tx_builder::MAX_REAL_TX_FEE * 3 / 2 + MIN_COLLATERAL_RETURN;
         let collateral = v4_state
             .wallet_utxos
             .iter()
+            .filter(|(i, _)| !consumed_wallet.contains(i))
             .find(|(_, v)| {
                 use num_traits::ToPrimitive;
                 v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
@@ -575,20 +581,37 @@ impl Scooper {
         // build can succeed without funding; pools that do need one will
         // fail with a clear "bump needed" error.
         const MIN_FUNDING_ADA: u64 = 2_500_000;
+        // Funding candidates: confirmed wallet UTxOs not consumed by any
+        // in-flight tx, plus — when we can submit through the local node —
+        // the change outputs our in-flight txs predict (funding one chained
+        // scoop from the previous one's change). A predicted funding source
+        // forces node submission, since only that node is guaranteed to see
+        // the creating tx.
+        let predicted_wallet = if self.v4_node_submit.is_some() {
+            self.v4_chain_tracker.predicted_wallet_utxos()
+        } else {
+            Default::default()
+        };
         let funding = v4_state
             .wallet_utxos
             .iter()
-            .filter(|(i, _)| *i != &collateral_input)
-            .filter(|(_, v)| {
+            .filter(|(i, _)| !consumed_wallet.contains(i))
+            .map(|(i, v)| (i, v, false))
+            .chain(predicted_wallet.iter().map(|(i, v)| (i, v, true)))
+            .filter(|(i, _, _)| *i != &collateral_input)
+            .filter(|(_, v, _)| {
                 use num_traits::ToPrimitive;
                 v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= MIN_FUNDING_ADA
             })
-            .min_by_key(|(_, v)| {
+            .min_by_key(|(_, v, is_predicted)| {
                 use num_traits::ToPrimitive;
-                v.get(&ada_asset).unwrap().to_u64().unwrap_or(0)
+                // Prefer confirmed UTxOs at equal size; predicted only when
+                // nothing confirmed qualifies.
+                (*is_predicted, v.get(&ada_asset).unwrap().to_u64().unwrap_or(0))
             });
+        let funding_is_predicted = funding.map(|(_, _, p)| p).unwrap_or(false);
         let funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> =
-            funding.map(|(i, v)| (i.clone(), v.clone()));
+            funding.map(|(i, v, _)| (i.clone(), v.clone()));
         if funding_owned.is_none() {
             debug!(
                 min_ada = MIN_FUNDING_ADA,
@@ -875,6 +898,7 @@ impl Scooper {
                 &collateral_input, &collateral_value, &funding_owned,
                 &strategy_executions,
                 &BTreeMap::new(),
+                funding_is_predicted,
             ).await;
         }
 
@@ -1541,6 +1565,7 @@ impl Scooper {
             &collateral_input, &collateral_value, &funding_owned,
             &strategy_executions,
             &provisional_parent,
+            funding_is_predicted,
         ).await
     }
 
@@ -1560,6 +1585,7 @@ impl Scooper {
         funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
         strategy_executions: &BTreeMap<TransactionInput, pallas_primitives::PlutusData>,
         provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
+        funding_is_predicted: bool,
     ) -> bool {
         let n_orders: usize = final_plan.batches.iter()
             .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.claims.len())
@@ -1732,29 +1758,28 @@ impl Scooper {
             .chain(final_plan.conversions.iter().map(|c| &c.order))
             .filter_map(|o| provisional_parent.get(&o.input).cloned())
             .collect();
+        let needs_node = !tx_provisional_parents.is_empty() || funding_is_predicted;
         let submit_start = std::time::Instant::now();
-        let submit_result: anyhow::Result<String> = match (
-            tx_provisional_parents.is_empty(),
-            &self.v4_node_submit,
-        ) {
-            (false, Some((socket, magic))) => {
+        let submit_result: anyhow::Result<String> = match (needs_node, &self.v4_node_submit) {
+            (true, Some((socket, magic))) => {
                 info!(
                     tx_hash = %final_tx.tx_hash_hex,
                     parents = ?tx_provisional_parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                    funding_is_predicted,
                     "chained scoop: submitting via local node",
                 );
                 crate::mempool::submit_via_node(socket, *magic, &final_tx.cbor)
                     .await
                     .map(|_| final_tx.tx_hash_hex.clone())
             }
-            (false, None) => {
-                // Shouldn't happen (provisional candidates only exist when
-                // the monitor is configured), but degrade to the external
-                // endpoint rather than dropping the tx.
-                warn!("provisional-parent tx with no node submit path configured");
+            (true, None) => {
+                // Shouldn't happen (provisional candidates and predicted
+                // funding only exist when the monitor is configured), but
+                // degrade to the external endpoint rather than dropping the tx.
+                warn!("chained tx with no node submit path configured");
                 crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
             }
-            (true, _) => {
+            (false, _) => {
                 crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
             }
         };
@@ -1819,6 +1844,20 @@ impl Scooper {
                     predicted_pools,
                     ttl: final_tx.ttl,
                     provisional_parents: tx_provisional_parents,
+                    consumed_wallet_inputs: funding_owned
+                        .as_ref()
+                        .map(|(i, _)| vec![i.clone()])
+                        .unwrap_or_default(),
+                    predicted_wallet: final_tx
+                        .wallet_change
+                        .as_ref()
+                        .map(|(idx, value)| {
+                            vec![(
+                                TransactionInput::new(final_tx.tx_hash, *idx),
+                                value.clone(),
+                            )]
+                        })
+                        .unwrap_or_default(),
                 };
                 self.v4_chain_tracker.record_submission(in_flight);
                 self.sync_in_flight_metrics();
@@ -1837,7 +1876,12 @@ impl Scooper {
                 //     we don't flag them as uplc-turbo divergence.
                 let is_race_lost = msg.contains("BadInputsUTxO")
                     || msg.contains("ConwayMempoolFailure")
-                    || msg.contains("All inputs are spent");
+                    || msg.contains("All inputs are spent")
+                    // Local-node rejects arrive as opaque reason CBOR. The tx
+                    // already passed our own evaluator, so a reject is a
+                    // state conflict (spent input, mempool race) — treat as
+                    // race-lost, not as uplc divergence needing a CBOR dump.
+                    || msg.starts_with("node rejected tx:");
                 let reason = if is_race_lost {
                     crate::metrics::BatchFailureReason::RaceLost
                 } else {
