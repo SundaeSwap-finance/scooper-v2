@@ -72,6 +72,18 @@ pub enum IndexEvent {
         #[allow(dead_code)]
         settings: Arc<SundaeV4Settings>,
     },
+    /// A valid order appeared in the local node's mempool (unconfirmed).
+    /// The provisional store already holds it — this event's job is to wake
+    /// the scooper's dispatch loop.
+    V4MempoolOrderSeen {
+        order: Arc<SundaeV4Order>,
+    },
+    /// A mempool tx that created provisional orders vanished without ever
+    /// confirming (evicted, replaced, or conflict lost). Any in-flight tx of
+    /// ours chained on its orders can no longer settle and must be discarded.
+    V4MempoolTxDropped {
+        tx_hash: Vec<u8>,
+    },
     /// Emitted for every block (including empty ones) with current tip info.
     TipAdvanced {
         slot: u64,

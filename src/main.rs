@@ -170,15 +170,53 @@ async fn main() -> Result<()> {
     // Captured before `protocol` moves into manager_loop.
     let mempool_spawn = protocol.v4.as_ref().and_then(|v4| {
         v4.mempool.clone().map(|cfg| {
-            (
-                cfg,
-                mempool::ProtocolWatch {
-                    pool_script_hash: v4.pool_script_hash,
-                    order_script_hashes: v4.order_script_hashes.clone(),
-                },
-            )
+            let module_hash = |s: &Option<crate::sundaev4::ScriptRefInfo>| {
+                s.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default()
+            };
+            let watch = mempool::ProtocolWatch {
+                pool_script_hash: v4.pool_script_hash,
+                order_script_hashes: v4.order_script_hashes.clone(),
+                swap_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.swap_order))
+                    .unwrap_or_default(),
+                basic_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.basic_order))
+                    .unwrap_or_default(),
+                strategy_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.strategy_order))
+                    .unwrap_or_default(),
+            };
+            // Chained execution needs both the execute flag and an execution
+            // config (we can't decode constraints without module hashes).
+            let provisional: Option<mempool::SharedProvisional> =
+                if cfg.execute && v4.execution.is_some() {
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(
+                        mempool::ProvisionalState::default(),
+                    )))
+                } else {
+                    if cfg.execute {
+                        tracing::warn!(
+                            "mempool.execute set but no v4 execution config; observing only"
+                        );
+                    }
+                    None
+                };
+            (cfg, watch, provisional)
         })
     });
+    let scooper_provisional = mempool_spawn
+        .as_ref()
+        .and_then(|(_, _, p)| p.clone());
+    let scooper_node_submit = mempool_spawn
+        .as_ref()
+        .filter(|(_, _, p)| p.is_some())
+        .map(|(cfg, _, _)| (cfg.socket_path.clone(), cfg.network_magic));
     let manager_handle = tokio::spawn(manager_loop(
         v3_state.clone(),
         v4_state.clone(),
@@ -200,12 +238,16 @@ async fn main() -> Result<()> {
     // Mempool monitor (phase 1: observation only): mirrors the local node's
     // mempool and measures how far pre-block we see relevant txs. Config
     // absent → not spawned.
-    if let (Some((mempool_cfg, watch)), Some(v4_state_ref)) = (mempool_spawn, v4_state.as_ref()) {
+    if let (Some((mempool_cfg, watch, provisional)), Some(v4_state_ref)) =
+        (mempool_spawn, v4_state.as_ref())
+    {
         tokio::spawn(mempool::run_mempool_monitor(
             mempool_cfg,
             watch,
             v4_state_ref.clone(),
             event_tx.subscribe(),
+            event_tx.clone(),
+            provisional,
             metrics.clone(),
             shutdown.child_token(),
         ));
@@ -220,6 +262,8 @@ async fn main() -> Result<()> {
             paused.clone(),
             metrics.clone(),
             intents.clone(),
+            scooper_provisional,
+            scooper_node_submit,
         )?
         .run(shutdown.child_token()),
     );

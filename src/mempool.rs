@@ -1,13 +1,22 @@
-//! Mempool monitor — phase 1: observation only.
+//! Mempool monitor + provisional order feed.
 //!
 //! Speaks the N2C LocalTxMonitor miniprotocol (via pallas-network) against a
 //! co-located cardano-node socket, mirrors the mempool, classifies each
 //! transaction against the v4 protocol's script hashes, and measures how far
 //! ahead of block inclusion the mempool showed us each relevant tx by
-//! correlating against the indexer's event stream. Emits logs and metrics
-//! only — dispatch is deliberately not coupled yet. Phase 2 (chaining scoops
-//! off unconfirmed orders, with cascade reset when a parent tx dies) will
-//! consume this same feed.
+//! correlating against the indexer's event stream.
+//!
+//! With `execute = true`, order outputs on mempool txs are parsed into full
+//! [`SundaeV4Order`]s and published through a [`ProvisionalState`] shared
+//! with the scooper, which dispatches scoops *chained on the unconfirmed
+//! order tx*. The safety story: a chained tx whose parent never lands simply
+//! never lands either — no on-chain cost — so reset is pure bookkeeping:
+//! when a parent leaves the mempool its orders stop being dispatchable
+//! immediately (either the confirmed copy takes over via the indexer, or the
+//! eviction window expires and a [`IndexEvent::V4MempoolTxDropped`] tells the
+//! scooper to cascade-discard chains built on it). Provisional *spends* are
+//! tracked too, so orders being cancelled or scooped by someone else
+//! in-mempool stop being dispatched before the block confirms it.
 //!
 //! Protocol shape: `acquire` returns a mempool snapshot; `query_next_tx`
 //! drains it; acquiring *again* blocks until the mempool has changed — so the
@@ -36,6 +45,11 @@ pub struct MempoolMonitorConfig {
     /// Network magic for the N2C handshake (preview = 2, preprod = 1,
     /// mainnet = 764824073).
     pub network_magic: u64,
+    /// When true, mempool-seen orders become dispatch candidates (chained
+    /// execution) and provisional-parent scoops submit through the local
+    /// node. False = observe only.
+    #[serde(default)]
+    pub execute: bool,
 }
 
 /// The script hashes the monitor classifies against. Derived from the v4
@@ -44,6 +58,12 @@ pub struct MempoolMonitorConfig {
 pub struct ProtocolWatch {
     pub pool_script_hash: pallas_addresses::ScriptHash,
     pub order_script_hashes: Vec<pallas_addresses::ScriptHash>,
+    /// Constraint-module hashes for decoding order datums into dispatchable
+    /// constraints (empty when execution isn't configured — parsing then
+    /// classifies orders but can't produce candidates).
+    pub swap_order_hash: Vec<u8>,
+    pub basic_order_hash: Vec<u8>,
+    pub strategy_order_hash: Vec<u8>,
 }
 
 /// What a mempool tx does to the protocol, as far as we can tell without
@@ -103,6 +123,236 @@ pub fn classify_tx(
     class
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Provisional orders (phase 2: execution feed)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// An order whose creating tx is still in the mempool.
+#[derive(Clone)]
+pub struct ProvisionalOrder {
+    pub order: Arc<crate::sundaev4::SundaeV4Order>,
+    /// Hash of the mempool tx that created this order UTxO.
+    pub source_tx: Vec<u8>,
+    /// True once the source tx has left the mempool. Not dispatchable in
+    /// that window: either the confirmed copy is about to arrive via the
+    /// indexer, or the tx was evicted and building on it is wasted work.
+    pub gone: bool,
+}
+
+/// Effects a single mempool tx had on the order book, tracked so that
+/// confirmation or eviction of that tx can be undone as a unit.
+#[derive(Clone, Default)]
+struct TxEffects {
+    created_orders: Vec<crate::cardano_types::TransactionInput>,
+    spent_orders: Vec<crate::cardano_types::TransactionInput>,
+}
+
+/// Shared between the mempool monitor (writer) and the scooper (reader).
+/// All methods are quick and lock-free internally — callers hold the outer
+/// `std::sync::Mutex` only for the duration of a call.
+#[derive(Default)]
+pub struct ProvisionalState {
+    orders: BTreeMap<crate::cardano_types::TransactionInput, ProvisionalOrder>,
+    /// Order inputs spent by some unconfirmed tx (cancellation, or a scoop —
+    /// ours or a competitor's), keyed by order input → spender tx hash.
+    spent: BTreeMap<crate::cardano_types::TransactionInput, Vec<u8>>,
+    by_tx: BTreeMap<Vec<u8>, TxEffects>,
+}
+
+pub type SharedProvisional = Arc<std::sync::Mutex<ProvisionalState>>;
+
+impl ProvisionalState {
+    /// Record a mempool tx's effects. Idempotent per tx hash.
+    pub fn note_tx(
+        &mut self,
+        tx_hash: Vec<u8>,
+        created: Vec<(crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Order>)>,
+        spent: Vec<crate::cardano_types::TransactionInput>,
+    ) {
+        if self.by_tx.contains_key(&tx_hash) {
+            return;
+        }
+        let mut effects = TxEffects::default();
+        for (input, order) in created {
+            effects.created_orders.push(input.clone());
+            self.orders.insert(
+                input,
+                ProvisionalOrder { order, source_tx: tx_hash.clone(), gone: false },
+            );
+        }
+        for input in spent {
+            effects.spent_orders.push(input.clone());
+            self.spent.insert(input, tx_hash.clone());
+        }
+        self.by_tx.insert(tx_hash, effects);
+    }
+
+    /// The source tx left the mempool: suspend its orders immediately.
+    /// (If it reappears — a re-add after a brief eviction — un-suspend.)
+    pub fn set_gone(&mut self, tx_hash: &[u8], gone: bool) {
+        if let Some(effects) = self.by_tx.get(tx_hash) {
+            for input in &effects.created_orders {
+                if let Some(p) = self.orders.get_mut(input) {
+                    p.gone = gone;
+                }
+            }
+        }
+    }
+
+    /// Remove a tx's effects entirely (confirmed in a block, or evicted).
+    /// Returns the order inputs it had created, for logging.
+    pub fn remove_tx(&mut self, tx_hash: &[u8]) -> Vec<crate::cardano_types::TransactionInput> {
+        let Some(effects) = self.by_tx.remove(tx_hash) else {
+            return Vec::new();
+        };
+        for input in &effects.created_orders {
+            self.orders.remove(input);
+        }
+        for input in &effects.spent_orders {
+            // Only clear the mark if WE set it (a later tx may have re-spent).
+            if self.spent.get(input).map(|h| h.as_slice()) == Some(tx_hash) {
+                self.spent.remove(input);
+            }
+        }
+        effects.created_orders
+    }
+
+    /// Orders currently eligible for chained dispatch, with their parent tx.
+    pub fn dispatchable_orders(
+        &self,
+    ) -> Vec<(Arc<crate::sundaev4::SundaeV4Order>, Vec<u8>)> {
+        self.orders
+            .values()
+            .filter(|p| !p.gone && !self.spent.contains_key(&p.order.input))
+            .map(|p| (p.order.clone(), p.source_tx.clone()))
+            .collect()
+    }
+
+    /// Order inputs that some unconfirmed tx already spends — the scooper
+    /// must not dispatch these even if they're still unspent on-chain.
+    pub fn spent_inputs(&self) -> BTreeSet<crate::cardano_types::TransactionInput> {
+        self.spent.keys().cloned().collect()
+    }
+
+    /// Inputs of currently-tracked provisional orders (for classification).
+    pub fn order_inputs(&self) -> BTreeSet<(Vec<u8>, u64)> {
+        self.orders
+            .keys()
+            .map(|i| (i.0.transaction_id.as_ref().to_vec(), i.0.index))
+            .collect()
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        (self.orders.len(), self.spent.len())
+    }
+}
+
+/// Parse the order-address outputs of a mempool tx into dispatchable orders.
+/// Returns only outputs whose datum decodes into a known constraint shape —
+/// anything else is logged and skipped (same tolerance as the indexer).
+/// Datum resolution covers inline datums and the tx's own witness set;
+/// metadata-posted datums are not resolvable here, and such orders simply
+/// wait for block confirmation (the indexer handles them).
+pub fn provisional_orders_from_tx(
+    tx: &MultiEraTx,
+    watch: &ProtocolWatch,
+    slot: u64,
+) -> Vec<(crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Order>)> {
+    use plutus_parser::AsPlutus;
+    let tx_hash = tx.hash();
+    let witness_datums: BTreeMap<pallas_primitives::DatumHash, pallas_primitives::PlutusData> = tx
+        .plutus_data()
+        .iter()
+        .map(|d| {
+            (
+                pallas_crypto::hash::Hasher::<256>::hash(d.raw_cbor()),
+                d.clone().unwrap(),
+            )
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (idx, output) in tx.outputs().iter().enumerate() {
+        let Ok(address) = output.address() else { continue };
+        let pallas_addresses::Address::Shelley(shelley) = address else {
+            continue;
+        };
+        if !watch.order_script_hashes.iter().any(|h| h == shelley.payment().as_hash()) {
+            continue;
+        }
+        let converted = crate::cardano_types::convert_txo(output);
+        let datum_pd = match &converted.datum {
+            crate::cardano_types::RawDatum::Inline(d) => d.clone(),
+            crate::cardano_types::RawDatum::Hash(h) => match witness_datums.get(h) {
+                Some(d) => d.clone(),
+                None => {
+                    debug!(tx = %hex::encode(tx_hash), idx, "mempool order datum by hash, not in witness set; deferring to confirmation");
+                    continue;
+                }
+            },
+            crate::cardano_types::RawDatum::None => continue,
+        };
+        let datum: crate::sundaev4::OrderDatum = match AsPlutus::from_plutus(datum_pd) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(tx = %hex::encode(tx_hash), idx, error = %e, "mempool order output datum did not parse");
+                continue;
+            }
+        };
+        let constraint = match crate::sundaev4::Constraint::from_order_datum_with_strategy(
+            &datum,
+            &watch.swap_order_hash,
+            &watch.basic_order_hash,
+            &watch.strategy_order_hash,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(tx = %hex::encode(tx_hash), idx, error = %e, "mempool order constraint did not decode");
+                continue;
+            }
+        };
+        let input = crate::cardano_types::TransactionInput::new(tx_hash, idx as u64);
+        out.push((
+            input.clone(),
+            Arc::new(crate::sundaev4::SundaeV4Order {
+                input,
+                value: converted.value,
+                datum,
+                constraint,
+                slot,
+            }),
+        ));
+    }
+    out
+}
+
+/// Submit a tx through the local node's N2C LocalTxSubmission. Used for
+/// scoops chained on provisional parents: the parent tx is guaranteed
+/// visible to this node's mempool (we read it from there), which an external
+/// submit endpoint can't promise during the propagation window.
+pub async fn submit_via_node(
+    socket_path: &str,
+    network_magic: u64,
+    cbor: &[u8],
+) -> anyhow::Result<()> {
+    use pallas_network::miniprotocols::localtxsubmission::{EraTx, Response};
+    const CONWAY_ERA: u16 = 6;
+    let mut client =
+        pallas_network::facades::NodeClient::connect(socket_path, network_magic).await?;
+    let result = client
+        .submission()
+        .submit_tx(EraTx(CONWAY_ERA, cbor.to_vec()))
+        .await;
+    client.abort().await;
+    match result {
+        Ok(Response::Accepted) => Ok(()),
+        Ok(Response::Rejected(reason)) => anyhow::bail!(
+            "node rejected tx: {}",
+            hex::encode(&reason.0),
+        ),
+        Err(e) => anyhow::bail!("local tx submission failed: {e}"),
+    }
+}
+
 struct SeenTx {
     seen_at: Instant,
     class: TxClass,
@@ -126,13 +376,21 @@ pub async fn run_mempool_monitor(
     watch: ProtocolWatch,
     v4_state: Arc<tokio::sync::Mutex<SundaeV4HistoricalState>>,
     events: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
+    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
+    provisional: Option<SharedProvisional>,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
     let seen: Arc<std::sync::Mutex<SeenMap>> = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
 
-    let correlate = correlate_confirmations(events, seen.clone(), metrics.clone());
-    let monitor = monitor_loop(cfg, watch, v4_state, seen, metrics);
+    let correlate = correlate_confirmations(
+        events,
+        seen.clone(),
+        provisional.clone(),
+        event_tx.clone(),
+        metrics.clone(),
+    );
+    let monitor = monitor_loop(cfg, watch, v4_state, seen, provisional, event_tx, metrics);
 
     tokio::select! {
         _ = shutdown.cancelled() => info!("mempool monitor shutting down"),
@@ -148,6 +406,8 @@ async fn monitor_loop(
     watch: ProtocolWatch,
     v4_state: Arc<tokio::sync::Mutex<SundaeV4HistoricalState>>,
     seen: Arc<std::sync::Mutex<SeenMap>>,
+    provisional: Option<SharedProvisional>,
+    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     metrics: Arc<Metrics>,
 ) {
     loop {
@@ -156,7 +416,16 @@ async fn monitor_loop(
         {
             Ok(mut client) => {
                 info!(socket = %cfg.socket_path, "mempool monitor connected to node");
-                if let Err(e) = watch_mempool(&mut client, &watch, &v4_state, &seen, &metrics).await
+                if let Err(e) = watch_mempool(
+                    &mut client,
+                    &watch,
+                    &v4_state,
+                    &seen,
+                    provisional.as_ref(),
+                    &event_tx,
+                    &metrics,
+                )
+                .await
                 {
                     warn!(error = %e, "mempool monitor session ended; reconnecting");
                 }
@@ -175,6 +444,8 @@ async fn watch_mempool(
     watch: &ProtocolWatch,
     v4_state: &Arc<tokio::sync::Mutex<SundaeV4HistoricalState>>,
     seen: &Arc<std::sync::Mutex<SeenMap>>,
+    provisional: Option<&SharedProvisional>,
+    event_tx: &tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     metrics: &Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let monitor = client.monitor();
@@ -185,23 +456,28 @@ async fn watch_mempool(
         // until the mempool changes.
         monitor.acquire().await?;
 
-        // The known-UTxO view refreshes per snapshot, not per tx: cheap, and
-        // an order created earlier in this same snapshot won't be in it —
-        // acceptable undercounting for phase 1.
-        let (known_order_inputs, known_pool_inputs) = {
+        // The known-UTxO view refreshes per snapshot, not per tx. Provisional
+        // order inputs are folded in so that a tx spending an order that only
+        // exists in the mempool (e.g. a cancellation racing us) still
+        // classifies as an order spend.
+        let mut new_events: Vec<IndexEvent> = Vec::new();
+        let (known_order_inputs, known_pool_inputs, tip_slot) = {
             let state = v4_state.lock().await;
             let latest = state.latest();
-            let orders: BTreeSet<(Vec<u8>, u64)> = latest
+            let mut orders: BTreeSet<(Vec<u8>, u64)> = latest
                 .orders
                 .iter()
                 .map(|o| (o.input.0.transaction_id.as_ref().to_vec(), o.input.0.index))
                 .collect();
+            if let Some(p) = provisional {
+                orders.extend(p.lock().unwrap().order_inputs());
+            }
             let pools: BTreeSet<(Vec<u8>, u64)> = latest
                 .pools
                 .values()
                 .map(|p| (p.input.0.transaction_id.as_ref().to_vec(), p.input.0.index))
                 .collect();
-            (orders, pools)
+            (orders, pools, latest.network_tip_slot.unwrap_or(latest.tip_slot))
         };
 
         let mut current: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -217,6 +493,10 @@ async fn watch_mempool(
             let hash = tx.hash().to_vec();
             current.insert(hash.clone());
             if in_mempool.contains(&hash) {
+                // Re-appeared after a brief absence: resume dispatchability.
+                if let Some(p) = provisional {
+                    p.lock().unwrap().set_gone(&hash, false);
+                }
                 continue;
             }
             metrics.mempool_txs_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -240,6 +520,35 @@ async fn watch_mempool(
                 pool_spends = class.pool_spends,
                 "mempool: relevant tx observed",
             );
+            if let Some(p) = provisional {
+                // Parse order outputs into dispatch candidates and record
+                // order spends, as one unit keyed by this tx.
+                let created = if class.order_creates > 0 {
+                    provisional_orders_from_tx(&tx, watch, tip_slot)
+                } else {
+                    Vec::new()
+                };
+                let spent: Vec<crate::cardano_types::TransactionInput> = if class.order_spends > 0 {
+                    tx.inputs()
+                        .iter()
+                        .filter(|i| {
+                            known_order_inputs.contains(&(i.hash().to_vec(), i.index()))
+                        })
+                        .map(|i| crate::cardano_types::TransactionInput::new(*i.hash(), i.index()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for (_, order) in &created {
+                    info!(
+                        order = %order.input,
+                        source_tx = %hex::encode(&hash),
+                        "mempool: provisional order candidate",
+                    );
+                    new_events.push(IndexEvent::V4MempoolOrderSeen { order: order.clone() });
+                }
+                p.lock().unwrap().note_tx(hash.clone(), created, spent);
+            }
             seen.lock().unwrap().insert(
                 hash,
                 SeenTx { seen_at: Instant::now(), class, gone_at: None },
@@ -248,16 +557,26 @@ async fn watch_mempool(
 
         // Anything we knew that the fresh snapshot no longer contains was
         // either included in a block (the correlator will hear about it) or
-        // evicted (TTL / replaced / conflict lost).
+        // evicted (TTL / replaced / conflict lost). Suspend its provisional
+        // orders right away — the confirmed copies arrive via the indexer if
+        // it was a block.
         let now = Instant::now();
         let mut seen_map = seen.lock().unwrap();
         for gone in in_mempool.difference(&current) {
             if let Some(entry) = seen_map.get_mut(gone) {
                 entry.gone_at.get_or_insert(now);
             }
+            if let Some(p) = provisional {
+                p.lock().unwrap().set_gone(gone, true);
+            }
         }
         drop(seen_map);
         in_mempool = current;
+        if !new_events.is_empty() {
+            // Wake the scooper's dispatch loop; the provisional store is the
+            // source of truth, the event is the doorbell.
+            let _ = event_tx.send((tip_slot, new_events));
+        }
     }
 }
 
@@ -267,6 +586,8 @@ async fn watch_mempool(
 async fn correlate_confirmations(
     mut events: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
     seen: Arc<std::sync::Mutex<SeenMap>>,
+    provisional: Option<SharedProvisional>,
+    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     metrics: Arc<Metrics>,
 ) {
     let mut sweep = tokio::time::interval(Duration::from_secs(60));
@@ -302,6 +623,11 @@ async fn correlate_confirmations(
                 }
                 let mut seen_map = seen.lock().unwrap();
                 for hash in confirmed {
+                    // Confirmed: the indexer now carries this tx's orders, so
+                    // the provisional copies retire silently (dedupe).
+                    if let Some(p) = &provisional {
+                        p.lock().unwrap().remove_tx(&hash);
+                    }
                     if let Some(entry) = seen_map.remove(&hash) {
                         let lead = entry.seen_at.elapsed();
                         metrics.mempool_confirmed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -319,24 +645,50 @@ async fn correlate_confirmations(
             }
             _ = sweep.tick() => {
                 let now = Instant::now();
-                let mut seen_map = seen.lock().unwrap();
-                seen_map.retain(|hash, entry| {
-                    let evicted = entry
-                        .gone_at
-                        .map(|gone| now.duration_since(gone) > EVICTION_WINDOW)
-                        .unwrap_or(false);
-                    let expired = now.duration_since(entry.seen_at) > SEEN_TTL;
-                    if evicted || expired {
-                        metrics.mempool_evicted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        info!(
-                            tx = %hex::encode(hash),
-                            "mempool: tx vanished without block confirmation (evicted or replaced)",
-                        );
-                        false
-                    } else {
-                        true
+                let mut dropped: Vec<Vec<u8>> = Vec::new();
+                {
+                    let mut seen_map = seen.lock().unwrap();
+                    seen_map.retain(|hash, entry| {
+                        let evicted = entry
+                            .gone_at
+                            .map(|gone| now.duration_since(gone) > EVICTION_WINDOW)
+                            .unwrap_or(false);
+                        let expired = now.duration_since(entry.seen_at) > SEEN_TTL;
+                        if evicted || expired {
+                            metrics.mempool_evicted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            info!(
+                                tx = %hex::encode(hash),
+                                "mempool: tx vanished without block confirmation (evicted or replaced)",
+                            );
+                            dropped.push(hash.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                if let Some(p) = &provisional {
+                    let mut drop_events: Vec<IndexEvent> = Vec::new();
+                    {
+                        let mut prov = p.lock().unwrap();
+                        for hash in &dropped {
+                            let removed = prov.remove_tx(hash);
+                            if !removed.is_empty() {
+                                warn!(
+                                    tx = %hex::encode(hash),
+                                    orders = removed.len(),
+                                    "mempool: provisional parent evicted; cascading discard",
+                                );
+                                drop_events.push(IndexEvent::V4MempoolTxDropped {
+                                    tx_hash: hash.clone(),
+                                });
+                            }
+                        }
                     }
-                });
+                    if !drop_events.is_empty() {
+                        let _ = event_tx.send((0, drop_events));
+                    }
+                }
             }
         }
     }
@@ -345,6 +697,108 @@ async fn correlate_confirmations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisional_store_lifecycle() {
+        use crate::cardano_types::TransactionInput;
+        fn dummy_order(tx_byte: u8, idx: u64) -> (TransactionInput, Arc<crate::sundaev4::SundaeV4Order>) {
+            let input = TransactionInput::new([tx_byte; 32].into(), idx);
+            let asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+            let order = crate::sundaev4::SundaeV4Order::test_swap_order(
+                input.clone(),
+                Default::default(),
+                crate::multisig::Multisig::Signature(vec![0xAA; 28]),
+                crate::sundaev4::Destination::SelfDestination,
+                (asset.clone(), crate::bigint::BigInt::from(1)),
+                (asset, crate::bigint::BigInt::from(1)),
+                crate::bigint::BigInt::from(1_000_000),
+                1,
+            );
+            (input, Arc::new(order))
+        }
+        let mut state = ProvisionalState::default();
+        let parent_a = vec![0xA1; 32];
+        let parent_b = vec![0xB2; 32];
+        let (in_a, ord_a) = dummy_order(0xA1, 0);
+        let (spent_target, _) = dummy_order(0x33, 0);
+
+        state.note_tx(parent_a.clone(), vec![(in_a.clone(), ord_a)], vec![spent_target.clone()]);
+        state.note_tx(parent_b.clone(), vec![], vec![in_a.clone()]);
+
+        // Order from A is tracked but B spends it → not dispatchable.
+        assert_eq!(state.dispatchable_orders().len(), 0);
+        assert!(state.spent_inputs().contains(&spent_target));
+        assert!(state.spent_inputs().contains(&in_a));
+
+        // B evicted: its spend mark clears, A's order becomes dispatchable.
+        state.remove_tx(&parent_b);
+        let dispatchable = state.dispatchable_orders();
+        assert_eq!(dispatchable.len(), 1);
+        assert_eq!(dispatchable[0].1, parent_a);
+
+        // A leaves the mempool: suspended immediately...
+        state.set_gone(&parent_a, true);
+        assert_eq!(state.dispatchable_orders().len(), 0);
+        // ...and resumes if it reappears.
+        state.set_gone(&parent_a, false);
+        assert_eq!(state.dispatchable_orders().len(), 1);
+
+        // A confirmed/evicted: everything it did unwinds.
+        let removed = state.remove_tx(&parent_a);
+        assert_eq!(removed, vec![in_a]);
+        assert_eq!(state.counts(), (0, 0));
+    }
+
+    /// A partial-fill scoop's continuation output is a REAL order-creating
+    /// output at the order address with an inline datum — exactly the shape
+    /// user order txs have in the mempool. Parsing it must yield a
+    /// dispatchable order with the decremented remaining_offered.
+    #[test]
+    fn parse_provisional_order_from_tx() {
+        use std::collections::BTreeMap as Map;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use crate::sundaev4::test_harness::test_harness::*;
+        use crate::bigint::BigInt;
+
+        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        let pool = make_pool(&env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
+        let mut pool_map = Map::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+        let order = make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
+        let fill = BigInt::from(100_000_000u64);
+        let route = router::find_optimal_route(
+            &pool_map, &[], &token_a(), &token_b(), &fill,
+            router::RoutingLimits::unlimited(),
+        ).expect("partial route exists");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("partial fill adds");
+        let plan = accum.into_plan();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, _eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+            .expect("partial fill builds");
+
+        let tx = MultiEraTx::decode(&build.cbor).expect("tx decodes");
+        let watch = ProtocolWatch {
+            pool_script_hash: env.exec.module_scripts.pool.hash,
+            order_script_hashes: vec![env.exec.module_scripts.order.hash],
+            swap_order_hash: env.exec.module_scripts.swap_order.as_ref().unwrap().hash.as_ref().to_vec(),
+            basic_order_hash: env.exec.module_scripts.basic_order.as_ref().unwrap().hash.as_ref().to_vec(),
+            strategy_order_hash: env.exec.module_scripts.strategy_order.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default(),
+        };
+        let parsed = provisional_orders_from_tx(&tx, &watch, 42);
+        assert_eq!(parsed.len(), 1, "continuation parses as one provisional order");
+        let (input, cont) = &parsed[0];
+        assert_eq!(input.0.transaction_id.as_ref(), tx.hash().as_ref());
+        assert_eq!(cont.slot, 42);
+        match &cont.constraint {
+            crate::sundaev4::Constraint::Swap { remaining_offered, original_offered, .. } => {
+                assert_eq!(*original_offered, BigInt::from(400_000_000u64));
+                assert_eq!(*remaining_offered, BigInt::from(300_000_000u64));
+            }
+            other => panic!("expected swap constraint, got {other:?}"),
+        }
+    }
 
     /// A scoop tx built by the real pipeline must classify as spending its
     /// pool + order inputs; a partial fill's continuation output must count
@@ -367,6 +821,9 @@ mod tests {
         let watch = ProtocolWatch {
             pool_script_hash: env.exec.module_scripts.pool.hash,
             order_script_hashes: vec![env.exec.module_scripts.order.hash],
+            swap_order_hash: Vec::new(),
+            basic_order_hash: Vec::new(),
+            strategy_order_hash: Vec::new(),
         };
         let order_inputs: BTreeSet<(Vec<u8>, u64)> = orders
             .iter()
@@ -388,6 +845,9 @@ mod tests {
         let other_watch = ProtocolWatch {
             pool_script_hash: pallas_primitives::Hash::new([0xEE; 28]),
             order_script_hashes: vec![pallas_primitives::Hash::new([0xDD; 28])],
+            swap_order_hash: Vec::new(),
+            basic_order_hash: Vec::new(),
+            strategy_order_hash: Vec::new(),
         };
         let class = classify_tx(&tx, &other_watch, &BTreeSet::new(), &BTreeSet::new());
         assert!(!class.relevant());

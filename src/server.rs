@@ -1273,6 +1273,14 @@ impl AdminServer {
 /// Format an IndexEvent into an SSE event type name and JSON data string.
 fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
     match event {
+        IndexEvent::V4MempoolOrderSeen { order } => (
+            "v4_mempool_order_seen",
+            serde_json::json!({ "order": order.input.to_string() }).to_string(),
+        ),
+        IndexEvent::V4MempoolTxDropped { tx_hash } => (
+            "v4_mempool_tx_dropped",
+            serde_json::json!({ "tx_hash": hex::encode(tx_hash) }).to_string(),
+        ),
         IndexEvent::V3PoolCreated { id, .. } => (
             "v3_pool_created",
             serde_json::json!({ "id": id.to_string() }).to_string(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::{
     collections::BTreeMap,
     fs,
@@ -74,6 +75,12 @@ pub struct Scooper {
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
     logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
+    /// Unconfirmed orders observed in the local node's mempool, shared with
+    /// the mempool monitor. None = chained execution disabled.
+    v4_provisional: Option<crate::mempool::SharedProvisional>,
+    /// (socket path, network magic) for local-node submission of scoops
+    /// that chain on provisional parents.
+    v4_node_submit: Option<(String, u64)>,
 }
 
 impl Scooper {
@@ -86,6 +93,8 @@ impl Scooper {
         paused: Arc<AtomicBool>,
         metrics: Arc<Metrics>,
         v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
+        v4_provisional: Option<crate::mempool::SharedProvisional>,
+        v4_node_submit: Option<(String, u64)>,
     ) -> Result<Self> {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
@@ -107,6 +116,8 @@ impl Scooper {
             metrics,
             backoff_until_after_slot: None,
             quarantine: BTreeMap::new(),
+            v4_provisional,
+            v4_node_submit,
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
@@ -428,6 +439,24 @@ impl Scooper {
                 IndexEvent::V4SettingsUpdated { .. } => {
                     trace!(slot, "v4 settings updated");
                 }
+                IndexEvent::V4MempoolOrderSeen { order } => {
+                    // The provisional store already holds it — receipt of
+                    // this event is what wakes the dispatch loop.
+                    trace!(slot, order = %order.input, "provisional order seen in mempool");
+                }
+                IndexEvent::V4MempoolTxDropped { tx_hash } => {
+                    let n = self
+                        .v4_chain_tracker
+                        .discard_by_provisional_parent(&tx_hash);
+                    if n > 0 {
+                        warn!(
+                            parent = %hex::encode(&tx_hash),
+                            pools = n,
+                            "mempool parent evicted; discarded chained in-flight txs",
+                        );
+                        self.sync_in_flight_metrics();
+                    }
+                }
                 IndexEvent::TipAdvanced { .. } => {
                     // Tip tracking is handled by the shared state;
                     // the scooper uses this event to unblock the sync loop.
@@ -722,7 +751,57 @@ impl Scooper {
                 }
             }
         }
-        candidates.sort_by_key(|o| o.slot);
+        // Provisional candidates: unconfirmed orders observed in the local
+        // node's mempool. They dispatch through the same pipeline but are
+        // never mixed with confirmed orders in one tx (blast-radius policy:
+        // if the provisional parent dies, only the purely-provisional scoop
+        // dies with it). Sorting them strictly last plus the mixing guard in
+        // the dispatch loop enforces the separation.
+        let mut provisional_inputs: BTreeSet<TransactionInput> = BTreeSet::new();
+        let mut provisional_parent: BTreeMap<TransactionInput, Vec<u8>> = BTreeMap::new();
+        if let Some(prov) = &self.v4_provisional {
+            let (dispatchable, spent_provisionally) = {
+                let p = prov.lock().unwrap();
+                (p.dispatchable_orders(), p.spent_inputs())
+            };
+            // Orders some unconfirmed tx already spends (a cancellation, or
+            // a competitor's scoop) are off the table before the block says
+            // so — dispatching them would build a tx that can't settle.
+            if !spent_provisionally.is_empty() {
+                let before = candidates.len();
+                candidates.retain(|o| !spent_provisionally.contains(&o.input));
+                let dropped = before - candidates.len();
+                if dropped > 0 {
+                    debug!(dropped, "skipping orders spent by unconfirmed mempool txs");
+                }
+            }
+            for (order, parent) in dispatchable {
+                if !matches!(
+                    order.constraint,
+                    crate::sundaev4::Constraint::Swap { .. }
+                        | crate::sundaev4::Constraint::Deposit { .. }
+                        | crate::sundaev4::Constraint::Withdraw { .. },
+                ) {
+                    continue;
+                }
+                if in_flight_inputs.contains(&order.input)
+                    || self.is_quarantined(&order.input, current_slot)
+                {
+                    continue;
+                }
+                {
+                    use num_traits::ToPrimitive;
+                    let budget = order.datum.budget.clone().unwrap().to_u64().unwrap_or(0);
+                    if budget == 0 {
+                        continue;
+                    }
+                }
+                provisional_inputs.insert(order.input.clone());
+                provisional_parent.insert(order.input.clone(), parent);
+                candidates.push(order);
+            }
+        }
+        candidates.sort_by_key(|o| (provisional_inputs.contains(&o.input), o.slot));
 
         // Apply any permanent quarantines deferred from the filter chain
         // (we couldn't borrow `&mut self` while iterating).
@@ -795,6 +874,7 @@ impl Scooper {
                 claim_plan, &settings, &exec, &v4_state, &language_views,
                 &collateral_input, &collateral_value, &funding_owned,
                 &strategy_executions,
+                &BTreeMap::new(),
             ).await;
         }
 
@@ -832,6 +912,8 @@ impl Scooper {
         let mut skip_add_failed = 0u32;
         let mut skip_no_route = 0u32;
         let mut skip_route_failed = 0u32;
+        let mut n_confirmed_added = 0u32;
+        let mut n_provisional_added = 0u32;
 
         let mut conversion_edges =
             crate::sundaev4::conversions::routable_edges(&exec.conversions);
@@ -861,6 +943,13 @@ impl Scooper {
             // single-pool or multi-pool split. Falling back to "first pool
             // with both assets" picked a suboptimal pool and rejected the
             // order when a better pool existed.
+            let is_provisional = provisional_inputs.contains(&order.input);
+            if is_provisional && n_confirmed_added > 0 {
+                // Provisional orders ride their own tx; the loop re-runs
+                // immediately after this one submits, so they only wait one
+                // build cycle, not a block.
+                continue;
+            }
             let mut candidate = accum.clone();
             let added = match &order.constraint {
                 crate::sundaev4::Constraint::Deposit { .. } => {
@@ -1129,8 +1218,20 @@ impl Scooper {
             if !added {
                 continue;
             }
+            if is_provisional {
+                n_provisional_added += 1;
+            } else {
+                n_confirmed_added += 1;
+            }
             accum = candidate;
             checkpoints.push(accum.clone());
+        }
+        if n_provisional_added > 0 {
+            info!(
+                n_provisional_added,
+                n_confirmed_added,
+                "batch includes mempool-chained (provisional) orders",
+            );
         }
 
         if checkpoints.is_empty() {
@@ -1439,6 +1540,7 @@ impl Scooper {
             final_plan, &settings, &exec, &v4_state, &language_views,
             &collateral_input, &collateral_value, &funding_owned,
             &strategy_executions,
+            &provisional_parent,
         ).await
     }
 
@@ -1457,6 +1559,7 @@ impl Scooper {
         collateral_value: &crate::cardano_types::Value,
         funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
         strategy_executions: &BTreeMap<TransactionInput, pallas_primitives::PlutusData>,
+        provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
     ) -> bool {
         let n_orders: usize = final_plan.batches.iter()
             .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.claims.len())
@@ -1614,8 +1717,47 @@ impl Scooper {
             "multi-pool scoop tx built, submitting"
         );
 
+        // Scoops chained on provisional parents submit through the local
+        // node: the parent tx is guaranteed present in that node's mempool
+        // (we read it from there), which an external endpoint can't promise
+        // during the gossip propagation window.
+        let tx_provisional_parents: BTreeSet<Vec<u8>> = final_plan
+            .batches
+            .iter()
+            .flat_map(|b| {
+                b.swaps.iter().map(|s| &s.order)
+                    .chain(b.deposits.iter().map(|d| &d.order))
+                    .chain(b.withdraws.iter().map(|w| &w.order))
+            })
+            .chain(final_plan.conversions.iter().map(|c| &c.order))
+            .filter_map(|o| provisional_parent.get(&o.input).cloned())
+            .collect();
         let submit_start = std::time::Instant::now();
-        let submit_result = crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await;
+        let submit_result: anyhow::Result<String> = match (
+            tx_provisional_parents.is_empty(),
+            &self.v4_node_submit,
+        ) {
+            (false, Some((socket, magic))) => {
+                info!(
+                    tx_hash = %final_tx.tx_hash_hex,
+                    parents = ?tx_provisional_parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "chained scoop: submitting via local node",
+                );
+                crate::mempool::submit_via_node(socket, *magic, &final_tx.cbor)
+                    .await
+                    .map(|_| final_tx.tx_hash_hex.clone())
+            }
+            (false, None) => {
+                // Shouldn't happen (provisional candidates only exist when
+                // the monitor is configured), but degrade to the external
+                // endpoint rather than dropping the tx.
+                warn!("provisional-parent tx with no node submit path configured");
+                crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
+            }
+            (true, _) => {
+                crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
+            }
+        };
         self.metrics.submit_latency.observe(submit_start.elapsed().as_secs_f64());
         match submit_result {
             Ok(submitted_hash) => {
@@ -1654,6 +1796,11 @@ impl Scooper {
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
                             .chain(b.withdraws.iter().map(|w| w.order.clone()))
                     })
+                    // Conversion legs consume their order too — a pure-
+                    // conversion order (e.g. ADAb mint with no pool split)
+                    // appears ONLY here, and missing it would let the next
+                    // cycle re-dispatch a spent order.
+                    .chain(final_plan.conversions.iter().map(|c| c.order.clone()))
                     .collect();
 
                 // Build predicted pools for chain tracker
@@ -1671,6 +1818,7 @@ impl Scooper {
                     consumed_orders,
                     predicted_pools,
                     ttl: final_tx.ttl,
+                    provisional_parents: tx_provisional_parents,
                 };
                 self.v4_chain_tracker.record_submission(in_flight);
                 self.sync_in_flight_metrics();

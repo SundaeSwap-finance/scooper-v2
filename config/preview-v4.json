@@ -21,7 +21,8 @@
       "starting-point": "113087829.da3343c5567f00186b90f9ff51104b6d2355c6a5d221d007d8148924e0e93061",
       "mempool": {
         "socket-path": "/home/ec2-user/cardano-node/ipc/socket",
-        "network-magic": 2
+        "network-magic": 2,
+        "execute": true
       },
       "execution": {
         "scooper-secret-key": "68eca8def78fb41d307bc79a8b7eeece30bb5bae63682ce491c6978a728b6953f4d641889e6eaa048c0b29b6344f8e37cf850e5516c60f5d350fd3fb51e7e888",

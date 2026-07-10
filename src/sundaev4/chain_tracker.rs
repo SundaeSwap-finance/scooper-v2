@@ -42,6 +42,11 @@ pub struct InFlightTx {
     pub predicted_pools: Vec<(Ident, PredictedPoolUtxo)>,
     /// Transaction validity upper bound (slot)
     pub ttl: u64,
+    /// Hashes of unconfirmed mempool txs this tx chains on (its scooped
+    /// orders' creating txs). If any of them is evicted, this tx can never
+    /// settle: `discard_by_provisional_parent` removes it and everything
+    /// downstream. Empty for txs built purely on confirmed state.
+    pub provisional_parents: BTreeSet<Vec<u8>>,
 }
 
 impl InFlightTx {
@@ -185,6 +190,31 @@ impl ChainTracker {
         }
     }
 
+    /// Discard every chain containing a tx that chained on the given
+    /// (now evicted) mempool parent, cascading to related pools. Returns the
+    /// number of pools whose chains were discarded.
+    pub fn discard_by_provisional_parent(&mut self, parent_tx: &[u8]) -> usize {
+        let affected: Vec<Ident> = self
+            .chains
+            .iter()
+            .filter(|(_, chain)| {
+                chain.iter().any(|tx| {
+                    tx.provisional_parents.iter().any(|p| p.as_slice() == parent_tx)
+                })
+            })
+            .map(|(ident, _)| ident.clone())
+            .collect();
+        for ident in &affected {
+            info!(
+                pool = %ident,
+                parent = %hex::encode(parent_tx),
+                "discarding chain built on evicted mempool parent"
+            );
+            self.discard_chain_and_related(ident);
+        }
+        affected.len()
+    }
+
     /// Discard all chains (e.g. on rollback).
     pub fn discard_all(&mut self) {
         let count: usize = self.chains.values().map(|c| c.len()).sum();
@@ -297,6 +327,7 @@ mod tests {
                 pool,
             })],
             ttl,
+            provisional_parents: BTreeSet::new(),
         }
     }
 
@@ -321,6 +352,7 @@ mod tests {
             consumed_orders: vec![],
             predicted_pools,
             ttl,
+            provisional_parents: BTreeSet::new(),
         }
     }
 
@@ -603,5 +635,32 @@ mod tests {
         assert_eq!(tracker.next_chain_index(&ident), 1);
         let latest = tracker.latest_predicted_pool(&ident).unwrap();
         assert_eq!(latest.input.0.transaction_id, Hash::<32>::from([0xcc; 32]));
+    }
+
+    #[test]
+    fn test_discard_by_provisional_parent() {
+        let mut tracker = ChainTracker::new();
+        let ident1 = Ident::new(&[0x01]);
+        let ident2 = Ident::new(&[0x02]);
+        let parent = vec![0xFE; 32];
+
+        // Pool 1: a confirmed-order tx, then a chained provisional tx.
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 200, 0));
+        let mut chained = make_in_flight(0x01, 0xbb, 260, 1);
+        chained.provisional_parents.insert(parent.clone());
+        tracker.record_submission(chained);
+        // Pool 2: unrelated in-flight tx.
+        tracker.record_submission(make_in_flight(0x02, 0xcc, 200, 0));
+
+        // Unknown parent: nothing happens.
+        assert_eq!(tracker.discard_by_provisional_parent(&[0x00; 32]), 0);
+        assert!(tracker.latest_predicted_pool(&ident1).is_some());
+
+        // Evicting the parent discards pool 1's whole chain (the confirmed
+        // link too — its successor spent its predicted output, so a rebuild
+        // from on-chain state is the only safe restart) but not pool 2.
+        assert_eq!(tracker.discard_by_provisional_parent(&parent), 1);
+        assert!(tracker.latest_predicted_pool(&ident1).is_none());
+        assert!(tracker.latest_predicted_pool(&ident2).is_some());
     }
 }
