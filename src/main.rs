@@ -28,6 +28,7 @@ mod datum_lookup;
 mod events;
 mod historical_state;
 mod instrumentation;
+mod mempool;
 mod metrics;
 mod multisig;
 mod persistence;
@@ -166,6 +167,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Captured before `protocol` moves into manager_loop.
+    let mempool_spawn = protocol.v4.as_ref().and_then(|v4| {
+        v4.mempool.clone().map(|cfg| {
+            (
+                cfg,
+                mempool::ProtocolWatch {
+                    pool_script_hash: v4.pool_script_hash,
+                    order_script_hashes: v4.order_script_hashes.clone(),
+                },
+            )
+        })
+    });
     let manager_handle = tokio::spawn(manager_loop(
         v3_state.clone(),
         v4_state.clone(),
@@ -184,6 +197,19 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let paused = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(metrics::Metrics::new());
+    // Mempool monitor (phase 1: observation only): mirrors the local node's
+    // mempool and measures how far pre-block we see relevant txs. Config
+    // absent → not spawned.
+    if let (Some((mempool_cfg, watch)), Some(v4_state_ref)) = (mempool_spawn, v4_state.as_ref()) {
+        tokio::spawn(mempool::run_mempool_monitor(
+            mempool_cfg,
+            watch,
+            v4_state_ref.clone(),
+            event_tx.subscribe(),
+            metrics.clone(),
+            shutdown.child_token(),
+        ));
+    }
     let scooper_handle = tokio::spawn(
         Scooper::new(
             config.log.trace_directory.clone(),

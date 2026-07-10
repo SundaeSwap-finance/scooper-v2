@@ -19,6 +19,10 @@
       "settings-nft": "0bc15c1eb8a2c70d40b94f43b5ec7ac840e4cda09e6f1a01512a02bc.",
       "pool-nft-policy": "975459b453bcf0d5dc72c837cc39e6473d98d7138733dab5269021d8",
       "starting-point": "113087829.da3343c5567f00186b90f9ff51104b6d2355c6a5d221d007d8148924e0e93061",
+      "mempool": {
+        "socket-path": "/home/ec2-user/cardano-node/ipc/socket",
+        "network-magic": 2
+      },
       "execution": {
         "scooper-secret-key": "68eca8def78fb41d307bc79a8b7eeece30bb5bae63682ce491c6978a728b6953f4d641889e6eaa048c0b29b6344f8e37cf850e5516c60f5d350fd3fb51e7e888",
         "scooper-stake-keyhash": "19f8f253c67c91082c43d306cd4edf825494ff8dc69b6678b83aa669",

@@ -4716,6 +4716,7 @@ dependencies = [
  "pallas-addresses",
  "pallas-codec",
  "pallas-crypto",
+ "pallas-network",
  "pallas-primitives",
  "pallas-traverse",
  "plutus-parser",

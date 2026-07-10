@@ -1127,6 +1127,9 @@ pub struct SundaeV4Protocol {
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub starting_point: Point,
     pub execution: Option<ScooperExecution>,
+    /// Local-node mempool monitor (N2C LocalTxMonitor). Absent = disabled.
+    #[serde(default)]
+    pub mempool: Option<crate::mempool::MempoolMonitorConfig>,
     /// Optional blueprint for deriving scripts. Retained for serde round-trip.
     #[serde(default)]
     #[allow(dead_code)]

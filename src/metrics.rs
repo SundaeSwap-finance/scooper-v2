@@ -154,6 +154,16 @@ pub struct Metrics {
     /// Blockfrost: most submits land in 100ms-2s, tail past 5s is a
     /// sign of upstream trouble.
     pub submit_latency: Histogram,
+    // Mempool monitor (phase 1, observation only). Counters of relevant
+    // txs seen pre-block plus the mempool→block lead-time histogram — the
+    // empirical basis for the chaining/batching work.
+    pub mempool_txs_seen: AtomicU64,
+    pub mempool_order_creates: AtomicU64,
+    pub mempool_order_spends: AtomicU64,
+    pub mempool_pool_spends: AtomicU64,
+    pub mempool_confirmed: AtomicU64,
+    pub mempool_evicted: AtomicU64,
+    pub mempool_lead_time: Histogram,
     /// Process start instant — used to compute `scooper_uptime_seconds`
     /// so operators can spot crash loops without scraping systemd state.
     start_instant: Instant,
@@ -163,6 +173,13 @@ pub struct Metrics {
 
 const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
+];
+
+/// Mempool lead time: how long before block inclusion the mempool showed us
+/// a tx. Preview/mainnet blocks average 20s, so the interesting range is
+/// 1-60s with a tail for txs that waited out several blocks.
+const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[
+    0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0,
 ];
 
 impl Metrics {
@@ -179,6 +196,13 @@ impl Metrics {
             scooped_cs: AtomicU64::new(0),
             scooped_cl: AtomicU64::new(0),
             submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
+            mempool_txs_seen: AtomicU64::new(0),
+            mempool_order_creates: AtomicU64::new(0),
+            mempool_order_spends: AtomicU64::new(0),
+            mempool_pool_spends: AtomicU64::new(0),
+            mempool_confirmed: AtomicU64::new(0),
+            mempool_evicted: AtomicU64::new(0),
+            mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
             start_instant: Instant::now(),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
             quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
@@ -380,6 +404,19 @@ pub async fn render_metrics(
     ] {
         let _ = writeln!(out, "scooper_orders_scooped_by_pool_type_total{{pool_type=\"{family}\"}} {value}");
     }
+
+    // Mempool monitor (phase 1). All zero when the monitor is disabled.
+    write_counter(&mut out, "scooper_mempool_txs_seen_total", "Transactions observed in the local node mempool", metrics.mempool_txs_seen.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_mempool_order_creates_total", "Order-address outputs observed in mempool txs", metrics.mempool_order_creates.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_mempool_order_spends_total", "Known order UTxOs spent by mempool txs", metrics.mempool_order_spends.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_mempool_pool_spends_total", "Known pool UTxOs spent by mempool txs", metrics.mempool_pool_spends.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_mempool_confirmed_total", "Mempool-seen txs later confirmed in a block", metrics.mempool_confirmed.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_mempool_evicted_total", "Mempool-seen txs that vanished without confirming", metrics.mempool_evicted.load(Ordering::Relaxed));
+    metrics.mempool_lead_time.write(
+        &mut out,
+        "scooper_mempool_lead_time_seconds",
+        "How far ahead of block inclusion the mempool showed us a relevant tx",
+    );
 
     // Submit latency histogram.
     metrics.submit_latency.write(
