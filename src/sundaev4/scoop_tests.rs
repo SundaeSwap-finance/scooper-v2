@@ -401,6 +401,82 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 2);
     }
 
+    /// A route-module order whose constraint carries a non-empty pool
+    /// whitelist must execute through a whitelisted pool even when a
+    /// better-priced pool exists, and the resulting tx must satisfy
+    /// route.ak's check_pool_whitelisted. Mirrors dispatch in scooper.rs,
+    /// which filters the router's pool view by the parsed whitelist —
+    /// preview orders b42626…/f3080db6… quarantine-looped because the
+    /// router ignored the whitelist and picked the deeper pool.
+    #[test]
+    fn route_whitelist_restricts_routing() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use crate::sundaev4::parse_route_whitelist;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+
+        // Two CP pools on the same pair: 0xAA is deep (better price for the
+        // taker), 0xBB is thin.
+        let deep = make_pool(&env, 0xAA, token_a(), 2_000_000_000, token_b(), 2_000_000_000);
+        let thin = make_pool(&env, 0xBB, token_a(), 500_000_000, token_b(), 500_000_000);
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(deep.pool_datum.identifier.clone(), deep.clone());
+        pool_map.insert(thin.pool_datum.identifier.clone(), thin.clone());
+
+        let order = make_order(token_a(), 10_000_000, token_b(), 1, 1);
+        let order = with_route_whitelist(order, &[thin.pool_datum.identifier.clone()]);
+
+        // Sanity: unrestricted, the router prefers the deep pool — the
+        // exact trap the preview orders fell into.
+        let free = router::find_optimal_route(
+            &pool_map,
+            &[], &token_a(), &token_b(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        ).expect("unrestricted route exists");
+        assert_eq!(
+            free.hops[0].splits[0].pool.ident,
+            deep.pool_datum.identifier,
+            "unrestricted router should pick the deep pool",
+        );
+
+        // Dispatch-equivalent: parse the whitelist off the order and filter
+        // the pool view before routing.
+        let route_hash = env.exec.module_scripts.route_order.as_ref().unwrap().hash.as_ref().to_vec();
+        let wl = parse_route_whitelist(
+            order.datum.find_constraint_by_hash(&route_hash).expect("order carries route module"),
+        ).expect("whitelist parses");
+        assert_eq!(wl, vec![thin.pool_datum.identifier.clone()]);
+        let filtered: BTreeMap<_, _> = pool_map
+            .iter()
+            .filter(|(ident, _)| wl.contains(ident))
+            .map(|(i, p)| (i.clone(), p.clone()))
+            .collect();
+
+        let route = router::find_optimal_route(
+            &filtered,
+            &[], &token_a(), &token_b(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        ).expect("whitelisted route exists");
+        assert_eq!(route.hops.len(), 1);
+        assert_eq!(
+            route.hops[0].splits[0].pool.ident,
+            thin.pool_datum.identifier,
+            "whitelist should force the thin pool",
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &filtered)
+            .expect("whitelisted order should execute");
+        let plan = accum.into_plan();
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+            .expect("whitelisted route must satisfy route.ak's check_pool_whitelisted");
+        assert!(!eval.budgets.is_empty());
+    }
+
     /// A swap expressed via the BASIC constraint module routes — and
     /// BLENDS across two disjoint paths — through the real validators.
     /// Pools: direct A/B (1B/1B) plus A/E and E/B (1B each), so the blend

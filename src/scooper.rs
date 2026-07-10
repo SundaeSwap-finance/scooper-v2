@@ -934,19 +934,54 @@ impl Scooper {
                     // full-flow chain. Plain swap-constraint orders may
                     // blend across parallel paths (min_received is their
                     // only on-chain output check).
-                    let has_route_module = exec
+                    let route_constraint_data = exec
                         .module_scripts
                         .route_order
                         .as_ref()
-                        .map(|m| {
-                            order.datum.constraints.iter().any(|(h, _)| {
-                                h.as_slice() == m.hash.as_ref()
+                        .and_then(|m| {
+                            order.datum.constraints.iter().find_map(|(h, d)| {
+                                (h.as_slice() == m.hash.as_ref()).then_some(d)
                             })
-                        })
-                        .unwrap_or(false);
+                        });
+                    let has_route_module = route_constraint_data.is_some();
+                    // The route constraint's payload is a pool whitelist;
+                    // when non-empty, route_lib.check_pool_whitelisted
+                    // rejects any pool outside it, so restrict the router's
+                    // view to match. A malformed payload can never validate
+                    // on-chain (route.ak `expect`s a List<Ident>), so skip
+                    // those orders instead of quarantine-looping them.
+                    let route_whitelist = match route_constraint_data
+                        .map(crate::sundaev4::parse_route_whitelist)
+                    {
+                        None => Vec::new(),
+                        Some(Ok(whitelist)) => whitelist,
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                order = %order.input,
+                                error = %e,
+                                "order dispatch: unparseable route whitelist; order can never validate, skipping",
+                            );
+                            skip_no_route += 1;
+                            continue;
+                        }
+                    };
+                    let pool_view = if route_whitelist.is_empty() {
+                        pool_view
+                    } else {
+                        pool_view
+                            .into_iter()
+                            .filter(|(ident, _)| route_whitelist.contains(ident))
+                            .collect()
+                    };
+                    // The route module's redeemer attests pool transcript
+                    // steps only — a conversion leg (e.g. a Butane mint) is
+                    // unrepresentable in it — so route-module orders route
+                    // through pools alone.
+                    let conversion_edges: &[crate::sundaev4::conversions::ConversionEdge] =
+                        if has_route_module { &[] } else { &conversion_edges };
                     let Some(blend) = router::find_blended_route(
                         &pool_view,
-                        &conversion_edges,
+                        conversion_edges,
                         offer_asset,
                         ask_asset,
                         offer_amount,
@@ -961,7 +996,7 @@ impl Scooper {
                         // constrained orders.
                         match router::find_optimal_route(
                             &pool_view,
-                            &conversion_edges,
+                            conversion_edges,
                             offer_asset,
                             ask_asset,
                             offer_amount,
@@ -1047,13 +1082,13 @@ impl Scooper {
                             if let Some(dx) = self.find_partial_fill_dx(
                                 order,
                                 &pool_view,
-                                &conversion_edges,
+                                conversion_edges,
                                 &exec,
                                 limits,
                             ) {
                                 if let Some(pblend) = router::find_blended_route(
                                     &pool_view,
-                                    &conversion_edges,
+                                    conversion_edges,
                                     offer_asset,
                                     ask_asset,
                                     &dx,

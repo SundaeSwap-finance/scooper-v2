@@ -884,6 +884,35 @@ pub(crate) mod test_harness {
         order
     }
 
+    /// Override the route constraint's pool whitelist on a test order.
+    /// `with_real_constraints` writes an empty list (unrestricted); whitelist
+    /// tests swap in explicit pool idents. No-op on pre-PR#11 fixtures or
+    /// orders without the route module.
+    pub fn with_route_whitelist(
+        order: Arc<SundaeV4Order>,
+        whitelist: &[Ident],
+    ) -> Arc<SundaeV4Order> {
+        let Some(Some(ctx)) = TEST_CTX.get() else {
+            return order;
+        };
+        let data = PlutusData::Array(MaybeIndefArray::Def(
+            whitelist
+                .iter()
+                .map(|i| PlutusData::BoundedBytes(i.to_bytes().to_vec().into()))
+                .collect(),
+        ));
+        let mut order = match Arc::try_unwrap(order) {
+            Ok(o) => o,
+            Err(_) => panic!("with_route_whitelist requires sole ownership of the order"),
+        };
+        for (h, d) in order.datum.constraints.iter_mut() {
+            if *h == ctx.route_order {
+                *d = data.clone();
+            }
+        }
+        Arc::new(order)
+    }
+
     /// Build a settings UTxO from the test env's scooper keyhash.
     ///
     /// The settings value includes the settings NFT (settingsMint policy, empty token name)

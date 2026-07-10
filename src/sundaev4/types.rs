@@ -187,6 +187,25 @@ impl OrderDatum {
     }
 }
 
+/// Parse a route constraint's data payload. On-chain it is the order's pool
+/// whitelist (`List<Ident>` — see route.ak); empty means unrestricted, and
+/// `route_lib.check_pool_whitelisted` rejects any pool outside a non-empty
+/// list. A payload that isn't a list of byte strings can never satisfy the
+/// module's `expect pool_whitelist: List<Ident>`, so callers should treat
+/// `Err` as "order can never validate".
+pub fn parse_route_whitelist(data: &PlutusData) -> Result<Vec<Ident>, String> {
+    let PlutusData::Array(items) = data else {
+        return Err("route constraint payload is not a list".to_string());
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            PlutusData::BoundedBytes(b) => Ok(Ident::new(b.as_ref())),
+            _ => Err("route whitelist entry is not a byte string".to_string()),
+        })
+        .collect()
+}
+
 /// Decoded form of a single constraint entry pulled out of
 /// `OrderDatum.constraints`. The constructor tag of the inner Data picks
 /// the variant; the constraint *class* (swap vs basic) is identified by
@@ -1120,6 +1139,43 @@ pub struct SundaeV4Protocol {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_whitelist_parses_idents() {
+        use super::*;
+        let idents = vec![vec![0xAA; 28], vec![0xBB; 28]];
+        let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(
+            idents
+                .iter()
+                .map(|i| PlutusData::BoundedBytes(i.clone().into()))
+                .collect(),
+        ));
+        let wl = parse_route_whitelist(&pd).unwrap();
+        assert_eq!(wl, vec![Ident::new(&[0xAA; 28]), Ident::new(&[0xBB; 28])]);
+    }
+
+    #[test]
+    fn route_whitelist_empty_is_unrestricted() {
+        use super::*;
+        let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(vec![]));
+        assert_eq!(parse_route_whitelist(&pd).unwrap(), Vec::<Ident>::new());
+        // Indefinite-length encoding parses the same.
+        let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Indef(vec![]));
+        assert_eq!(parse_route_whitelist(&pd).unwrap(), Vec::<Ident>::new());
+    }
+
+    #[test]
+    fn route_whitelist_rejects_malformed() {
+        use super::*;
+        // Not a list at all.
+        let pd = PlutusData::BoundedBytes(vec![0xAA; 28].into());
+        assert!(parse_route_whitelist(&pd).is_err());
+        // A list whose entry isn't a byte string.
+        let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(vec![
+            PlutusData::BigInt(pallas_primitives::BigInt::Int(1i64.into())),
+        ]));
+        assert!(parse_route_whitelist(&pd).is_err());
+    }
+
     #[test]
     fn basic_tag2_decodes_as_swap() {
         use super::*;
