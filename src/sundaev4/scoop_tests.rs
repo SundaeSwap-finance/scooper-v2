@@ -659,6 +659,54 @@ mod tests {
         }
     }
 
+    /// Audit probe: can a swap-module order RECEIVING ADA fill at all?
+    /// compute_fee_taken measures in_ada − out_ada; a destination that
+    /// receives dy ADA drives it negative, and the module expects ≥ 0.
+    #[test]
+    fn swap_order_receiving_ada_full_fill() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xC9, ada(), 1_000_000_000, token_a(), 1_000_000_000);
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+
+        // Sell 10M tOKENA for ADA, easily satisfiable min.
+        let order = make_order(token_a(), 10_000_000, ada(), 1_000_000, 1);
+        let route = router::find_optimal_route(
+            &pool_map, &[], &token_a(), &ada(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("route exists");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("adds");
+        let plan = accum.into_plan();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        // KNOWN CONTRACT BUG (found 2026-07-09, pre-launch finding):
+        // compute_fee_taken = in_ada − out_ada goes negative when the
+        // destination receives ADA, and swap.ak expects ≥ 0 — so orders
+        // selling a token FOR ADA cannot execute at all (basic.ak shares
+        // the shape). This test documents the bug; when the contracts fix
+        // fee accounting to net out received ADA, it will fail here and
+        // should be flipped to assert success.
+        match env.build_and_eval_plan(&plan, &settings, 1000) {
+            Ok(_) => panic!(
+                "ADA-receiving fill VALIDATES — contract fixed! Flip this \
+                 test to assert success and re-enable ADA-receiving \
+                 dispatch (see swap.ak compute_fee_taken)."
+            ),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("ExplicitErrorTerm"),
+                    "expected the fee_taken>=0 failure, got: {msg}"
+                );
+            }
+        }
+    }
+
     /// Single-pool basic swap: the degenerate case must also evaluate.
     #[test]
     fn basic_swap_direct() {
