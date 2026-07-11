@@ -798,7 +798,15 @@ impl Scooper {
                     debug!(dropped, "skipping orders spent by unconfirmed mempool txs");
                 }
             }
+            // The indexer may confirm an order a beat before the correlator
+            // retires its provisional copy — never present both copies to
+            // the accumulator.
+            let confirmed_inputs: BTreeSet<TransactionInput> =
+                candidates.iter().map(|o| o.input.clone()).collect();
             for (order, parent) in dispatchable {
+                if confirmed_inputs.contains(&order.input) {
+                    continue;
+                }
                 if !matches!(
                     order.constraint,
                     crate::sundaev4::Constraint::Swap { .. }
