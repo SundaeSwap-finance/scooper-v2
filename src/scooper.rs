@@ -898,6 +898,7 @@ impl Scooper {
                 &collateral_input, &collateral_value, &funding_owned,
                 &strategy_executions,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 funding_is_predicted,
             ).await;
         }
@@ -921,13 +922,63 @@ impl Scooper {
         //      pre-spend pool input and the resulting tx would race itself —
         //      node returns BadInputsUTxO since our own predecessor tx in the
         //      mempool already consumed that input.
+        // Foreign scoop predictions from the mempool: other actors' txs
+        // spending pools we track. Our own submissions also land in the
+        // provisional store (the monitor can't tell), so filter them by our
+        // in-flight set — the chain tracker is authoritative for ours.
+        let own_tx_hashes = self.v4_chain_tracker.in_flight_tx_hashes();
+        let mut foreign_pools: BTreeMap<
+            crate::sundaev3::Ident,
+            (Arc<crate::sundaev4::SundaeV4Pool>, Vec<u8>, TransactionInput),
+        > = BTreeMap::new();
+        if let Some(prov) = &self.v4_provisional {
+            for (ident, fp) in prov.lock().unwrap().foreign_pools() {
+                if own_tx_hashes.iter().any(|h| h.as_ref() == fp.source_tx.as_slice()) {
+                    continue;
+                }
+                foreign_pools.insert(ident, (fp.pool, fp.source_tx, fp.spent_input));
+            }
+        }
+        // Conflict rule: a foreign tx spending the same base UTxO as our
+        // in-flight chain can only be in OUR node's mempool if our tx no
+        // longer is (the node rejects conflicting txs). We lost the race —
+        // discard our chain now and rebuild on theirs, instead of waiting
+        // for the block to tell us.
+        for (ident, (_, source, spent_input)) in &foreign_pools {
+            if self.v4_chain_tracker.latest_predicted_pool(ident).is_some() {
+                if let Some(base) = v4_state.pools.get(ident) {
+                    if &base.input == spent_input {
+                        warn!(
+                            pool = %ident,
+                            foreign = %hex::encode(source),
+                            "foreign mempool scoop conflicts with our in-flight chain; rebuilding on theirs",
+                        );
+                        self.v4_chain_tracker.discard_chain_and_related(ident);
+                    }
+                }
+            }
+        }
+        // Effective pool per ident: our chain tip normally; the foreign
+        // prediction when it IS the tip (it spends our latest predicted
+        // output — someone chained on us) or when we have no chain.
+        let mut foreign_pool_parent: BTreeMap<crate::sundaev3::Ident, Vec<u8>> = BTreeMap::new();
         let pools_filtered: std::collections::BTreeMap<_, _> = v4_state.pools.iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes())))
             .map(|(ident, pool)| {
-                let effective = self.v4_chain_tracker
-                    .latest_predicted_pool(ident)
-                    .map(|p| p.pool.clone())
-                    .unwrap_or_else(|| pool.clone());
+                let own = self.v4_chain_tracker.latest_predicted_pool(ident);
+                let foreign = foreign_pools.get(ident);
+                let effective = match (own, foreign) {
+                    (Some(own), Some((fpool, fsource, fspent))) if fspent == &own.input => {
+                        foreign_pool_parent.insert(ident.clone(), fsource.clone());
+                        fpool.clone()
+                    }
+                    (Some(own), _) => own.pool.clone(),
+                    (None, Some((fpool, fsource, _))) => {
+                        foreign_pool_parent.insert(ident.clone(), fsource.clone());
+                        fpool.clone()
+                    }
+                    (None, None) => pool.clone(),
+                };
                 (ident.clone(), effective)
             })
             .collect();
@@ -1565,6 +1616,7 @@ impl Scooper {
             &collateral_input, &collateral_value, &funding_owned,
             &strategy_executions,
             &provisional_parent,
+            &foreign_pool_parent,
             funding_is_predicted,
         ).await
     }
@@ -1585,6 +1637,7 @@ impl Scooper {
         funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
         strategy_executions: &BTreeMap<TransactionInput, pallas_primitives::PlutusData>,
         provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
+        foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
         funding_is_predicted: bool,
     ) -> bool {
         let n_orders: usize = final_plan.batches.iter()
@@ -1757,29 +1810,52 @@ impl Scooper {
             })
             .chain(final_plan.conversions.iter().map(|c| &c.order))
             .filter_map(|o| provisional_parent.get(&o.input).cloned())
+            // Pools whose effective state came from a foreign mempool scoop:
+            // this tx spends that scoop's output, so it inherits the foreign
+            // tx as a parent (eviction cascades through us).
+            .chain(
+                final_plan
+                    .batches
+                    .iter()
+                    .filter_map(|b| foreign_pool_parent.get(&b.pool_ident).cloned()),
+            )
             .collect();
-        let needs_node = !tx_provisional_parents.is_empty() || funding_is_predicted;
+        // Local node is the default submission path when configured: ~12ms
+        // vs 1-2s through the external endpoint, and chained parents are
+        // guaranteed visible. Rejects are authoritative (the node validated
+        // against ledger + mempool; an external endpoint won't disagree);
+        // transport failures fall back — except for chained txs, whose
+        // parents the external endpoint may not see yet.
+        let is_chained = !tx_provisional_parents.is_empty() || funding_is_predicted;
         let submit_start = std::time::Instant::now();
-        let submit_result: anyhow::Result<String> = match (needs_node, &self.v4_node_submit) {
-            (true, Some((socket, magic))) => {
-                info!(
-                    tx_hash = %final_tx.tx_hash_hex,
-                    parents = ?tx_provisional_parents.iter().map(hex::encode).collect::<Vec<_>>(),
-                    funding_is_predicted,
-                    "chained scoop: submitting via local node",
-                );
-                crate::mempool::submit_via_node(socket, *magic, &final_tx.cbor)
-                    .await
-                    .map(|_| final_tx.tx_hash_hex.clone())
+        let submit_result: anyhow::Result<String> = match &self.v4_node_submit {
+            Some((socket, magic)) => {
+                if is_chained {
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        parents = ?tx_provisional_parents.iter().map(hex::encode).collect::<Vec<_>>(),
+                        funding_is_predicted,
+                        "chained scoop: submitting via local node",
+                    );
+                }
+                match crate::mempool::submit_via_node(socket, *magic, &final_tx.cbor).await {
+                    Ok(()) => Ok(final_tx.tx_hash_hex.clone()),
+                    Err(e @ crate::mempool::NodeSubmitError::Rejected(_)) => Err(e.into()),
+                    Err(crate::mempool::NodeSubmitError::Transport(e)) if !is_chained => {
+                        warn!(error = %e, "local node submission failed; falling back to submit_url");
+                        crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
+                    }
+                    Err(e) => Err(e.into()),
+                }
             }
-            (true, None) => {
+            None if is_chained => {
                 // Shouldn't happen (provisional candidates and predicted
                 // funding only exist when the monitor is configured), but
                 // degrade to the external endpoint rather than dropping the tx.
                 warn!("chained tx with no node submit path configured");
                 crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
             }
-            (false, _) => {
+            None => {
                 crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
             }
         };

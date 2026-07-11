@@ -139,12 +139,26 @@ pub struct ProvisionalOrder {
     pub gone: bool,
 }
 
+/// A pool state predicted by a FOREIGN unconfirmed tx (someone else's scoop
+/// observed in the mempool). Dispatch chains on it instead of racing the
+/// stale on-chain UTxO.
+#[derive(Clone)]
+pub struct ForeignPoolPrediction {
+    pub pool: Arc<crate::sundaev4::SundaeV4Pool>,
+    pub source_tx: Vec<u8>,
+    /// The pool UTxO the foreign tx spent — used to detect conflicts with
+    /// our own in-flight chains and to order chained predictions.
+    pub spent_input: crate::cardano_types::TransactionInput,
+    pub gone: bool,
+}
+
 /// Effects a single mempool tx had on the order book, tracked so that
 /// confirmation or eviction of that tx can be undone as a unit.
 #[derive(Clone, Default)]
 struct TxEffects {
     created_orders: Vec<crate::cardano_types::TransactionInput>,
     spent_orders: Vec<crate::cardano_types::TransactionInput>,
+    predicted_pools: Vec<crate::sundaev3::Ident>,
 }
 
 /// Shared between the mempool monitor (writer) and the scooper (reader).
@@ -156,6 +170,10 @@ pub struct ProvisionalState {
     /// Order inputs spent by some unconfirmed tx (cancellation, or a scoop —
     /// ours or a competitor's), keyed by order input → spender tx hash.
     spent: BTreeMap<crate::cardano_types::TransactionInput, Vec<u8>>,
+    /// Latest predicted pool state per ident from mempool pool spends
+    /// (includes our own scoops; the scooper filters those out against its
+    /// in-flight set — its own chain tracker is authoritative for them).
+    pools: BTreeMap<crate::sundaev3::Ident, ForeignPoolPrediction>,
     by_tx: BTreeMap<Vec<u8>, TxEffects>,
 }
 
@@ -168,6 +186,11 @@ impl ProvisionalState {
         tx_hash: Vec<u8>,
         created: Vec<(crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Order>)>,
         spent: Vec<crate::cardano_types::TransactionInput>,
+        pool_predictions: Vec<(
+            crate::sundaev3::Ident,
+            Arc<crate::sundaev4::SundaeV4Pool>,
+            crate::cardano_types::TransactionInput,
+        )>,
     ) {
         if self.by_tx.contains_key(&tx_hash) {
             return;
@@ -184,6 +207,20 @@ impl ProvisionalState {
             effects.spent_orders.push(input.clone());
             self.spent.insert(input, tx_hash.clone());
         }
+        for (ident, pool, spent_input) in pool_predictions {
+            effects.predicted_pools.push(ident.clone());
+            // Last writer wins: mempool snapshots arrive in chain order, so
+            // the newest prediction is the tip of that pool's mempool chain.
+            self.pools.insert(
+                ident,
+                ForeignPoolPrediction {
+                    pool,
+                    source_tx: tx_hash.clone(),
+                    spent_input,
+                    gone: false,
+                },
+            );
+        }
         self.by_tx.insert(tx_hash, effects);
     }
 
@@ -194,6 +231,13 @@ impl ProvisionalState {
             for input in &effects.created_orders {
                 if let Some(p) = self.orders.get_mut(input) {
                     p.gone = gone;
+                }
+            }
+            for ident in &effects.predicted_pools {
+                if let Some(fp) = self.pools.get_mut(ident) {
+                    if fp.source_tx.as_slice() == tx_hash {
+                        fp.gone = gone;
+                    }
                 }
             }
         }
@@ -212,6 +256,11 @@ impl ProvisionalState {
             // Only clear the mark if WE set it (a later tx may have re-spent).
             if self.spent.get(input).map(|h| h.as_slice()) == Some(tx_hash) {
                 self.spent.remove(input);
+            }
+        }
+        for ident in &effects.predicted_pools {
+            if self.pools.get(ident).map(|fp| fp.source_tx.as_slice()) == Some(tx_hash) {
+                self.pools.remove(ident);
             }
         }
         effects.created_orders
@@ -239,6 +288,17 @@ impl ProvisionalState {
         self.orders
             .keys()
             .map(|i| (i.0.transaction_id.as_ref().to_vec(), i.0.index))
+            .collect()
+    }
+
+    /// Live (not-gone) foreign pool predictions.
+    pub fn foreign_pools(
+        &self,
+    ) -> Vec<(crate::sundaev3::Ident, ForeignPoolPrediction)> {
+        self.pools
+            .iter()
+            .filter(|(_, fp)| !fp.gone)
+            .map(|(i, fp)| (i.clone(), fp.clone()))
             .collect()
     }
 
@@ -325,19 +385,108 @@ pub fn provisional_orders_from_tx(
     out
 }
 
-/// Submit a tx through the local node's N2C LocalTxSubmission. Used for
-/// scoops chained on provisional parents: the parent tx is guaranteed
-/// visible to this node's mempool (we read it from there), which an external
-/// submit endpoint can't promise during the propagation window.
+/// Parse the pool-address outputs of a mempool tx into predicted pool
+/// states. `pool_context` maps known pool idents to their current
+/// (input, pool) so the prediction can carry over pool_type/fee_split
+/// (a scoop can't change a pool's module) and record which UTxO the
+/// foreign tx spent. Pools we don't already know are skipped — a pool
+/// *creation* in the mempool waits for its block.
+pub fn pool_predictions_from_tx(
+    tx: &MultiEraTx,
+    watch: &ProtocolWatch,
+    pool_context: &BTreeMap<
+        crate::sundaev3::Ident,
+        (crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Pool>),
+    >,
+    slot: u64,
+) -> Vec<(
+    crate::sundaev3::Ident,
+    Arc<crate::sundaev4::SundaeV4Pool>,
+    crate::cardano_types::TransactionInput,
+)> {
+    use plutus_parser::AsPlutus;
+    let tx_hash = tx.hash();
+    let spent: BTreeSet<(Vec<u8>, u64)> = tx
+        .inputs()
+        .iter()
+        .map(|i| (i.hash().to_vec(), i.index()))
+        .collect();
+    let mut out = Vec::new();
+    for (idx, output) in tx.outputs().iter().enumerate() {
+        let Ok(address) = output.address() else { continue };
+        let pallas_addresses::Address::Shelley(shelley) = address else {
+            continue;
+        };
+        if shelley.payment().as_hash() != &watch.pool_script_hash {
+            continue;
+        }
+        let converted = crate::cardano_types::convert_txo(output);
+        let datum_pd = match &converted.datum {
+            crate::cardano_types::RawDatum::Inline(d) => d.clone(),
+            _ => continue,
+        };
+        let pool_datum: crate::sundaev4::PoolDatum = match AsPlutus::from_plutus(datum_pd) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(tx = %hex::encode(tx_hash), idx, error = %e, "mempool pool output datum did not parse");
+                continue;
+            }
+        };
+        let ident = pool_datum.identifier.clone();
+        let Some((old_input, old_pool)) = pool_context.get(&ident) else {
+            debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output for unknown pool; deferring to confirmation");
+            continue;
+        };
+        // Sanity: the tx must actually spend the pool UTxO we know about —
+        // otherwise this is a chain we can't see the base of.
+        if !spent.contains(&(old_input.0.transaction_id.as_ref().to_vec(), old_input.0.index)) {
+            debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output doesn't spend the known pool input; skipping");
+            continue;
+        }
+        out.push((
+            ident,
+            Arc::new(crate::sundaev4::SundaeV4Pool {
+                input: crate::cardano_types::TransactionInput::new(tx_hash, idx as u64),
+                value: converted.value,
+                pool_datum,
+                pool_type: old_pool.pool_type.clone(),
+                slot,
+                fee_split_config: old_pool.fee_split_config.clone(),
+            }),
+            old_input.clone(),
+        ));
+    }
+    out
+}
+
+/// Local-node submission failure, split so callers can tell an
+/// authoritative ledger reject from an infrastructure problem: rejects must
+/// not fall back to an external endpoint (the answer won't change), while a
+/// dead socket should.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeSubmitError {
+    /// The node validated the tx against ledger + mempool state and said no.
+    #[error("node rejected tx: {0}")]
+    Rejected(String),
+    /// Couldn't reach the node or the protocol errored.
+    #[error("local tx submission failed: {0}")]
+    Transport(String),
+}
+
+/// Submit a tx through the local node's N2C LocalTxSubmission. The default
+/// submission path when a mempool config is present: ~12ms observed vs 1-2s
+/// through an external endpoint, and chained txs' parents are guaranteed
+/// visible to this node's mempool (we read them from there).
 pub async fn submit_via_node(
     socket_path: &str,
     network_magic: u64,
     cbor: &[u8],
-) -> anyhow::Result<()> {
+) -> Result<(), NodeSubmitError> {
     use pallas_network::miniprotocols::localtxsubmission::{EraTx, Response};
     const CONWAY_ERA: u16 = 6;
-    let mut client =
-        pallas_network::facades::NodeClient::connect(socket_path, network_magic).await?;
+    let mut client = pallas_network::facades::NodeClient::connect(socket_path, network_magic)
+        .await
+        .map_err(|e| NodeSubmitError::Transport(e.to_string()))?;
     let result = client
         .submission()
         .submit_tx(EraTx(CONWAY_ERA, cbor.to_vec()))
@@ -345,11 +494,10 @@ pub async fn submit_via_node(
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
-        Ok(Response::Rejected(reason)) => anyhow::bail!(
-            "node rejected tx: {}",
-            hex::encode(&reason.0),
-        ),
-        Err(e) => anyhow::bail!("local tx submission failed: {e}"),
+        Ok(Response::Rejected(reason)) => {
+            Err(NodeSubmitError::Rejected(hex::encode(&reason.0)))
+        }
+        Err(e) => Err(NodeSubmitError::Transport(e.to_string())),
     }
 }
 
@@ -469,14 +617,23 @@ async fn watch_mempool(
                 .iter()
                 .map(|o| (o.input.0.transaction_id.as_ref().to_vec(), o.input.0.index))
                 .collect();
-            if let Some(p) = provisional {
-                orders.extend(p.lock().unwrap().order_inputs());
-            }
-            let pools: BTreeSet<(Vec<u8>, u64)> = latest
+            let mut pools: BTreeSet<(Vec<u8>, u64)> = latest
                 .pools
                 .values()
                 .map(|p| (p.input.0.transaction_id.as_ref().to_vec(), p.input.0.index))
                 .collect();
+            if let Some(p) = provisional {
+                let prov = p.lock().unwrap();
+                orders.extend(prov.order_inputs());
+                // Foreign predicted pool UTxOs: spends of them are chain
+                // links we want to classify as pool spends too.
+                for (_, fp) in prov.foreign_pools() {
+                    pools.insert((
+                        fp.pool.input.0.transaction_id.as_ref().to_vec(),
+                        fp.pool.input.0.index,
+                    ));
+                }
+            }
             (orders, pools, latest.network_tip_slot.unwrap_or(latest.tip_slot))
         };
 
@@ -521,8 +678,9 @@ async fn watch_mempool(
                 "mempool: relevant tx observed",
             );
             if let Some(p) = provisional {
-                // Parse order outputs into dispatch candidates and record
-                // order spends, as one unit keyed by this tx.
+                // Parse order outputs into dispatch candidates, record order
+                // spends, and predict pool states — as one unit keyed by
+                // this tx.
                 let created = if class.order_creates > 0 {
                     provisional_orders_from_tx(&tx, watch, tip_slot)
                 } else {
@@ -539,6 +697,29 @@ async fn watch_mempool(
                 } else {
                     Vec::new()
                 };
+                let pool_predictions = if class.pool_spends > 0 {
+                    // Context: confirmed pools overlaid with existing
+                    // provisional predictions, so chains of foreign scoops
+                    // resolve link by link.
+                    let mut context: BTreeMap<
+                        crate::sundaev3::Ident,
+                        (crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Pool>),
+                    > = {
+                        let state = v4_state.lock().await;
+                        let latest = state.latest();
+                        latest
+                            .pools
+                            .iter()
+                            .map(|(i, pl)| (i.clone(), (pl.input.clone(), pl.clone())))
+                            .collect()
+                    };
+                    for (ident, fp) in p.lock().unwrap().foreign_pools() {
+                        context.insert(ident, (fp.pool.input.clone(), fp.pool.clone()));
+                    }
+                    pool_predictions_from_tx(&tx, watch, &context, tip_slot)
+                } else {
+                    Vec::new()
+                };
                 for (_, order) in &created {
                     info!(
                         order = %order.input,
@@ -547,7 +728,17 @@ async fn watch_mempool(
                     );
                     new_events.push(IndexEvent::V4MempoolOrderSeen { order: order.clone() });
                 }
-                p.lock().unwrap().note_tx(hash.clone(), created, spent);
+                for (ident, _, spent_input) in &pool_predictions {
+                    info!(
+                        pool = %ident,
+                        source_tx = %hex::encode(&hash),
+                        spent = %spent_input,
+                        "mempool: pool spend predicted",
+                    );
+                }
+                p.lock()
+                    .unwrap()
+                    .note_tx(hash.clone(), created, spent, pool_predictions);
             }
             seen.lock().unwrap().insert(
                 hash,
@@ -722,8 +913,8 @@ mod tests {
         let (in_a, ord_a) = dummy_order(0xA1, 0);
         let (spent_target, _) = dummy_order(0x33, 0);
 
-        state.note_tx(parent_a.clone(), vec![(in_a.clone(), ord_a)], vec![spent_target.clone()]);
-        state.note_tx(parent_b.clone(), vec![], vec![in_a.clone()]);
+        state.note_tx(parent_a.clone(), vec![(in_a.clone(), ord_a)], vec![spent_target.clone()], vec![]);
+        state.note_tx(parent_b.clone(), vec![], vec![in_a.clone()], vec![]);
 
         // Order from A is tracked but B spends it → not dispatchable.
         assert_eq!(state.dispatchable_orders().len(), 0);
@@ -747,6 +938,76 @@ mod tests {
         let removed = state.remove_tx(&parent_a);
         assert_eq!(removed, vec![in_a]);
         assert_eq!(state.counts(), (0, 0));
+    }
+
+    #[test]
+    fn foreign_pool_prediction_lifecycle() {
+        use crate::cardano_types::TransactionInput;
+        use crate::sundaev3::Ident;
+        use crate::bigint::BigInt;
+        use crate::sundaev4::{PoolDatum, PoolType, Rational};
+
+        fn dummy_pool(ident: &Ident, tx_byte: u8) -> Arc<crate::sundaev4::SundaeV4Pool> {
+            Arc::new(crate::sundaev4::SundaeV4Pool {
+                input: TransactionInput::new([tx_byte; 32].into(), 0),
+                value: Default::default(),
+                pool_datum: PoolDatum {
+                    assets: vec![],
+                    total_lp: BigInt::from(0),
+                    circulating_lp: BigInt::from(0),
+                    preminted_lp: BigInt::from(0),
+                    identifier: ident.clone(),
+                    actions: vec![],
+                    module_state: vec![],
+                },
+                pool_type: PoolType::ConstantProduct {
+                    fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                },
+                slot: 1,
+                fee_split_config: None,
+            })
+        }
+
+        let mut state = ProvisionalState::default();
+        let ident = Ident::new(&[0x77]);
+        let foreign_tx = vec![0xF0; 32];
+        let base_input = TransactionInput::new([0x01; 32].into(), 0);
+        let predicted = dummy_pool(&ident, 0xF0);
+
+        state.note_tx(
+            foreign_tx.clone(),
+            vec![],
+            vec![],
+            vec![(ident.clone(), predicted, base_input.clone())],
+        );
+        let live = state.foreign_pools();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, ident);
+        assert_eq!(live[0].1.spent_input, base_input);
+
+        // A second foreign tx chains on the first: last writer wins.
+        let foreign_tx2 = vec![0xF1; 32];
+        let tip_input = live[0].1.pool.input.clone();
+        state.note_tx(
+            foreign_tx2.clone(),
+            vec![],
+            vec![],
+            vec![(ident.clone(), dummy_pool(&ident, 0xF1), tip_input.clone())],
+        );
+        let live = state.foreign_pools();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].1.source_tx, foreign_tx2);
+        assert_eq!(live[0].1.spent_input, tip_input);
+
+        // Tip leaves the mempool → suspended; removal clears it. The first
+        // tx's removal must NOT clear the entry (it's no longer the writer).
+        state.set_gone(&foreign_tx2, true);
+        assert!(state.foreign_pools().is_empty());
+        state.remove_tx(&foreign_tx);
+        state.set_gone(&foreign_tx2, false);
+        assert_eq!(state.foreign_pools().len(), 1);
+        state.remove_tx(&foreign_tx2);
+        assert!(state.foreign_pools().is_empty());
     }
 
     /// A partial-fill scoop's continuation output is a REAL order-creating

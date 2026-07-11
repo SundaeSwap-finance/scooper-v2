@@ -197,6 +197,18 @@ impl ChainTracker {
         }
     }
 
+    /// Hashes of all in-flight txs — used to tell our own mempool txs apart
+    /// from foreign ones.
+    pub fn in_flight_tx_hashes(&self) -> BTreeSet<Hash<32>> {
+        let mut hashes = BTreeSet::new();
+        for chain in self.chains.values() {
+            for tx in chain {
+                hashes.insert(tx.tx_hash);
+            }
+        }
+        hashes
+    }
+
     /// Wallet UTxOs consumed by any in-flight tx. These are spent as far as
     /// the mempool is concerned — offering them to a new build produces a
     /// guaranteed node reject.
