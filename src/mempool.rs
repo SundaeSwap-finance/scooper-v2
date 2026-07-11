@@ -564,6 +564,7 @@ async fn monitor_loop(
         {
             Ok(mut client) => {
                 info!(socket = %cfg.socket_path, "mempool monitor connected to node");
+                metrics.mempool_connected.store(1, std::sync::atomic::Ordering::Relaxed);
                 if let Err(e) = watch_mempool(
                     &mut client,
                     &watch,
@@ -578,6 +579,7 @@ async fn monitor_loop(
                     warn!(error = %e, "mempool monitor session ended; reconnecting");
                 }
                 client.abort().await;
+                metrics.mempool_connected.store(0, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 warn!(error = %e, socket = %cfg.socket_path, "mempool monitor could not connect; retrying");
@@ -603,6 +605,13 @@ async fn watch_mempool(
         // First call returns the current snapshot; subsequent calls block
         // until the mempool changes.
         monitor.acquire().await?;
+        metrics.mempool_last_snapshot_unix.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // The known-UTxO view refreshes per snapshot, not per tx. Provisional
         // order inputs are folded in so that a tx spending an order that only

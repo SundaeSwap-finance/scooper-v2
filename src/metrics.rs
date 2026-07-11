@@ -164,6 +164,15 @@ pub struct Metrics {
     pub mempool_confirmed: AtomicU64,
     pub mempool_evicted: AtomicU64,
     pub mempool_lead_time: Histogram,
+    /// 1 while the mempool monitor holds a live node connection.
+    pub mempool_connected: AtomicU64,
+    /// Unix seconds of the last mempool snapshot processed. Age > ~1 min
+    /// with mempool_connected=1 means the monitor is wedged.
+    pub mempool_last_snapshot_unix: AtomicU64,
+    /// Local-node tx rejections (authoritative ledger/mempool conflicts).
+    pub node_rejects: AtomicU64,
+    ops_snapshot: std::sync::Mutex<OpsSnapshot>,
+    failures: std::sync::Mutex<std::collections::VecDeque<FailureRecord>>,
     /// Process start instant — used to compute `scooper_uptime_seconds`
     /// so operators can spot crash loops without scraping systemd state.
     start_instant: Instant,
@@ -181,6 +190,45 @@ const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[
 const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[
     0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0,
 ];
+
+/// Point-in-time operator health, refreshed by the scooper each batch cycle.
+/// Everything an operator needs to answer "why is nothing happening":
+/// wallet exhaustion, backlog, provisional state, backoff.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct OpsSnapshot {
+    /// Confirmed wallet UTxOs not consumed by in-flight txs.
+    pub wallet_spendable_utxos: usize,
+    pub wallet_total_ada: u64,
+    /// Wallet UTxOs locked up by in-flight (unconfirmed) txs.
+    pub wallet_consumed_in_flight: usize,
+    /// UTxOs (confirmed + predicted change) that could fund the next build.
+    pub funding_candidates: usize,
+    pub collateral_available: bool,
+    /// Dispatchable order candidates this cycle (after filters).
+    pub pending_orders: usize,
+    /// Slot of the oldest pending candidate — a growing gap between this and
+    /// the tip means something is stuck.
+    pub oldest_pending_slot: Option<u64>,
+    pub provisional_orders: usize,
+    pub provisional_spent: usize,
+    pub foreign_pools: usize,
+    /// True while the scooper is sitting out cycles after a lost race.
+    pub backoff_active: bool,
+}
+
+/// One failure for the operator debug ring — the "what went wrong recently"
+/// panel, so debugging doesn't start with journalctl archaeology.
+#[derive(Clone, serde::Serialize)]
+pub struct FailureRecord {
+    pub at_unix: u64,
+    /// Where it failed: "submit", "eval-isolation", "build".
+    pub stage: String,
+    pub tx_hash: String,
+    pub detail: String,
+    pub orders: Vec<String>,
+}
+
+const FAILURE_RING_CAP: usize = 50;
 
 impl Metrics {
     pub fn new() -> Self {
@@ -203,6 +251,11 @@ impl Metrics {
             mempool_confirmed: AtomicU64::new(0),
             mempool_evicted: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
+            mempool_connected: AtomicU64::new(0),
+            mempool_last_snapshot_unix: AtomicU64::new(0),
+            node_rejects: AtomicU64::new(0),
+            ops_snapshot: std::sync::Mutex::new(OpsSnapshot::default()),
+            failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
             start_instant: Instant::now(),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
             quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
@@ -254,6 +307,43 @@ impl Metrics {
 
     pub fn quarantine_snapshot(&self) -> QuarantineSnapshot {
         self.quarantine_snapshot.lock().unwrap().clone()
+    }
+
+    pub fn update_ops(&self, snapshot: OpsSnapshot) {
+        *self.ops_snapshot.lock().unwrap() = snapshot;
+    }
+
+    pub fn ops_snapshot(&self) -> OpsSnapshot {
+        self.ops_snapshot.lock().unwrap().clone()
+    }
+
+    pub fn record_failure_event(
+        &self,
+        stage: &str,
+        tx_hash: &str,
+        detail: String,
+        orders: Vec<String>,
+    ) {
+        let at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut ring = self.failures.lock().unwrap();
+        if ring.len() >= FAILURE_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(FailureRecord {
+            at_unix,
+            stage: stage.to_string(),
+            tx_hash: tx_hash.to_string(),
+            detail,
+            orders,
+        });
+    }
+
+    /// Most recent first.
+    pub fn failures_snapshot(&self) -> Vec<FailureRecord> {
+        self.failures.lock().unwrap().iter().rev().cloned().collect()
     }
 }
 
@@ -404,6 +494,22 @@ pub async fn render_metrics(
     ] {
         let _ = writeln!(out, "scooper_orders_scooped_by_pool_type_total{{pool_type=\"{family}\"}} {value}");
     }
+
+    // Operator health gauges (refreshed each batch cycle).
+    let ops = metrics.ops_snapshot();
+    write_gauge(&mut out, "scooper_wallet_spendable_utxos", "Confirmed wallet UTxOs not locked by in-flight txs", ops.wallet_spendable_utxos);
+    write_gauge(&mut out, "scooper_wallet_total_ada_lovelace", "Total lovelace across spendable wallet UTxOs", ops.wallet_total_ada);
+    write_gauge(&mut out, "scooper_wallet_consumed_in_flight", "Wallet UTxOs locked by in-flight txs", ops.wallet_consumed_in_flight);
+    write_gauge(&mut out, "scooper_funding_candidates", "UTxOs eligible to fund the next build", ops.funding_candidates);
+    write_gauge(&mut out, "scooper_collateral_available", "1 when a collateral-capable UTxO exists", ops.collateral_available as usize);
+    write_gauge(&mut out, "scooper_pending_orders", "Dispatchable order candidates last cycle", ops.pending_orders);
+    write_gauge(&mut out, "scooper_provisional_orders", "Unconfirmed mempool orders tracked", ops.provisional_orders);
+    write_gauge(&mut out, "scooper_provisional_spent", "Order UTxOs spent by unconfirmed txs", ops.provisional_spent);
+    write_gauge(&mut out, "scooper_foreign_pool_predictions", "Pool states predicted from foreign mempool txs", ops.foreign_pools);
+    write_gauge(&mut out, "scooper_backoff_active", "1 while sitting out cycles after a lost race", ops.backoff_active as usize);
+    write_gauge(&mut out, "scooper_mempool_monitor_connected", "1 while the mempool monitor holds a node connection", metrics.mempool_connected.load(Ordering::Relaxed));
+    write_gauge(&mut out, "scooper_mempool_last_snapshot_unix", "Unix time of the last processed mempool snapshot", metrics.mempool_last_snapshot_unix.load(Ordering::Relaxed));
+    write_counter(&mut out, "scooper_node_rejects_total", "Local-node tx rejections (state conflicts)", metrics.node_rejects.load(Ordering::Relaxed));
 
     // Mempool monitor (phase 1). All zero when the monitor is disabled.
     write_counter(&mut out, "scooper_mempool_txs_seen_total", "Transactions observed in the local node mempool", metrics.mempool_txs_seen.load(Ordering::Relaxed));

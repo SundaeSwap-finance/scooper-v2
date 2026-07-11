@@ -81,6 +81,9 @@ pub struct Scooper {
     /// (socket path, network magic) for local-node submission of scoops
     /// that chain on provisional parents.
     v4_node_submit: Option<(String, u64)>,
+    /// (tx hash, consecutive node-reject count) — a tx rejected repeatedly
+    /// is structurally stuck, not transiently contested.
+    last_node_reject: Option<(String, u32)>,
 }
 
 impl Scooper {
@@ -118,6 +121,7 @@ impl Scooper {
             quarantine: BTreeMap::new(),
             v4_provisional,
             v4_node_submit,
+            last_node_reject: None,
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
@@ -833,6 +837,44 @@ impl Scooper {
             }
         }
         candidates.sort_by_key(|o| (provisional_inputs.contains(&o.input), o.slot));
+
+        // Operator health snapshot: the numbers that answer "why is nothing
+        // happening" without log archaeology.
+        {
+            use num_traits::ToPrimitive;
+            let spendable: Vec<u64> = v4_state
+                .wallet_utxos
+                .iter()
+                .filter(|(i, _)| !consumed_wallet.contains(i))
+                .map(|(_, v)| v.get(&ada_asset).unwrap().to_u64().unwrap_or(0))
+                .collect();
+            let (prov_orders, prov_spent, foreign_count) = self
+                .v4_provisional
+                .as_ref()
+                .map(|p| {
+                    let prov = p.lock().unwrap();
+                    let (o, sp) = prov.counts();
+                    (o, sp, prov.foreign_pools().len())
+                })
+                .unwrap_or((0, 0, 0));
+            self.metrics.update_ops(crate::metrics::OpsSnapshot {
+                wallet_spendable_utxos: spendable.len(),
+                wallet_total_ada: spendable.iter().sum(),
+                wallet_consumed_in_flight: consumed_wallet.len(),
+                funding_candidates: spendable
+                    .iter()
+                    .filter(|ada| **ada >= MIN_FUNDING_ADA)
+                    .count()
+                    + predicted_wallet.len(),
+                collateral_available: true, // we bailed above if not
+                pending_orders: candidates.len(),
+                oldest_pending_slot: candidates.first().map(|o| o.slot),
+                provisional_orders: prov_orders,
+                provisional_spent: prov_spent,
+                foreign_pools: foreign_count,
+                backoff_active: self.backoff_until_after_slot.is_some(),
+            });
+        }
 
         // Apply any permanent quarantines deferred from the filter chain
         // (we couldn't borrow `&mut self` while iterating).
@@ -1581,6 +1623,12 @@ impl Scooper {
                     }
                     self.sync_quarantine_metrics();
                     self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    self.metrics.record_failure_event(
+                        "eval-isolation",
+                        "",
+                        reason.clone(),
+                        diag.order_inputs().iter().map(|i| i.to_string()).collect(),
+                    );
                     return false;
                 }
 
@@ -1588,6 +1636,12 @@ impl Scooper {
                 // Quarantine the offending order(s): they're truly structurally
                 // unsound (build error) or too big to ever fit alone (over budget).
                 let bad_inputs = diag.order_inputs();
+                self.metrics.record_failure_event(
+                    "build",
+                    "",
+                    reason.clone(),
+                    bad_inputs.iter().map(|i| i.to_string()).collect(),
+                );
                 for input in bad_inputs {
                     warn!(order = %input, %reason, "permanently quarantining order");
                     self.quarantine.insert(input.clone(), Quarantine::Permanent {
@@ -1949,62 +2003,115 @@ impl Scooper {
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Race-lost classifier covers both shapes the node uses when
-                // our inputs were already spent:
-                //   - BadInputsUTxO: somebody else's tx beat us to a pool/order
-                //   - ConwayMempoolFailure "All inputs are spent. Transaction
-                //     has probably already been included": our own previous
-                //     submission was already accepted and we resubmitted
-                //     (typically a state-lag artefact between submit and
-                //     indexer-confirm). Both should be treated as RaceLost so
-                //     we don't flag them as uplc-turbo divergence.
+                // Local-node rejects arrive as opaque reason CBOR. The tx
+                // already passed our own evaluator, so a reject is a state
+                // conflict (spent input, mempool race) — race-lost, not uplc
+                // divergence. The reason hex embeds the conflicting outrefs;
+                // matching plan input hashes against it classifies WHAT was
+                // contested (order / pool / wallet), which decides who gets
+                // quarantined — an order whose input is fine must not sit
+                // out minutes for a wallet-UTxO conflict.
+                let node_reject_hex: Option<&str> = msg.strip_prefix("node rejected tx: ");
+                if node_reject_hex.is_some() {
+                    self.metrics.node_rejects.fetch_add(1, Ordering::Relaxed);
+                }
                 let is_race_lost = msg.contains("BadInputsUTxO")
                     || msg.contains("ConwayMempoolFailure")
                     || msg.contains("All inputs are spent")
-                    // Local-node rejects arrive as opaque reason CBOR. The tx
-                    // already passed our own evaluator, so a reject is a
-                    // state conflict (spent input, mempool race) — treat as
-                    // race-lost, not as uplc divergence needing a CBOR dump.
-                    || msg.starts_with("node rejected tx:");
+                    || node_reject_hex.is_some();
                 let reason = if is_race_lost {
                     crate::metrics::BatchFailureReason::RaceLost
                 } else {
                     crate::metrics::BatchFailureReason::SubmitError
                 };
                 self.metrics.record_batch_failure(reason);
+                self.metrics.record_failure_event(
+                    "submit",
+                    &final_tx.tx_hash_hex,
+                    msg.clone(),
+                    plan_order_inputs.iter().map(|i| i.to_string()).collect(),
+                );
                 if matches!(reason, crate::metrics::BatchFailureReason::RaceLost) {
                     let pool_strs: Vec<String> = pool_idents.iter().map(|i| i.to_string()).collect();
-                    info!(
-                        tx_hash = %final_tx.tx_hash_hex,
-                        pools = ?pool_strs,
-                        "lost scoop race — pool or order UTxO already spent by another scooper"
-                    );
-                    // Parse bad inputs from the error and quarantine only those
-                    let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
-                    let bad_refs = parse_bad_inputs(&msg);
-                    let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
-                    if bad_refs.is_empty() {
-                        // Couldn't parse — quarantine all orders as fallback
-                        info!(n_orders = order_inputs.len(), until_slot, "temporarily quarantining all batch orders (unparseable error)");
-                        for input in &order_inputs {
-                            self.quarantine.insert((*input).clone(), Quarantine::Temporary {
-                                reason: "BadInputsUTxO (fallback)".into(),
-                                until_slot,
-                            });
+                    // Which of our inputs does the reject implicate? For the
+                    // external endpoint the error is JSON with explicit bad
+                    // inputs; for node rejects, scan the reason hex for each
+                    // plan input's tx hash.
+                    let mut bad_refs = parse_bad_inputs(&msg);
+                    if let Some(hex_reason) = node_reject_hex {
+                        let mut implicated_kinds: Vec<String> = Vec::new();
+                        for input in plan_order_inputs.iter() {
+                            if hex_reason.contains(&hex::encode(input.0.transaction_id.as_ref())) {
+                                bad_refs.insert(input.to_string());
+                                implicated_kinds.push(format!("order {input}"));
+                            }
                         }
+                        for batch in &final_plan.batches {
+                            let pin = &batch.pool.input;
+                            if hex_reason.contains(&hex::encode(pin.0.transaction_id.as_ref())) {
+                                implicated_kinds.push(format!("pool {} ({})", batch.pool_ident, pin));
+                            }
+                        }
+                        if let Some((fi, _)) = &funding_owned {
+                            if hex_reason.contains(&hex::encode(fi.0.transaction_id.as_ref())) {
+                                implicated_kinds.push(format!("funding {fi}"));
+                            }
+                        }
+                        if hex_reason.contains(&hex::encode(collateral_input.0.transaction_id.as_ref())) {
+                            implicated_kinds.push(format!("collateral {collateral_input}"));
+                        }
+                        warn!(
+                            tx_hash = %final_tx.tx_hash_hex,
+                            implicated = ?implicated_kinds,
+                            reason_hex = %hex_reason,
+                            "node rejected scoop tx",
+                        );
                     } else {
-                        // Only quarantine orders whose input appears in the bad inputs list
+                        info!(
+                            tx_hash = %final_tx.tx_hash_hex,
+                            pools = ?pool_strs,
+                            "lost scoop race — pool or order UTxO already spent by another scooper"
+                        );
+                    }
+                    // Repeat-reject guard: the same tx bouncing repeatedly is
+                    // structurally stuck, not transiently contested.
+                    let repeat_count = match &self.last_node_reject {
+                        Some((h, n)) if h == &final_tx.tx_hash_hex => n + 1,
+                        _ => 1,
+                    };
+                    if node_reject_hex.is_some() {
+                        self.last_node_reject = Some((final_tx.tx_hash_hex.clone(), repeat_count));
+                    }
+                    let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
+                    let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
+                    if !bad_refs.is_empty() {
+                        // Quarantine only the orders the error implicates.
                         let mut n_quarantined = 0u32;
                         for input in &order_inputs {
                             if bad_refs.contains(&input.to_string()) {
                                 self.quarantine.insert((*input).clone(), Quarantine::Temporary {
-                                    reason: "BadInputsUTxO".into(),
+                                    reason: "spent input (race lost)".into(),
                                     until_slot,
                                 });
                                 n_quarantined += 1;
                             }
                         }
                         info!(n_quarantined, n_bad_inputs = bad_refs.len(), until_slot, "temporarily quarantining spent orders");
+                    } else if node_reject_hex.is_some() && repeat_count < 3 {
+                        // Node reject implicating none of the orders (pool /
+                        // wallet contention): retry next cycle against fresh
+                        // state instead of benching innocent orders.
+                        info!(repeat_count, "node reject without implicated orders; retrying next cycle");
+                    } else {
+                        // Unparseable external error, or the same tx bounced
+                        // 3+ times: bench everything briefly.
+                        info!(n_orders = order_inputs.len(), until_slot, "temporarily quarantining all batch orders (unattributable failure)");
+                        for input in &order_inputs {
+                            self.quarantine.insert((*input).clone(), Quarantine::Temporary {
+                                reason: "unattributable submit failure".into(),
+                                until_slot,
+                            });
+                        }
                     }
                     self.sync_quarantine_metrics();
                 } else {

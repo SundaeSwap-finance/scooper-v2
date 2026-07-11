@@ -382,6 +382,13 @@
   <!-- Health Tab -->
   <div class="tab-panel" id="panel-health">
     <div class="stats" id="health-cards"></div>
+    <div class="section-title">Operator</div>
+    <div class="stats" id="ops-cards"></div>
+    <div class="section-title">Recent Failures</div>
+    <table id="ops-failures-table">
+      <thead><tr><th>Time</th><th>Stage</th><th>Tx</th><th>Orders</th><th>Detail</th></tr></thead>
+      <tbody id="ops-failures-body"><tr><td colspan="5" class="empty-state">No recent failures</td></tr></tbody>
+    </table>
     <div class="section-title">Scooper Leaderboard</div>
     <table id="health-leaderboard-table">
       <thead><tr><th>Scooper</th><th>Scoops</th><th>Orders</th></tr></thead>
@@ -641,7 +648,53 @@
     document.getElementById('syncFill').style.width = Math.min(pct, 100) + '%';
   }
 
+  function renderOpsCards() {
+    var el = document.getElementById('ops-cards');
+    if (!el) return;
+    var v4 = status.v4 || {};
+    var ops = v4.ops;
+    var mp = v4.mempool || {};
+    if (!ops) { el.innerHTML = '<div class="not-configured">No operator data yet</div>'; return; }
+    var mpAge = mp.last_snapshot_unix ? Math.max(0, Math.round(Date.now()/1000 - mp.last_snapshot_unix)) : null;
+    var mpLabel = !mp.connected ? 'down' : (mpAge != null && mpAge > 90 ? 'stale ' + mpAge + 's' : 'live');
+    el.innerHTML =
+      statCard('Wallet UTxOs', ops.wallet_spendable_utxos + (ops.wallet_consumed_in_flight ? ' (+' + ops.wallet_consumed_in_flight + ' in-flight)' : '')) +
+      statCard('Wallet ADA', (ops.wallet_total_ada / 1e6).toFixed(1)) +
+      statCard('Funding OK', ops.funding_candidates > 0 ? ops.funding_candidates : 'NONE') +
+      statCard('Collateral', ops.collateral_available ? 'ok' : 'MISSING') +
+      statCard('Pending Orders', ops.pending_orders) +
+      statCard('Provisional', ops.provisional_orders + (ops.provisional_spent ? ' / ' + ops.provisional_spent + ' spent' : '')) +
+      statCard('Foreign Pools', ops.foreign_pools) +
+      statCard('Mempool Mon', mpLabel) +
+      statCard('Node Rejects', mp.node_rejects || 0) +
+      statCard('Backoff', ops.backoff_active ? 'ACTIVE' : 'no');
+  }
+
+  async function loadFailures() {
+    try {
+      var res = await fetch('/failures');
+      var rows = await res.json();
+      var body = document.getElementById('ops-failures-body');
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="5" class="empty-state">No recent failures</td></tr>';
+        return;
+      }
+      var esc = function(x) {
+        return String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      };
+      body.innerHTML = rows.slice(0, 25).map(function(f) {
+        var t = new Date(f.at_unix * 1000).toLocaleTimeString();
+        return '<tr><td>' + t + '</td><td>' + esc(f.stage) + '</td><td>' +
+          (f.tx_hash ? copyable(truncate(f.tx_hash, 12), f.tx_hash) : '—') +
+          '</td><td>' + (f.orders || []).map(function(o) { return copyable(truncate(o, 14), o); }).join(' ') +
+          '</td><td title="' + esc(f.detail) + '">' + esc(truncate(f.detail, 90)) + '</td></tr>';
+      }).join('');
+    } catch (e) { /* ignore */ }
+  }
+
   function updateStats() {
+    renderOpsCards();
     const v3s = document.getElementById('v3-stats');
     renderStrategyIntents(status.v4 && status.v4.strategy_intents);
     const v4s = document.getElementById('v4-stats');
@@ -1152,6 +1205,28 @@
   let eventSource = null;
   const MAX_LOG_ENTRIES = 200;
 
+  // Any traffic (including heartbeats) proves the stream is alive; a silent
+  // EventSource under a green dot is a zombie connection. The watchdog kills
+  // and reconnects it, and every (re)connect reloads full state so panels
+  // catch up on whatever the dead stream missed.
+  let lastSseActivity = Date.now();
+
+  function fullReload() {
+    fetchStatus();
+    loadV3Pools(); loadV3Orders(); loadV3SpentOrders();
+    loadV4Pools(); loadV4Orders(); loadV4SpentOrders();
+    loadHealthStats();
+    loadFailures();
+  }
+
+  setInterval(function() {
+    if (Date.now() - lastSseActivity > 45000) {
+      lastSseActivity = Date.now();
+      document.getElementById('connLabel').textContent = 'Stale — reconnecting...';
+      connectSSE();
+    }
+  }, 10000);
+
   function connectSSE() {
     if (eventSource) eventSource.close();
     eventSource = new EventSource('/events');
@@ -1159,13 +1234,20 @@
     eventSource.onopen = function() {
       document.getElementById('connDot').classList.add('connected');
       document.getElementById('connLabel').textContent = 'Connected';
+      lastSseActivity = Date.now();
+      fullReload();
     };
     eventSource.onerror = function() {
       document.getElementById('connDot').classList.remove('connected');
       document.getElementById('connLabel').textContent = 'Reconnecting...';
     };
 
+    eventSource.addEventListener('heartbeat', function() {
+      lastSseActivity = Date.now();
+    });
+
     eventSource.addEventListener('tip', function(e) {
+      lastSseActivity = Date.now();
       try {
         const d = JSON.parse(e.data);
         const v4 = status.v4 || {};
@@ -1185,6 +1267,7 @@
       'v3_order_created', 'v3_order_scooped', 'v3_order_cancelled',
       'v4_pool_created', 'v4_pool_updated', 'v4_pool_removed',
       'v4_order_created', 'v4_order_scooped', 'v4_order_cancelled',
+      'v4_mempool_order_seen', 'v4_mempool_tx_dropped',
       'v3_settings_updated', 'v4_settings_updated', 'rollback'
     ];
 
@@ -1193,6 +1276,7 @@
 
     refreshEvents.forEach(function(evtType) {
       eventSource.addEventListener(evtType, function(e) {
+        lastSseActivity = Date.now();
         addLogEntry(evtType, e.data);
         // Debounced refresh
         if (!refreshTimer) {
@@ -1201,7 +1285,7 @@
             fetchStatus();
             if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
             if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
-            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); }
+            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); loadFailures(); }
             if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); }
           }, 500);
         }
@@ -1265,14 +1349,10 @@
   });
 
   // --- Init ---
-  fetchStatus();
-  loadV3Pools();
-  loadV3Orders();
-  loadV3SpentOrders();
-  loadV4Pools();
-  loadV4Orders();
-  loadV4SpentOrders();
-  loadHealthStats();
+  // connectSSE's onopen runs fullReload (which covers everything the old
+  // init loaded, plus the failures panel), but load once eagerly anyway so
+  // the page isn't blank if the SSE connection is slow to establish.
+  fullReload();
   connectSSE();
 })();
 </script>

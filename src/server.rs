@@ -779,6 +779,9 @@ impl AdminServer {
         match path.as_str() {
             "/dashboard" => self.serve_dashboard(),
             "/events" => self.serve_sse(),
+            "/failures" => Self::json_response(
+                serde_json::to_string(&self.metrics.failures_snapshot()).unwrap(),
+            ),
             "/status" => Self::json_response(self.serve_status().await),
             "/resync-from-acropolis" => {
                 let _ = self.resync_tx.send(());
@@ -829,6 +832,15 @@ impl AdminServer {
         };
         let in_flight = self.metrics.in_flight_snapshot();
         let quarantine = self.metrics.quarantine_snapshot();
+        let ops = self.metrics.ops_snapshot();
+        let mempool = serde_json::json!({
+            "connected": self.metrics.mempool_connected.load(std::sync::atomic::Ordering::Relaxed) == 1,
+            "last_snapshot_unix": self.metrics.mempool_last_snapshot_unix.load(std::sync::atomic::Ordering::Relaxed),
+            "txs_seen": self.metrics.mempool_txs_seen.load(std::sync::atomic::Ordering::Relaxed),
+            "confirmed": self.metrics.mempool_confirmed.load(std::sync::atomic::Ordering::Relaxed),
+            "evicted": self.metrics.mempool_evicted.load(std::sync::atomic::Ordering::Relaxed),
+            "node_rejects": self.metrics.node_rejects.load(std::sync::atomic::Ordering::Relaxed),
+        });
 
         let v4_info = if let Some(v4) = &self.v4_state {
             let state = v4.lock().await.latest().into_owned();
@@ -847,6 +859,8 @@ impl AdminServer {
                 "in_flight_pools": in_flight.pool_ids,
                 "in_flight_orders": in_flight.order_refs,
                 "quarantine": quarantine,
+                "ops": ops,
+                "mempool": mempool,
             })
         } else {
             serde_json::json!({ "configured": false })
@@ -922,8 +936,24 @@ impl AdminServer {
         let mut event_rx = self.event_tx.subscribe();
 
         tokio::spawn(async move {
+            // Heartbeat keeps intermediaries from silently killing the idle
+            // connection AND gives the client a liveness signal: a dashboard
+            // that hasn't heard anything for ~45s knows its EventSource is a
+            // zombie and reconnects + reloads, instead of showing stale
+            // state under a green dot.
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                match event_rx.recv().await {
+                let received = tokio::select! {
+                    r = event_rx.recv() => r,
+                    _ = heartbeat.tick() => {
+                        if tx.send(Bytes::from("event: heartbeat\ndata: {}\n\n")).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match received {
                     Ok((_slot, events)) => {
                         for event in events {
                             let (event_type, data) = format_sse_event(&event);
