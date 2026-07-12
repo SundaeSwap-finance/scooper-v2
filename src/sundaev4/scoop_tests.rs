@@ -929,6 +929,186 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 2);
     }
 
+    // ─── Batch-rule regression tests (devnet-discovered, migration notes) ────
+
+    /// Rule 1+2 of the multi-order batch scoop rules: each route-bearing
+    /// order claims its OWN transcript step, and per-pool transcript
+    /// sequencing must match the canonical (TxOutRef-sorted) order of the
+    /// orders it serves — route.ak's `check_route_uniqueness` walks order
+    /// inputs canonically and demands strictly increasing step claims per
+    /// pool. Orders arrive here in NON-canonical order (slots 3,1,2 — the
+    /// harness embeds slot in the tx hash, so canonical order == slot
+    /// order); the batch pipeline must still produce a valid transcript.
+    #[test]
+    fn batch_route_claims_follow_canonical_order() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        // Deliberately shuffled admission order vs canonical input order.
+        let orders = vec![
+            make_order(token_a(), 10_000_000, token_b(), 1, 3),
+            make_order(token_a(), 20_000_000, token_b(), 1, 1),
+            make_order(token_a(), 5_000_000, token_b(), 1, 2),
+        ];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("batch assembly should succeed");
+        assert_eq!(batch.swaps.len(), 3);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("shuffled-admission batch must satisfy check_route_uniqueness");
+        assert!(!eval.budgets.is_empty());
+    }
+
+    /// The accumulator's canonical-append guard: a same-pool admission whose
+    /// order sorts canonically before an order already in the batch must be
+    /// rejected (it goes in the next tx) — dispatch sorts candidates
+    /// canonically, but the confirmed/provisional boundary can still present
+    /// them out of order. In canonical order both fit and the tx validates.
+    #[test]
+    fn accumulator_rejects_noncanonical_same_pool_admission() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let ident = pool.pool_datum.identifier.clone();
+
+        let early = make_order(token_a(), 20_000_000, token_b(), 1, 1);
+        let late = make_order(token_a(), 10_000_000, token_b(), 1, 2);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_order(&late, &ident, &pool).expect("first admission succeeds");
+        let err = accum.try_add_order(&early, &ident, &pool)
+            .expect_err("out-of-canonical-order same-pool admission must be rejected");
+        assert!(err.contains("canonical-order violation"), "unexpected error: {err}");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_order(&early, &ident, &pool).expect("canonical first");
+        accum.try_add_order(&late, &ident, &pool).expect("canonical second");
+        let plan = accum.into_plan();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+            .expect("canonical admission builds a valid tx");
+        assert!(!eval.budgets.is_empty());
+    }
+
+    /// Rule 1: each route-bearing order claims its OWN transcript step. Two
+    /// routed orders sharing BOTH pools of an E→A→B chain must claim steps
+    /// 0 and 1 on each pool — "everyone points at step 0" fails as soon as
+    /// a batch has two orders on one pool.
+    #[test]
+    fn batch_two_routed_orders_share_pools() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let cs_pool = make_cs_pool(
+            &env, 0xDD,
+            vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(cp_pool.pool_datum.identifier.clone(), cp_pool.clone());
+        pool_map.insert(cs_pool.pool_datum.identifier.clone(), cs_pool.clone());
+
+        // No direct E/B pool: both orders must route E→A (CS) →B (CP).
+        // Canonical order == slot order (the harness embeds slot in the tx
+        // hash); add them canonically, as dispatch does.
+        let orders = vec![
+            make_order(token_e(), 10_000_000, token_b(), 1, 1),
+            make_order(token_e(), 20_000_000, token_b(), 1, 2),
+        ];
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        for order in &orders {
+            let view = accum.current_pool_view(&pool_map);
+            let route = router::find_optimal_route(
+                &view,
+                &[], &token_e(), &token_b(), &order.swap_offered().1,
+                router::RoutingLimits::unlimited(),
+            ).expect("router should find E→A→B path");
+            assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
+            accum.try_add_routed_order(order, &route, &view)
+                .expect("routed order should execute");
+        }
+
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2, "both orders share the same 2 pools");
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+            .expect("two routed orders on shared pools must claim distinct, increasing steps");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 2);
+    }
+
+    /// Rule 3: per-step protocol-LP capture. fee_split.Operate requires
+    /// every transcript entry's fee_budget >= 0 AND aggregate LP gap growth
+    /// == floor(total_gross_fee × protocol_share) — so the protocol share
+    /// must be captured per step via the cumulative-floor trick. (Deducting
+    /// the whole share from the last entry goes negative once a batch has
+    /// ≥3 similar swaps.) Reconstructs gross fees from the built transcript
+    /// and asserts both bounds offline, on top of the on-chain evaluation.
+    #[test]
+    fn batch_protocol_capture_per_step() {
+        use plutus_parser::AsPlutus;
+        use crate::sundaev4::types::PoolRedeemer;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let orders: Vec<_> = (1..=5u64)
+            .map(|i| make_order(token_a(), 10_000_000, token_b(), 1, i))
+            .collect();
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("batch assembly should succeed");
+        assert_eq!(batch.swaps.len(), 5);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("5-similar-swap batch must satisfy fee_split's per-entry budget bound");
+        assert!(!eval.budgets.is_empty());
+
+        let transcript = result.redeemers.iter()
+            .find_map(|(_, pd, _)| match PoolRedeemer::from_plutus(pd.clone()) {
+                Ok(PoolRedeemer::Action { transcript, .. }) => Some(transcript),
+                _ => None,
+            })
+            .expect("tx carries a PoolRedeemer::Action");
+        assert_eq!(transcript.len(), 5, "one transcript entry per swap");
+
+        let (ps_num, ps_den) = (
+            BigInt::from(env.exec.protocol_share.0),
+            BigInt::from(env.exec.protocol_share.1),
+        );
+        let mut prev_lp = pool.pool_datum.total_lp.clone();
+        let mut total_gross = BigInt::from(0);
+        let mut total_growth = BigInt::from(0);
+        for (i, entry) in transcript.iter().enumerate() {
+            assert!(
+                entry.fee_budget >= BigInt::from(0),
+                "entry {i} fee_budget went negative: {} — protocol share must be captured per step",
+                entry.fee_budget,
+            );
+            let growth = &entry.state_after.total_lp - &prev_lp;
+            assert!(growth >= BigInt::from(0), "entry {i} shrank total_lp");
+            total_gross = &total_gross + &entry.fee_budget + &growth;
+            total_growth = &total_growth + &growth;
+            prev_lp = entry.state_after.total_lp.clone();
+        }
+        assert!(total_gross > BigInt::from(0), "similar swaps should accrue fees");
+        assert_eq!(
+            total_growth,
+            &total_gross * &ps_num / &ps_den,
+            "cumulative capture must telescope to floor(total_gross_fee × protocol_share)",
+        );
+    }
+
     // ─── Assertion helpers ────────────────────────────────────────────────────
 
     fn assert_k_nondecreasing(a0: &BigInt, b0: &BigInt, a1: &BigInt, b1: &BigInt) {

@@ -358,9 +358,14 @@ fn find_pool_by_lp_asset(
     None
 }
 
-/// Greedy batch assembly: scan candidates oldest→newest, try to execute each
-/// against running pool state. If a swap succeeds and satisfies min_received,
-/// include it and restart from the beginning (a sell might enable an earlier buy).
+/// Greedy batch assembly: scan candidates in canonical (TxOutRef) order, try
+/// to execute each against running pool state. If a swap succeeds and
+/// satisfies min_received, include it and restart from the beginning (a sell
+/// might enable an earlier buy) — but an order can only join if it sorts
+/// after the last selected order: the route constraint's
+/// `check_route_uniqueness` requires the pool's transcript sequencing to
+/// match the canonical order of the orders it serves, so late joiners that
+/// sort earlier must wait for the next tx.
 ///
 /// Returns `None` if no orders can be executed.
 /// Used by scoop_tests and accumulator comparison tests.
@@ -376,6 +381,9 @@ pub fn assemble_batch(
         return None;
     }
 
+    let mut candidates: Vec<Arc<SundaeV4Order>> = candidates.to_vec();
+    candidates.sort_by(|a, b| a.input.cmp(&b.input));
+
     let mut running_assets = pool.pool_datum.assets.clone();
     let initial_total_lp = pool.pool_datum.total_lp.clone();
 
@@ -387,6 +395,11 @@ pub fn assemble_batch(
 
         for (i, order) in candidates.iter().enumerate() {
             if used[i] || selected.len() >= limits.max_orders {
+                continue;
+            }
+            // Canonical-append rule (see doc comment): retry passes may only
+            // add orders that sort after everything already selected.
+            if selected.last().map_or(false, |s| order.input < s.order.input) {
                 continue;
             }
 

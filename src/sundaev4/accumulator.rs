@@ -55,6 +55,36 @@ pub struct PoolAccum {
     ps: (BigInt, BigInt),
     /// Interleaved order of swaps, continuations, and deposits.
     ops_order: Vec<BatchOp>,
+    /// The order input behind the most recently appended op. The deployed
+    /// route constraint's `check_route_uniqueness` walks a tx's order inputs
+    /// in canonical (TxOutRef-sorted) order and requires each pool's
+    /// transcript step claims to be strictly increasing along that walk —
+    /// which is only satisfiable when the orders behind a pool's ops appear
+    /// in canonical order. `check_canonical_append` enforces it.
+    last_order_input: Option<crate::cardano_types::TransactionInput>,
+}
+
+impl PoolAccum {
+    /// Reject an op whose order sorts canonically before an order already in
+    /// this pool's batch — the resulting transcript could never satisfy
+    /// route.ak's strictly-increasing per-pool step claims. The rejected
+    /// order isn't lost; it just goes in a later tx. Multiple ops from the
+    /// SAME order (multi-step routes) compare equal and pass.
+    fn check_canonical_append(
+        &mut self,
+        order_input: &crate::cardano_types::TransactionInput,
+    ) -> Result<(), String> {
+        if let Some(last) = &self.last_order_input {
+            if last > order_input {
+                return Err(format!(
+                    "canonical-order violation on pool {}: order {} sorts before order {} already in the batch (check_route_uniqueness would fail on-chain)",
+                    self.ident, order_input, last,
+                ));
+            }
+        }
+        self.last_order_input = Some(order_input.clone());
+        Ok(())
+    }
 }
 
 /// Incrementally-built multi-pool transaction state.
@@ -118,6 +148,7 @@ impl Accumulator {
             cum_protocol_lp: BigInt::from(0),
             ps,
             ops_order: Vec::new(),
+            last_order_input: None,
         }
     }
 
@@ -153,6 +184,7 @@ impl Accumulator {
     ) -> Result<(), String> {
         let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
         let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
+        accum.check_canonical_append(&order.input)?;
 
         let swap = batch::try_execute_order(
             order,
@@ -212,6 +244,7 @@ impl Accumulator {
     ) -> Result<(), String> {
         let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
         let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
+        accum.check_canonical_append(&order.input)?;
 
         // Build a transient pool reflecting the accumulator's running reserves
         // so the resolver applies to the post-previous-ops state.
@@ -248,6 +281,7 @@ impl Accumulator {
     ) -> Result<(), String> {
         let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
         let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
+        accum.check_canonical_append(&order.input)?;
 
         let mut transient = (**effective_pool).clone();
         transient.pool_datum.assets = accum.running_assets.clone();
@@ -515,6 +549,7 @@ impl Accumulator {
                 // Initialize pool accum if not already present
                 let fresh = self.fresh_pool_accum(pool_ident, &effective_pool);
                 let accum = trial_pools.entry(pool_ident.clone()).or_insert(fresh);
+                accum.check_canonical_append(&order.input)?;
 
                 // Determine input/output direction for this pool
                 let (input_idx, output_idx) = Self::find_direction_for_tokens_static(

@@ -1371,6 +1371,72 @@ pub fn build_multi_pool_scoop_tx(
         })
         .collect();
 
+    // Steps per order, aligned with `input_sorted_order` (the canonical
+    // order-input walk route.ak performs).
+    let route_steps_per_order: Vec<Vec<(u64, u64)>> = input_sorted_order
+        .iter()
+        .map(|&flat_idx| {
+            let is_route = route_order_hash
+                .as_ref()
+                .and_then(|route_hash| {
+                    let oc = order_configs.get(&order_config_token(flat_idx))?;
+                    oc.config
+                        .required_constraints
+                        .iter()
+                        .any(|h| h == route_hash)
+                        .then_some(())
+                })
+                .is_some();
+            if !is_route {
+                Vec::new()
+            } else {
+                let flat = &flat_orders[flat_idx];
+                let bi = flat.batch_idx;
+                match &flat.kind {
+                    FlatOrderKind::Swap(si) => match &batches[bi].swaps[*si].route {
+                        // Routed order: full serial hop chain.
+                        Some(rr) => per_route[rr.route_idx].clone(),
+                        // Direct single-pool swap: one step at its pool.
+                        None => vec![(
+                            pool_sorted_indices[bi] as u64,
+                            *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
+                        )],
+                    },
+                    // Conversion-primary orders touch no pool: no
+                    // steps to attest (and no pool to index — a pool-
+                    // less tx panicked here).
+                    FlatOrderKind::Conversion(_) => Vec::new(),
+                    // Non-swap orders don't carry a route constraint in
+                    // phase 1; emit a single step to stay 1:1 with entries.
+                    _ if m_pools == 0 => Vec::new(),
+                    _ => vec![(pool_sorted_indices[bi] as u64, 0)],
+                }
+            }
+        })
+        .collect();
+
+    // Pre-flight the route mandate: check_route_uniqueness demands strictly
+    // increasing transcript step claims per pool along the canonical walk.
+    // The accumulator's canonical-append guard should make violations
+    // impossible; failing the build here (instead of shipping a tx the chain
+    // rejects) catches any future admission-ordering regression with a
+    // diagnosable error.
+    {
+        let mut last_claim: BTreeMap<u64, u64> = BTreeMap::new();
+        for steps in &route_steps_per_order {
+            for (pin, tsi) in steps {
+                if let Some(last) = last_claim.get(pin) {
+                    if tsi <= last {
+                        anyhow::bail!(
+                            "route mandate violation: pool input {pin} transcript step {tsi} claimed after step {last} along the canonical order walk (per-pool op sequencing must follow canonical order-input order)"
+                        );
+                    }
+                }
+                last_claim.insert(*pin, *tsi);
+            }
+        }
+    }
+
     let route_redeemer = || -> pallas_primitives::PlutusData {
         // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
         let make_step = |pin: u64, tsi: u64| -> pallas_primitives::PlutusData {
@@ -1387,45 +1453,9 @@ pub fn build_multi_pool_scoop_tx(
                 ]),
             })
         };
-        let route_lists: Vec<pallas_primitives::PlutusData> = input_sorted_order
+        let route_lists: Vec<pallas_primitives::PlutusData> = route_steps_per_order
             .iter()
-            .map(|&flat_idx| {
-                let is_route = route_order_hash
-                    .as_ref()
-                    .and_then(|route_hash| {
-                        let oc = order_configs.get(&order_config_token(flat_idx))?;
-                        oc.config
-                            .required_constraints
-                            .iter()
-                            .any(|h| h == route_hash)
-                            .then_some(())
-                    })
-                    .is_some();
-                let steps: Vec<(u64, u64)> = if !is_route {
-                    Vec::new()
-                } else {
-                    let flat = &flat_orders[flat_idx];
-                    let bi = flat.batch_idx;
-                    match &flat.kind {
-                        FlatOrderKind::Swap(si) => match &batches[bi].swaps[*si].route {
-                            // Routed order: full serial hop chain.
-                            Some(rr) => per_route[rr.route_idx].clone(),
-                            // Direct single-pool swap: one step at its pool.
-                            None => vec![(
-                                pool_sorted_indices[bi] as u64,
-                                *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
-                            )],
-                        },
-                        // Conversion-primary orders touch no pool: no
-                        // steps to attest (and no pool to index — a pool-
-                        // less tx panicked here).
-                        FlatOrderKind::Conversion(_) => Vec::new(),
-                        // Non-swap orders don't carry a route constraint in
-                        // phase 1; emit a single step to stay 1:1 with entries.
-                        _ if m_pools == 0 => Vec::new(),
-                        _ => vec![(pool_sorted_indices[bi] as u64, 0)],
-                    }
-                };
+            .map(|steps| {
                 let step_data: Vec<pallas_primitives::PlutusData> =
                     steps.iter().map(|(pin, tsi)| make_step(*pin, *tsi)).collect();
                 pallas_primitives::PlutusData::Array(

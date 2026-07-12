@@ -1,12 +1,17 @@
 # Scooper-v2 migration plan: post-audit sundae-v4 contracts
 
 > **Status (2026-07-12):** D1 (fixture regen), workstream A (all shapes),
-> and B1 (fee-free semantics) are DONE — commits `2f7b4bb` + `45813fc`,
-> suite green at 184 passed / 0 failed against the real post-audit
-> bytecode. SUNDAE-2613 canary flipped: ADA-receiving fills + partial-fill
-> dispatch enabled. Multi-pool LP mint restriction lifted (SUN-102).
-> Remaining: B2 batch-rule regression tests, the devnet load-test soak,
-> C (claims/balance_fee generalization — hints currently gated to
+> B1 (fee-free semantics), and B2 (batch rules) are DONE — commits
+> `2f7b4bb` + `45813fc` + B2, suite green at 188 passed / 0 failed against
+> the real post-audit bytecode. SUNDAE-2613 canary flipped: ADA-receiving
+> fills + partial-fill dispatch enabled. Multi-pool LP mint restriction
+> lifted (SUN-102). **B2 found a real bug**: dispatch admitted orders in
+> age (slot) order, but the route mandate requires per-pool transcript
+> sequencing to follow canonical (TxOutRef) order — fixed by sorting
+> candidates canonically, a canonical-append guard in the accumulator, and
+> a build-time pre-flight in tx_builder; four regression tests pin all
+> three batch rules. Remaining: the devnet load-test soak, C
+> (claims/balance_fee generalization — hints currently gated to
 > balance_fee == 0 pools), B3 fee-bearing mode (parked pending the
 > fee-collection design decision). Note: `.cargo/config.toml` sets
 > RUST_MIN_STACK=32MB — the UPLC evaluator overflows the default test
@@ -129,13 +134,24 @@ decided. In this mode the trade constraints alone bound the deduction:
 - **Basic orders reject `Self` destinations** on-chain — filter them out at
   admission instead of building failing txs.
 
-### B2. Batch-rule verification (cheap, do with B1)
+### B2. Batch-rule verification (cheap, do with B1) — DONE
 
 The three devnet-discovered batch rules (migration notes, "Multi-order batch
 scoop rules"): per-order route step claims, canonical per-pool ordering,
-per-step protocol capture. The scooper likely already satisfies all three
-(see "already compatible") — encode each as a regression test against the
-new bytecode.
+per-step protocol capture. Rules 1 and 3 were already satisfied; **rule 2
+was NOT** — dispatch sorted candidates by `(provisional, slot)`, so two
+same-pool orders whose hash order disagreed with their slot order built a
+transcript `check_route_uniqueness` rejects (probe test reproduced the
+on-chain `ExplicitErrorTerm` against real bytecode). Fixed in three layers:
+canonical `(provisional, TxOutRef)` dispatch sort (scooper.rs),
+`check_canonical_append` guard on every accumulator admission path
+(accumulator.rs — catches the confirmed/provisional boundary), and a
+build-time route-mandate pre-flight (tx_builder.rs). Regression tests in
+scoop_tests.rs: `batch_route_claims_follow_canonical_order`,
+`accumulator_rejects_noncanonical_same_pool_admission`,
+`batch_two_routed_orders_share_pools`, `batch_protocol_capture_per_step`
+(the last reconstructs gross fees from the built transcript and asserts
+per-entry `fee_budget ≥ 0` + the telescoped aggregate floor).
 
 ### B3. Fee-bearing mode (flag-gated, LATER — pending fee-design decision)
 

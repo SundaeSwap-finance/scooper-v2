@@ -850,7 +850,16 @@ impl Scooper {
                 candidates.push(order);
             }
         }
-        candidates.sort_by_key(|o| (provisional_inputs.contains(&o.input), o.slot));
+        // Canonical (TxOutRef) admission order, confirmed before provisional.
+        // The deployed route constraint requires each pool's transcript step
+        // claims to be strictly increasing along the canonical order-input
+        // walk, so same-pool orders MUST enter the batch in TxOutRef order —
+        // sorting by age (slot) built txs the route module rejects whenever
+        // two orders' hash order disagreed with their slot order. The
+        // accumulator's check_canonical_append catches anything this sort
+        // can't see (e.g. a provisional order sorting before a confirmed one
+        // on the same pool); rejected orders just go in the next tx.
+        candidates.sort_by_key(|o| (provisional_inputs.contains(&o.input), o.input.clone()));
 
         // Operator health snapshot: the numbers that answer "why is nothing
         // happening" without log archaeology.
