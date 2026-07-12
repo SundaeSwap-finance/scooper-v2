@@ -591,16 +591,25 @@ impl AdminServer {
                 "detail": "the hinted pool ident is not in the indexed pool set",
             });
         };
-        let PoolType::ConstantSum { prices, bounty_k, waive_fee_on_claim: true, .. } =
-            &pool.pool_type
+        // SUN-310: the old boolean waiver became `balance_fee` (0 = full
+        // waiver). The claims engine currently implements the waived math
+        // only, so gate on balance_fee == 0 until it generalizes.
+        let PoolType::ConstantSum { prices, bounty_k, balance_fee, .. } = &pool.pool_type
         else {
             return serde_json::json!({
                 "state": "pool-not-claimable",
                 "pool": pool_hex,
-                "detail": "claims are only supported against waived-fee \
-                           constant-sum pools",
+                "detail": "claims are only supported against constant-sum pools",
             });
         };
+        if balance_fee.num != crate::bigint::BigInt::from(0) {
+            return serde_json::json!({
+                "state": "pool-not-claimable",
+                "pool": pool_hex,
+                "detail": "claims are currently only supported against \
+                           balance_fee=0 (full-waiver) constant-sum pools",
+            });
+        }
         let assets = &pool.pool_datum.assets;
 
         // Per-asset value deviation: n·p_i·r_i − V. Positive means the pool

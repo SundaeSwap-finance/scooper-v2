@@ -900,8 +900,8 @@ mod tests {
             datum: OrderDatum {
                 owner: Multisig::Signature(vec![0x11; 28]),
                 destination: Destination::SelfDestination,
-                budget: BigInt::from(3_000_000),
-                share_batcher: BigInt::from(0),
+                service_budget: BigInt::from(3_000_000),
+                max_per_execution: BigInt::from(3_000_000),
                 config_token: vec![],
                 constraints: vec![(vec![0xEE; 28], constraints.clone().to_plutus())],
                 extension: unit,

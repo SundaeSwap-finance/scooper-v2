@@ -473,7 +473,7 @@ pub(crate) mod test_harness {
                 prices: prices.to_vec(),
                 fee: fee.clone(),
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-                waive_fee_on_claim: false,
+                balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
             };
             let cs_cbor = minicbor::to_vec(&cs_config.to_plutus()).unwrap();
             let cs_hash = Hasher::<256>::hash(&cs_cbor).to_vec();
@@ -700,7 +700,7 @@ pub(crate) mod test_harness {
                 prices,
                 fee,
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-                waive_fee_on_claim: false,
+                balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
             },
             slot: 100,
             fee_split_config: None,
@@ -969,13 +969,7 @@ pub(crate) mod test_harness {
             datum: SettingsDatum {
                 settings_admin: Multisig::Signature(vec![0xFF; 28]),
                 treasury_admin: Multisig::Signature(vec![0xFF; 28]),
-                treasury_address: vec![0x60, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
                 authorized_scoopers: Some(vec![scooper_keyhash.to_vec()]),
-                order_modules: vec![],
-                min_share_batcher: BigInt::from(0),
                 extension: PlutusData::Constr(pallas_primitives::Constr {
                     tag: 121,
                     any_constructor: None,

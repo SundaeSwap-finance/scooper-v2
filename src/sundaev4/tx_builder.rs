@@ -865,12 +865,12 @@ pub fn build_multi_pool_scoop_tx(
                     config,
                 });
             }
-            PoolType::ConstantSum { prices, fee, bounty_k, waive_fee_on_claim } => {
+            PoolType::ConstantSum { prices, fee, bounty_k, balance_fee } => {
                 let cs_cfg = ConstantSumConfig {
                     prices: prices.clone(),
                     fee: fee.clone(),
                     bounty_k: bounty_k.clone(),
-                    waive_fee_on_claim: *waive_fee_on_claim,
+                    balance_fee: balance_fee.clone(),
                 };
                 if let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() {
                     let cs_cred = cs_script.hash.as_ref();
@@ -1616,9 +1616,9 @@ pub fn build_multi_pool_scoop_tx(
     }
     let total_pool_bump: u64 = pool_output_bumps.iter().sum();
 
-    // Fee split across all orders
-    let per_order_fee = tx_fee / n_orders as u64;
-    let last_order_fee = tx_fee - per_order_fee * (n_orders as u64 - 1);
+    // (SUNDAE-2587: no per-order tx-fee split — each order's deduction is
+    // datum-determined; tx_fee is paid from the deduction pot and the
+    // remainder reaches the scooper change output by value conservation.)
 
     // Fulfillment outputs in input-sorted order — one per order (Swap or
     // Deposit). The order validator iterates filtered order inputs and entries
@@ -1668,6 +1668,39 @@ pub fn build_multi_pool_scoop_tx(
             }
             _ => None,
         };
+        // Fee redesign (SUNDAE-2587): the deduction is order-determined,
+        // decoupled from tx_body.fee.
+        //  - Terminal fill: exactly min(max_per_execution, service_budget)
+        //    (ADR-0001 terminal settlement — the trade constraint's
+        //    consumption bound allows exactly this, and check_fill_ratio
+        //    grosses the ADA leg by this amount whether or not we take it).
+        //  - Partial fill: pro-rata against the REMAINING order (the
+        //    anti-micro-fill boundary, SUNDAE-2611), capped by
+        //    max_per_execution; the continuation datum carries
+        //    service_budget − fee.
+        // The tx fee is paid out of the sum of deductions; the remainder
+        // lands on the scooper change output by value conservation.
+        let terminal_settlement = order
+            .datum
+            .max_per_execution
+            .clone()
+            .min(order.datum.service_budget.clone());
+        let actual_fee: u64 = {
+            use num_traits::ToPrimitive;
+            let fee_big = match &swap_fill {
+                Some(fill) if fill < order.swap_offered().1 => {
+                    let (_, remaining) = order.swap_offered();
+                    let prorata = &(fill * &order.datum.service_budget) / remaining;
+                    prorata.min(order.datum.max_per_execution.clone())
+                }
+                _ => terminal_settlement.clone(),
+            };
+            fee_big
+                .unwrap()
+                .to_u64()
+                .context("order fee deduction exceeds u64")?
+        };
+
         let partial_continuation: Option<pallas_primitives::PlutusData> = match &swap_fill {
             Some(fill) if fill < order.swap_offered().1 => {
                 let (_, remaining) = order.swap_offered();
@@ -1678,9 +1711,11 @@ pub fn build_multi_pool_scoop_tx(
                     .as_ref()
                     .context("partial fill requires the swap_order module config")?
                     .hash;
-                let datum = order
-                    .datum
-                    .with_swap_remaining(swap_hash.as_ref(), &new_remaining)?;
+                let datum = order.datum.with_swap_continuation(
+                    swap_hash.as_ref(),
+                    &new_remaining,
+                    &BigInt::from(actual_fee),
+                )?;
                 Some(datum.to_plutus())
             }
             _ => None,
@@ -1717,18 +1752,6 @@ pub fn build_multi_pool_scoop_tx(
             }
             };
 
-        let fee = if out_pos == n_orders - 1 { last_order_fee } else { per_order_fee };
-        // Take the full per_order share. The contract's
-        //   allowance = fee_share + share_batcher·(budget − fee_share)/10000
-        // can drop below fee_share when an order's budget is small, and the
-        // order_validator separately requires `budget·n >= tx_body.fee`
-        // (line 139 of validators/order.ak). Capping our deduction without
-        // also lowering tx_body.fee would break value conservation, and
-        // lowering tx.fee involves a fixed-point computation — left as a
-        // follow-up. For now we always take fee_share; orders that can't
-        // afford it get caught by the budget-too-low filter at the scooper
-        // and never reach this code.
-        let actual_fee = fee;
 
         let fulfillment_value = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => {
@@ -1764,28 +1787,9 @@ pub fn build_multi_pool_scoop_tx(
                 };
                 let (offer_asset, offer_amount) = swap.order.swap_offered();
                 let spend_amount = swap_fill.as_ref().unwrap_or(offer_amount);
-                // Contract fee cap for partials: fee ≤ allowance·fill/original.
-                if spend_amount < offer_amount {
-                    if let crate::sundaev4::Constraint::Swap { original_offered, .. } =
-                        &swap.order.constraint
-                    {
-                        use num_traits::ToPrimitive;
-                        let allowance = {
-                            let fee_share = BigInt::from(actual_fee);
-                            let share = &swap.order.datum.share_batcher;
-                            let surplus = &swap.order.datum.budget - &fee_share;
-                            &fee_share + &(&(share * &surplus) / &BigInt::from(10_000u64))
-                        };
-                        let cap = &(&allowance * spend_amount) / original_offered;
-                        let cap_u64 = cap.clone().unwrap().to_u64().unwrap_or(0);
-                        if actual_fee > cap_u64 {
-                            bail!(
-                                "partial fill fee {actual_fee} exceeds pro-rata cap \
-                                 {cap_u64} (fill {spend_amount} of {original_offered})",
-                            );
-                        }
-                    }
-                }
+                // (The pro-rata anti-micro-fill cap is applied when
+                // actual_fee is computed above — vs REMAINING offered,
+                // per the redesigned swap constraint.)
                 build_fulfillment_value_from_order(
                     &swap.order.value,
                     offer_asset,
@@ -2062,25 +2066,16 @@ pub fn build_multi_pool_scoop_tx(
             let mint_redeemer_data = if asset_pairs.is_empty() {
                 None
             } else {
-                // One Mint redeemer per minting policy. With only pool_mint
-                // here, every entry shares it — but the contract reads
-                // `pool_ident` from the redeemer, so all entries must target
-                // the same pool. Today we restrict to a single pool with a
-                // non-zero LP delta per tx.
+                // One Mint redeemer per minting policy. SUN-102: MintLP
+                // carries the ident of EVERY pool whose LP moves this tx, so
+                // multi-pool deposit/withdraw batches are allowed now.
                 let pool_idents: Vec<_> = batches.iter().enumerate()
                     .filter(|(i, _)| {
                         !(&per_pool[*i].lp_minted - &per_pool[*i].lp_burned).is_zero()
                     })
                     .map(|(_, b)| b.pool.pool_datum.identifier.clone())
                     .collect();
-                if pool_idents.len() != 1 {
-                    anyhow::bail!(
-                        "multi-pool LP mint/burn in one tx isn't supported by pool_mint \
-                         (only_own_lp check rejects mixed lp_names); got {} pools",
-                        pool_idents.len()
-                    );
-                }
-                let r = PoolMintRedeemer::MintLP { pool_ident: pool_idents.into_iter().next().unwrap() };
+                let r = PoolMintRedeemer::MintLP { pool_idents };
                 Some(r.to_plutus())
             };
             // Assemble the multi-policy mint map in sorted-policy order and

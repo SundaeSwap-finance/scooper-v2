@@ -652,13 +652,20 @@ impl Scooper {
                     n_quarantined += 1;
                     return false;
                 }
-                // Orders with budget == 0 are structurally unscoopable:
-                // order_validator enforces `budget * n >= tx_body.fee`
-                // and `tx_body.fee >= chain_min_fee > 0`. Mark them for
-                // permanent quarantine (applied below) so we stop
-                // dispatching them every cycle — V4 orders don't TTL.
-                let budget = o.datum.budget.clone().unwrap().to_u64().unwrap_or(0);
-                if budget == 0 {
+                // Fee redesign (SUNDAE-2587): the scooper's compensation
+                // is the deduction itself — min(max_per_execution,
+                // service_budget) on a terminal fill. Zero means the order
+                // pays nothing, ever: economically unscoopable. Quarantine
+                // permanently — V4 orders don't TTL.
+                let settlement = o
+                    .datum
+                    .max_per_execution
+                    .clone()
+                    .min(o.datum.service_budget.clone())
+                    .unwrap()
+                    .to_u64()
+                    .unwrap_or(0);
+                if settlement == 0 {
                     quarantine_budget_zero.push(o.input.clone());
                     n_quarantined += 1;
                     return false;
@@ -826,8 +833,15 @@ impl Scooper {
                 }
                 {
                     use num_traits::ToPrimitive;
-                    let budget = order.datum.budget.clone().unwrap().to_u64().unwrap_or(0);
-                    if budget == 0 {
+                    let settlement = order
+                        .datum
+                        .max_per_execution
+                        .clone()
+                        .min(order.datum.service_budget.clone())
+                        .unwrap()
+                        .to_u64()
+                        .unwrap_or(0);
+                    if settlement == 0 {
                         continue;
                     }
                 }
@@ -1136,7 +1150,9 @@ impl Scooper {
                     // paying more get more elaborate routes.
                     let order_budget_lov: u64 = {
                         use num_traits::ToPrimitive;
-                        order.datum.budget.clone().unwrap().to_u64().unwrap_or(0)
+                        // Fee redesign: the per-execution cap is what an
+                        // execution can spend, so it buys the route fan-out.
+                        order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0)
                     };
                     let limits = router::RoutingLimits::from_budget(
                         order_budget_lov,
@@ -1283,14 +1299,11 @@ impl Scooper {
                                 })
                             })
                             .unwrap_or(false);
-                        // swap.ak's compute_fee_taken demands ada_consumed
-                        // ≥ 0; an ADA-receiving continuation accumulates ADA
-                        // on the order, so such orders CANNOT partial-fill
-                        // under the current contract (flagged for module v2).
-                        let receives_ada = order.swap_min_received().0.policy.is_empty();
+                        // SUNDAE-2613: min_received is measured gross of
+                        // the fee on ADA legs, so ADA-receiving orders can
+                        // partial-fill like any other now.
                         if e.contains("below min_received")
                             && is_swap_module
-                            && !receives_ada
                             && exec.partial_fill_margin.is_some()
                         {
                             if let Some(dx) = self.find_partial_fill_dx(
@@ -2174,13 +2187,15 @@ impl Scooper {
         {
             return None;
         }
-        let PoolType::ConstantSum { prices, bounty_k, waive_fee_on_claim, .. } =
+        let PoolType::ConstantSum { prices, bounty_k, balance_fee, .. } =
             &pool.pool_type
         else {
             debug!(pool = %pool_hex, "claim hint targets a non-CS pool; skipping");
             return None;
         };
-        if !waive_fee_on_claim {
+        // SUN-310: balance_fee == 0 is the old full waiver; the claims
+        // engine implements only that mode until workstream C generalizes.
+        if balance_fee.num != BigInt::from(0) {
             debug!(
                 pool = %pool_hex,
                 "claim hint targets a fee-paying-claims pool; only waived mode is supported",
@@ -2330,16 +2345,23 @@ impl Scooper {
         let (offer_asset, remaining) = order.swap_offered();
         let (ask_asset, min_qty) = order.swap_min_received();
 
-        // Economic floor: fill ≥ original · margin · fee_est / allowance.
+        // Economic floor under the fee redesign (SUNDAE-2587): a partial
+        // fill of `dx` lets the scooper deduct at most
+        // `dx · service_budget / remaining` (the anti-micro-fill boundary,
+        // pro-rata against the REMAINING order), capped by
+        // max_per_execution. Require the deduction to cover
+        // `margin · fee_est`, i.e. dx ≥ remaining·margin·fee_est/budget.
         let fee_est = BigInt::from(exec.partial_fill_fee_estimate);
-        let surplus = &order.datum.budget - &fee_est;
-        let allowance = &fee_est
-            + &(&(&order.datum.share_batcher * &surplus) / &BigInt::from(10_000u64));
-        if !allowance.is_positive() {
+        let budget = order
+            .datum
+            .service_budget
+            .clone()
+            .min(order.datum.max_per_execution.clone());
+        if !budget.is_positive() {
             return None;
         }
-        let floor_dx = &(&(original_offered * &BigInt::from(margin_num)) * &fee_est)
-            / &(&allowance * &BigInt::from(margin_den));
+        let floor_dx = &(&(remaining * &BigInt::from(margin_num)) * &fee_est)
+            / &(&budget * &BigInt::from(margin_den));
         if &floor_dx >= remaining {
             return None; // even the minimum viable fill exceeds what's left
         }

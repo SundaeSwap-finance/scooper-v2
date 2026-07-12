@@ -636,7 +636,7 @@ pub fn extract_cs_config_from_tx(
         .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
     let parsed: ConstantSumRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
-        ConstantSumRedeemer::Create { initial_state } => {
+        ConstantSumRedeemer::Create { initial_state, .. } => {
             ConstantSumConfig::from_plutus(initial_state).ok()
         }
         _ => None,
@@ -667,8 +667,8 @@ pub fn extract_fee_split_config_from_tx(
         .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
-        FeeSplitRedeemer::Create { config } => Some(config),
-        FeeSplitRedeemer::Operate { .. } => None,
+        FeeSplitRedeemer::Create { config, .. } => Some(config),
+        _ => None,
     }
 }
 
@@ -692,7 +692,7 @@ pub fn extract_cp_config_from_tx(
     let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
-        ConstantProductRedeemer::Operate { .. } => None,
+        _ => None,
     }
 }
 
@@ -716,8 +716,7 @@ pub fn extract_cl_config_from_tx(
     let parsed: ConcentratedLiquidityRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConcentratedLiquidityRedeemer::Create { initial_state } => Some(initial_state),
-        ConcentratedLiquidityRedeemer::Operate { .. } => None,
-        ConcentratedLiquidityRedeemer::Destroy => None,
+        _ => None,
     }
 }
 
@@ -741,11 +740,12 @@ pub fn extract_fee_split_config_for_pool_from_tx(
         .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
-        FeeSplitRedeemer::Create { config } => Some(config),
+        FeeSplitRedeemer::Create { config, .. } => Some(config),
         FeeSplitRedeemer::Operate { entries } => entries
             .into_iter()
             .find(|e| &e.pool_oref == pool_oref)
             .map(|e| e.config),
+        FeeSplitRedeemer::Destroy { .. } => None,
     }
 }
 
@@ -1234,7 +1234,8 @@ impl ChainIndex for SundaeV4Indexer {
                 }
                 Some(PoolRedeemer::EscapeHatch { .. })
                 | Some(PoolRedeemer::Upgrade)
-                | Some(PoolRedeemer::EmergencyDisable { .. }) => {
+                | Some(PoolRedeemer::EmergencyDisable { .. })
+                | Some(PoolRedeemer::Destroy) => {
                     // Non-scoop pool operation
                 }
                 None => {
@@ -1716,7 +1717,12 @@ pub fn detect_pool_type(
                     den: BigInt::from(fee.1),
                 },
                 bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-                waive_fee_on_claim: false,
+                // Bounty off => balance_fee unread; mirror the fee for hash
+                // consistency with the CLI's create default.
+                balance_fee: Rational {
+                    num: BigInt::from(fee.0),
+                    den: BigInt::from(fee.1),
+                },
             };
         }
 
@@ -1726,7 +1732,7 @@ pub fn detect_pool_type(
                 prices: cs_config.prices.clone(),
                 fee: cs_config.fee.clone(),
                 bounty_k: cs_config.bounty_k.clone(),
-                waive_fee_on_claim: cs_config.waive_fee_on_claim,
+                balance_fee: cs_config.balance_fee.clone(),
             };
         }
 
@@ -1738,7 +1744,10 @@ pub fn detect_pool_type(
                 den: BigInt::from(exec.fee.1),
             },
             bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-            waive_fee_on_claim: false,
+            balance_fee: Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            },
         };
     }
 

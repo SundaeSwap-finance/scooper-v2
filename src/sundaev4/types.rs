@@ -114,6 +114,10 @@ pub enum PoolRedeemer {
         pool_input_index: BigInt,
         pool_output_index: BigInt,
     },
+    /// SUN-103/ADR-0006 teardown spend path (constructor 4, appended —
+    /// EscapeHatch 0, Upgrade 1, EmergencyDisable 2, Action 3 are stable).
+    /// Parsed only (indexer tolerance); the scooper never builds it.
+    Destroy,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -164,10 +168,15 @@ impl serde::Serialize for Destination {
 pub struct OrderDatum {
     pub owner: Multisig,
     pub destination: Destination,
-    /// Per-order tx-fee budget. Contract requires `budget * n_orders >= tx_fee`.
-    pub budget: BigInt,
-    /// Scooper share of `budget - fee_share` surplus, in basis points (0..=10000).
-    pub share_batcher: BigInt,
+    /// Mutable lifetime service-fee counter (SUNDAE-2587): every partial-fill
+    /// continuation must carry `service_budget - fee_deducted`; the fee
+    /// constraint (when the order's config requires it) pins the delta to
+    /// exactly `order_fee`. Cancel returns the remainder.
+    pub service_budget: BigInt,
+    /// Immutable flat cap on lovelace deducted in a single scoop, AND the
+    /// terminal settlement amount: a terminal (order-consuming) fill deducts
+    /// exactly `min(max_per_execution, service_budget)` (ADR-0001).
+    pub max_per_execution: BigInt,
     /// Asset name of the OrderConfig settings entry this order's constraints
     /// must match.
     #[serde(serialize_with = "hex_ser::bytes")]
@@ -272,6 +281,27 @@ impl OrderDatum {
         anyhow::ensure!(fields.len() == 4, "swap constraint must have 4 fields");
         fields[2] = new_remaining.clone().to_plutus();
         c.fields = pallas_primitives::MaybeIndefArray::Def(fields);
+        Ok(datum)
+    }
+
+    /// Continuation datum for a partial fill (SUNDAE-2587): remaining_offered
+    /// drops by the fill AND service_budget drops by the fee deducted this
+    /// execution. swap.ak pins the continuation datum equal to the input
+    /// datum EXCEPT service_budget and the swap constraint's own entry, so
+    /// both must move here and nothing else.
+    pub fn with_swap_continuation(
+        &self,
+        swap_hash: &[u8],
+        new_remaining: &BigInt,
+        fee_deducted: &BigInt,
+    ) -> anyhow::Result<OrderDatum> {
+        use num_traits::Signed;
+        let mut datum = self.with_swap_remaining(swap_hash, new_remaining)?;
+        datum.service_budget = &datum.service_budget - fee_deducted;
+        anyhow::ensure!(
+            !datum.service_budget.is_negative(),
+            "fee {fee_deducted} exceeds the order's remaining service_budget"
+        );
         Ok(datum)
     }
 }
@@ -461,16 +491,15 @@ pub enum OrderRedeemer {
 pub struct SettingsDatum {
     pub settings_admin: Multisig,
     pub treasury_admin: Multisig,
-    #[serde(serialize_with = "hex_ser::bytes")]
-    pub treasury_address: Vec<u8>,
     #[serde(serialize_with = "hex_ser::opt_vec_bytes")]
     pub authorized_scoopers: Option<Vec<Vec<u8>>>,
-    /// Maps order constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim) → module script hash.
-    pub order_modules: Vec<(BigInt, Vec<u8>)>,
-    /// Minimum scooper share in basis points; orders with `share_batcher < min_share_batcher` are rejected.
-    pub min_share_batcher: BigInt,
     pub extension: PlutusData,
 }
+// SUN-301 removed `treasury_address` (unused), `order_modules`, and
+// `min_share_batcher` from the global settings: order dispatch is
+// OrderConfig-based (constraint script hashes from module config, not a
+// settings tag map), and service-fee parameters live in the dedicated
+// FeeSettings node (docs/fee-system.md).
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Shared Plutus types (must be structs, not tuples, to match Aiken's Constr encoding)
@@ -503,7 +532,7 @@ pub struct OutputRef {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PoolType {
     ConstantProduct { fee: Rational },
-    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational, waive_fee_on_claim: bool },
+    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational, balance_fee: Rational },
     /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
     /// bound the pool's price range (`a < b`). The validator works on
     /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
@@ -532,11 +561,13 @@ pub struct ConstantSumConfig {
     /// Quadratic rebalance bounty parameter. `(0, 1)` disables the bounty
     /// mechanism.
     pub bounty_k: Rational,
-    /// When `true`, the swap portion of a `tag_claim` step is value-neutral
-    /// (`dy = dx · p_in / p_out` exactly, no fee retained) and the on-chain
-    /// validator requires `v_increase = 0`, `fee_budget = 0`,
-    /// `before_lp == after_lp`. The claim itself is bounded only by cap_b.
-    pub waive_fee_on_claim: bool,
+    /// SUN-310: fee rate charged on the swap portion of a `tag_claim` step,
+    /// in place of `fee`. Must satisfy `0 <= balance_fee <= fee`; `0` is the
+    /// full waiver (value-neutral swap portion, `v_increase = 0`,
+    /// `fee_budget = 0`). The claim step's LP-budget pin is on the
+    /// OP-PORTION V (claim restored), so the claim is bounded by cap_b plus
+    /// the no-overshoot guard — cap_a (claim <= v_increase) is gone.
+    pub balance_fee: Rational,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -687,6 +718,8 @@ pub const TAG_DEPOSIT: u64 = 6;
 pub enum ConstantProductRedeemer {
     Create { initial_state: ConstantProductConfig },
     Operate { entries: Vec<CPOperateEntry> },
+    /// SUN-103/ADR-0006 teardown; parsed only (indexer tolerance).
+    Destroy { entries: Vec<PlutusData> },
 }
 
 /// Redeemer for the pool_mint policy. The scooper only uses `MintLP` (to mint
@@ -695,7 +728,8 @@ pub enum ConstantProductRedeemer {
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum PoolMintRedeemer {
     CreatePool { seed_utxo: OutputRef, settings_ref_index: u64 },
-    MintLP { pool_ident: Ident },
+    /// SUN-102: one MintLP redeemer may mint/burn LP for several pools.
+    MintLP { pool_idents: Vec<Ident> },
     BurnPool { pool_ident: Ident },
 }
 
@@ -707,16 +741,20 @@ pub struct CPOperateEntry {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantSumRedeemer {
-    Create { initial_state: PlutusData },
+    /// SUN-005: Create pins the created pool's output index (initial_state
+    /// stays field 0 — pool_mint hashes it for module_state).
+    Create { initial_state: PlutusData, pool_output_index: u64 },
     Operate { entries: Vec<CSOperateEntry> },
-    Destroy,
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy { entries: Vec<PlutusData> },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConcentratedLiquidityRedeemer {
     Create { initial_state: ConcentratedLiquidityConfig },
     Operate { entries: Vec<CLOperateEntry> },
-    Destroy,
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy { entries: Vec<PlutusData> },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -738,8 +776,18 @@ pub struct FeeSplitConfig {
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum FeeSplitRedeemer {
-    Create { config: FeeSplitConfig },
+    /// SUN-005/ADR-0003: Create pins the pool output and the PoolConfig +
+    /// Approved Stake List reference-input indices (fee tiers). `config`
+    /// stays field 0 (hashed for module_state).
+    Create {
+        config: FeeSplitConfig,
+        pool_output_index: u64,
+        settings_ref_index: u64,
+        stake_list_ref_index: u64,
+    },
     Operate { entries: Vec<FSOperateEntry> },
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy { entries: Vec<PlutusData> },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -752,7 +800,8 @@ pub struct FSOperateEntry {
 pub enum FairnessRedeemer {
     Create,
     Operate { entries: Vec<FairnessOperateEntry> },
-    Destroy,
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy { entries: Vec<PlutusData> },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -1085,14 +1134,10 @@ impl SundaeV4Order {
         let datum = OrderDatum {
             owner,
             destination,
-            budget,
-            // Production orders set share_batcher = 10000 (full surplus to
-            // the batcher), making the fee allowance ~= budget. With 0, the
-            // allowance is exactly fee/n and the scooper's last-order-absorbs
-            // -remainder fee split violates it whenever fee % n != 0.
-            // TODO: teach the fee split to respect per-order allowances so
-            // low-share orders are also batchable.
-            share_batcher: BigInt::from(10_000),
+            // Single-execution shape: service_budget == max_per_execution,
+            // so the terminal settlement deducts exactly the budget.
+            service_budget: budget.clone(),
+            max_per_execution: budget,
             config_token: Vec::new(),
             constraints,
             extension: unit,
@@ -1327,8 +1372,8 @@ mod tests {
         let datum = OrderDatum {
             owner: Multisig::Signature(vec![0xaa; 28]),
             destination: Destination::SelfDestination,
-            budget: BigInt::from(1_000_000),
-            share_batcher: BigInt::from(50),
+            service_budget: BigInt::from(1_000_000),
+            max_per_execution: BigInt::from(400_000),
             config_token: vec![0xbb; 32],
             constraints: vec![(SWAP_HASH.to_vec(), constraints.clone())],
             extension: unit,
@@ -1338,8 +1383,8 @@ mod tests {
         let decoded: OrderDatum = AsPlutus::from_plutus(pd).unwrap();
         assert_eq!(decoded.owner, Multisig::Signature(vec![0xaa; 28]));
         assert_eq!(decoded.destination, Destination::SelfDestination);
-        assert_eq!(decoded.budget, BigInt::from(1_000_000));
-        assert_eq!(decoded.share_batcher, BigInt::from(50));
+        assert_eq!(decoded.service_budget, BigInt::from(1_000_000));
+        assert_eq!(decoded.max_per_execution, BigInt::from(400_000));
 
         let inner = decoded
             .find_constraint_by_hash(&SWAP_HASH)
@@ -1401,16 +1446,12 @@ mod tests {
 
     #[test]
     fn test_decode_v4_settings_datum() {
-        // Round-trip: build a SettingsDatum with all 7 fields, encode, decode, compare.
+        // Round-trip the SUN-301 shape (treasury_address, order_modules and
+        // min_share_batcher were removed from the global settings).
         let datum = SettingsDatum {
             settings_admin: Multisig::Signature(vec![0xaa; 28]),
             treasury_admin: Multisig::Signature(vec![0xbb; 28]),
-            treasury_address: vec![0xcc, 0xcc],
             authorized_scoopers: Some(vec![vec![0xdd; 28]]),
-            order_modules: vec![
-                (BigInt::from(2), vec![0xee; 28]), // tag 2 = Swap
-            ],
-            min_share_batcher: BigInt::from(50),
             extension: PlutusData::Constr(pallas_primitives::Constr {
                 tag: 121,
                 any_constructor: None,
@@ -1419,11 +1460,8 @@ mod tests {
         };
         let pd = datum.clone().to_plutus();
         let decoded: SettingsDatum = AsPlutus::from_plutus(pd).unwrap();
-        assert_eq!(decoded.treasury_address, vec![0xcc, 0xcc]);
+        assert_eq!(decoded.settings_admin, Multisig::Signature(vec![0xaa; 28]));
         assert_eq!(decoded.authorized_scoopers.as_ref().unwrap().len(), 1);
-        assert_eq!(decoded.order_modules.len(), 1);
-        assert_eq!(decoded.order_modules[0].0, BigInt::from(2));
-        assert_eq!(decoded.min_share_batcher, BigInt::from(50));
     }
 
     #[test]
@@ -1433,13 +1471,14 @@ mod tests {
             prices: vec![BigInt::from(1), BigInt::from(2)],
             fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
             bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-            waive_fee_on_claim: false,
+            balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
         };
         let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
         // Persisted byte shape used by sqlite tests in persistence::sqlite.
         // If this changes, update those test fixtures.
-        // Trailing `d87980` = Constr 0 [] (False) for waive_fee_on_claim.
-        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffd87980ff");
+        // Trailing `d8799f0001ff` = Rational 0/1 for balance_fee (SUN-310;
+        // replaces the old waive_fee_on_claim Bool).
+        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffd8799f0001ffff");
 
         let pd: PlutusData = minicbor::decode(&cbor).unwrap();
         let decoded: ConstantSumConfig = AsPlutus::from_plutus(pd).unwrap();
@@ -1448,7 +1487,8 @@ mod tests {
         assert_eq!(decoded.fee.den, cfg.fee.den);
         assert_eq!(decoded.bounty_k.num, cfg.bounty_k.num);
         assert_eq!(decoded.bounty_k.den, cfg.bounty_k.den);
-        assert!(!decoded.waive_fee_on_claim);
+        assert_eq!(decoded.balance_fee.num, BigInt::from(0));
+        assert_eq!(decoded.balance_fee.den, BigInt::from(1));
     }
 
     #[test]

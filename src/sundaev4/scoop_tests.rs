@@ -760,27 +760,12 @@ mod tests {
         accum.try_add_routed_order(&order, &route, &pool_map).expect("adds");
         let plan = accum.into_plan();
         let settings = make_settings(&env, &env.scooper_keyhash());
-        // KNOWN CONTRACT BUG (found 2026-07-09, pre-launch finding):
-        // compute_fee_taken = in_ada − out_ada goes negative when the
-        // destination receives ADA, and swap.ak expects ≥ 0 — so orders
-        // selling a token FOR ADA cannot execute at all (basic.ak shares
-        // the shape). This test documents the bug; when the contracts fix
-        // fee accounting to net out received ADA, it will fail here and
-        // should be flipped to assert success.
-        match env.build_and_eval_plan(&plan, &settings, 1000) {
-            Ok(_) => panic!(
-                "ADA-receiving fill VALIDATES — contract fixed! Flip this \
-                 test to assert success and re-enable ADA-receiving \
-                 dispatch (see swap.ak compute_fee_taken)."
-            ),
-            Err(e) => {
-                let msg = format!("{e:#}");
-                assert!(
-                    msg.contains("ExplicitErrorTerm"),
-                    "expected the fee_taken>=0 failure, got: {msg}"
-                );
-            }
-        }
+        // SUNDAE-2613 fixed the pre-launch fee_taken >= 0 bug: min_received
+        // is measured GROSS of the fee on ADA legs, so selling a token FOR
+        // ADA is a first-class fill now. This used to be the canary test
+        // documenting the old contract bug.
+        env.build_and_eval_plan(&plan, &settings, 1000)
+            .expect("ADA-receiving full fill validates under SUNDAE-2613");
     }
 
     /// Single-pool basic swap: the degenerate case must also evaluate.
