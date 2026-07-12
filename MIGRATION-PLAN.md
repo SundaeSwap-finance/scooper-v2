@@ -1,5 +1,17 @@
 # Scooper-v2 migration plan: post-audit sundae-v4 contracts
 
+> **Status (2026-07-12):** D1 (fixture regen), workstream A (all shapes),
+> and B1 (fee-free semantics) are DONE — commits `2f7b4bb` + `45813fc`,
+> suite green at 184 passed / 0 failed against the real post-audit
+> bytecode. SUNDAE-2613 canary flipped: ADA-receiving fills + partial-fill
+> dispatch enabled. Multi-pool LP mint restriction lifted (SUN-102).
+> Remaining: B2 batch-rule regression tests, the devnet load-test soak,
+> C (claims/balance_fee generalization — hints currently gated to
+> balance_fee == 0 pools), B3 fee-bearing mode (parked pending the
+> fee-collection design decision). Note: `.cargo/config.toml` sets
+> RUST_MIN_STACK=32MB — the UPLC evaluator overflows the default test
+> stack on the traced post-audit validators.
+
 Companion to `~/proj/sundae/sundae-v4/docs/offchain-migration-notes.md` (the
 protocol-change catalog — read it first). This document maps each change onto
 this codebase with file:line anchors, ordered by dependency. Reference
