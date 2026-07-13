@@ -617,11 +617,19 @@ impl Scooper {
         let funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> =
             funding.map(|(i, v, _)| (i.clone(), v.clone()));
         if funding_owned.is_none() {
-            debug!(
+            // Fee redesign (SUNDAE-2587): the deduction pot's surplus over
+            // the tx fee lands on the scooper change output, which only
+            // exists when a funding UTxO is spent — without one, every
+            // build fails value conservation, and the shrink-to-isolate
+            // path would blame (and permanently quarantine) innocent
+            // orders. Skip the cycle until the wallet recovers.
+            warn!(
                 min_ada = MIN_FUNDING_ADA,
                 wallet_utxos = v4_state.wallet_utxos.len(),
-                "no wallet UTxO available for funding; builds will fail if any pool needs a min-ada bump"
+                "no wallet UTxO available for funding; skipping scoop cycle \
+                 (fee-pot change output requires a funding input)"
             );
+            return false;
         }
 
         // Filter orders: exclude in-flight and quarantined, sort oldest first

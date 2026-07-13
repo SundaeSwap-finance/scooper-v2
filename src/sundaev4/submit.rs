@@ -3,6 +3,18 @@
 
 use anyhow::{Context, Result, bail};
 
+/// Submit HTTP client with a hard timeout. A default `reqwest::Client` has
+/// NO timeout — one hung submit endpoint blocks the dispatch loop forever
+/// (holding its state, starving the HTTP server, and letting the block-event
+/// backlog grow without bound). Seen live: a wedged devnet submit-api froze
+/// the scooper at 10+ GB RSS.
+fn submit_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builds")
+}
+
 /// Submit a CBOR-encoded signed transaction.
 ///
 /// Backend selection from the URL:
@@ -44,7 +56,7 @@ async fn submit_blockfrost(url: &str, cbor: &[u8]) -> Result<String> {
         format!("{}/tx/submit", endpoint)
     };
 
-    let client = reqwest::Client::new();
+    let client = submit_client();
     let resp = client
         .post(&submit_url)
         .header("project_id", project_id)
@@ -64,7 +76,7 @@ async fn submit_blockfrost(url: &str, cbor: &[u8]) -> Result<String> {
 }
 
 async fn submit_cardano_api(url: &str, cbor: &[u8]) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = submit_client();
     let resp = client
         .post(url)
         .header("Content-Type", "application/cbor")
@@ -86,7 +98,7 @@ async fn submit_cardano_api(url: &str, cbor: &[u8]) -> Result<String> {
 }
 
 async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = submit_client();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "submitTransaction",
