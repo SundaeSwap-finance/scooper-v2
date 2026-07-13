@@ -404,6 +404,53 @@ pub(crate) mod test_harness {
                 None,
             )?;
 
+            // Lovelace conservation: inputs == outputs + fee. Phase-2 eval
+            // can't see this — the ledger rejects violations at submit
+            // (ValueNotConservedUTxO), so assert it here where the suite can
+            // catch fee-accounting regressions.
+            {
+                use num_traits::ToPrimitive;
+                let ada_lo = ada();
+                let in_ada: u64 = build
+                    .tx_body
+                    .inputs
+                    .iter()
+                    .map(|i| {
+                        let key = crate::cardano_types::TransactionInput::new(
+                            i.transaction_id,
+                            i.index,
+                        );
+                        build
+                            .resolved_inputs
+                            .get(&key)
+                            .map(|r| r.value.get(&ada_lo).unwrap().to_u64().unwrap_or(0))
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let out_ada: u64 = build
+                    .tx_body
+                    .outputs
+                    .iter()
+                    .map(|o| match o {
+                        pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b) => {
+                            match &b.value {
+                                pallas_primitives::conway::Value::Coin(c) => *c,
+                                pallas_primitives::conway::Value::Multiasset(c, _) => *c,
+                            }
+                        }
+                        pallas_primitives::conway::PseudoTransactionOutput::Legacy(_) => 0,
+                    })
+                    .sum();
+                anyhow::ensure!(
+                    in_ada == out_ada + build.tx_body.fee,
+                    "lovelace not conserved: inputs {} != outputs {} + fee {} (diff {})",
+                    in_ada,
+                    out_ada,
+                    build.tx_body.fee,
+                    in_ada as i128 - out_ada as i128 - build.tx_body.fee as i128,
+                );
+            }
+
             Ok((build, eval))
         }
 

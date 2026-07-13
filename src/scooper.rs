@@ -1230,51 +1230,57 @@ impl Scooper {
                         skip_no_route += 1;
                         continue;
                     };
-                    let blend = if has_route_module && blend.as_single().is_none() {
-                        // Fall back to the best single path for route-
-                        // constrained orders.
-                        match router::find_optimal_route(
-                            &pool_view,
-                            conversion_edges,
-                            offer_asset,
-                            ask_asset,
-                            offer_amount,
-                            limits,
-                        ) {
-                            Some(single) => crate::sundaev4::router::BlendedRoute {
-                                total_input: single.total_input.clone(),
-                                total_output: single.total_output.clone(),
-                                branches: vec![single],
-                            },
-                            None => {
-                                skip_no_route += 1;
-                                continue;
+                    // The deployed route module validates only a strictly
+                    // serial chain: each hop's positive delta must negate the
+                    // next hop's negative delta (route_lib.check_intermediate_flow).
+                    // A hop that fans out across parallel pools (or a multi-
+                    // branch blend) is unrepresentable in that redeemer, so
+                    // route-constrained orders get collapsed to the best
+                    // serial single-split path — whole flow through each
+                    // hop's deepest split. min_received is re-checked against
+                    // the collapsed path's actual outputs at admission. Plain
+                    // swap-constraint orders are unaffected (min_received is
+                    // their only on-chain check).
+                    let blend = if has_route_module {
+                        let serial_ok = blend
+                            .as_single()
+                            .map(|p| p.hops.iter().all(|h| h.splits.len() == 1))
+                            .unwrap_or(false);
+                        if serial_ok {
+                            blend
+                        } else {
+                            let single = match blend.as_single() {
+                                Some(p) => Some(p.clone()),
+                                None => router::find_optimal_route(
+                                    &pool_view,
+                                    conversion_edges,
+                                    offer_asset,
+                                    ask_asset,
+                                    offer_amount,
+                                    limits,
+                                ),
+                            };
+                            match single
+                                .and_then(|p| router::collapse_to_serial(&p, offer_amount))
+                            {
+                                Some(serial) => crate::sundaev4::router::BlendedRoute {
+                                    total_input: serial.total_input.clone(),
+                                    total_output: serial.total_output.clone(),
+                                    branches: vec![serial],
+                                },
+                                None => {
+                                    tracing::info!(
+                                        order = %order.input,
+                                        "order dispatch: swap, route-module order has no serial single-split path; skipping",
+                                    );
+                                    skip_no_route += 1;
+                                    continue;
+                                }
                             }
                         }
                     } else {
                         blend
                     };
-                    // The deployed route module validates only a strictly
-                    // serial chain: each hop's positive delta must negate the
-                    // next hop's negative delta (route_lib.check_intermediate_flow).
-                    // A hop that fans out across parallel pools is unrepresentable
-                    // in that redeemer, so hold route-constrained orders to a
-                    // single-split-per-hop path. Plain swap-constraint orders are
-                    // unaffected (min_received is their only on-chain check).
-                    if has_route_module {
-                        let serial = blend
-                            .as_single()
-                            .map(|p| p.hops.iter().all(|h| h.splits.len() == 1))
-                            .unwrap_or(false);
-                        if !serial {
-                            tracing::info!(
-                                order = %order.input,
-                                "order dispatch: swap, route-module order has no serial single-split path; skipping",
-                            );
-                            skip_no_route += 1;
-                            continue;
-                        }
-                    }
                     tracing::info!(
                         order = %order.input,
                         kind = "swap",

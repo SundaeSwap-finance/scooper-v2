@@ -1659,6 +1659,12 @@ pub fn build_multi_pool_scoop_tx(
     // outputs above the ledger's min-UTxO — standing (Self) orders with
     // several assets and an inline datum need ~2.5M lovelace retained.
     let mut total_fulfillment_subsidy: u64 = 0;
+    // Sum of per-order deductions (SUNDAE-2587). The tx fee is paid out of
+    // this pot and the remainder must be ADDED to the scooper change output
+    // below — outputs here are constructed explicitly, so nothing balances
+    // "by conservation" on its own; omitting it is a ValueNotConservedUTxO
+    // rejection at submit (local eval is phase-2 only and can't catch it).
+    let mut total_fee_deducted: u64 = 0;
     let mut fulfillment_order: Vec<usize> = (0..n_orders).collect();
     fulfillment_order.sort_by_key(|i| order_filtered_indices[*i]);
 
@@ -1730,6 +1736,7 @@ pub fn build_multi_pool_scoop_tx(
                 .to_u64()
                 .context("order fee deduction exceeds u64")?
         };
+        total_fee_deducted += actual_fee;
 
         let partial_continuation: Option<pallas_primitives::PlutusData> = match &swap_fill {
             Some(fill) if fill < order.swap_offered().1 => {
@@ -1954,6 +1961,15 @@ pub fn build_multi_pool_scoop_tx(
              no funding UTxO was provided"
         );
     }
+    if funding_value_opt.is_none() && total_fee_deducted != tx_fee {
+        // Without a change output there is nowhere for the deduction pot's
+        // surplus (or shortfall) vs the tx fee to go — the ledger would
+        // reject the tx as ValueNotConservedUTxO.
+        bail!(
+            "fee deductions ({total_fee_deducted}) != tx fee ({tx_fee}) and no \
+             funding UTxO to absorb the difference in a change output"
+        );
+    }
     if let Some(funding_value) = funding_value_opt {
         use num_traits::ToPrimitive;
         use pallas_primitives::NonEmptyKeyValuePairs;
@@ -1963,9 +1979,14 @@ pub fn build_multi_pool_scoop_tx(
             .unwrap()
             .to_u64()
             .context("funding UTxO ada doesn't fit u64")?;
-        let change_ada = funding_ada.checked_sub(total_funding_draw)
+        // change = funding − bumps + (deduction pot − tx fee): the per-order
+        // deductions (SUNDAE-2587) pay the network fee and the remainder is
+        // the scooper's compensation, landing here.
+        let change_ada = (funding_ada + total_fee_deducted)
+            .checked_sub(total_funding_draw + tx_fee)
             .with_context(|| format!(
-                "funding UTxO ada ({funding_ada}) insufficient for min-ada support ({total_funding_draw})"
+                "funding UTxO ada ({funding_ada}) + fee deductions ({total_fee_deducted}) \
+                 insufficient for min-ada support ({total_funding_draw}) + tx fee ({tx_fee})"
             ))?;
         if change_ada < SCOOPER_CHANGE_MIN_ADA {
             bail!(

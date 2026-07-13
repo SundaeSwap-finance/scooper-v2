@@ -945,6 +945,48 @@ impl BlendedRoute {
     }
 }
 
+/// Collapse a routed plan to a strictly serial single-split chain: keep each
+/// hop's largest split and send the full flow through it. The deployed route
+/// constraint can only attest a serial pool chain, so route-module orders
+/// need this shape whenever the optimizer split a hop across pools (e.g.
+/// two pools on the same pair). Per-split output amounts become stale
+/// estimates — the accumulator recomputes actual dys against running pool
+/// state and enforces min_received on the result, so a collapse that
+/// under-delivers simply fails admission. Returns `None` if any kept split
+/// is a conversion edge (unrepresentable in the route redeemer).
+pub fn collapse_to_serial(plan: &RoutingPlan, input: &BigInt) -> Option<RoutingPlan> {
+    let mut hops = Vec::with_capacity(plan.hops.len());
+    for (hop_idx, hop) in plan.hops.iter().enumerate() {
+        let best = hop
+            .splits
+            .iter()
+            .max_by(|a, b| a.input_amount.cmp(&b.input_amount))?;
+        if matches!(best.pool.view_type, PoolViewType::Conversion { .. }) {
+            return None;
+        }
+        // Only the entry hop's input_amount is read downstream (later
+        // single-split hops cascade the previous hop's actual output).
+        let hop_input = if hop_idx == 0 { input.clone() } else { best.input_amount.clone() };
+        hops.push(HopResult {
+            input_token: hop.input_token.clone(),
+            output_token: hop.output_token.clone(),
+            splits: vec![SplitEntry {
+                pool: best.pool.clone(),
+                input_amount: hop_input,
+                output_amount: best.output_amount.clone(),
+            }],
+            total_output: best.output_amount.clone(),
+        });
+    }
+    let total_output = hops.last()?.total_output.clone();
+    Some(RoutingPlan {
+        hops,
+        total_input: input.clone(),
+        total_output,
+        naive_output: plan.naive_output.clone(),
+    })
+}
+
 /// The distinct pool/edge idents a path's hops could touch (candidate set —
 /// conservative: `optimize_split` may end up allocating 0 to some of them).
 fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {

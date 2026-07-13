@@ -163,6 +163,15 @@ impl SundaeV4Indexer {
                 if let Some(bo) = &scripts.basic_order {
                     set.insert(bo.ref_utxo.clone());
                 }
+                if let Some(ro) = &scripts.route_order {
+                    set.insert(ro.ref_utxo.clone());
+                }
+                if let Some(fo) = &scripts.fairness_order {
+                    set.insert(fo.ref_utxo.clone());
+                }
+                if let Some(st) = &scripts.strategy_order {
+                    set.insert(st.ref_utxo.clone());
+                }
                 set
             })
             .unwrap_or_default();
