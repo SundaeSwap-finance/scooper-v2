@@ -607,7 +607,7 @@
 
   async function togglePause() {
     try {
-      var res = await fetch('/pause');
+      var res = await fetch('/pause', { method: 'POST' });
       var data = await res.json();
       updatePauseBtn(data.paused);
     } catch (e) { /* ignore */ }

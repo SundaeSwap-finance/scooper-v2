@@ -67,6 +67,10 @@ pub struct Scooper {
     /// until the tip advances past this slot, giving the indexer time to
     /// process the competitor's block and remove spent UTxOs.
     backoff_until_after_slot: Option<u64>,
+    /// Last time we warned that cycles are being skipped because the
+    /// scooper is paused. A pause left on (once for 3 days) is otherwise
+    /// invisible: the skip itself only logs at trace level.
+    last_paused_warn: Option<std::time::Instant>,
     /// Orders quarantined due to structural failure or suspected spent inputs.
     quarantine: BTreeMap<TransactionInput, Quarantine>,
     /// Loaded + verified Butane runtime (None = integration disabled).
@@ -118,6 +122,7 @@ impl Scooper {
             paused,
             metrics,
             backoff_until_after_slot: None,
+            last_paused_warn: None,
             quarantine: BTreeMap::new(),
             v4_provisional,
             v4_node_submit,
@@ -201,8 +206,28 @@ impl Scooper {
             self.sync_quarantine_metrics();
 
             // 3. Attempt batch cycle (skip if paused or backing off after lost race)
-            let did_work = if self.paused.load(Ordering::Relaxed) {
-                trace!("scooper paused, skipping batch cycle");
+            let paused = self.paused.load(Ordering::Relaxed);
+            if !paused {
+                // Re-arm so the next pause warns immediately.
+                self.last_paused_warn = None;
+            }
+            let did_work = if paused {
+                const PAUSED_WARN_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(300);
+                if self
+                    .last_paused_warn
+                    .is_none_or(|t| t.elapsed() >= PAUSED_WARN_INTERVAL)
+                {
+                    let n_orders = match &self.v4_state {
+                        Some(s) => s.lock().await.latest().orders.len(),
+                        None => 0,
+                    };
+                    warn!(
+                        n_orders,
+                        "scooper is PAUSED — skipping batch cycles (POST /pause to resume)"
+                    );
+                    self.last_paused_warn = Some(std::time::Instant::now());
+                }
                 false
             } else if let Some(backoff_slot) = self.backoff_until_after_slot {
                 if let Some(tip) = self.current_tip_slot().await {

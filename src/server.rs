@@ -157,6 +157,7 @@ pub async fn admin_server(
         paused,
         metrics,
         intents,
+        remote_addr: None,
     };
 
     let mut listeners = Vec::new();
@@ -207,14 +208,15 @@ async fn run_listener(
 ) {
     let listener = TcpListener::bind(addr).await.unwrap();
     loop {
-        let stream = select! {
+        let (stream, peer) = select! {
             res = listener.accept() => match res {
-                Ok((s, _)) => s,
+                Ok(pair) => pair,
                 Err(e) => { debug!("accept failed: {e}"); continue; }
             },
             _ = shutdown.cancelled() => { break; }
         };
-        let server = server.clone();
+        let mut server = server.clone();
+        server.remote_addr = Some(peer);
         let tls_acceptor = tls_acceptor.clone();
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
@@ -271,6 +273,9 @@ struct AdminServer {
     paused: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
     intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
+    /// Peer address of the connection this (per-connection) clone serves.
+    /// `None` only on the base template before a connection is accepted.
+    remote_addr: Option<SocketAddr>,
 }
 
 impl hyper::service::Service<Request<IncomingBody>> for AdminServer {
@@ -798,13 +803,46 @@ impl AdminServer {
             }
             "/health" => Self::json_response(self.serve_health_stats().await),
             "/metrics" => self.serve_metrics().await,
-            "/pause" => {
-                let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
-                let now_paused = !was_paused;
-                Self::json_response(
-                    serde_json::to_string(&serde_json::json!({ "paused": now_paused })).unwrap(),
-                )
-            }
+            // POST toggles; GET just reports. A GET that mutated state let
+            // any stray request (scanner, browser prefetch, curl typo)
+            // silently stop all scooping — which once went unnoticed for
+            // days because the toggle also didn't log.
+            "/pause" => match *req.method() {
+                hyper::Method::POST => {
+                    let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
+                    let now_paused = !was_paused;
+                    let remote = self
+                        .remote_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    let forwarded_for = req
+                        .headers()
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    tracing::warn!(
+                        %remote,
+                        forwarded_for,
+                        paused = now_paused,
+                        "scooping {} via /pause",
+                        if now_paused { "PAUSED" } else { "RESUMED" },
+                    );
+                    Self::json_response(
+                        serde_json::to_string(&serde_json::json!({ "paused": now_paused }))
+                            .unwrap(),
+                    )
+                }
+                hyper::Method::GET => Self::json_response(
+                    serde_json::to_string(&serde_json::json!({
+                        "paused": self.paused.load(Ordering::Relaxed),
+                    }))
+                    .unwrap(),
+                ),
+                _ => Self::error_response(
+                    hyper::StatusCode::METHOD_NOT_ALLOWED,
+                    "POST to toggle, GET to read",
+                ),
+            },
             _ => {
                 let body = self.route_protocol(&path).await;
                 if body == "unknown" {
