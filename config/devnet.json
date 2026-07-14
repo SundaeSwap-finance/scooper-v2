@@ -4,21 +4,21 @@
   },
   "persistence": {
     "sqlite": {
-      "filename": "scooper-devnet.db"
+      "filename": "scooper-devnet-postaudit.db"
     }
   },
   "protocol": {
     "v4": {
-      "pool-script-hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
+      "pool-script-hash": "6f20009fe3c2554592dceaf8780c03a3d3198ef979ac7414842e4dc9",
       "order-script-hashes": [
-        "805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f"
+        "f35454b126df4cfd768ddf4035a41b90d7b8703285bc42da97cfdb45"
       ],
-      "settings-script-hash": "86856b8c0c8492cafe295ec9e3e9c6b407b7fa16878a7336966a462f",
-      "settings-nft": "fde929a29fda9b0b540bf2036903a2c54232c15014f629c58f10d1d3.",
-      "pool-nft-policy": "5b8ae2b3b3fce7bc870981d31c1267d870e310fde3e052251065f87e",
+      "settings-script-hash": "314d69c16606bff84a630822f15282e55fae9b2c9af810bb63f6a585",
+      "settings-nft": "a1bbc8aa021739510599d2cd9656fe502cff63783e208ba9e0a3594e.",
+      "pool-nft-policy": "6a4bd00d3622fdd516ae0582c61f6bf1e560592ce79255e87a806711",
       "starting-point": "origin",
       "execution": {
-        "scooper-secret-key": "0101010101010101010101010101010101010101010101010101010101010101",
+        "scooper-secret-key": "0202020202020202020202020202020202020202020202020202020202020202",
         "submit-url": "http://localhost:8090/api/submit/tx",
         "fee": [
           3,
@@ -329,50 +329,71 @@
         ],
         "slot-config": {
           "zero-slot": 0,
-          "zero-time": 1772750859000,
+          "zero-time": 1784036892000,
           "slot-length": 1000
         },
         "module-scripts": {
-          "constant-product": {
-            "hash": "6f52b2bfa7c4e342c81a3b0a42d974d8b75f6319271c11dec981e495",
-            "ref-utxo": "78279aa525ff75ca970840bec708e8c2628c8fcd425892185ac531647709768c#0"
-          },
-          "fee-split": {
-            "hash": "8982c2782d11e3047d9a2f50a31543970f95a9ed45aac2acc608fde3",
-            "ref-utxo": "333daeff993e78c7471723f4c1c2fbdb6b84b336491dbe910c78f7dfc1de6d00#0"
-          },
-          "fairness": {
-            "hash": "1632f4650f19647d3bb2a71f2182f1f6068dc8bb04ee223134a17f58",
-            "ref-utxo": "f656f5ef0e0262284f7b80816af13d50f04a50a3031b5eeb8c69e3a9afd23a09#0"
-          },
           "pool": {
-            "hash": "1657c9d9cf56e36595873e8a58dee4c1cc5a23b9f81ed27b9b5f8753",
-            "ref-utxo": "e836dd72ff443f2e994d5c7e85de22758996c910c658209d944ac3ac2319e22c#0"
+            "hash": "6f20009fe3c2554592dceaf8780c03a3d3198ef979ac7414842e4dc9",
+            "ref-utxo": "b7d0303f7e01ae5930f341a6a68d94012146b4a28f4b797e5d34877b8258304c#0"
           },
           "order": {
-            "hash": "805a1d62f0d86fb9a7d4a0183732703b66a7311935747e842169a53f",
-            "ref-utxo": "a449c14df85d9c728d0a4cb9be3bf066c8e063b438273022218400d9eb5691d8#0"
+            "hash": "f35454b126df4cfd768ddf4035a41b90d7b8703285bc42da97cfdb45",
+            "ref-utxo": "5f98f7f96ced6b831f176e8e57302b5a8dfcd3b047c52b066cb376c1d3fde432#0"
           },
           "pool-mint": {
-            "hash": "5b8ae2b3b3fce7bc870981d31c1267d870e310fde3e052251065f87e",
-            "ref-utxo": "6260f1c0034aae7030da2c71976b4c16a13e9550bb3a4d87ba7aad7230085146#0"
+            "hash": "6a4bd00d3622fdd516ae0582c61f6bf1e560592ce79255e87a806711",
+            "ref-utxo": "b02356cc46aa76ecb2a6bf426857c26fe4b4dd0104df40521ba27803120bc733#0"
           },
           "settings": {
-            "hash": "86856b8c0c8492cafe295ec9e3e9c6b407b7fa16878a7336966a462f",
-            "ref-utxo": "776afef3b55e33332bc695525eaab22d93d6701607fb23c91844ed675a383633#0"
+            "hash": "314d69c16606bff84a630822f15282e55fae9b2c9af810bb63f6a585",
+            "ref-utxo": "f230a146673145efe0648c76fda80a14de4f93d197aadcc7be5b1ce48a5c47b0#0"
+          },
+          "fee-split": {
+            "hash": "e481e7f61303889fe4e6bcd540c316b0104f83543bfe0c79b379f299",
+            "ref-utxo": "22776380fc1da3b774368ea6f6ea4f272c4e5c07ad881a239e912339c9a03cd2#0"
+          },
+          "fairness": {
+            "hash": "fb63a41bccd15cec0742e760e9f3a79fbcbfbc64cfba65e5970165fe",
+            "ref-utxo": "e11491292ad3251177bdbba299ed3aa0aad5f862609ec99e7d8f95e1572e186c#0"
           },
           "constant-sum": {
-            "hash": "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da",
-            "ref-utxo": "135af4abfc89d32187c83ecda78fdf6a7c12fd18a51df0460454287e3eedfbc1#0"
+            "hash": "a4f16e3ea08c10536103b249807f6512049eb39c943b6bef945e35a7",
+            "ref-utxo": "dbb1fc4608b25aa6fcefe74d2d8a42c55c99cc165007e30d450bf9bd622c8bde#0"
+          },
+          "constant-product": {
+            "hash": "cfdd027d998121473634feb844b0f8926475871e92463ac76645e1b7",
+            "ref-utxo": "5b707923dc7abe30100f57e7c130b348471142ca2134413aca526bc12ccb8626#0"
+          },
+          "concentrated-liquidity": {
+            "hash": "45b4e7dcd980b3b5e0f7b20c59ef48395ccf3877b16dee3459922324",
+            "ref-utxo": "e5bd3e4100cdb3ae8964b1db4282eefcb22eca41c29ce52e324d0534f7152c79#0"
+          },
+          "swap-order": {
+            "hash": "6ae0f79d47f51fb6ed032e48be3b83e2fac151dec22fa3a394d074ba",
+            "ref-utxo": "6221a553afcdee365a5518fcc144711de1a861a8b52b98c0401fa0305a43b43b#0"
+          },
+          "basic-order": {
+            "hash": "57c27826f90c1df82c43c758ca17734440dffe6d31fb4283caf5a276",
+            "ref-utxo": "7530f182dee6aa81717d991511a41bbc8346ad02ededfeaeca4bcabeefeacedd#0"
+          },
+          "route-order": {
+            "hash": "ea00657fc021166a1e7bbf90830aec371596f622d38b2764f2a20663",
+            "ref-utxo": "71df97155635159484d1ba1aeb0a618d51be2c85776a419f4714602c50de4600#0"
+          },
+          "fairness-order": {
+            "hash": "d9a49ca903677ba7c429a1f567e8c03beeb94dba6f222fa83d51dc97",
+            "ref-utxo": "7f12f00da231154ae729c3c31638d9d0a604803acac45210b6dc60dcfd425107#0"
+          },
+          "strategy-order": {
+            "hash": "8c5dd6fee0765c6db03a24fdbc2c0d0caf6287c4d487098020b73c0d",
+            "ref-utxo": "355989d1fc337de9dd26ed44f406c1fa13a6da1946b3f1ae0488264f8dba971d#0"
           }
         },
-        "pool-configs": {
-          "ca888bf247bb0a887e4509e23432edaec574bf50ed66e4effc7babc6": {
-            "type": "constant-sum",
-            "prices": [1, 1, 1],
-            "fee": [3, 1000]
-          }
-        }
+        "partial-fill-margin": [
+          3,
+          2
+        ]
       }
     }
   },

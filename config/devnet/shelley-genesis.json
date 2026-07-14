@@ -1,5 +1,5 @@
 {
-  "activeSlotsCoeff": 1.0,
+  "activeSlotsCoeff": 1,
   "epochLength": 600,
   "genDelegs": {
     "337bc5ef0f1abf205624555c13a37258c42b46b1259a6b1a6d82574e": {
@@ -38,7 +38,7 @@
   "networkId": "Testnet",
   "networkMagic": 42,
   "protocolParams": {
-    "a0": 0.0,
+    "a0": 0,
     "decentralisationParam": 0,
     "eMax": 18,
     "extraEntropy": {
@@ -64,6 +64,6 @@
   "securityParam": 100,
   "slotLength": 1,
   "slotsPerKESPeriod": 129600,
-  "systemStart": "2026-03-05T01:51:17Z",
+  "systemStart": "2026-07-14T13:48:12Z",
   "updateQuorum": 1
 }
