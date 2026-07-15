@@ -194,25 +194,19 @@ impl SundaeV4Indexer {
         self.loaded_slot = slot;
     }
 
-    pub async fn load(&mut self) -> Result<()> {
-        let txos = self.dao.load_txos().await?;
-        let datums = self.dao.load_datums().await?;
+    /// (Re-)hydrate the per-module config cache from the DB's
+    /// `module_configs` table, dispatching each entry by module hash.
+    /// Entries whose module_hash matches no configured module are ignored.
+    ///
+    /// Called from `load()`, and again from main after a bootstrap: the
+    /// bootstrap recovers configs from pool tx history and persists them
+    /// AFTER `load()` has already hydrated against the pre-bootstrap DB.
+    /// Without the second pass, the first live update of a bootstrapped
+    /// pool re-classifies it with an empty cache and silently falls back
+    /// to default configs (wrong module_state hash → on-chain eval fails).
+    pub async fn rehydrate_module_configs(&self) -> Result<()> {
+        use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, ConcentratedLiquidityConfig, FeeSplitConfig};
         let persisted_configs = self.dao.load_module_configs().await?;
-        let mut slot = 0;
-        let mut state = SundaeV4State::default();
-        for datum in datums {
-            let data = PlutusData::from_plutus_bytes(&datum.datum)
-                .context("could not parse persisted datum")?;
-            state
-                .datums
-                .add_metadata_datum((datum.datum.to_vec(), data));
-        }
-
-        // Hydrate the per-module config cache from DB so detect_pool_type
-        // calls below resolve correctly even though the original Create tx
-        // is long out of the indexer's stream. Dispatch by module hash:
-        // entries whose module_hash matches a known module land in that
-        // module's map; unknown entries are ignored.
         let cs_module_hash: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -231,6 +225,56 @@ impl SundaeV4Indexer {
             .execution
             .as_ref()
             .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+        let mut cache = self.module_configs.lock().await;
+        for cfg in persisted_configs {
+            let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
+                .context("could not parse persisted module config CBOR")?;
+            if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
+                let parsed = ConstantSumConfig::from_plutus(pd)
+                    .context("could not parse persisted ConstantSumConfig")?;
+                cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
+            } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+                let parsed = ConstantProductConfig::from_plutus(pd)
+                    .context("could not parse persisted ConstantProductConfig")?;
+                cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
+            } else if Some(&cfg.module_hash) == cl_module_hash.as_ref() {
+                let parsed = ConcentratedLiquidityConfig::from_plutus(pd)
+                    .context("could not parse persisted ConcentratedLiquidityConfig")?;
+                cache.cl.insert(Ident::new(&cfg.pool_id), parsed);
+            } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
+                let parsed = FeeSplitConfig::from_plutus(pd)
+                    .context("could not parse persisted FeeSplitConfig")?;
+                cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+        }
+        info!(
+            cs = cache.cs.len(),
+            cp = cache.cp.len(),
+            cl = cache.cl.len(),
+            fs = cache.fee_split.len(),
+            "v4: hydrated per-module pool configs from DB",
+        );
+        Ok(())
+    }
+
+    pub async fn load(&mut self) -> Result<()> {
+        let txos = self.dao.load_txos().await?;
+        let datums = self.dao.load_datums().await?;
+        let mut slot = 0;
+        let mut state = SundaeV4State::default();
+        for datum in datums {
+            let data = PlutusData::from_plutus_bytes(&datum.datum)
+                .context("could not parse persisted datum")?;
+            state
+                .datums
+                .add_metadata_datum((datum.datum.to_vec(), data));
+        }
+
+        // Hydrate the per-module config cache from DB so detect_pool_type
+        // calls below resolve correctly even though the original Create tx
+        // is long out of the indexer's stream.
+        self.rehydrate_module_configs().await?;
+
         // Constraint script hashes — used to find the right entry in the
         // order datum's `constraints: List<(hash, Data)>` list (PR #11).
         let swap_order_hash: Vec<u8> = self.protocol
@@ -251,38 +295,6 @@ impl SundaeV4Indexer {
             .and_then(|e| e.module_scripts.strategy_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        {
-            use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, ConcentratedLiquidityConfig, FeeSplitConfig};
-            let mut cache = self.module_configs.lock().await;
-            for cfg in persisted_configs {
-                let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
-                    .context("could not parse persisted module config CBOR")?;
-                if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
-                    let parsed = ConstantSumConfig::from_plutus(pd)
-                        .context("could not parse persisted ConstantSumConfig")?;
-                    cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
-                } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
-                    let parsed = ConstantProductConfig::from_plutus(pd)
-                        .context("could not parse persisted ConstantProductConfig")?;
-                    cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
-                } else if Some(&cfg.module_hash) == cl_module_hash.as_ref() {
-                    let parsed = ConcentratedLiquidityConfig::from_plutus(pd)
-                        .context("could not parse persisted ConcentratedLiquidityConfig")?;
-                    cache.cl.insert(Ident::new(&cfg.pool_id), parsed);
-                } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
-                    let parsed = FeeSplitConfig::from_plutus(pd)
-                        .context("could not parse persisted FeeSplitConfig")?;
-                    cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
-                }
-            }
-            info!(
-                cs = cache.cs.len(),
-                cp = cache.cp.len(),
-                cl = cache.cl.len(),
-                fs = cache.fee_split.len(),
-                "v4: hydrated per-module pool configs from DB",
-            );
-        }
 
         let cache = self.module_configs.lock().await;
         for txo in txos {
@@ -1745,7 +1757,12 @@ pub fn detect_pool_type(
             };
         }
 
-        debug!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults");
+        // Loud on purpose: a CS pool's config is hash-pinned in its datum's
+        // module_state, so guessed defaults only eval if the pool really was
+        // created with them. Reaching this branch usually means the config
+        // cache lost an entry (e.g. hydration ordering), not that defaults
+        // are right.
+        warn!(pool = %ident_hex, "CS pool has no pool-config entry, using defaults (likely wrong — scoops will fail eval if the pool was created with a different config)");
         return PoolType::ConstantSum {
             prices: vec![BigInt::from(1); pool_datum.assets.len()],
             fee: Rational {

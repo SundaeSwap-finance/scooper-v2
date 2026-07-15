@@ -425,6 +425,15 @@ async fn manager_loop(
                         }
                         if let Some((ref mut v4_index, _)) = v4_index_and_config {
                             v4_index.set_loaded_slot(result.tip_slot);
+                            // Bootstrap recovers per-pool module configs from
+                            // tx history and persists them AFTER load()
+                            // hydrated the cache from the pre-bootstrap DB.
+                            // Re-hydrate, or the first live update of each
+                            // bootstrapped pool falls back to default configs
+                            // (wrong module_state hash → eval failures).
+                            if let Err(e) = v4_index.rehydrate_module_configs().await {
+                                warn!("v4: post-bootstrap module-config rehydrate failed: {e:#}");
+                            }
                         }
                         if bootstrap_point.is_some() {
                             info!("Bootstrap succeeded, starting chain sync from tip");
