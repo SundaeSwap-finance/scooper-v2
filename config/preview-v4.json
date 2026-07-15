@@ -26,6 +26,9 @@
       },
       "execution": {
         "scooper-secret-key": "0202020202020202020202020202020202020202020202020202020202020202",
+        "max-tx-ex-mem": 16500000,
+        "cost-per-pool-lovelace": 1000000,
+        "cost-per-step-lovelace": 500000,
         "submit-url": "https://cardano-preview.blockfrost.io/api/v0/tx/submit?project_id=previewUJJvqX2v9TOOAis8dZWiuyTPfJxJIKgH",
         "fee": [
           3,
