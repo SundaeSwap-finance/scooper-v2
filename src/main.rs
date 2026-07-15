@@ -229,6 +229,9 @@ async fn main() -> Result<()> {
         shutdown.child_token(),
     ));
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
+    let v4_routing_costs = v4_execution
+        .as_ref()
+        .map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
     let v4_module_preimages = v4_execution
         .as_ref()
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
@@ -272,6 +275,7 @@ async fn main() -> Result<()> {
         v3_state.clone(),
         v4_state.clone(),
         v4_fee,
+        v4_routing_costs,
         v4_module_preimages,
         resync_tx,
         event_tx.clone(),

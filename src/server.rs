@@ -138,6 +138,7 @@ pub async fn admin_server(
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
+    v4_routing_costs: Option<(u64, u64)>,
     v4_module_preimages: ModuleStatePreimages,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -151,6 +152,7 @@ pub async fn admin_server(
         v3_state,
         v4_state,
         v4_fee,
+        v4_routing_costs,
         v4_module_preimages: Arc::new(v4_module_preimages),
         resync_tx,
         event_tx,
@@ -267,6 +269,10 @@ struct AdminServer {
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
+    /// (cost_per_pool_lovelace, cost_per_step_lovelace) — the router's
+    /// fan-out gating knobs, mirrored here so executability reporting
+    /// agrees with what dispatch will actually do.
+    v4_routing_costs: Option<(u64, u64)>,
     v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -1242,6 +1248,30 @@ impl AdminServer {
         let mut non_executable = Vec::new();
 
         for order in &candidates {
+            // Mirror the router's fan-out gate: an order's max_per_execution
+            // buys its route budget, and one that can't afford a single pool
+            // touch will never dispatch, no matter how in-range the swap is.
+            // Without this check the dashboard calls such orders executable
+            // while dispatch logs "no route" every cycle (seen live with a
+            // max_per_execution of 10,000 lovelace against a 1 ADA/pool
+            // routing cost).
+            if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
+                use num_traits::ToPrimitive;
+                let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
+                let limits =
+                    crate::sundaev4::router::RoutingLimits::from_budget(per_exec, cost_per_pool, cost_per_step);
+                if limits.max_pools < 1 || limits.max_steps < 1 {
+                    non_executable.push(serde_json::json!({
+                        "order": order.input.to_string(),
+                        "reason": format!(
+                            "max_per_execution {per_exec} lovelace cannot fund any route \
+                             (scooper prices {cost_per_pool} per pool / {cost_per_step} per step); \
+                             cancel and re-place with a higher per-execution cap"
+                        ),
+                    }));
+                    continue;
+                }
+            }
             match batch::check_order_executability(
                 order,
                 &pool.pool_datum.assets,
