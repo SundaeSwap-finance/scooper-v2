@@ -332,11 +332,10 @@ impl SundaeV4Indexer {
                 "order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                            crate::sundaev4::decode_order_constraint(
                                 &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                             )
                                 .map(|c| (datum, c))
-                                .map_err(|e| format!("constraint decode: {e}"))
                         })
                     {
                         Ok((datum, constraint)) => {
@@ -361,11 +360,10 @@ impl SundaeV4Indexer {
                 "invalid_order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                         .and_then(|datum| {
-                            crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                            crate::sundaev4::decode_order_constraint(
                                 &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                             )
                                 .map(|c| (datum, c))
-                                .map_err(|e| format!("constraint decode: {e}"))
                         })
                     {
                         Ok((datum, constraint)) => {
@@ -1072,11 +1070,10 @@ impl ChainIndex for SundaeV4Indexer {
                 let tx_out = cardano_types::convert_txo(output);
                 match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
                     .and_then(|datum| {
-                        crate::sundaev4::Constraint::from_order_datum_with_strategy(
+                        crate::sundaev4::decode_order_constraint(
                             &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                         )
                             .map(|c| (datum, c))
-                            .map_err(|e| format!("constraint decode: {e}"))
                     }) {
                     Ok((od, constraint)) => {
                         changes.created_txos.push(PersistedTxo {
@@ -1467,7 +1464,17 @@ impl ChainIndex for SundaeV4Indexer {
         let cutoff = slot.saturating_sub(self.rollback_limit);
         state.spent_orders.retain(|s| s.slot >= cutoff);
         state.spent_pools.retain(|s| s.slot >= cutoff);
-        state.invalid_orders.retain(|io| io.slot >= cutoff);
+
+        // Invalid orders are NOT pruned by slot: an unparseable order stays
+        // relevant for as long as its UTxO is unspent (spent ones are dropped
+        // above when their input is consumed), and V4 orders never expire.
+        // Bound the set by count instead so a spray of malformed orders can't
+        // grow it without limit, keeping the newest by slot.
+        if state.invalid_orders.len() > crate::config::INVALID_ORDER_CAP {
+            state.invalid_orders.sort_by_key(|io| io.slot);
+            let overflow = state.invalid_orders.len() - crate::config::INVALID_ORDER_CAP;
+            state.invalid_orders.drain(..overflow);
+        }
 
         if history.prune_history(self.rollback_limit)
             && let Some(min_height) = info.number.checked_sub(self.rollback_limit)

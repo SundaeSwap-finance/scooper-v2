@@ -1579,11 +1579,10 @@ async fn bootstrap_v4(
                     sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
                 })
                 .and_then(|datum| {
-                    sundaev4::Constraint::from_order_datum_with_strategy(
+                    sundaev4::decode_order_constraint(
                         &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
                     )
                         .map(|constraint| (datum, constraint))
-                        .map_err(|e| format!("{e}"))
                 }) {
                 Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
@@ -1940,6 +1939,14 @@ async fn bootstrap_v4(
         let s = locked.update_slot(tip_slot)?;
         s.pools = pools;
         s.orders = orders;
+        // Bound the malformed-order set by count (newest by slot), matching the
+        // live indexer's cap so it can't grow without limit from a spray of
+        // unparseable orders.
+        invalid_orders.sort_by_key(|io| io.slot);
+        if invalid_orders.len() > crate::config::INVALID_ORDER_CAP {
+            let overflow = invalid_orders.len() - crate::config::INVALID_ORDER_CAP;
+            invalid_orders.drain(..overflow);
+        }
         s.invalid_orders = invalid_orders;
         s.settings = settings;
         s.order_configs = order_configs;

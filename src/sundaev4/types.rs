@@ -476,6 +476,46 @@ impl Constraint {
     }
 }
 
+/// Decode an order's constraint into `(OrderDatum, Constraint)`, or an
+/// enriched error string suitable for surfacing to operators / the API.
+///
+/// On failure the message names the constraint module hashes present on the
+/// order that are *not* among the executable set (`swap`/`basic`/`strategy`)
+/// — i.e. exactly the modules that make this scooper unable to execute the
+/// order (route, fairness, a mismatched/undeployed strategy build, etc.).
+/// Callers that hit `Err` should record the order as invalid with this
+/// reason rather than dropping it silently.
+pub fn decode_order_constraint(
+    datum: &OrderDatum,
+    swap_order_hash: &[u8],
+    basic_order_hash: &[u8],
+    strategy_order_hash: &[u8],
+) -> Result<Constraint, String> {
+    Constraint::from_order_datum_with_strategy(
+        datum,
+        swap_order_hash,
+        basic_order_hash,
+        strategy_order_hash,
+    )
+    .map_err(|e| {
+        let supported: [&[u8]; 3] = [swap_order_hash, basic_order_hash, strategy_order_hash];
+        let unsupported: Vec<String> = datum
+            .constraints
+            .iter()
+            .filter(|(h, _)| !supported.iter().any(|s| *s == h.as_slice()))
+            .map(|(h, _)| hex::encode(h))
+            .collect();
+        if unsupported.is_empty() {
+            format!("constraint decode: {e}")
+        } else {
+            format!(
+                "constraint decode: {e}; unsupported constraint modules: [{}]",
+                unsupported.join(", ")
+            )
+        }
+    })
+}
+
 /// An order can be spent either to Scoop (execute) it, or to cancel it
 #[derive(AsPlutus, Debug, PartialEq, Eq)]
 pub enum OrderRedeemer {

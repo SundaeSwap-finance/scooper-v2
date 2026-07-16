@@ -11,6 +11,16 @@ use crate::{
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
 
+/// Maximum number of malformed (unparseable) order UTxOs retained for API
+/// reporting. Unlike spent-order/pool history (which ages out by slot), an
+/// invalid order stays relevant for as long as its UTxO is unspent on chain
+/// — V4 orders never expire, so a slot window would drop still-live records
+/// (and bootstrap reloads them anyway, ignoring age). We therefore bound the
+/// set by count, keeping the newest entries, so it can't grow without bound
+/// under a spray of malformed orders while still answering "why is this order
+/// malformed?" for anything recent.
+pub const INVALID_ORDER_CAP: usize = 10_000;
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub log: LogConfig,

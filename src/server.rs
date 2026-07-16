@@ -402,10 +402,15 @@ impl AdminServer {
             }
         };
 
-        // Snapshot current orders so validation doesn't hold the state lock.
-        let orders: Vec<Arc<crate::sundaev4::SundaeV4Order>> = {
+        // Snapshot current orders (and the malformed set) so validation doesn't
+        // hold the state lock.
+        let (orders, invalid_orders): (
+            Vec<Arc<crate::sundaev4::SundaeV4Order>>,
+            Vec<crate::events::InvalidOrder>,
+        ) = {
             let state = v4_state.lock().await;
-            state.latest().orders.clone()
+            let latest = state.latest();
+            (latest.orders.clone(), latest.invalid_orders.clone())
         };
         let find_order = |key: &crate::sundaev4::intents::OrderKey| {
             orders
@@ -416,8 +421,19 @@ impl AdminServer {
                 })
                 .cloned()
         };
+        // When the target order was indexed but is unparseable, surface the
+        // recorded reason instead of a bare "not found".
+        let describe_invalid = |key: &crate::sundaev4::intents::OrderKey| {
+            invalid_orders
+                .iter()
+                .find(|io| {
+                    io.input.0.transaction_id.as_ref() == key.0.as_slice()
+                        && io.input.0.index == key.1
+                })
+                .map(|io| io.reason.clone())
+        };
 
-        match intents.submit(sse_cbor, parsed.hint, find_order).await {
+        match intents.submit(sse_cbor, parsed.hint, find_order, describe_invalid).await {
             Ok(outcome) => Self::json_response(serde_json::to_string(&outcome).unwrap()),
             Err(e) => Self::error_response(hyper::StatusCode::BAD_REQUEST, format!("{e:#}")),
         }

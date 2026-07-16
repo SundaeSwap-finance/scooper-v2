@@ -208,6 +208,7 @@ impl IntentStore {
         sse_cbor: Vec<u8>,
         hint: Option<ExecutionHint>,
         find_order: impl Fn(&OrderKey) -> Option<std::sync::Arc<SundaeV4Order>>,
+        describe_invalid: impl Fn(&OrderKey) -> Option<String>,
         now_ms: u64,
     ) -> Result<(SubmitOutcome, Option<StoredIntent>)> {
         let pd: PlutusData = minicbor::decode(&sse_cbor)
@@ -245,13 +246,25 @@ impl IntentStore {
         // The target order must exist, be unspent, and carry a strategy
         // constraint whose auth this intent's signatures satisfy.
         let key = order_key(&sse);
-        let order = find_order(&key).with_context(|| {
-            format!(
-                "order {}#{} not found (unknown, spent, or not yet indexed)",
-                hex::encode(&key.0),
-                key.1
-            )
-        })?;
+        let order = match find_order(&key) {
+            Some(o) => o,
+            None => {
+                // Distinguish "we indexed this order but it's unparseable" from
+                // a genuine miss, so the poster learns *why* it can't be used.
+                if let Some(reason) = describe_invalid(&key) {
+                    bail!(
+                        "order {}#{} is malformed and cannot accept intents: {reason}",
+                        hex::encode(&key.0),
+                        key.1
+                    );
+                }
+                bail!(
+                    "order {}#{} not found (unknown, spent, or not yet indexed)",
+                    hex::encode(&key.0),
+                    key.1
+                );
+            }
+        };
         let Constraint::Strategy { ref constraints } = order.constraint else {
             bail!("target order does not carry a strategy constraint");
         };
@@ -711,10 +724,11 @@ impl IntentService {
         sse_cbor: Vec<u8>,
         hint: Option<ExecutionHint>,
         find_order: impl Fn(&OrderKey) -> Option<std::sync::Arc<SundaeV4Order>>,
+        describe_invalid: impl Fn(&OrderKey) -> Option<String>,
     ) -> Result<SubmitOutcome> {
         let (outcome, stored) = {
             let mut store = self.store.lock().await;
-            store.submit(sse_cbor, hint, find_order, now_ms())?
+            store.submit(sse_cbor, hint, find_order, describe_invalid, now_ms())?
         };
         if !outcome.replaced.is_empty() {
             self.dao.mark_terminal(&outcome.replaced, "replaced", None).await?;
@@ -924,7 +938,7 @@ mod tests {
 
         let hint = Some(ExecutionHint::Claim { pool: "cafe01".into() });
         let (outcome, stored) = store
-            .submit(cbor.clone(), hint.clone(), |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), hint.clone(), |_| Some(order.clone()), |_| None, NOW_MS)
             .expect("valid intent should be accepted");
         assert!(outcome.newly_stored);
         let stored = stored.expect("stored intent returned");
@@ -939,7 +953,7 @@ mod tests {
 
         // Same bytes again: dedup, no error, not re-stored.
         let (echo, stored2) = store
-            .submit(cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
             .expect("duplicate intent should be a no-op");
         assert!(!echo.newly_stored);
         assert!(stored2.is_none());
@@ -949,13 +963,13 @@ mod tests {
         // A duplicate can attach/replace a hint (latest Some wins) …
         let new_hint = Some(ExecutionHint::Claim { pool: "beef02".into() });
         let (echo2, updated) = store
-            .submit(cbor.clone(), new_hint.clone(), |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), new_hint.clone(), |_| Some(order.clone()), |_| None, NOW_MS)
             .expect("hint update should succeed");
         assert!(!echo2.newly_stored);
         assert_eq!(updated.expect("updated intent returned").hint, new_hint);
         // … but a hint-less duplicate leaves the stored hint untouched.
         let (_, none_update) = store
-            .submit(cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .submit(cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
             .expect("no-hint duplicate is a no-op");
         assert!(none_update.is_none());
         let key0 = (vec![0xAB; 32], 1u64);
@@ -975,7 +989,7 @@ mod tests {
         let cbor = signed_sse_cbor(&interloper, test_execution(NOW_MS + 60_000));
         let mut store = IntentStore::default();
         let err = store
-            .submit(cbor, None, |_| Some(order.clone()), NOW_MS)
+            .submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
             .unwrap_err();
         assert!(err.to_string().contains("do not satisfy"), "got: {err}");
     }
@@ -997,7 +1011,7 @@ mod tests {
         };
         let cbor = minicbor::to_vec(&sse.to_plutus()).unwrap();
         let mut store = IntentStore::default();
-        assert!(store.submit(cbor, None, |_| Some(order.clone()), NOW_MS).is_err());
+        assert!(store.submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).is_err());
     }
 
     #[test]
@@ -1007,10 +1021,33 @@ mod tests {
         let mut store = IntentStore::default();
 
         let expired = signed_sse_cbor(&sk, test_execution(NOW_MS - 1));
-        assert!(store.submit(expired, None, |_| Some(order.clone()), NOW_MS).is_err());
+        assert!(store.submit(expired, None, |_| Some(order.clone()), |_| None, NOW_MS).is_err());
 
         let fine = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
-        assert!(store.submit(fine, None, |_| None, NOW_MS).is_err());
+        assert!(store.submit(fine, None, |_| None, |_| None, NOW_MS).is_err());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn malformed_order_reports_its_reason() {
+        let sk = key();
+        let mut store = IntentStore::default();
+        // Order isn't in the valid set (find_order misses) but is on record as
+        // malformed — the poster should learn why rather than getting a bare
+        // "not found".
+        let fine = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
+        let err = store
+            .submit(
+                fine,
+                None,
+                |_| None,
+                |_| Some("unsupported constraint modules: [feedface]".to_string()),
+                NOW_MS,
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("malformed"), "got: {msg}");
+        assert!(msg.contains("feedface"), "got: {msg}");
         assert!(store.is_empty());
     }
 
@@ -1087,10 +1124,10 @@ mod tests {
         let new_cbor = signed_sse_cbor(&sk, unbounded(NOW_MS));
 
         let (o1, _) = store
-            .submit(old_cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .submit(old_cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
             .unwrap();
         let (o2, _) = store
-            .submit(new_cbor.clone(), None, |_| Some(order.clone()), NOW_MS)
+            .submit(new_cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
             .unwrap();
         assert!(o2.newly_stored, "later valid-from replaces the standing intent");
         assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
@@ -1099,10 +1136,10 @@ mod tests {
         // Reversed arrival order converges on the same winner.
         let mut store2 = IntentStore::default();
         let (r2, _) = store2
-            .submit(new_cbor, None, |_| Some(order.clone()), NOW_MS)
+            .submit(new_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
             .unwrap();
         let (r1, _) = store2
-            .submit(old_cbor, None, |_| Some(order.clone()), NOW_MS)
+            .submit(old_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
             .unwrap();
         assert!(r2.newly_stored);
         assert!(r1.superseded);
@@ -1118,10 +1155,10 @@ mod tests {
 
         // A newer intent (later expiry) replaces the standing one.
         let first = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
-        let (o1, _) = store.submit(first.clone(), None, |_| Some(order.clone()), NOW_MS).unwrap();
+        let (o1, _) = store.submit(first.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(o1.newly_stored);
         let second = signed_sse_cbor(&sk, test_execution(NOW_MS + 90_000));
-        let (o2, _) = store.submit(second, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        let (o2, _) = store.submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(o2.newly_stored);
         assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
         assert_eq!(store.len(), 1);
@@ -1132,7 +1169,7 @@ mod tests {
 
         // A gossip echo of the replaced intent loses deterministically:
         // not stored, flagged superseded, winner untouched.
-        let (echo, stored) = store.submit(first, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        let (echo, stored) = store.submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(!echo.newly_stored);
         assert!(echo.superseded);
         assert!(stored.is_none());
@@ -1141,7 +1178,7 @@ mod tests {
         // An older intent arriving *after* the winner also loses, even
         // without a tombstone (deterministic (expiry, id) ranking).
         let stale = signed_sse_cbor(&sk, test_execution(NOW_MS + 70_000));
-        let (o3, stored) = store.submit(stale, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        let (o3, stored) = store.submit(stale, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(!o3.newly_stored);
         assert!(o3.superseded);
         assert!(stored.is_none());
@@ -1164,7 +1201,7 @@ mod tests {
 
         // Spent-order pruning drops the bucket and records execution.
         let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 200_000));
-        store.submit(cbor, None, |_| Some(order.clone()), NOW_MS).unwrap();
+        store.submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         let removed = store.on_order_spent(&(vec![0xAB; 32], 1), Some(vec![0x77; 32]), NOW_MS);
         assert_eq!(removed.len(), 1);
         assert!(store.is_empty());
