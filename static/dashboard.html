@@ -211,6 +211,7 @@
   .badge-in-flight { background: rgba(253,203,110,0.10); color: var(--yellow); font-size: 13px; }
   .badge-quarantine { background: rgba(225,112,85,0.10); color: var(--red); font-size: 13px; }
   .badge-strategy { background: rgba(162,155,254,0.15); color: var(--purple, #a29bfe); }
+  .badge-malformed { background: rgba(225,112,85,0.18); color: var(--red); }
   tr.our-row td { background: rgba(108,92,231,0.06); }
 
   .event-log {
@@ -431,6 +432,12 @@
     return s.length > n ? s.slice(0, n) + '...' : s;
   }
 
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
   function timeStr() {
     return new Date().toLocaleTimeString('en-US', { hour12: false });
   }
@@ -533,6 +540,8 @@
   var inFlightOrders = new Set();
   // --- Quarantine tracking ---
   var quarantinedOrders = new Set();
+  // --- Malformed tracking (count of unparseable orders from /v4/orders) ---
+  var malformedCount = 0;
 
   // --- Status / sync bar ---
   let status = {};
@@ -712,6 +721,7 @@
       v4s.innerHTML = statCard('Pools', v4.pool_count) + statCard('Orders', v4.order_count)
         + (inFlightCount > 0 ? statCard('\u23f3 In-Flight', inFlightCount) : '')
         + (quarantineCount > 0 ? statCard('\u26d4 Quarantined', quarantineCount) : '')
+        + (malformedCount > 0 ? statCard('\u26a0 Malformed', malformedCount) : '')
         + statCard('Tip Slot', (v4.tip_slot || 0).toLocaleString());
     } else {
       v4s.innerHTML = '<div class="not-configured">V4 indexer not configured</div>';
@@ -910,6 +920,9 @@
       let data;
       try { data = JSON.parse(text); } catch { return; }
 
+      // Track malformed-order count for the V4 stat card.
+      malformedCount = Array.isArray(data.invalid) ? data.invalid.length : 0;
+
       // Fetch executability info per pool
       var execInfo = {};
       var poolIds = Object.keys(data).filter(function(k) { return k !== 'unmatched'; });
@@ -942,8 +955,13 @@
         var isInFlight = inFlightOrders.has(orderRef);
         var isQuarantined = quarantinedOrders.has(orderRef);
         var info = execInfo[orderRef];
-        var statusBadge, detail;
-        if (isInFlight) {
+        var statusBadge, detail, detailHtml = null;
+        if (e.order.reason) {
+          // Malformed / unparseable order (the `invalid` array from /v4/orders):
+          // its datum didn't decode into a supported constraint. Show why.
+          statusBadge = '<span class="badge badge-malformed" title="Order datum could not be decoded into a supported constraint">\u26a0 malformed</span>';
+          detailHtml = '<span title="' + escapeHtml(e.order.reason) + '">' + escapeHtml(truncate(e.order.reason, 72)) + '</span>';
+        } else if (isInFlight) {
           statusBadge = '<span class="badge badge-in-flight" title="Transaction in mempool">\u23f3 in-flight</span>';
           detail = 'awaiting settlement';
         } else if (isQuarantined) {
@@ -965,13 +983,15 @@
           statusBadge = '<span class="badge badge-red">blocked</span>';
           detail = info.detail;
         }
-        row.innerHTML = '<td>' + copyable(truncate(e.poolId, 16), e.poolId) + '</td>' +
+        var poolCell = e.order.reason ? '—' : copyable(truncate(e.poolId, 16), e.poolId);
+        row.innerHTML = '<td>' + poolCell + '</td>' +
           '<td>' + copyable(truncate(orderRef, 24), orderRef) + '</td>' +
           '<td>' + statusBadge + '</td>' +
-          '<td>' + truncate(detail, 50) + '</td>';
+          '<td>' + (detailHtml !== null ? detailHtml : escapeHtml(truncate(detail, 50))) + '</td>';
         return row;
       });
       renderLimited('v4-orders-body', rows);
+      updateStats(); // reflect the fresh malformed count in the V4 stat card
     } catch (e) { /* ignore */ }
   }
 
