@@ -369,7 +369,7 @@
     <div class="section-title">Strategy Intents</div>
     <div class="stats" id="v4-intent-stats"></div>
     <table id="v4-intents-table">
-      <thead><tr><th>Intent</th><th>Order</th><th>Hint</th><th>Expires</th><th>Received</th></tr></thead>
+      <thead><tr><th>Intent</th><th>Order</th><th>Hint</th><th>Dispatch</th><th>Expires</th><th>Received</th></tr></thead>
       <tbody id="v4-intents-body"></tbody>
     </table>
     <div class="section-title">Spent Orders</div>
@@ -575,11 +575,45 @@
         ? 'never'
         : new Date(Number(i.expiry_ms)).toISOString().replace('T', ' ').slice(0, 19);
       const rcv = new Date(Number(i.received_at_ms)).toISOString().replace('T', ' ').slice(0, 19);
+      // Dispatch cell keyed by intent id; filled asynchronously by the probe.
       return '<tr><td class="mono">' + copyable(truncate(i.intent_id, 16), i.intent_id) + '</td>' +
              '<td class="mono">' + copyable(truncate(i.order, 20), i.order) + '</td>' +
              '<td>' + (i.hint || 'swap') + '</td>' +
+             '<td id="dispatch-' + escapeHtml(i.intent_id) + '"><span style="opacity:.5">probing…</span></td>' +
              '<td>' + exp + '</td><td>' + rcv + '</td></tr>';
-    }).join('') || '<tr><td colspan="5" style="opacity:.5">none</td></tr>';
+    }).join('') || '<tr><td colspan="6" style="opacity:.5">none</td></tr>';
+    // Probe each live intent's dispatchability and fill its cell.
+    (si.live || []).forEach(function(i) { loadIntentDispatch(i.intent_id); });
+  }
+
+  // Map a probe `dispatch` object to a badge + human detail. The probe
+  // reports a `state` (e.g. dispatchable / below-floor / pool-not-claimable /
+  // pool-not-found / order-not-indexed) plus a `detail` string.
+  function dispatchCellHtml(dispatch) {
+    if (dispatch == null) return '<span style="opacity:.5">—</span>';
+    // `order-not-indexed` comes back as a bare string, not an object.
+    if (typeof dispatch === 'string') {
+      return '<span class="badge badge-yellow">' + escapeHtml(dispatch) + '</span>';
+    }
+    var state = dispatch.state || 'unknown';
+    var detail = dispatch.detail || '';
+    // green = ready to fire; red = structurally blocked; yellow = waiting
+    // (close-but-not-yet, e.g. below-floor / awaiting a more imbalanced pool).
+    var green = { dispatchable: 1, claimable: 1 };
+    var red = { 'pool-not-found': 1, 'pool-not-claimable': 1, 'no-route': 1, 'shape-unsupported': 1 };
+    var cls = green[state] ? 'badge-green' : (red[state] ? 'badge-red' : 'badge-yellow');
+    var badge = '<span class="badge ' + cls + '" title="' + escapeHtml(detail) + '">' + escapeHtml(state) + '</span>';
+    return badge + (detail ? ' <span title="' + escapeHtml(detail) + '" style="opacity:.7">' + escapeHtml(truncate(detail, 60)) + '</span>' : '');
+  }
+
+  async function loadIntentDispatch(intentId) {
+    try {
+      const res = await fetch('/v4/strategy-intents/' + intentId);
+      if (!res.ok) return;
+      const data = await res.json();
+      const cell = document.getElementById('dispatch-' + intentId);
+      if (cell) cell.innerHTML = dispatchCellHtml(data.dispatch);
+    } catch (e) { /* leave the "probing…" placeholder */ }
   }
 
   async function fetchStatus() {
