@@ -2241,15 +2241,9 @@ impl Scooper {
             debug!(pool = %pool_hex, "claim hint targets a non-CS pool; skipping");
             return None;
         };
-        // SUN-310: balance_fee == 0 is the old full waiver; the claims
-        // engine implements only that mode until workstream C generalizes.
-        if balance_fee.num != BigInt::from(0) {
-            debug!(
-                pool = %pool_hex,
-                "claim hint targets a fee-paying-claims pool; only waived mode is supported",
-            );
-            return None;
-        }
+        // SUN-310: the claims engine handles any balance_fee — the op portion
+        // pays balance_fee (0 = full waiver), and the fee_budget flows through
+        // the transcript. Infeasible shapes are rejected per-plan below.
 
         let resolved_shape = match claims::resolve_claim_shape(
             &order.value,
@@ -2293,6 +2287,7 @@ impl Scooper {
                     &pool.pool_datum.assets,
                     prices,
                     (&bounty_k.num, &bounty_k.den),
+                    (&balance_fee.num, &balance_fee.den),
                     shape.in_idx,
                     shape.out_idx,
                     &shape.spendable,
@@ -2326,6 +2321,7 @@ impl Scooper {
                     &pool.pool_datum.assets,
                     prices,
                     (&bounty_k.num, &bounty_k.den),
+                    (&balance_fee.num, &balance_fee.den),
                     &r.held,
                     &r.targets,
                 ) {

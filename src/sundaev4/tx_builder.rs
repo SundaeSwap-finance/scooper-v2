@@ -443,11 +443,14 @@ pub fn build_multi_pool_scoop_tx(
         let mut op_data_override: Option<pallas_primitives::PlutusData> = None;
         let (operation_tag, gross_fb) = match op {
             crate::sundaev4::batch::BatchOp::Claim(i) => {
-                // Waived-mode CS bounty claim (cs_check tag 5): the reserve
-                // vector moves by the resolved deltas (a pair-wise swap or a
-                // multi-receive rebalance — same shape either way), with the
-                // bounty named in operation_data; no fee retained, LP
-                // untouched.
+                // CS bounty claim (cs_check tag 5): the reserve vector moves by
+                // the resolved deltas (pair-wise swap or multi-receive
+                // rebalance), with the bounty named in operation_data. The op
+                // portion (claim restored) is a plain CS swap at the pool's
+                // balance_fee — a full waiver (balance_fee = 0) leaves the fee
+                // budget at 0 (op portion value-neutral); a positive rate
+                // retains floor(input·bf) of value, and the fee_budget flows
+                // through the transcript exactly like a swap's does.
                 let c = &batch.claims[*i];
                 for (idx, delta) in c.pool_deltas.iter().enumerate() {
                     running_assets[idx].1 = &running_assets[idx].1 + delta;
@@ -459,15 +462,29 @@ pub fn build_multi_pool_scoop_tx(
                     }
                     .to_plutus(),
                 );
+                // Fee budget on the op portion (claim restored to its asset),
+                // matching the contract's `(after_lp + fee_budget)·V_b <=
+                // V_a_op·before_lp` pin. Collapses to 0 for waived pools.
+                let op_portion: Vec<(_, BigInt)> = running_assets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (a, amt))| {
+                        (a.clone(), if idx == c.claim_idx { amt + &c.claim } else { amt.clone() })
+                    })
+                    .collect();
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type, &prev_assets, &op_portion, running_total_lp,
+                );
                 tracing::info!(
                     walk = "op-claim",
                     batch_idx,
                     pool = %batch.pool_ident,
                     deltas = ?c.pool_deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
                     claim = %c.claim,
+                    fee_budget = %fb,
                     "streaming walk: claim op",
                 );
-                (BigInt::from(crate::sundaev4::types::TAG_CLAIM), BigInt::from(0))
+                (BigInt::from(crate::sundaev4::types::TAG_CLAIM), fb)
             }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
                 let s = &batch.swaps[*i];

@@ -1,24 +1,54 @@
 //! Constant-sum rebalance bounty ("claim") math.
 //!
-//! Port of `lib/modules/cs_check.ak`'s tag_claim (5) validation, waived-fee
-//! mode only (`waive_fee_on_claim = true`):
+//! Port of `lib/modules/cs_check.ak`'s tag_claim (5) validation, for any
+//! `balance_fee` (SUN-310) — both the full waiver (`balance_fee = 0`) and the
+//! fee-paying mode (`0 < balance_fee ≤ fee`):
 //!
-//! - The entry's swap portion is value-neutral: `dy · p_out = dx · p_in`
-//!   exactly, no fee retained (`v_increase = 0`, `fee_budget = 0`,
-//!   `before_lp == after_lp`).
+//! - The entry's swap portion ("op portion", claim restored) is a plain CS
+//!   swap at the pool's `balance_fee` rate: `v_increase_op =
+//!   floor(input_value_op · bf_num / bf_den)` and `dy · p_out = input_value_op
+//!   − v_increase_op`. `balance_fee = 0` makes it value-neutral (`v_increase =
+//!   0`, `fee_budget = 0`, `before_lp == after_lp`); a positive rate leaves
+//!   `v_increase_op` of value in the pool and grows LP by `fee_budget =
+//!   floor(before_lp · v_increase_op / V_b)`.
 //! - The claim extracts `c` units of the claim asset on top, bounded by
 //!   cap_b: `k_num · (V_a·Q_b − V_b·Q_a) ≥ c·p_claim · k_den · N² · V_a·V_b`
 //!   where `V = Σ p_i·r_i` (pool value) and `Q = Σ (N·p_i·r_i − V)²`
 //!   (squared imbalance), with the after-state measured on the *actual*
-//!   post-claim reserves.
+//!   post-claim reserves. cap_b is identical in both modes.
 //! - The op portion must still be a real swap (`has_inc && has_dec`), so a
 //!   claim always rides on a nonzero `dx`.
+//! - No-overshoot guard (`no_flip`): no traded asset may cross its pre-step
+//!   balance point, measured against the frozen pre-step value `V_b`. For
+//!   every traded asset, `(N·p_i·r_b − V_b)·(N·p_i·r_a − V_b) ≥ 0`.
 //!
 //! Mirrors the reference implementation in
 //! `sundae-v4/test/devnet/src/actions/order.ts` (`claimBounty`).
 
 use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
+
+/// The no-overshoot guard from `cs_check.ak::compute_q_pair`: every asset that
+/// changed between `before` and `after` must stay on its side of the pre-step
+/// balance point `N·p_i·r == V_b` (landing exactly on it is allowed).
+/// Untouched assets are skipped (their check is a tautology against `V_b`).
+fn no_flip(
+    before: &[(AssetClass, BigInt)],
+    after: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+    v_b: &BigInt,
+) -> bool {
+    use num_traits::Signed;
+    let n = BigInt::from(before.len() as u64);
+    before.iter().zip(after).zip(prices).all(|(((_, rb), (_, ra)), p)| {
+        if rb == ra {
+            return true;
+        }
+        let d_b = &(&(&n * p) * rb) - v_b;
+        let d_a = &(&(&n * p) * ra) - v_b;
+        !(&d_b * &d_a).is_negative()
+    })
+}
 
 /// A fully-resolved waived-mode claim step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +83,7 @@ pub fn compute_q(reserves: &[(AssetClass, BigInt)], prices: &[BigInt], v: &BigIn
         })
 }
 
-/// Plan a waived-fee claim entry against a CS pool.
+/// Plan a claim entry against a CS pool at the pool's `balance_fee` rate.
 ///
 /// `reserves`/`prices` are the pool's current state in pool asset order;
 /// `in_idx`/`out_idx` pick the swap direction (input = what the order
@@ -61,21 +91,25 @@ pub fn compute_q(reserves: &[(AssetClass, BigInt)], prices: &[BigInt], v: &BigIn
 /// Returns the largest claim cap_b admits (possibly finding that even the
 /// swap alone is infeasible → `None`).
 ///
-/// Waived-mode requirements enforced here:
+/// Requirements enforced here (mirroring `cs_check.ak::check_swap_with_claim`):
 /// - `bounty_k.num > 0` (claims disabled otherwise)
-/// - `dy` divides exactly (`dx·p_in % p_out == 0`) and `dy ≤ reserve_out`
+/// - op-portion `dy` from the `balance_fee`-rate CS swap divides exactly and
+///   `dy ≤ reserve_out` (`balance_fee = 0` ⇒ the value-neutral waiver)
 /// - claim ≤ post-swap reserve of the claim asset, and `V_a > 0`
-pub fn plan_waived_claim(
+/// - cap_b on the actual after-state, and the `no_flip` no-overshoot guard
+pub fn plan_claim(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
     bounty_k: (&BigInt, &BigInt),
+    balance_fee: (&BigInt, &BigInt),
     in_idx: usize,
     out_idx: usize,
     dx: &BigInt,
 ) -> Option<ClaimPlan> {
-    use num_traits::{Signed, Zero};
+    use num_traits::Signed;
 
     let (k_num, k_den) = bounty_k;
+    let (bf_num, bf_den) = balance_fee;
     if !k_num.is_positive() || in_idx == out_idx || !dx.is_positive() {
         return None;
     }
@@ -83,15 +117,12 @@ pub fn plan_waived_claim(
     if prices.len() != n || in_idx >= n || out_idx >= n {
         return None;
     }
-    let p_in = &prices[in_idx];
     let p_out = &prices[out_idx];
 
-    // Value-neutral swap: dy·p_out == dx·p_in exactly.
-    let input_value = dx * p_in;
-    if !(&input_value % p_out).is_zero() {
-        return None;
-    }
-    let dy = &input_value / p_out;
+    // Op portion: a plain CS swap at balance_fee. `cs_swap_result` returns 0
+    // when the resulting dy isn't integer (swap impossible for this dx). At
+    // balance_fee = 0 this is the value-neutral waiver (dy·p_out = dx·p_in).
+    let dy = super::swap_math::cs_swap_result(dx, prices, in_idx, out_idx, bf_num, bf_den);
     if !dy.is_positive() || dy > reserves[out_idx].1 {
         return None;
     }
@@ -105,7 +136,7 @@ pub fn plan_waived_claim(
     let q_b = compute_q(reserves, prices, &v_b);
     let n_big = BigInt::from(n as u64);
 
-    // cap_b check for a candidate claim `c` on the actual after-state.
+    // cap_b + no_flip check for a candidate claim `c` on the actual after-state.
     let passes = |c: &BigInt| -> bool {
         if !c.is_positive() || *c > after_op[out_idx].1 {
             return false;
@@ -114,6 +145,9 @@ pub fn plan_waived_claim(
         after_actual[out_idx].1 = &after_actual[out_idx].1 - c;
         let v_a = compute_v(&after_actual, prices);
         if !v_a.is_positive() {
+            return false;
+        }
+        if !no_flip(reserves, &after_actual, prices, &v_b) {
             return false;
         }
         let q_a = compute_q(&after_actual, prices, &v_a);
@@ -184,6 +218,7 @@ pub fn plan_claim_meeting_floor(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
     bounty_k: (&BigInt, &BigInt),
+    balance_fee: (&BigInt, &BigInt),
     in_idx: usize,
     out_idx: usize,
     spendable: &BigInt,
@@ -210,7 +245,7 @@ pub fn plan_claim_meeting_floor(
     }
 
     let plan_at = |dx: &BigInt| -> Option<ClaimPlan> {
-        plan_waived_claim(reserves, prices, bounty_k, in_idx, out_idx, dx)
+        plan_claim(reserves, prices, bounty_k, balance_fee, in_idx, out_idx, dx)
     };
     let total = |p: &ClaimPlan| -> BigInt { &p.dy + &p.claim };
 
@@ -293,12 +328,14 @@ pub fn plan_rebalance_claim(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
     bounty_k: (&BigInt, &BigInt),
+    balance_fee: (&BigInt, &BigInt),
     held: &[BigInt],
     targets: &[BigInt],
 ) -> Result<RebalancePlan, &'static str> {
     use num_traits::{Signed, Zero};
 
     let (k_num, k_den) = bounty_k;
+    let (bf_num, bf_den) = balance_fee;
     if !k_num.is_positive() {
         return Err("claims are disabled on this pool (bounty_k ≤ 0)");
     }
@@ -376,6 +413,46 @@ pub fn plan_rebalance_claim(
         return Err(
             "the pool isn't imbalanced enough to fund the requested net gain \
              (cap_b rejects the claim)",
+        );
+    }
+
+    // No-overshoot guard on the actual after-state, per cs_check.
+    if !no_flip(reserves, &after_assets, prices, &v_b) {
+        return Err(
+            "rebalance overshoots a traded asset past its pre-step balance \
+             point (cs_check no-overshoot guard)",
+        );
+    }
+
+    // Op-portion fee pin at balance_fee. The rebalance shape is structurally
+    // value-neutral (v_increase_op = v(after_op) − V_b is 0 by the held/target
+    // accounting identity), so on a fee-charging pool (balance_fee > 0) the
+    // pin `(v_increase_op + 1)·bf_den > input_value_op·bf_num` can only hold
+    // for a trivial trade — a real rebalance can't fund the pool's fee. Such
+    // orders must use the pair shape (single receive asset, dy absorbs the
+    // fee) instead. At balance_fee = 0 the pin reduces to v_increase_op == 0,
+    // which the shape satisfies by construction.
+    let after_op: Vec<(AssetClass, BigInt)> = after_assets
+        .iter()
+        .enumerate()
+        .map(|(i, (a, amt))| {
+            (a.clone(), if i == claim_idx { amt + &claim } else { amt.clone() })
+        })
+        .collect();
+    let input_value_op: BigInt = (0..n)
+        .map(|i| &after_op[i].1 - &reserves[i].1)
+        .zip(prices.iter())
+        .filter(|(d, _)| d.is_positive())
+        .map(|(d, p)| &d * p)
+        .fold(BigInt::from(0), |acc, x| acc + x);
+    let v_increase_op = &compute_v(&after_op, prices) - &v_b;
+    if !(&(&v_increase_op * bf_den) <= &(&input_value_op * bf_num)) {
+        return Err("rebalance op portion underpays the pool's balance_fee");
+    }
+    if !(&(&(&v_increase_op + &BigInt::from(1)) * bf_den) > &(&input_value_op * bf_num)) {
+        return Err(
+            "pool charges balance_fee; a value-neutral rebalance can't fund it \
+             — use a single-receive (pair) claim shape instead",
         );
     }
 
@@ -581,27 +658,46 @@ mod tests {
         vec![BigInt::from(1); n]
     }
 
-    /// Brute-force cap_b verifier — the exact contract inequality.
+    /// Brute-force verifier — the exact `cs_check.ak::check_swap_with_claim`
+    /// clauses (op-portion fee pin at balance_fee, shape, no_flip, cap_b).
     fn contract_accepts(
         before: &[(AssetClass, BigInt)],
         prices: &[BigInt],
         k: (&BigInt, &BigInt),
+        bf: (&BigInt, &BigInt),
         plan: &ClaimPlan,
         in_idx: usize,
         out_idx: usize,
     ) -> bool {
         use num_traits::Signed;
-        // Reconstruct after_actual from the plan and re-check every clause
-        // the validator checks in waived mode.
+        // Reconstruct the op portion (claim restored) from the plan.
         let mut after_op = before.to_vec();
         after_op[in_idx].1 = &after_op[in_idx].1 + &plan.dx;
         after_op[out_idx].1 = &after_op[out_idx].1 - &plan.dy;
-        // v_increase_op == 0 (value-neutral swap)
         let v_before = compute_v(before, prices);
         let v_op = compute_v(&after_op, prices);
-        if v_op != v_before {
+        // Op-portion shape: ≥1 up, ≥1 down.
+        let has_inc = (0..before.len()).any(|i| after_op[i].1 > before[i].1);
+        let has_dec = (0..before.len()).any(|i| after_op[i].1 < before[i].1);
+        if !has_inc || !has_dec {
             return false;
         }
+        // Fee-exact pin: v_increase_op == floor(input_value_op · bf).
+        let mut input_value_op = BigInt::from(0);
+        for i in 0..before.len() {
+            let d = &after_op[i].1 - &before[i].1;
+            if d.is_positive() {
+                input_value_op = &input_value_op + &(&d * &prices[i]);
+            }
+        }
+        let v_increase_op = &v_op - &v_before;
+        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+            return false;
+        }
+        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+            return false;
+        }
+        // Actual after-state (claim extracted) must match the plan.
         let mut after_actual = after_op;
         after_actual[out_idx].1 = &after_actual[out_idx].1 - &plan.claim;
         if after_actual != plan.final_assets {
@@ -611,6 +707,9 @@ mod tests {
         let q_b = compute_q(before, prices, &v_b);
         let v_a = compute_v(&after_actual, prices);
         if !v_a.is_positive() || !plan.claim.is_positive() {
+            return false;
+        }
+        if !no_flip(before, &after_actual, prices, &v_b) {
             return false;
         }
         let q_a = compute_q(&after_actual, prices, &v_a);
@@ -628,7 +727,7 @@ mod tests {
         let before = pool(&[1_000_000, 1_000_000, 1_000_000]);
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
-        let plan = plan_waived_claim(&before, &prices, (&k.0, &k.1), 0, 1, &BigInt::from(10_000));
+        let plan = plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &BigInt::from(10_000));
         assert!(plan.is_none());
     }
 
@@ -640,17 +739,17 @@ mod tests {
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
         let dx = BigInt::from(50_000_000);
-        let plan = plan_waived_claim(&before, &prices, (&k.0, &k.1), 0, 1, &dx)
+        let plan = plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &dx)
             .expect("imbalanced pool should admit a claim");
         assert!(plan.claim > BigInt::from(0));
         assert_eq!(plan.dy, dx); // 1:1 prices, fee waived
-        assert!(contract_accepts(&before, &prices, (&k.0, &k.1), &plan, 0, 1));
+        assert!(contract_accepts(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &plan, 0, 1));
 
         // Maximality: one more unit must fail the contract inequality.
         let mut greedy = plan.clone();
         greedy.claim = &plan.claim + &BigInt::from(1);
         greedy.final_assets[1].1 = &plan.final_assets[1].1 - &BigInt::from(1);
-        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), &greedy, 0, 1));
+        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &greedy, 0, 1));
     }
 
     #[test]
@@ -660,7 +759,7 @@ mod tests {
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
         let plan =
-            plan_waived_claim(&before, &prices, (&k.0, &k.1), 1, 0, &BigInt::from(50_000_000));
+            plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 1, 0, &BigInt::from(50_000_000));
         assert!(plan.is_none());
     }
 
@@ -670,17 +769,18 @@ mod tests {
         let prices = ones(3);
         let k = (BigInt::from(0), BigInt::from(1));
         let plan =
-            plan_waived_claim(&before, &prices, (&k.0, &k.1), 0, 1, &BigInt::from(50_000_000));
+            plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &BigInt::from(50_000_000));
         assert!(plan.is_none());
     }
 
-    /// Regression: preview scoop 7a66bd76… (2026-07-07) — the multi-offer
-    /// single-op rebalance our scooper couldn't dispatch (built manually via
-    /// the CLI's audit-fixes-bounty-cli branch, commit 8ba6491 semantics).
-    /// The order pushes BOTH deficit assets in one tag_claim op: 623,915,369
-    /// USDCx + 4,399,312 USDM in, 629,252,486 USDr out, claim 937,805.
+    /// SUN-310 behaviour change: the manual multi-offer rebalance from preview
+    /// scoop 7a66bd76… (2026-07-07, pre-SUN-310 contract) pushed USDr from a
+    /// surplus (n·p·r > V_b) to a deficit — i.e. it *overshot* USDr's balance
+    /// point. The pre-SUN-310 contract accepted that; the current contract's
+    /// no-overshoot guard (commit dbf8997) rejects it. We assert the guard
+    /// fires, so a scooper won't build a tx the deployed contract would fail.
     #[test]
-    fn rebalance_claim_matches_manual_scoop_7a66bd76() {
+    fn rebalance_overshoot_rejected_by_no_flip_sun310() {
         let reserves = pool(&[1, 1_252_230_053, 619_516_058]); // USDCx, USDr, USDM
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
@@ -695,19 +795,16 @@ mod tests {
             BigInt::from(999_991_674_301u64),   // USDM pin
         ];
 
-        let plan = plan_rebalance_claim(&reserves, &prices, (&k.0, &k.1), &held, &targets)
-            .expect("the manual scoop's shape must plan");
-        assert_eq!(plan.claim_idx, 1, "claim carried on USDr");
-        assert_eq!(plan.claim, BigInt::from(937_805));
-        assert_eq!(plan.deltas[0], BigInt::from(623_915_369)); // USDCx in
-        assert_eq!(plan.deltas[1], BigInt::from(-629_252_486i64)); // USDr out
-        assert_eq!(plan.deltas[2], BigInt::from(4_399_312)); // USDM in
-        // Pool after-state matches the on-chain result of 7a66bd76.
-        assert_eq!(plan.final_assets[0].1, BigInt::from(623_915_370u64));
-        assert_eq!(plan.final_assets[1].1, BigInt::from(622_977_567u64));
-        assert_eq!(plan.final_assets[2].1, BigInt::from(623_915_370u64));
+        // Under the current (SUN-310) contract this shape overshoots USDr's
+        // balance point (surplus → deficit) and must be rejected.
+        let err = plan_rebalance_claim(
+            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &held, &targets,
+        )
+        .expect_err("no-overshoot guard must reject the pre-SUN-310 shape");
+        assert!(err.contains("overshoot"), "got: {err}");
 
-        // And the shape resolver routes this order to the rebalance path.
+        // The shape resolver still routes this order to the rebalance path
+        // (the guard is a planning-feasibility check, not a shape decision).
         let mut value = crate::cardano_types::Value::default();
         for (i, (asset, _)) in reserves.iter().enumerate() {
             value.insert(asset, held[i].clone());
@@ -728,46 +825,84 @@ mod tests {
         }
     }
 
-    /// Regression: preview intent ce8b83b0… (2026-07-07). The pool was
-    /// drained to a single unit of the input asset; the intent's floor
-    /// needed ~5.3M more than the deficit-capped dx could deliver. The
-    /// floor IS reachable — dx may overshoot the input-asset deficit
-    /// because the waived swap is value-neutral; cap_b (not the deficit)
-    /// is the real bound. The old `dx = min(spendable, deficit)` heuristic
-    /// reported below-floor here.
+    /// SUN-310: the no-overshoot guard caps a claim at the pre-step balance
+    /// points. For the ce8b83b0… pool state (drained to 1 unit of the input
+    /// asset), the receive asset (USDr) sits at reserve 1,252,230,053 with a
+    /// balance point of 623,915,370, so a claim can extract at most
+    /// 1,252,230,053 − 623,915,370 = 628,314,683 without pushing USDr past
+    /// balance. A floor above that (629,252,486) is now genuinely unreachable
+    /// — pre-SUN-310 it was reachable by overshooting, which the current
+    /// contract forbids.
     #[test]
-    fn floor_meeting_dx_overshoots_the_deficit() {
+    fn no_flip_caps_claim_below_an_overshoot_floor() {
         let reserves = pool(&[1, 1_252_230_053, 619_516_058]);
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
-        let needed = BigInt::from(629_252_486u64);
         let spendable = BigInt::from(1_000_000_000_000u64);
 
+        // A floor that only an overshoot could clear is now below-floor, and
+        // the best plan the planner reports still satisfies the contract.
+        let overshoot_floor = BigInt::from(629_252_486u64);
         let search = plan_claim_meeting_floor(
-            &reserves, &prices, (&k.0, &k.1), 0, 1, &spendable, &needed,
+            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &spendable, &overshoot_floor,
+        )
+        .expect("a best-effort plan is still feasible");
+        assert!(!search.meets_floor, "no_flip caps the total below the overshoot floor");
+        let total = &search.plan.dy + &search.plan.claim;
+        assert!(total <= BigInt::from(628_314_683u64), "capped at the balance point: {total}");
+        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &search.plan, 0, 1));
+
+        // A floor at or under the cap is met, and the plan respects no_flip.
+        let reachable_floor = BigInt::from(600_000_000u64);
+        let search = plan_claim_meeting_floor(
+            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &spendable, &reachable_floor,
         )
         .expect("claim must be feasible");
-        assert!(search.meets_floor, "floor is reachable by overshooting the deficit");
-        let total = &search.plan.dy + &search.plan.claim;
-        assert!(total >= needed);
-        // Minimal dx: barely past the floor, not the full budget.
-        assert!(search.plan.dx < BigInt::from(630_000_000u64), "dx = {}", search.plan.dx);
-        assert!(
-            search.plan.dx > BigInt::from(623_915_369u64),
-            "dx must exceed the input-asset deficit (old cap): {}",
-            search.plan.dx,
-        );
-        // The exact contract inequality accepts the plan.
-        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), &search.plan, 0, 1));
+        assert!(search.meets_floor, "a sub-cap floor is reachable");
+        assert!(&search.plan.dy + &search.plan.claim >= reachable_floor);
+        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &search.plan, 0, 1));
+    }
 
-        // And when the floor is genuinely out of reach, the best plan is
-        // reported without meets_floor.
-        let too_much = BigInt::from(3_000_000_000u64);
-        let search = plan_claim_meeting_floor(
-            &reserves, &prices, (&k.0, &k.1), 0, 1, &spendable, &too_much,
+    #[test]
+    fn fee_paying_pool_claim_pays_balance_fee_and_contract_accepts() {
+        // Non-waived pool (balance_fee = 10/10000, like preview c618676e…):
+        // the op-portion swap must leave floor(input·bf) of value in the pool.
+        // With prices [1,1,1], dy = dx − floor(dx·10/10000), so the pool keeps
+        // the fee and the claim rides on the rebalancing on top.
+        let before = pool(&[400_000_000, 800_000_000, 600_000_000]);
+        let prices = ones(3);
+        let k = (BigInt::from(9), BigInt::from(4000));
+        let bf = (BigInt::from(10), BigInt::from(10000));
+        let dx = BigInt::from(50_000_000);
+        let plan = plan_claim(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), 0, 1, &dx)
+            .expect("imbalanced fee-paying pool should still admit a claim");
+        assert!(plan.claim > BigInt::from(0));
+        // dy is reduced by the balance_fee: v_increase_op = floor(50M·10/10000)
+        // = 50_000, so dy = 50_000_000 − 50_000 = 49_950_000.
+        assert_eq!(plan.dy, BigInt::from(49_950_000));
+        // The exact contract clauses (incl. the balance_fee fee-pin) accept it.
+        assert!(contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan, 0, 1));
+        // Maximality: one more claim unit fails the contract check.
+        let mut greedy = plan.clone();
+        greedy.claim = &plan.claim + &BigInt::from(1);
+        greedy.final_assets[1].1 = &plan.final_assets[1].1 - &BigInt::from(1);
+        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &greedy, 0, 1));
+    }
+
+    #[test]
+    fn fee_pin_rejects_a_waived_plan_on_a_fee_paying_pool() {
+        // A value-neutral (waived) plan must NOT pass the contract check when
+        // the pool charges balance_fee > 0: the op-portion underpays the fee.
+        let before = pool(&[400_000_000, 800_000_000, 600_000_000]);
+        let prices = ones(3);
+        let k = (BigInt::from(9), BigInt::from(4000));
+        let waived = plan_claim(
+            &before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1,
+            &BigInt::from(50_000_000),
         )
-        .expect("still feasible");
-        assert!(!search.meets_floor);
-        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), &search.plan, 0, 1));
+        .expect("waived plan exists");
+        // Same plan, judged against a fee-charging pool → rejected by the pin.
+        let bf = (BigInt::from(10), BigInt::from(10000));
+        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &waived, 0, 1));
     }
 }
