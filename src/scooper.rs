@@ -662,6 +662,12 @@ impl Scooper {
         let in_flight_pools = self.v4_chain_tracker.in_flight_pools();
         let n_in_flight_orders = in_flight_inputs.len();
         let mut n_quarantined = 0u32;
+        // Orders naming an OrderConfig token we haven't indexed. The order
+        // validator's withdraw handler demands that config as a reference
+        // input, so dispatching one builds a tx that can only fail eval.
+        // Skipped, not quarantined: the config UTxO may be minted later,
+        // at which point the order becomes live.
+        let mut n_config_missing = 0u32;
         // Inputs to be permanently quarantined this pass — collected in the
         // filter chain (where we hold only `&self`) and applied below.
         let mut quarantine_budget_zero: Vec<TransactionInput> = Vec::new();
@@ -703,6 +709,15 @@ impl Scooper {
                     n_quarantined += 1;
                     return false;
                 }
+                if !v4_state.order_configs.contains_key(&o.datum.config_token) {
+                    trace!(
+                        order = %o.input,
+                        config_token = %hex::encode(&o.datum.config_token),
+                        "order references an unindexed OrderConfig; skipping"
+                    );
+                    n_config_missing += 1;
+                    return false;
+                }
                 true
             })
             .cloned()
@@ -737,6 +752,20 @@ impl Scooper {
                 if in_flight_inputs.contains(&order.input)
                     || self.is_quarantined(&order.input, current_slot)
                 {
+                    continue;
+                }
+                // Same gate as the regular candidate filter: without the
+                // referenced OrderConfig as a reference input, the order
+                // validator's withdraw handler fails and the doomed build
+                // aborts the whole cycle (seen live with intent a7c96e58…
+                // whose order named a never-minted config token).
+                if !v4_state.order_configs.contains_key(&order.datum.config_token) {
+                    trace!(
+                        order = %order.input,
+                        config_token = %hex::encode(&order.datum.config_token),
+                        "strategy order references an unindexed OrderConfig; skipping"
+                    );
+                    n_config_missing += 1;
                     continue;
                 }
                 let key = (
@@ -878,6 +907,10 @@ impl Scooper {
                         continue;
                     }
                 }
+                if !v4_state.order_configs.contains_key(&order.datum.config_token) {
+                    n_config_missing += 1;
+                    continue;
+                }
                 provisional_inputs.insert(order.input.clone());
                 provisional_parent.insert(order.input.clone(), parent);
                 candidates.push(order);
@@ -928,6 +961,7 @@ impl Scooper {
                 provisional_orders: prov_orders,
                 provisional_spent: prov_spent,
                 foreign_pools: foreign_count,
+                config_missing_orders: n_config_missing as usize,
                 backoff_active: self.backoff_until_after_slot.is_some(),
             });
         }
@@ -953,10 +987,11 @@ impl Scooper {
         self.sync_quarantine_metrics();
 
         if candidates.is_empty() && pending_claim_plan.is_none() {
-            if n_in_flight_orders > 0 || n_quarantined > 0 {
+            if n_in_flight_orders > 0 || n_quarantined > 0 || n_config_missing > 0 {
                 debug!(
                     n_in_flight_orders,
                     n_quarantined,
+                    n_config_missing,
                     in_flight_pools = ?in_flight_pools.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
                     total_orders = v4_state.orders.len(),
                     "\u{23f3} all orders in-flight or quarantined, waiting"

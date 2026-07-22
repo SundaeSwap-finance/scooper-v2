@@ -212,6 +212,9 @@ pub struct OpsSnapshot {
     pub provisional_orders: usize,
     pub provisional_spent: usize,
     pub foreign_pools: usize,
+    /// Orders skipped because they name an OrderConfig token that isn't
+    /// indexed (typically never minted) — undispatchable until it appears.
+    pub config_missing_orders: usize,
     /// True while the scooper is sitting out cycles after a lost race.
     pub backoff_active: bool,
 }
@@ -506,6 +509,7 @@ pub async fn render_metrics(
     write_gauge(&mut out, "scooper_provisional_orders", "Unconfirmed mempool orders tracked", ops.provisional_orders);
     write_gauge(&mut out, "scooper_provisional_spent", "Order UTxOs spent by unconfirmed txs", ops.provisional_spent);
     write_gauge(&mut out, "scooper_foreign_pool_predictions", "Pool states predicted from foreign mempool txs", ops.foreign_pools);
+    write_gauge(&mut out, "scooper_config_missing_orders", "Orders skipped for referencing an unindexed OrderConfig", ops.config_missing_orders);
     write_gauge(&mut out, "scooper_backoff_active", "1 while sitting out cycles after a lost race", ops.backoff_active as usize);
     write_gauge(&mut out, "scooper_mempool_monitor_connected", "1 while the mempool monitor holds a node connection", metrics.mempool_connected.load(Ordering::Relaxed));
     write_gauge(&mut out, "scooper_mempool_last_snapshot_unix", "Unix time of the last processed mempool snapshot", metrics.mempool_last_snapshot_unix.load(Ordering::Relaxed));
