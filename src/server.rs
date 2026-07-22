@@ -471,13 +471,17 @@ impl AdminServer {
         };
 
         // Pool + order snapshots for the probe (before taking the store lock).
-        let (pools, orders) = match &self.v4_state {
+        let (pools, orders, order_configs) = match &self.v4_state {
             Some(v4) => {
                 let state = v4.lock().await;
                 let latest = state.latest();
-                (latest.pools.clone(), latest.orders.clone())
+                (
+                    latest.pools.clone(),
+                    latest.orders.clone(),
+                    latest.order_configs.clone(),
+                )
             }
-            None => (Default::default(), Vec::new()),
+            None => (Default::default(), Vec::new(), Default::default()),
         };
 
         let store = intents.store.lock().await;
@@ -497,6 +501,22 @@ impl AdminServer {
                 });
                 let probe: serde_json::Value = match (order, &i.hint) {
                     (None, _) => serde_json::json!("order-not-indexed"),
+                    // The order validator's withdraw handler demands the
+                    // order's OrderConfig as a reference input; when that
+                    // token isn't on chain, no execution can succeed no
+                    // matter what the swap/claim math says.
+                    (Some(order), _)
+                        if !order_configs.contains_key(&order.datum.config_token) =>
+                    {
+                        serde_json::json!({
+                            "state": "config-missing",
+                            "config_token": hex::encode(&order.datum.config_token),
+                            "detail": "the order references an OrderConfig token that \
+                                       is not on chain; it cannot execute until that \
+                                       config is published (or the order is re-placed \
+                                       against an existing config)",
+                        })
+                    }
                     (Some(order), Some(crate::sundaev4::intents::ExecutionHint::Claim {
                         pool,
                     })) => Self::probe_claim(order, i, pool, &pools),
@@ -1257,6 +1277,19 @@ impl AdminServer {
         let mut non_executable = Vec::new();
 
         for order in &candidates {
+            // Mirror the scooper's dispatch gate: an order naming an
+            // unindexed OrderConfig can never validate on chain.
+            if !state.order_configs.contains_key(&order.datum.config_token) {
+                non_executable.push(serde_json::json!({
+                    "order": order.input.to_string(),
+                    "reason": format!(
+                        "references OrderConfig token {} which is not on chain; \
+                         the order cannot execute until that config is published",
+                        hex::encode(&order.datum.config_token),
+                    ),
+                }));
+                continue;
+            }
             // Mirror the router's fan-out gate: an order's max_per_execution
             // buys its route budget, and one that can't afford a single pool
             // touch will never dispatch, no matter how in-range the swap is.
