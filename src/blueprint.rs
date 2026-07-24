@@ -105,14 +105,19 @@ impl Blueprint {
         // so use the most specific suffix (e.g. `_module`, `_validator`) to avoid
         // collisions: `pool` would match `pool_mint` and `pool_validator`; `order`
         // would match `order_validator`, `basic_order_module`, and `swap_order_module`.
+        //
+        // Current deployment blueprints emit dotted `module.purpose` titles and
+        // reference keys ("pool.mint", "order.spend", …) matching the V1/V3
+        // convention — those are listed first; the camelCase / raw-plutus.json
+        // aliases keep older blueprint files loadable.
         let mappings: &[(&[&str], &str, &str)] = &[
-            (&["constant_product_module", "constant_product", "constantProduct"], "constantProduct", "constant_product"),
-            (&["fee_split_module", "fee_split", "feeSplit"], "feeSplit", "fee_split"),
-            (&["fairness_module", "fairness"], "fairness", "fairness"),
-            (&["pool_validator", "pool", "vault"], "pool", "pool"),
-            (&["order_validator", "order"], "order", "order"),
-            (&["pool_mint", "poolMint"], "poolMint", "pool_mint"),
-            (&["settings_validator", "settings"], "settings", "settings"),
+            (&["constant_product.withdraw", "constant_product_module", "constant_product", "constantProduct"], "constant_product.withdraw", "constant_product"),
+            (&["fee_split.withdraw", "fee_split_module", "fee_split", "feeSplit"], "fee_split.withdraw", "fee_split"),
+            (&["fairness.withdraw", "fairness_module", "fairness"], "fairness.withdraw", "fairness"),
+            (&["pool.spend", "pool_validator", "pool", "vault"], "pool.spend", "pool"),
+            (&["order.spend", "order_validator", "order"], "order.spend", "order"),
+            (&["pool.mint", "pool_mint", "poolMint"], "pool.mint", "pool_mint"),
+            (&["settings.spend", "settings_validator", "settings"], "settings.spend", "settings"),
         ];
 
         fn find_by_patterns<'a>(bp: &'a Blueprint, patterns: &[&str]) -> Option<&'a Validator> {
@@ -168,49 +173,49 @@ impl Blueprint {
         // Try to find constant_sum (optional — not all blueprints include it)
         let constant_sum = make_info(
             self,
-            &["constant_sum_module", "constant_sum", "constantSum"],
-            "constantSum",
+            &["constant_sum.withdraw", "constant_sum_module", "constant_sum", "constantSum"],
+            "constant_sum.withdraw",
             "constant_sum",
         ).ok();
 
         // Try to find swap_order (optional — pre-redesign blueprints lack it)
         let swap_order = make_info(
             self,
-            &["swap_order_module", "swap_order", "swapOrder"],
-            "swapOrder",
+            &["swap_order.withdraw", "swap_order_module", "swap_order", "swapOrder"],
+            "swap_order.withdraw",
             "swap_order",
         ).ok();
         // Same for basic_order (handles Deposit/Withdraw/Claim).
         let basic_order = make_info(
             self,
-            &["basic_order_module", "basic_order", "basicOrder"],
-            "basicOrder",
+            &["basic_order.withdraw", "basic_order_module", "basic_order", "basicOrder"],
+            "basic_order.withdraw",
             "basic_order",
         ).ok();
         // Route/Fairness/Strategy constraint modules (PR #11).
         let route_order = make_info(
             self,
-            &["route_order_module", "route_order", "routeOrder", "route_constraint"],
-            "routeOrder",
+            &["route_order.withdraw", "route_order_module", "route_order", "routeOrder", "route_constraint"],
+            "route_order.withdraw",
             "route_order",
         ).ok();
         let fairness_order = make_info(
             self,
-            &["fairness_order_module", "fairness_order", "fairnessOrder", "fairness_order_constraint"],
-            "fairnessOrder",
+            &["fairness_order.withdraw", "fairness_order_module", "fairness_order", "fairnessOrder", "fairness_order_constraint"],
+            "fairness_order.withdraw",
             "fairness_order",
         ).ok();
         let strategy_order = make_info(
             self,
-            &["strategy_order_module", "strategy_order", "strategyOrder", "strategy_order_constraint"],
-            "strategyOrder",
+            &["strategy_order.withdraw", "strategy_order_module", "strategy_order", "strategyOrder", "strategy_order_constraint"],
+            "strategy_order.withdraw",
             "strategy_order",
         ).ok();
         // Concentrated liquidity module (optional — only present when CL pools exist).
         let concentrated_liquidity = make_info(
             self,
-            &["concentrated_liquidity_module", "concentrated_liquidity", "concentratedLiquidity"],
-            "concentratedLiquidity",
+            &["concentrated_liquidity.withdraw", "concentrated_liquidity_module", "concentrated_liquidity", "concentratedLiquidity"],
+            "concentrated_liquidity.withdraw",
             "concentrated_liquidity",
         ).ok();
 
