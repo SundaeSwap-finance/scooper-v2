@@ -401,6 +401,178 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 2);
     }
 
+    /// Target-pinned CS deposit (cs_check tag 6) on COPRIME reserves — the
+    /// exact case the old gcd-exact resolver could never fill (gcd = 1 makes
+    /// "one proportional unit" the whole pool). The built scoop must
+    /// evaluate cleanly against the real validators, proving the ceil-pinned
+    /// deltas, floor-pinned LP, and the declared t in operation_data all
+    /// match cs_check's brackets.
+    #[test]
+    fn cs_deposit_pinned_on_coprime_reserves_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        // Coprime reserves (both prime): gcd = 1.
+        let pool = make_cs_pool(
+            &env, 0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        // Roughly proportional but deliberately unround amounts.
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
+            lp_asset,
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_deposit(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("pinned deposit should resolve on coprime reserves");
+
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 1);
+        let dep = &plan.batches[0].deposits[0];
+        assert!(dep.lp_minted.is_positive(), "deposit must mint LP");
+        assert!(dep.target_delta_v.is_some(), "CS deposit must declare t");
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("pinned CS deposit should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
+    }
+
+    /// Target-pinned CS withdraw (cs_check tag 4) on the same coprime pool.
+    #[test]
+    fn cs_withdraw_pinned_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        // The harness pool premints all LP (circulating 0); a withdraw burns
+        // circulating LP, so move some out of the premint — as if a depositor
+        // holds it — keeping the datum and the pool value consistent.
+        let pool = {
+            let mut p = (*pool).clone();
+            let circ = BigInt::from(50_000_000i64);
+            p.pool_datum.circulating_lp = circ.clone();
+            p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &circ;
+            let lp = crate::cardano_types::AssetClass {
+                policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+                token: {
+                    let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                    t.extend_from_slice(&[0xDD; 28]);
+                    t
+                },
+            };
+            let held = p.value.get(&lp);
+            p.value.insert(&lp, &held - &circ);
+            std::sync::Arc::new(p)
+        };
+
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_withdraw_order(
+            lp_asset,
+            5_000_017,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("pinned withdraw should resolve");
+
+        let plan = accum.into_plan();
+        let wd = &plan.batches[0].withdraws[0];
+        assert!(wd.lp_burned.is_positive());
+        assert!(wd.target_delta_v.is_some(), "CS withdraw must declare t");
+        assert!(wd.dy.iter().any(|q| q.is_positive()));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("pinned CS withdraw should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
+    }
+
+    /// A single-sided CS deposit can never validate (cs_check disallows
+    /// asymmetric deposits) — the resolver must refuse it with a message
+    /// that says so, rather than quarantine-looping.
+    #[test]
+    fn cs_single_sided_deposit_rejected() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_000)],
+            lp_asset,
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let err = accum
+            .try_add_deposit(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect_err("single-sided CS deposit must be rejected");
+        assert!(
+            err.contains("asymmetric"),
+            "error should explain the on-chain rule, got: {err}"
+        );
+    }
+
     /// A route-module order whose constraint carries a non-empty pool
     /// whitelist must execute through a whitelisted pool even when a
     /// better-priced pool exists, and the resulting tx must satisfy

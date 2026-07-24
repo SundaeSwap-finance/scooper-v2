@@ -598,6 +598,11 @@ pub fn build_multi_pool_scoop_tx(
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
                 };
+                // cs_check's target-pinned deposit reads the declared value
+                // delta t from operation_data.
+                if let Some(t) = &d.target_delta_v {
+                    op_data_override = Some(t.clone().to_plutus());
+                }
                 (dep_tag, BigInt::from(0))
             }
             crate::sundaev4::batch::BatchOp::Withdraw(i) => {
@@ -619,6 +624,11 @@ pub fn build_multi_pool_scoop_tx(
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                 };
+                // cs_check's target-pinned withdraw reads the declared
+                // (negative) value delta t from operation_data.
+                if let Some(t) = &w.target_delta_v {
+                    op_data_override = Some(t.clone().to_plutus());
+                }
                 (wd_tag, BigInt::from(0))
             }
         };

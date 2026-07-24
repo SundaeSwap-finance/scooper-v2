@@ -106,6 +106,10 @@ pub struct ResolvedDeposit {
     /// Excess offered by the user that didn't fit the proportional unit and
     /// is returned alongside their LP tokens. Empty if exact-fit.
     pub surplus: Vec<(AssetClass, BigInt)>,
+    /// CS pools: the declared value delta `t` for the target-pinned deposit
+    /// (cs_check tag 6 reads it from the entry's operation_data). None for
+    /// other curves, whose entries keep the void placeholder.
+    pub target_delta_v: Option<BigInt>,
 }
 
 /// A resolved proportional Withdraw. The user offers an exact amount of LP
@@ -115,10 +119,16 @@ pub struct ResolvedDeposit {
 #[derive(Clone)]
 pub struct ResolvedWithdraw {
     pub order: Arc<SundaeV4Order>,
-    /// Amount of LP burned. Equal to whatever the user offered.
+    /// Amount of LP burned. At most what the user offered — for CS pools the
+    /// target-pin can leave an un-burnable remainder, which stays in the
+    /// fulfillment (returned to the user).
     pub lp_burned: BigInt,
     /// Per pool asset, in pool-asset-order. Amount paid out to the user.
     pub dy: Vec<BigInt>,
+    /// CS pools: the declared (negative) value delta `t` for the
+    /// target-pinned withdraw (cs_check tag 4 reads it from the entry's
+    /// operation_data). None for other curves.
+    pub target_delta_v: Option<BigInt>,
 }
 
 /// Identifies an operation in the batch's interleaved order.
@@ -680,40 +690,124 @@ pub fn resolve_proportional_deposit(
         offered_map.get(a).map(|q| (*q).clone()).unwrap_or_else(|| BigInt::from(0))
     }).collect();
 
-    // gcd over all reserves
-    let mut g = reserves[0].clone();
-    for r in &reserves[1..] { g = g.gcd(r); }
-    if g.is_zero() {
-        return Err("pool reserves are all zero".into());
+    let total_lp = &pool.pool_datum.total_lp;
+    if !total_lp.is_positive() {
+        return Err("pool total_lp is zero".into());
     }
 
-    let bs: Vec<BigInt> = reserves.iter().map(|r| (*r) / &g).collect();
+    let (dx, lp_minted, target_delta_v): (Vec<BigInt>, BigInt, Option<BigInt>) =
+        match &pool.pool_type {
+            // Target-pinned deposit (cs_check tag 6): the entry declares a
+            // value delta t > 0; every asset's delta is ceil-pinned to
+            // `ceil(r_i·t/V_b)` and total_lp is floor-pinned to
+            // `floor(lp_b·(V_b+t)/V_b)`. We pick the largest t the offered
+            // amounts cover: `ceil(r_i·t/V_b) <= offered_i  <=>
+            // t <= offered_i·V_b/r_i`, so t = min_i floor(offered_i·V_b/r_i).
+            // Exact gcd-proportionality (the old resolver) is unsatisfiable
+            // on real pools — post-trading reserves are coprime, making "one
+            // unit" the whole pool — which is precisely why the validator is
+            // target-pinned.
+            crate::sundaev4::types::PoolType::ConstantSum { prices, .. } => {
+                if prices.len() != reserves.len() {
+                    return Err("CS pool prices not aligned with reserves".into());
+                }
+                let mut v_b = BigInt::from(0);
+                for (r, p) in reserves.iter().zip(prices.iter()) {
+                    v_b += *r * p;
+                }
+                if !v_b.is_positive() {
+                    return Err("pool value is zero".into());
+                }
 
-    // num_max = min_i floor(offered_i / bs_i). Where bs_i == 0 (i.e. a pool
-    // asset's reserve is zero — shouldn't happen for live pools) skip the
-    // constraint.
-    let mut num_max: Option<BigInt> = None;
-    for (off, b) in offered_per_pool.iter().zip(bs.iter()) {
-        if b.is_zero() { continue; }
-        let cap = off / b;
-        num_max = Some(match num_max.take() {
-            None => cap,
-            Some(prev) => if cap < prev { cap } else { prev },
-        });
-    }
-    let num_max = num_max.unwrap_or_else(|| BigInt::from(0));
-    if !num_max.is_positive() {
-        return Err("deposit can't be filled — offered doesn't cover one proportional unit".into());
-    }
+                let mut t: Option<BigInt> = None;
+                for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
+                    if r.is_zero() { continue; }
+                    let cap = off * &v_b / *r;
+                    t = Some(match t.take() {
+                        None => cap,
+                        Some(prev) => if cap < prev { cap } else { prev },
+                    });
+                }
+                let t = t.unwrap_or_else(|| BigInt::from(0));
+                if !t.is_positive() {
+                    return Err(
+                        "deposit can't be filled — a constant-sum deposit must \
+                         offer every pool asset in proportion (asymmetric \
+                         deposits are disallowed on-chain)"
+                            .into(),
+                    );
+                }
 
-    let dx: Vec<BigInt> = bs.iter().map(|b| &num_max * b).collect();
+                let one = BigInt::from(1);
+                let dx: Vec<BigInt> = reserves
+                    .iter()
+                    .map(|r| (*r * &t + &v_b - &one) / &v_b) // ceil(r·t/V_b)
+                    .collect();
 
-    // lp_minted = total_lp * num_max / gcd. For pools where total_lp ==
-    // sum(reserves) (menu-created), gcd divides total_lp exactly so this
-    // is integer; otherwise we floor.
-    let lp_minted = &pool.pool_datum.total_lp * &num_max / &g;
+                let after_lp = total_lp * (&v_b + &t) / &v_b; // floor
+                let lp_minted = &after_lp - total_lp;
+                (dx, lp_minted, Some(t))
+            }
+            // Constant product: the validator only bounds LP by per-asset
+            // proportionality (`after_i·lp_b >= before_i·lp_a`), so mint by
+            // the worst offered ratio and take just enough of each asset:
+            //   minted  = min_i floor(offered_i·lp_b/r_i)
+            //   delta_i = ceil(r_i·minted/lp_b)   (satisfies the bound)
+            crate::sundaev4::types::PoolType::ConstantProduct { .. } => {
+                let mut minted: Option<BigInt> = None;
+                for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
+                    if r.is_zero() { continue; }
+                    let cap = off * total_lp / *r;
+                    minted = Some(match minted.take() {
+                        None => cap,
+                        Some(prev) => if cap < prev { cap } else { prev },
+                    });
+                }
+                let minted = minted.unwrap_or_else(|| BigInt::from(0));
+                if !minted.is_positive() {
+                    return Err(
+                        "deposit can't be filled — a constant-product deposit \
+                         must offer every pool asset in proportion"
+                            .into(),
+                    );
+                }
+                let one = BigInt::from(1);
+                let dx: Vec<BigInt> = reserves
+                    .iter()
+                    .map(|r| (*r * &minted + total_lp - &one) / total_lp)
+                    .collect();
+                (dx, minted, None)
+            }
+            // Concentrated liquidity: no deposit support yet — the invariant
+            // needs its own pinning scheme. Refuse rather than guess.
+            crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
+                return Err("deposits into concentrated-liquidity pools aren't supported yet".into());
+            }
+        };
+
     if !lp_minted.is_positive() {
         return Err("deposit produces zero LP".into());
+    }
+
+    // The order's declared minimum (its min_received names this pool's LP
+    // token — that's how the order matched the pool). Refuse to build a fill
+    // the basic constraint would reject on-chain.
+    if let Constraint::Deposit { min_received, .. } = &order.constraint {
+        const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
+        let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
+        let min_lp = min_received.iter().find_map(|(a, q)| {
+            if a.token.len() < LP_LABEL.len() { return None; }
+            if &a.token[..LP_LABEL.len()] != LP_LABEL { return None; }
+            if &a.token[LP_LABEL.len()..] != pool_ident_bytes { return None; }
+            Some(q)
+        });
+        if let Some(min_lp) = min_lp {
+            if &lp_minted < min_lp {
+                return Err(format!(
+                    "deposit fill mints {lp_minted} LP, below the order's minimum {min_lp}"
+                ));
+            }
+        }
     }
 
     // Surplus = offered - dx for each pool asset (skip zeros).
@@ -728,6 +822,7 @@ pub fn resolve_proportional_deposit(
         dx,
         lp_minted,
         surplus,
+        target_delta_v,
     })
 }
 
@@ -773,15 +868,72 @@ pub fn resolve_proportional_withdraw(
         return Err("pool total_lp is zero".into());
     }
 
-    let dy: Vec<BigInt> = pool.pool_datum.assets.iter().map(|(_, r)| {
-        r * &lp_burned / total_lp
-    }).collect();
+    match &pool.pool_type {
+        // Target-pinned withdraw (cs_check tag 4): the entry declares a
+        // negative value delta t; payouts are pinned to `floor(r_i·|t|/V_b)`
+        // and total_lp to `floor(lp_b·(V_b+t)/V_b)`. Pick the most negative t
+        // the offered LP covers: t = -floor(lp_burned·V_b/lp_b). The pin can
+        // leave a small un-burnable LP remainder, which stays with the user
+        // via the fulfillment (we only burn lp_b - after_lp).
+        crate::sundaev4::types::PoolType::ConstantSum { prices, .. } => {
+            use num_traits::Zero;
+            let reserves: Vec<&BigInt> =
+                pool.pool_datum.assets.iter().map(|(_, q)| q).collect();
+            if prices.len() != reserves.len() {
+                return Err("CS pool prices not aligned with reserves".into());
+            }
+            let mut v_b = BigInt::from(0);
+            for (r, p) in reserves.iter().zip(prices.iter()) {
+                v_b += *r * p;
+            }
+            if !v_b.is_positive() {
+                return Err("pool value is zero".into());
+            }
 
-    if dy.iter().all(|q| !q.is_positive()) {
-        return Err("withdraw pays out zero of every reserve".into());
+            let t_abs = &lp_burned * &v_b / total_lp; // floor(lp_burned·V_b/lp_b)
+            if t_abs.is_zero() {
+                return Err("withdraw is too small to move the pool's value".into());
+            }
+            let t = -&t_abs;
+
+            let after_lp = total_lp * (&v_b + &t) / &v_b; // floor
+            let actual_burn = total_lp - &after_lp;
+            if !actual_burn.is_positive() {
+                return Err("withdraw burns zero LP".into());
+            }
+            if actual_burn > lp_burned {
+                // Shouldn't happen with t = -floor(lp_burned·V_b/lp_b); guard
+                // against burning LP the order didn't offer.
+                return Err("withdraw pin exceeds the offered LP".into());
+            }
+
+            let dy: Vec<BigInt> = reserves
+                .iter()
+                .map(|r| *r * &t_abs / &v_b) // floor(r·|t|/V_b)
+                .collect();
+            if dy.iter().all(|q| !q.is_positive()) {
+                return Err("withdraw pays out zero of every reserve".into());
+            }
+
+            Ok(ResolvedWithdraw {
+                order: order.clone(),
+                lp_burned: actual_burn,
+                dy,
+                target_delta_v: Some(t),
+            })
+        }
+        _ => {
+            let dy: Vec<BigInt> = pool.pool_datum.assets.iter().map(|(_, r)| {
+                r * &lp_burned / total_lp
+            }).collect();
+
+            if dy.iter().all(|q| !q.is_positive()) {
+                return Err("withdraw pays out zero of every reserve".into());
+            }
+
+            Ok(ResolvedWithdraw { order: order.clone(), lp_burned, dy, target_delta_v: None })
+        }
     }
-
-    Ok(ResolvedWithdraw { order: order.clone(), lp_burned, dy })
 }
 
 #[cfg(test)]
