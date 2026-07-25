@@ -436,6 +436,41 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
         .collect()
 }
 
+/// Generic tie-break among pools that yield the *same* output for a swap.
+///
+/// When several pools quote an identical amount — e.g. equal-price constant-sum
+/// pools, where splitting buys the trader nothing — the router is free to pick
+/// any of them, so it picks whichever is best for the LPs. Higher score wins; a
+/// pool type with no preference returns 0, so this is a no-op unless a pool type
+/// opts in. It's a generic hook: new pool types can add their own tie-break
+/// rationale here without touching the split solver.
+///
+/// Constant-sum: prefer the pool the swap rebalances the most. An imbalanced CS
+/// pool otherwise has to *pay* a rebalance bounty (`balance_fee`, funded from LP
+/// fees) to hire someone to fix it; steering equal-priced organic flow to the
+/// more-imbalanced pool does that rebalancing for free, so less bounty is ever
+/// paid out and being an LP is more lucrative. The score is the drop in the
+/// traded pair's value gap `|p_in·r_in − p_out·r_out|` — exactly the reduction
+/// in the contract's imbalance `Q = Σ(N·p_i·r_i − V)²` for a 2-asset pool
+/// (`Q = 2·gap²`), a local proxy for N-asset pools (the swap only touches these
+/// two legs). Positive = rebalances (preferred); negative = pushes further out
+/// (so the abundant-side pool is de-preferred).
+fn tiebreak_score(pool: &PoolView, dx: &BigInt) -> BigInt {
+    match &pool.view_type {
+        PoolViewType::ConstantSum { price_in, price_out } => {
+            let dy = pool_output(pool, dx);
+            let v_in_before = price_in * &pool.reserve_in;
+            let v_out_before = price_out * &pool.reserve_out;
+            let gap_before = (&v_in_before - &v_out_before).abs();
+            let v_in_after = price_in * &(&pool.reserve_in + dx);
+            let v_out_after = price_out * &(&pool.reserve_out - &dy);
+            let gap_after = (&v_in_after - &v_out_after).abs();
+            gap_before - gap_after
+        }
+        _ => BigInt::from(0),
+    }
+}
+
 /// Optimally split `total_input` across `pools` for the same token pair.
 ///
 /// Returns `SplitEntry` for each pool with positive allocation.
@@ -462,16 +497,25 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     }
     let mut lambda_lo = BigInt::from(1);
 
-    // Evaluate single-pool baselines
+    // Evaluate single-pool baselines. Strictly-more output always wins; on an
+    // exact output tie (e.g. equal-price constant-sum pools, where a split gains
+    // nothing) the tie-break score decides — routing to whichever pool the swap
+    // rebalances the most costs the trader nothing and spares the LPs a
+    // rebalance bounty (see `tiebreak_score`).
     let mut best_allocs: Vec<BigInt> = vec![BigInt::from(0); pools.len()];
     let mut best_output = BigInt::from(0);
+    let mut best_tiebreak = BigInt::from(0);
 
     for (i, pool) in pools.iter().enumerate() {
         let out = pool_output(pool, total_input);
-        if out > best_output {
+        let tie = tiebreak_score(pool, total_input);
+        if out > best_output
+            || (out == best_output && out.is_positive() && tie > best_tiebreak)
+        {
             best_output = out.clone();
             best_allocs = vec![BigInt::from(0); pools.len()];
             best_allocs[i] = total_input.clone();
+            best_tiebreak = tie;
         }
     }
 
@@ -1886,5 +1930,45 @@ mod tests {
             1,
             "overlapping paths must not blend",
         );
+    }
+
+    /// Equal-price constant-sum pools tie on output, so the router picks the one
+    /// the swap rebalances the most — free rebalancing that spares the LPs a
+    /// bounty. The balanced pool is listed first, so the old "first wins"
+    /// baseline would have taken it; the tie-break must route to the pool that's
+    /// short the input asset instead.
+    #[test]
+    fn test_split_cs_prefers_more_imbalanced_pool() {
+        let cs = |byte: u8, r_in: i64, r_out: i64| PoolView {
+            ident: Ident::new(&[byte]),
+            reserve_in: BigInt::from(r_in),
+            reserve_out: BigInt::from(r_out),
+            fee_num: 3,
+            fee_den: 1000,
+            view_type: PoolViewType::ConstantSum {
+                price_in: BigInt::from(1),
+                price_out: BigInt::from(1),
+            },
+        };
+        // Both trade 1:1 at the same fee, so they quote the same output. The
+        // first is balanced; the second is short the input asset (200k vs 1.8M),
+        // so taking in the input asset rebalances it.
+        let balanced = cs(0x01, 1_000_000, 1_000_000);
+        let imbalanced = cs(0x02, 200_000, 1_800_000);
+        let dx = BigInt::from(100_000);
+
+        let splits = optimize_split(&[balanced.clone(), imbalanced.clone()], &dx);
+
+        assert_eq!(splits.len(), 1, "equal-price CS pools should not split");
+        assert_eq!(
+            splits[0].pool.ident, imbalanced.ident,
+            "should route to the more-imbalanced pool",
+        );
+        assert_eq!(splits[0].input_amount, dx);
+
+        // The balanced pool scores negative (the swap unbalances it); the
+        // short-input pool positive (the swap rebalances it).
+        assert!(tiebreak_score(&balanced, &dx).is_negative());
+        assert!(tiebreak_score(&imbalanced, &dx).is_positive());
     }
 }
