@@ -748,12 +748,20 @@ pub fn resolve_proportional_deposit(
                 let lp_minted = &after_lp - total_lp;
                 (dx, lp_minted, Some(t))
             }
-            // Constant product: the validator only bounds LP by per-asset
-            // proportionality (`after_i·lp_b >= before_i·lp_a`), so mint by
-            // the worst offered ratio and take just enough of each asset:
-            //   minted  = min_i floor(offered_i·lp_b/r_i)
-            //   delta_i = ceil(r_i·minted/lp_b)   (satisfies the bound)
-            crate::sundaev4::types::PoolType::ConstantProduct { .. } => {
+            // Constant product AND concentrated liquidity share the same
+            // proportional pinning. CP's validator bounds LP by per-asset
+            // proportionality (`after_i·lp_b >= before_i·lp_a`); CL's non-swap
+            // check is the virtual-reserve product `va1·vb1·L0² >= va0·vb0·L1²`
+            // (cl_check.ak). Ceil-pinning each reserve delta to the worst
+            // offered ratio makes `a1·L0 >= a0·L1` hold PER ASSET — and those
+            // per-asset bounds multiply to exactly CL's product invariant. So
+            // the identical fill is chain-valid for both curves:
+            //   minted  = min_i floor(offered_i·L0/r_i)
+            //   delta_i = ceil(r_i·minted/L0)
+            // (L0 = total_lp = the CL virtual liquidity). A CL-specific
+            // property test asserts the product invariant on the generated fill.
+            crate::sundaev4::types::PoolType::ConstantProduct { .. }
+            | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
                 let mut minted: Option<BigInt> = None;
                 for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
                     if r.is_zero() { continue; }
@@ -766,8 +774,9 @@ pub fn resolve_proportional_deposit(
                 let minted = minted.unwrap_or_else(|| BigInt::from(0));
                 if !minted.is_positive() {
                     return Err(
-                        "deposit can't be filled — a constant-product deposit \
-                         must offer every pool asset in proportion"
+                        "deposit can't be filled — a constant-product or \
+                         concentrated-liquidity deposit must offer every pool \
+                         asset in proportion"
                             .into(),
                     );
                 }
@@ -777,11 +786,6 @@ pub fn resolve_proportional_deposit(
                     .map(|r| (*r * &minted + total_lp - &one) / total_lp)
                     .collect();
                 (dx, minted, None)
-            }
-            // Concentrated liquidity: no deposit support yet — the invariant
-            // needs its own pinning scheme. Refuse rather than guess.
-            crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
-                return Err("deposits into concentrated-liquidity pools aren't supported yet".into());
             }
         };
 
@@ -1020,6 +1024,137 @@ mod tests {
             BigInt::from(1_500_000i64),
             slot,
         ))
+    }
+
+    // A concentrated-liquidity pool over (ada, token_a) with the given reserves,
+    // total LP (the virtual liquidity L), and sqrt-price bounds as (num, den).
+    fn make_cl_pool(
+        a_reserve: i64,
+        b_reserve: i64,
+        total_lp: i64,
+        spa: (i64, i64),
+        spb: (i64, i64),
+    ) -> Arc<SundaeV4Pool> {
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(a_reserve));
+        value.insert(&token_a(), BigInt::from(b_reserve));
+        Arc::new(SundaeV4Pool {
+            input: TransactionInput::new([0xcc; 32].into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: vec![
+                    (ada(), BigInt::from(a_reserve)),
+                    (token_a(), BigInt::from(b_reserve)),
+                ],
+                total_lp: BigInt::from(total_lp),
+                circulating_lp: BigInt::from(total_lp / 2),
+                preminted_lp: BigInt::from(total_lp / 2),
+                identifier: Ident::new(&[0xde, 0xad]),
+                actions: vec![],
+                module_state: vec![],
+            },
+            pool_type: PoolType::ConcentratedLiquidity {
+                sqrt_price_a: Rational { num: BigInt::from(spa.0), den: BigInt::from(spa.1) },
+                sqrt_price_b: Rational { num: BigInt::from(spb.0), den: BigInt::from(spb.1) },
+                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            },
+            slot: 100,
+            fee_split_config: None,
+        })
+    }
+
+    // A deposit order offering (ada, token_a) amounts. min_received names the
+    // pool's LP token (label 0014df10 || ident[0xde,0xad]) so the resolver's LP
+    // floor check matches.
+    fn make_deposit_order(offer_a: i64, offer_b: i64, min_lp: i64) -> Arc<SundaeV4Order> {
+        let lp_asset = AssetClass {
+            policy: vec![],
+            token: vec![0x00, 0x14, 0xdf, 0x10, 0xde, 0xad],
+        };
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(offer_a));
+        value.insert(&token_a(), BigInt::from(offer_b));
+        let offered_bi = vec![
+            (ada(), BigInt::from(offer_a)),
+            (token_a(), BigInt::from(offer_b)),
+        ];
+        let min_received = vec![(lp_asset.clone(), BigInt::from(min_lp))];
+        let mut order = SundaeV4Order::test_swap_order(
+            TransactionInput::new([0x7d; 32].into(), 0),
+            value,
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (ada(), BigInt::from(offer_a)),
+            (lp_asset, BigInt::from(min_lp)),
+            BigInt::from(1_500_000i64),
+            1,
+        );
+        order.constraint = Constraint::Deposit {
+            offered: offered_bi,
+            min_received,
+        };
+        Arc::new(order)
+    }
+
+    // The on-chain CL non-swap invariant (cl_check.ak): the resolved deposit
+    // fill must satisfy va1·vb1·L0² >= va0·vb0·L1².
+    fn cl_invariant_holds(
+        a0: &BigInt,
+        b0: &BigInt,
+        l0: &BigInt,
+        da: &BigInt,
+        db: &BigInt,
+        dl: &BigInt,
+        spa: (i64, i64),
+        spb: (i64, i64),
+    ) -> bool {
+        let (span, spad) = (BigInt::from(spa.0), BigInt::from(spa.1));
+        let (spbn, spbd) = (BigInt::from(spb.0), BigInt::from(spb.1));
+        let l1 = l0 + dl;
+        let a1 = a0 + da;
+        let b1 = b0 + db;
+        let va0 = a0 * &spbn + l0 * &spbd;
+        let vb0 = b0 * &spad + l0 * &span;
+        let va1 = &a1 * &spbn + &l1 * &spbd;
+        let vb1 = &b1 * &spad + &l1 * &span;
+        &va1 * &vb1 * l0 * l0 >= &va0 * &vb0 * &l1 * &l1
+    }
+
+    #[test]
+    fn test_cl_deposit_satisfies_invariant() {
+        let spa = (1, 2);
+        let spb = (2, 1);
+        // Non-proportional offer (token_a surplus) into an imbalanced CL pool.
+        let cases: [(i64, i64, i64, i64, i64); 3] = [
+            // (aReserve, bReserve, totalLp, offerA, offerB)
+            (1_000_000, 2_000_000, 1_000_000, 100_000, 500_000),
+            (3_333_331, 991_237, 1_777_777, 250_000, 90_000),
+            (10_000_000, 10_000_000, 5_000_000, 12_345, 67_890),
+        ];
+        for (ar, br, lp, oa, ob) in cases {
+            let pool = make_cl_pool(ar, br, lp, spa, spb);
+            let order = make_deposit_order(oa, ob, 1);
+            let resolved = resolve_proportional_deposit(&pool, &order)
+                .expect("CL deposit should resolve");
+            assert!(resolved.lp_minted.is_positive(), "mints LP");
+            // Never consumes more than offered.
+            assert!(resolved.dx[0] <= BigInt::from(oa));
+            assert!(resolved.dx[1] <= BigInt::from(ob));
+            // The generated fill is chain-valid under the CL invariant.
+            assert!(
+                cl_invariant_holds(
+                    &BigInt::from(ar),
+                    &BigInt::from(br),
+                    &BigInt::from(lp),
+                    &resolved.dx[0],
+                    &resolved.dx[1],
+                    &resolved.lp_minted,
+                    spa,
+                    spb,
+                ),
+                "CL non-swap invariant must hold for the resolved deposit",
+            );
+        }
     }
 
     #[test]
