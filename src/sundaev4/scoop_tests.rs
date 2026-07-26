@@ -17,6 +17,282 @@ mod tests {
 
     const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
 
+    /// Reproduces the live router-parity divergence (order 84e3e4c8): the Go
+    /// resolver blends the direct f46671fb leg with a multi-hop MNGO→tOKENA→MINT
+    /// leg for 374G, but the scooper's find_blended_route single-hops (direct
+    /// split across the MNGO/MINT pools) for only 362G. token_a=MINT, token_b=
+    /// MNGO, token_e=tOKENA. Exact live reserves.
+    #[test]
+    fn repro_router_parity_84e3e4c8() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = BTreeMap::new();
+        for p in [
+            // Direct MNGO/MINT pools (token_a=MINT, token_b=MNGO).
+            make_cl_pool(&env, 0x46, token_a(), 349_594_488_343, token_b(), 53_852_218_245,
+                6_765_584_440_427, 97, 100, 103, 100, 5, 10000), // f46671fb
+            make_cl_pool(&env, 0x80, token_a(), 125_000_000_000, token_b(), 125_000_000_000,
+                1_309_382_102_236, 90, 100, 110, 100, 5, 10000), // 80c8d105
+            make_cl_pool(&env, 0xb5, token_a(), 75_100_000_000, token_b(), 74_899_865_896,
+                495_795_726_371, 85, 100, 118, 100, 10, 10000),  // b56479f5
+            make_pool(&env, 0xc2, token_a(), 125_000_000_000, token_b(), 125_000_000_000), // c21bd0b9 CP
+            make_cl_pool(&env, 0x65, token_a(), 144_196_000_000, token_b(), 0,
+                4_000_000_000_000, 1095, 1000, 1140, 1000, 30, 10000), // 65fe0a9e (value-losing)
+            // Multi-hop legs: MNGO→tOKENA (3f94fbd6), tOKENA→MINT (ea58fe73).
+            make_pool(&env, 0x3f, token_e(), 300_000_000_000, token_b(), 150_000_000_000), // tOKENA/MNGO
+            make_pool(&env, 0xea, token_e(), 200_000_000_000, token_a(), 100_000_000_000), // tOKENA/MINT
+            // ADA legs: MNGO→ADA (a22550f2), ADA→MINT (31bba660).
+            make_pool(&env, 0xa2, token_f(), 62_500_000_000, token_b(), 25_000_000_000),   // ADA/MNGO
+            make_pool(&env, 0x31, token_f(), 625_000_000_000, token_a(), 250_000_000_000), // ADA/MINT
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+
+        let order = make_order(token_b(), 400_000_000_000, token_a(), 1, 1);
+        // Order budget: 5 ADA → max_pools=5, max_steps=10 (cost 1/0.5 ADA).
+        let limits = router::RoutingLimits::from_budget(5_000_000, 1_000_000, 500_000);
+
+        let blend = router::find_blended_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, limits,
+        ).expect("route exists");
+        eprintln!("=== blend: branches={} total_out={}", blend.branches.len(), blend.total_output);
+        for (bi, br) in blend.branches.iter().enumerate() {
+            for (hi, hop) in br.hops.iter().enumerate() {
+                for sp in &hop.splits {
+                    eprintln!("  b{bi} h{hi} pool={} in={} out={}",
+                        hex::encode(&sp.pool.ident.to_bytes()[..1]), sp.input_amount, sp.output_amount);
+                }
+            }
+        }
+        let single = router::find_optimal_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, limits,
+        ).expect("single route exists");
+        eprintln!("=== find_optimal_route: hops={} total_out={}", single.hops.len(), single.total_output);
+
+        // The full blend fits max_pools=5 (direct 1 + tOKENA 2 + ADA 2), so it
+        // isn't pruned; it must beat the single-hop answer.
+        assert!(blend.branches.len() >= 2, "expected a multi-branch blend at 5-pool budget");
+        assert!(blend.total_output > single.total_output, "blend must beat single-hop");
+
+        // TIGHT budget (3 pools): the full 5-pool blend now exceeds the budget.
+        // Budget-aware pruning must find the best route that FITS 3 pools (direct
+        // + ONE multi-hop leg) rather than collapsing to the single-hop fallback.
+        let tight = router::RoutingLimits::from_budget(3_000_000, 1_000_000, 500_000);
+        let tight_single = router::find_optimal_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, tight,
+        ).expect("tight single exists");
+        let tight_blend = router::find_blended_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, tight,
+        ).expect("tight blend exists");
+        let tpools: std::collections::BTreeSet<_> = tight_blend.branches.iter()
+            .flat_map(|b| b.hops.iter()).flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone()))
+            .collect();
+        eprintln!("=== TIGHT(3): branches={} pools={} total_out={} (single={})",
+            tight_blend.branches.len(), tpools.len(), tight_blend.total_output, tight_single.total_output);
+        assert!(tpools.len() <= 3, "pruned blend must fit the 3-pool budget, used {}", tpools.len());
+        assert!(tight_blend.total_output > tight_single.total_output,
+            "budget-aware pruning must beat single-hop, not fall back to it");
+    }
+
+    /// Exact reproduction of the live quarantine (order 565ec5d3), a
+    /// tOKENE→tOKENB swap of 400G against the live tOKENB/tOKENE v4 pool set.
+    ///
+    /// Root cause (confirmed against production): the order carries the
+    /// ROUTE-ORDER constraint module (alongside swap + fairness), which forbids
+    /// parallel blending. The optimizer's best answer is a 5-way split (fillable,
+    /// output 364.7G ≥ the 363.3G floor), but the route module forces
+    /// `collapse_to_serial`, which routes the WHOLE 400G through the single
+    /// deepest pool (f46671fb). f46671fb's cl_max_dx ≈ 363.6G, so 400G over-drains
+    /// (dy≈383G > 350G reserve). collapse_to_serial must REJECT that (→ order
+    /// skipped) rather than emit an over-draining serial route. This test asserts
+    /// both the blended path (fillable) and the collapse path (rejected) are safe.
+    #[test]
+    fn repro_565ec5d3_f46671fb_over_drain() {
+        use std::collections::BTreeMap;
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        // token_a = tOKENB (asset A / idx0), token_b = tOKENE (asset B / idx1).
+        // The FULL live tOKENB/tOKENE v4 pool set on preview (dumped from the
+        // scooper at the time of the quarantine), so the router's path search
+        // sees exactly what it saw in production.
+        let mut pool_map = BTreeMap::new();
+        for p in [
+            // f46671fb — the tight pool that over-drained (350G B / 53.45G E).
+            make_cl_pool(&env, 0x46, token_a(), 350_000_000_000, token_b(), 53_452_218_245,
+                6_765_375_373_647, 97, 100, 103, 100, 5, 10000),
+            // 80c8d105 — mid CL, wider range [0.9,1.1].
+            make_cl_pool(&env, 0x80, token_a(), 125_000_000_000, token_b(), 125_000_000_000,
+                1_309_382_102_236, 90, 100, 110, 100, 5, 10000),
+            // b56479f5 — CL, range [0.85,1.18].
+            make_cl_pool(&env, 0xb5, token_a(), 75_100_000_000, token_b(), 74_899_865_896,
+                495_795_726_371, 85, 100, 118, 100, 10, 10000),
+            // c21bd0b9 — constant-product 125G/125G.
+            make_pool(&env, 0xc2, token_a(), 125_000_000_000, token_b(), 125_000_000_000),
+            // 65fe0a9e — dormant one-sided CL (all B, 0 E, parked out of range).
+            make_cl_pool(&env, 0x65, token_a(), 144_196_000_000, token_b(), 0,
+                4_000_000_000_000, 1095, 1000, 1140, 1000, 30, 10000),
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+
+        let order = make_order(token_b(), 400_000_000_000, token_a(), 1, 1);
+
+        // Exercise the PRODUCTION routing entrypoint (find_blended_route), the
+        // same one scooper.rs dispatches swaps through — not find_optimal_route
+        // directly. A single-branch blend (branches=1) is exactly what the live
+        // quarantine produced.
+        // Exercise the PRODUCTION routing entrypoint (find_blended_route). With
+        // the value-preservation cap, the dormant bimodal pool (65fe0a9e, range
+        // [1.199,1.30], spa>1) is excluded — a B-input swap into it is
+        // value-losing (its fee_budget goes negative, which the pool contract
+        // rejects). So the order must route cleanly through the healthy pools and
+        // ACCUMULATE OK — no over-drain, no fee_budget<0 leg, no quarantine.
+        let blend = router::find_blended_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("healthy pools can route the order");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let result = match blend.as_single() {
+            Some(single) => accum.try_add_routed_order(&order, single, &pool_map),
+            None => accum.try_add_blended_order(&order, &blend, &pool_map),
+        };
+        assert!(
+            result.is_ok(),
+            "value cap should let the order fill via the healthy pools, got: {result:?}"
+        );
+        // And the winning route must not touch the excluded bimodal pool.
+        for br in &blend.branches {
+            for hop in &br.hops {
+                for sp in &hop.splits {
+                    assert_ne!(
+                        sp.pool.ident.to_bytes().first().copied(),
+                        Some(0x65),
+                        "route used the value-losing bimodal pool 65fe0a9e"
+                    );
+                }
+            }
+        }
+
+        // The order in production carries the route-constraint MODULE, which
+        // forbids parallel blending: scooper.rs collapses the blended split to a
+        // serial single-split chain (collapse_to_serial), routing the WHOLE 400G
+        // through the deepest single pool (f46671fb). f46671fb can only absorb
+        // ~363.6G, so the collapse must be REJECTED (None) — never a route that
+        // sends 400G through it and over-drains. This is the exact live path.
+        if let Some(single) = router::find_optimal_route(
+            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        ) {
+            let collapsed = router::collapse_to_serial(&single, &order.swap_offered().1);
+            eprintln!("=== collapse_to_serial → {}",
+                collapsed.as_ref().map(|c| format!("Some(in={}, out={})", c.total_input, c.total_output))
+                    .unwrap_or_else(|| "None (skipped)".into()));
+            if let Some(serial) = collapsed {
+                let mut accum = Accumulator::new(env.exec.protocol_share);
+                if let Err(e) = accum.try_add_routed_order(&order, &serial, &pool_map) {
+                    assert!(
+                        !e.contains("over-drain"),
+                        "collapse_to_serial produced an over-draining serial route: {e}"
+                    );
+                }
+            }
+        }
+        // (No route is also acceptable — the order genuinely can't fill via one
+        // capped pool. What's NOT acceptable is a route that over-drains.)
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// INTEGRATION INVARIANT: every route the router produces must be
+        /// fillable — accumulating it must never over-drain a pool. This is the
+        /// live quarantine class (the router handed the accumulator a leg — 400k
+        /// into a tight CL pool — whose real dy blew past the pool's reserve). A
+        /// failure here is a router↔accumulator disagreement, not a bad order.
+        #[test]
+        fn router_route_never_over_drains(
+            specs in prop::collection::vec(
+                (0u8..3u8,                            // 0=CP 1=CS 2=CL
+                 1i64..2_000_000_000_000i64,          // reserve a (production scale)
+                 1i64..2_000_000_000_000i64,          // reserve b
+                 1i64..20_000_000_000_000i64,         // total_lp (CL) — lp≫reserve like live
+                 1i64..100_000i64, 1i64..100_000i64,  // sqrt_price_a num/den (incl. tight ranges)
+                 1i64..100_000i64, 1i64..100_000i64), // sqrt_price_b num/den
+                2..5usize,
+            ),
+            a_to_b in any::<bool>(),
+            amount in 1i64..8_000_000_000_000i64, // spans oversized inputs that drain pools
+        ) {
+            use std::collections::BTreeMap;
+            use crate::sundaev4::accumulator::Accumulator;
+            use crate::sundaev4::router;
+            use crate::sundaev4::types::Rational;
+
+            let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+            let mut pool_map = BTreeMap::new();
+            for (i, (curve, ra, rb, lp, san, sad, sbn, sbd)) in specs.iter().enumerate() {
+                let id = (0x10 + i) as u8;
+                let pool = match *curve {
+                    0 => make_pool(&env, id, token_a(), *ra, token_b(), *rb),
+                    1 => make_cs_pool(
+                        &env, id,
+                        vec![(token_a(), *ra), (token_b(), *rb)],
+                        vec![BigInt::from(1), BigInt::from(1)],
+                        Rational { num: BigInt::from(30), den: BigInt::from(10000) },
+                    ),
+                    _ => {
+                        // Order sqrt bounds so spa < spb; skip degenerate equal.
+                        let (san, sad, sbn, sbd) = if san * sbd < sbn * sad {
+                            (*san, *sad, *sbn, *sbd)
+                        } else {
+                            (*sbn, *sbd, *san, *sad)
+                        };
+                        if san * sbd == sbn * sad { continue; }
+                        make_cl_pool(&env, id, token_a(), *ra, token_b(), *rb, *lp,
+                                     san, sad, sbn, sbd, 30, 10000)
+                    }
+                };
+                pool_map.insert(pool.pool_datum.identifier.clone(), pool);
+            }
+
+            if !pool_map.is_empty() {
+                let (offer, ask) = if a_to_b { (token_a(), token_b()) } else { (token_b(), token_a()) };
+                let order = make_order(offer.clone(), amount, ask.clone(), 1, 1);
+                if let Some(blend) = router::find_blended_route(
+                    &pool_map, &[], &offer, &ask, &order.swap_offered().1,
+                    router::RoutingLimits::unlimited(),
+                ) {
+                    let mut accum = Accumulator::new(env.exec.protocol_share);
+                    let result = match blend.as_single() {
+                        Some(single) => accum.try_add_routed_order(&order, single, &pool_map),
+                        None => accum.try_add_blended_order(&order, &blend, &pool_map),
+                    };
+                    if let Err(e) = result {
+                        // Two router↔contract disagreements a route must never
+                        // contain: an over-draining leg (dy > reserve) and a
+                        // value-losing leg (fee_budget < 0, which the pool
+                        // contract's check_lp_accounting rejects). The random
+                        // sqrt bounds include range-above-1.0 (spa>1) CL pools,
+                        // so this exercises the value-preservation cap.
+                        prop_assert!(
+                            !e.contains("over-drain") && !e.contains("lose value"),
+                            "router produced an unfillable route: {} \
+                             (amount={amount}, a_to_b={a_to_b}, n_pools={})",
+                            e, pool_map.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_fixture_loads() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);

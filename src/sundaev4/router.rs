@@ -146,35 +146,48 @@ pub struct RoutingPlan {
 /// naturally — CP — or by the input value — CS). For CL, checks against
 /// `cl_max_dx_for_reserve`.
 fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
+    match pool_absorb_cap(pool) {
+        // Unbounded (CP): always absorbs.
+        None => true,
+        // Bounded: dx must fit under the cap. `Some(0)`/negative cap ⇒ nothing
+        // fits (a saturated CS/CL pool, or one whose max_dx solver bailed).
+        Some(cap) => dx <= &cap,
+    }
+}
+
+/// The largest `dx` a pool can absorb before its `dy` exceeds `reserve_out`
+/// (which the on-chain `amt_after >= 0` check rejects). `None` means unbounded
+/// (constant-product — its `dy` approaches but never reaches `reserve_out`).
+/// A bounded pool whose solver can't produce a cap returns `Some(0)` so callers
+/// treat it as unable to absorb anything, never as unbounded.
+fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
-        PoolViewType::ConstantProduct => true,
+        PoolViewType::ConstantProduct => None,
         PoolViewType::Conversion { rate_num, rate_den, .. } => {
-            // Depth-limited by the view's reserve_out (output units).
+            // Depth-limited by the view's reserve_out (output units): solve the
+            // largest dx whose post-fee, rate-converted output fits reserve_out.
+            //   dx_eff · rate_num/rate_den ≤ reserve_out
+            //   dx_eff ≤ reserve_out · rate_den / rate_num
+            //   dx     = dx_eff · fee_den / fee_mult
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
-            let dx_eff = dx - &(dx * &fee_num / &fee_den);
-            &dx_eff * rate_num / rate_den <= pool.reserve_out
+            let fee_mult = &fee_den - &fee_num;
+            if !fee_mult.is_positive() || !rate_num.is_positive() {
+                return Some(BigInt::from(0));
+            }
+            let dx_eff_max = &pool.reserve_out * rate_den / rate_num;
+            Some(&dx_eff_max * &fee_den / &fee_mult)
         }
         PoolViewType::ConstantSum { price_in, price_out } => {
-            // A CS pool can only absorb `dx` if the resulting `dy` fits its
-            // output reserve; a larger fill drains the pool negative and fails
-            // the on-chain `amt_after >= 0` check. Cap it like CL rather than
-            // relying on `pool_output`'s post-hoc clamp (which breaks value
-            // conservation when CS saturates).
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
             let prices = [price_in.clone(), price_out.clone()];
-            match swap_math::cs_max_dx_for_reserve(
-                &pool.reserve_out,
-                &prices,
-                0,
-                1,
-                &fee_num,
-                &fee_den,
-            ) {
-                Some(cap) => dx <= &cap,
-                None => false,
-            }
+            Some(
+                swap_math::cs_max_dx_for_reserve(
+                    &pool.reserve_out, &prices, 0, 1, &fee_num, &fee_den,
+                )
+                .unwrap_or_else(|| BigInt::from(0)),
+            )
         }
         PoolViewType::ConcentratedLiquidity {
             is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
@@ -186,14 +199,32 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
             };
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
-            match swap_math::cl_max_dx_for_reserve(
+            // Cap 1: don't drain the output reserve below zero.
+            let reserve_cap = match swap_math::cl_max_dx_for_reserve(
                 a, b, lp, *is_a_input, spa_num, spa_den, spb_num, spb_den,
                 &fee_num, &fee_den,
             ) {
-                Some(cap) => dx <= &cap,
-                None => false,
-            }
+                Some(cap) => cap,
+                None => return Some(BigInt::from(0)),
+            };
+            // Cap 2: don't push the swap into its value-losing range (the pool
+            // contract rejects fee_budget < 0). For a healthy in-range pool this
+            // returns reserve_cap unchanged; for a pool swapped in its
+            // value-losing direction it returns ~0, excluding it from routing.
+            Some(swap_math::cl_max_dx_value_preserving(
+                a, b, lp, &reserve_cap, *is_a_input,
+                spa_num, spa_den, spb_num, spb_den, &fee_num, &fee_den,
+            ))
         }
+    }
+}
+
+/// Clamp an allocation to what the pool can actually absorb, so no emitted
+/// split ever over-drains. Unbounded (CP) pools pass through unchanged.
+fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
+    match pool_absorb_cap(pool) {
+        Some(cap) if dx > &cap => cap,
+        _ => dx.clone(),
     }
 }
 
@@ -475,14 +506,33 @@ fn tiebreak_score(pool: &PoolView, dx: &BigInt) -> BigInt {
 ///
 /// Returns `SplitEntry` for each pool with positive allocation.
 pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntry> {
+    // Drop pools that can't absorb ANY value-preserving input (absorb cap 0) —
+    // e.g. a CL pool swapped in its value-losing direction. Leaving one in would
+    // let the λ-search allocate to it, then `clamp_to_absorb` would zero that
+    // allocation, dropping the routed sum below `total_input` and failing the
+    // whole path. Excluding it up front lets the split fill via the real pools.
+    let kept: Vec<PoolView> = pools
+        .iter()
+        .filter(|p| pool_absorb_cap(p) != Some(BigInt::from(0)))
+        .cloned()
+        .collect();
+    let pools = kept.as_slice();
     if pools.is_empty() {
         return vec![];
     }
     if pools.len() == 1 {
-        let out = pool_output(&pools[0], total_input);
+        // Clamp to the pool's absorb cap: a lone CL/CS pool can't take the full
+        // input if that would drive its dy past reserve_out. An undersized
+        // result lets `evaluate_path` reject the path (sum < input) rather than
+        // handing the accumulator an over-draining leg.
+        let alloc = clamp_to_absorb(&pools[0], total_input);
+        if !alloc.is_positive() {
+            return vec![];
+        }
+        let out = pool_output(&pools[0], &alloc);
         return vec![SplitEntry {
             pool: pools[0].clone(),
-            input_amount: total_input.clone(),
+            input_amount: alloc,
             output_amount: out,
         }];
     }
@@ -507,6 +557,16 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     let mut best_tiebreak = BigInt::from(0);
 
     for (i, pool) in pools.iter().enumerate() {
+        // A single-pool route is only valid if the pool can actually ABSORB the
+        // full input. `pool_output` caps the *output* at reserve_out, so an
+        // over-capacity pool still looks like it yields `reserve_out` — but we'd
+        // allocate the whole *input* to it, and the scoop then drains it past
+        // zero. Pools that can't take it all are left to the water-fill split
+        // below (which caps per-pool). If NO pool can solo it, the split path
+        // fills what it can and `evaluate_path` rejects an under-routed sum.
+        if !pool_can_absorb(pool, total_input) {
+            continue;
+        }
         let out = pool_output(pool, total_input);
         let tie = tiebreak_score(pool, total_input);
         if out > best_output
@@ -592,14 +652,23 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         // detects sum < total_input and rejects the path.
     }
 
-    // Build results
+    // Build results. Clamp each allocation to the pool's absorb cap as a final
+    // backstop: whatever the bisection/scaling produced, no SplitEntry may carry
+    // an input whose dy would exceed reserve_out. `pool_output` masks over-drains
+    // (it clamps the *output* at reserve_out), so an over-allocated CL pool would
+    // otherwise slip through here looking optimal and over-drain at accumulate
+    // time. An undersized sum is caught by `evaluate_path` (path rejected).
     let mut results = Vec::new();
     for (i, pool) in pools.iter().enumerate() {
         if best_allocs[i].is_positive() {
-            let out = pool_output(pool, &best_allocs[i]);
+            let alloc = clamp_to_absorb(pool, &best_allocs[i]);
+            if !alloc.is_positive() {
+                continue;
+            }
+            let out = pool_output(pool, &alloc);
             results.push(SplitEntry {
                 pool: pool.clone(),
-                input_amount: best_allocs[i].clone(),
+                input_amount: alloc,
                 output_amount: out,
             });
         }
@@ -1011,15 +1080,29 @@ pub fn collapse_to_serial(plan: &RoutingPlan, input: &BigInt) -> Option<RoutingP
         // Only the entry hop's input_amount is read downstream (later
         // single-split hops cascade the previous hop's actual output).
         let hop_input = if hop_idx == 0 { input.clone() } else { best.input_amount.clone() };
+        // Collapsing routes the WHOLE hop flow through this one pool, which can
+        // be far more than the split it was allocated (the optimizer split the
+        // hop precisely because no single pool could absorb it all). If the
+        // chosen pool can't take the collapsed input, there is no valid serial
+        // single-split chain — reject so the caller skips the order rather than
+        // handing the accumulator an over-draining leg (a route-module order
+        // can't blend across pools, so it genuinely can't be served here).
+        if !pool_can_absorb(&best.pool, &hop_input) {
+            return None;
+        }
+        // The kept split's stored output is a stale estimate at its *original*
+        // (smaller) allocation; recompute honestly at the collapsed input so
+        // total_output isn't a lie the min_received check would rely on.
+        let hop_output = pool_output(&best.pool, &hop_input);
         hops.push(HopResult {
             input_token: hop.input_token.clone(),
             output_token: hop.output_token.clone(),
             splits: vec![SplitEntry {
                 pool: best.pool.clone(),
                 input_amount: hop_input,
-                output_amount: best.output_amount.clone(),
+                output_amount: hop_output.clone(),
             }],
-            total_output: best.output_amount.clone(),
+            total_output: hop_output,
         });
     }
     let total_output = hops.last()?.total_output.clone();
@@ -1190,6 +1273,37 @@ pub fn find_blended_route(
         .map(|h| h.splits.len())
         .sum();
     if distinct_pools.len() > limits.max_pools || total_steps > limits.max_steps {
+        // The blend beats `single` but spends more pools/steps than the order's
+        // fee budget affords. Rather than throw it away and collapse to a single
+        // hop, drop the least-valuable pool in the blend and re-solve. Repeated
+        // pruning converges on the best route that FITS the budget — e.g. it
+        // trims a redundant per-hop split so the freed pool slot can fund a
+        // multi-hop leg. Only real (map) pools are prunable; conversion edges
+        // aren't, so they're skipped.
+        let mut contrib: std::collections::BTreeMap<Ident, BigInt> = Default::default();
+        for b in &branches {
+            for h in &b.hops {
+                for sp in &h.splits {
+                    if pools.contains_key(&sp.pool.ident) {
+                        let e = contrib
+                            .entry(sp.pool.ident.clone())
+                            .or_insert_with(|| BigInt::from(0));
+                        *e = &*e + &sp.output_amount;
+                    }
+                }
+            }
+        }
+        if let Some((weakest, _)) = contrib.into_iter().min_by(|a, b| a.1.cmp(&b.1)) {
+            let mut reduced = pools.clone();
+            reduced.remove(&weakest);
+            if let Some(pruned) = find_blended_route(
+                &reduced, conversions, input_token, output_token, amount, limits,
+            ) {
+                if pruned.total_output > single.total_output {
+                    return Some(pruned);
+                }
+            }
+        }
         return Some(single_plan(single));
     }
 

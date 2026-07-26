@@ -677,6 +677,77 @@ pub(crate) mod test_harness {
         })
     }
 
+    /// A concentrated-liquidity pool. Only the router/accumulator fields matter
+    /// (pool_type, assets, total_lp) — module_state is left CP-shaped since the
+    /// property tests exercise routing + accumulation, not on-chain eval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_cl_pool(
+        env: &TestEnv,
+        ident_byte: u8,
+        tok_a: AssetClass,
+        tok_a_reserve: i64,
+        tok_b: AssetClass,
+        tok_b_reserve: i64,
+        total_lp: i64,
+        spa_num: i64,
+        spa_den: i64,
+        spb_num: i64,
+        spb_den: i64,
+        fee_num: i64,
+        fee_den: i64,
+    ) -> Arc<SundaeV4Pool> {
+        let ident_bytes = vec![ident_byte; 28];
+        let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+        nft_name.extend_from_slice(&ident_bytes);
+        let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+        lp_name.extend_from_slice(&ident_bytes);
+        let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+        let nft_asset = AssetClass { policy: pool_mint_policy.clone(), token: nft_name };
+        let lp_asset = AssetClass { policy: pool_mint_policy, token: lp_name };
+
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(50_000_000i64));
+        if tok_a_reserve > 0 {
+            value.insert(&tok_a, BigInt::from(tok_a_reserve));
+        }
+        if tok_b_reserve > 0 {
+            value.insert(&tok_b, BigInt::from(tok_b_reserve));
+        }
+        value.insert(&nft_asset, BigInt::from(1i64));
+        value.insert(&lp_asset, BigInt::from(total_lp));
+
+        let mut tx_hash = [0u8; 32];
+        tx_hash[0] = ident_byte;
+
+        Arc::new(SundaeV4Pool {
+            input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+            value,
+            pool_datum: PoolDatum {
+                assets: vec![
+                    (tok_a, BigInt::from(tok_a_reserve)),
+                    (tok_b, BigInt::from(tok_b_reserve)),
+                ],
+                total_lp: BigInt::from(total_lp),
+                circulating_lp: BigInt::from(total_lp),
+                preminted_lp: BigInt::from(0i64),
+                identifier: Ident::new(&ident_bytes),
+                actions: vec![ActionEntry {
+                    tag: BigInt::from(100),
+                    enabled: true,
+                    modules: env.action_modules(),
+                }],
+                module_state: env.module_state(),
+            },
+            pool_type: PoolType::ConcentratedLiquidity {
+                sqrt_price_a: Rational { num: BigInt::from(spa_num), den: BigInt::from(spa_den) },
+                sqrt_price_b: Rational { num: BigInt::from(spb_num), den: BigInt::from(spb_den) },
+                fee: Rational { num: BigInt::from(fee_num), den: BigInt::from(fee_den) },
+            },
+            slot: 100,
+            fee_split_config: None,
+        })
+    }
+
     /// Create a constant-sum pool with the proper module pipeline (CS + FS + fairness).
     ///
     /// Similar to `make_pool` but uses CS module scripts and PoolType::ConstantSum.

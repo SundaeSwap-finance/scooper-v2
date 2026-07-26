@@ -193,6 +193,9 @@ impl Accumulator {
             &effective_pool.pool_type,
         )?;
 
+        // (The over-drain guard lives on the production admission path,
+        // add_route_branch_inner. try_add_order is only reached from tests.)
+
         // Capture reserves before update for fee budget computation
         let prev_assets = accum.running_assets.clone();
 
@@ -592,6 +595,20 @@ impl Accumulator {
                     return Err(format!("zero output from pool {}", pool_ident));
                 }
 
+                // Never emit a leg that drains a pool below zero. The pool
+                // contract rejects it (check_reserves_covered: `amount >= 0`),
+                // so building + evaluating it is wasted work ending in a
+                // quarantine loop. Reject the order up front instead — an
+                // over-allocated leg (the router put more input into this pool
+                // than its output reserve can cover) fails fast here.
+                if dy > accum.running_assets[output_idx].1 {
+                    return Err(format!(
+                        "leg would over-drain pool {pool_ident} output reserve \
+                         (dy={dy} > running reserve={})",
+                        accum.running_assets[output_idx].1
+                    ));
+                }
+
                 // Capture reserves before update for fee budget computation
                 let prev_assets = accum.running_assets.clone();
 
@@ -609,6 +626,20 @@ impl Accumulator {
                     &accum.running_assets,
                     &accum.running_total_lp,
                 );
+                // A swap must never drive the pool's fee budget negative — that
+                // means the leg lost the pool value, and the pool contract's
+                // check_lp_accounting (circulating_lp <= total_lp) rejects it,
+                // quarantining the order. The router's value-preservation cap
+                // (cl_max_dx_value_preserving) should already prevent this; this
+                // is the fail-fast backstop so a mispriced leg can never build an
+                // invalid tx. (Currently trips for B-input swaps on range-above-
+                // 1.0 CL pools — the spa_num/spa_den slip filed for audit.)
+                if fb.is_negative() {
+                    return Err(format!(
+                        "leg would make pool {pool_ident} lose value \
+                         (fee_budget={fb} < 0); swap outside its value-preserving range"
+                    ));
+                }
                 accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
                 let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
                 let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;

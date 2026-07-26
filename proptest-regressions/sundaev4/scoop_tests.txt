@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 63e12871d768e6c1af336b6b05a5c30e405b579c3e0689b4061bf60c664ad73c # shrinks to reserve_a = 500000000, reserve_b = 500000000, n_orders = 1, seed = 0
 cc c09c6184e1a077e1f19b68f8866ed88b39894bc810d75059b4aa4f2f69cf21d2 # shrinks to reserve_a1 = 500000000, reserve_b1 = 500000000, reserve_a2 = 500000000, reserve_b2 = 500000000, n1 = 1, n2 = 1, seed = 0
+cc 8efc63fb6c26678362cf6b2eec0ab1e308b14abe3f31ebb8456b7e9109b6be7d # shrinks to specs = [(2, 793099283548, 751708660192, 9611831949097, 53686, 79669, 74171, 89514), (0, 1, 1, 1, 1, 1, 1, 1)], a_to_b = false, amount = 1
