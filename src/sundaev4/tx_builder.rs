@@ -42,6 +42,29 @@ use crate::sundaev4::script_context::{ResolvedTxOut, DatumOption};
 // scales with n so it stays satisfied.
 pub const TX_FEE: u64 = 1_500_000;
 
+/// Encode an order's input UTxO ref as `OutputReference { transaction_id,
+/// output_index }` = `Constr 0 [Bytes, Int]` — the Aiken `OutputReference`
+/// shape. Stamped into a swap transcript entry's `operation_data` so the
+/// indexer can attribute the step to its order (basic orders carry no route
+/// redeemer to name it). The curve validators ignore `operation_data` for
+/// swaps, so this is transcript-only metadata today; a future contract
+/// version is expected to read it for the anti-skim check.
+fn order_ref_to_plutus(
+    input: &crate::cardano_types::TransactionInput,
+) -> pallas_primitives::PlutusData {
+    use pallas_primitives::PlutusData;
+    PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121, // Constr 0
+        any_constructor: None,
+        fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
+            PlutusData::BoundedBytes(input.0.transaction_id.to_vec().into()),
+            PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                (input.0.index as i64).into(),
+            )),
+        ]),
+    })
+}
+
 // Upper bound on the *real* fee any single scoop tx can have under our
 // current cost model — used to size collateral selection so the
 // collateral_return output stays above min_utxo even when the rebuild
@@ -488,6 +511,12 @@ pub fn build_multi_pool_scoop_tx(
             }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
                 let s = &batch.swaps[*i];
+                // Stamp the serving order's input ref into operation_data so the
+                // indexer can attribute this swap step to the order (basic orders
+                // carry no route redeemer to name it). The curve validators
+                // ignore operation_data for swaps, so this is transcript-only
+                // metadata. (Forward-compatible with a future anti-skim check.)
+                op_data_override = Some(order_ref_to_plutus(&s.order.input));
                 // dx is fixed by the order (direct) or by the route's entry
                 // split allocation (routed primary); both stored on `s.dx`.
                 let dx = s.dx.clone();
@@ -529,6 +558,9 @@ pub fn build_multi_pool_scoop_tx(
                 let c = &batch.continuations[*i];
                 let rref = &c.route;
                 let route = &routes[rref.route_idx];
+                // Attribute this multi-hop/split leg to its owning order (see
+                // the Swap arm) — the route's RouteInfo holds the order.
+                op_data_override = Some(order_ref_to_plutus(&route.order.input));
                 let hop = &route.hops[rref.hop_idx];
                 let split_count = hop.split_input_props.len();
                 // Entry-hop continuations: dx is the router's allocation
