@@ -51,7 +51,10 @@ done
 REMOTE_DIR="/home/ec2-user/scooper-v2"
 TARGET="x86_64-unknown-linux-gnu.2.34"
 BINARY="target/x86_64-unknown-linux-gnu/release/scooper-v2"
-LOCAL_CONFIG="config/preview-v4.json"
+case "$HOST" in
+  *preprod*) LOCAL_CONFIG="config/preprod-v4.json" ;;
+  *)         LOCAL_CONFIG="config/preview-v4.json" ;;
+esac
 LOCAL_UNIT="deploy/scooper-v2.service"
 
 echo "==> Building release binary for $TARGET"
