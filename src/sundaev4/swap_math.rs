@@ -319,6 +319,21 @@ pub fn cl_max_dx_value_preserving(
     if !dx_reserve_cap.is_positive() {
         return BigInt::from(0);
     }
+    // A pool that loses value on the SMALLEST possible swap is in deficit at
+    // rest: its declared total_lp already exceeds the liquidity its reserves
+    // support, so every dx below the deficit's break-even loses value and the
+    // admissible set is a suffix, not a prefix. A single max-dx cap cannot
+    // express that, so exclude the pool from this direction outright — which is
+    // what we want anyway for a pool whose books don't balance. Without this
+    // the scan below starts at cap/64 and never sees the deficit, handing back
+    // the full reserve cap and letting the router drop a small allocation
+    // straight into the value-losing zone (found by
+    // `underfunded_cl_pool_is_excluded_from_routing`). One extra evaluation;
+    // an on-curve pool answers `+` here and pays nothing further.
+    if fee_budget_after(&BigInt::from(1)).is_negative() {
+        return BigInt::from(0);
+    }
+
     // Coarse-scan for the FIRST dx that loses value, then binary-refine within
     // the last value-preserving interval. `fee_budget` is monotonic in dx for an
     // on-curve pool (all-positive or all-negative), so the scan just confirms the

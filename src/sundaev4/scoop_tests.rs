@@ -206,6 +206,75 @@ mod tests {
         // capped pool. What's NOT acceptable is a route that over-drains.)
     }
 
+    /// REGRESSION (found by `router_route_never_over_drains`): a CL pool whose
+    /// declared `total_lp` exceeds the liquidity its reserves actually support
+    /// is value-losing on every SMALL swap — `fee_budget < 0` until the input
+    /// out-earns the deficit — so its admissible inputs are a suffix, not a
+    /// prefix. A single max-dx cap can't express that, and the old 64-step
+    /// linear scan took its first sample at cap/64, past the crossing, so it
+    /// reported the FULL reserve cap as value-preserving. The router then put
+    /// a 466-unit dust allocation straight into the value-losing zone, and the
+    /// accumulator (like the validator) rejected the leg. Such a pool has to be
+    /// excluded from routing outright.
+    #[test]
+    fn underfunded_cl_pool_is_excluded_from_routing() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::{router, swap_math};
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let (a, b, lp) = (277_354_965_297i64, 374_991_445_735i64, 3_681_143_105_273i64);
+        let (spa_n, spa_d, spb_n, spb_d) = (244i64, 69702i64, 6966i64, 64161i64);
+        let big = |x: i64| BigInt::from(x);
+        let (fee_n, fee_d) = (big(30), big(10000));
+
+        // `cl_fee_budget` against lp_after = 0 is the liquidity the reserves
+        // support: this fixture is ~81.3e9 (2.2%) short of its own books.
+        let supported = swap_math::cl_fee_budget(
+            &big(a), &big(b), &big(0), &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d));
+        assert!(supported < big(lp), "fixture must be underfunded: {supported} vs {lp}");
+
+        // Neither direction may report spare capacity.
+        for is_a_input in [false, true] {
+            if let Some(reserve_cap) = swap_math::cl_max_dx_for_reserve(
+                &big(a), &big(b), &big(lp), is_a_input,
+                &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d), &fee_n, &fee_d,
+            ) {
+                let vp = swap_math::cl_max_dx_value_preserving(
+                    &big(a), &big(b), &big(lp), &reserve_cap, is_a_input,
+                    &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d), &fee_n, &fee_d,
+                );
+                assert_eq!(
+                    vp, big(0),
+                    "underfunded pool must be excluded, got cap {vp} (is_a_input={is_a_input})"
+                );
+            }
+        }
+
+        // End to end: the router routes around it and the route accumulates.
+        let cl = make_cl_pool(&env, 0x10, token_a(), a, token_b(), b, lp,
+                              spa_n, spa_d, spb_n, spb_d, 30, 10000);
+        let cp1 = make_pool(&env, 0x11, token_a(), 1_620_199_307_449, token_b(), 1_624_906_635_884);
+        let cp2 = make_pool(&env, 0x12, token_a(), 898_826_200_404, token_b(), 450_988_088_115);
+        let mut pool_map = BTreeMap::new();
+        for p in [cl, cp1, cp2] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+        let (offer, ask) = (token_b(), token_a());
+        let order = make_order(offer.clone(), 1_158_376_366_982, ask.clone(), 1, 1);
+        let blend = router::find_blended_route(
+            &pool_map, &[], &offer, &ask, &order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("the two healthy CP pools can fill this");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let result = match blend.as_single() {
+            Some(single) => accum.try_add_routed_order(&order, single, &pool_map),
+            None => accum.try_add_blended_order(&order, &blend, &pool_map),
+        };
+        assert!(result.is_ok(), "route must be fillable, got {:?}", result.err());
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -216,13 +285,23 @@ mod tests {
         /// live quarantine class (the router handed the accumulator a leg — 400k
         /// into a tight CL pool — whose real dy blew past the pool's reserve). A
         /// failure here is a router↔accumulator disagreement, not a bad order.
+        ///
+        /// Pools are generated so they could actually exist on chain (see the
+        /// CL branch below) — a failure that needs an impossible pool state is
+        /// noise, not signal. Malformed pools get deterministic coverage in
+        /// `underfunded_cl_pool_is_excluded_from_routing` instead, where the
+        /// expectation is "excluded from routing", not "the route must fill".
         #[test]
         fn router_route_never_over_drains(
             specs in prop::collection::vec(
                 (0u8..3u8,                            // 0=CP 1=CS 2=CL
                  1i64..2_000_000_000_000i64,          // reserve a (production scale)
                  1i64..2_000_000_000_000i64,          // reserve b
-                 1i64..20_000_000_000_000i64,         // total_lp (CL) — lp≫reserve like live
+                 // CL total_lp as ‰ of the liquidity the reserves support.
+                 // Weighted toward 1000‰ (zero accrued surplus) because that's
+                 // both the state a pool is left in by a deposit/withdraw and
+                 // the one with no fee cushion to mask a value-losing swap.
+                 prop_oneof![3 => Just(1000i64), 7 => 1i64..=1000i64],
                  1i64..100_000i64, 1i64..100_000i64,  // sqrt_price_a num/den (incl. tight ranges)
                  1i64..100_000i64, 1i64..100_000i64), // sqrt_price_b num/den
                 2..5usize,
@@ -232,12 +311,13 @@ mod tests {
         ) {
             use std::collections::BTreeMap;
             use crate::sundaev4::accumulator::Accumulator;
-            use crate::sundaev4::router;
             use crate::sundaev4::types::Rational;
+            use crate::sundaev4::{router, swap_math};
+            use num_traits::ToPrimitive;
 
             let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
             let mut pool_map = BTreeMap::new();
-            for (i, (curve, ra, rb, lp, san, sad, sbn, sbd)) in specs.iter().enumerate() {
+            for (i, (curve, ra, rb, lp_permille, san, sad, sbn, sbd)) in specs.iter().enumerate() {
                 let id = (0x10 + i) as u8;
                 let pool = match *curve {
                     0 => make_pool(&env, id, token_a(), *ra, token_b(), *rb),
@@ -255,8 +335,50 @@ mod tests {
                             (*sbn, *sbd, *san, *sad)
                         };
                         if san * sbd == sbn * sad { continue; }
-                        make_cl_pool(&env, id, token_a(), *ra, token_b(), *rb, *lp,
-                                     san, sad, sbn, sbd, 30, 10000)
+                        // A CL pool's total_lp is NOT free of its reserves. Every
+                        // validator path pins it: a swap to
+                        // `lp_after + fee_budget == L(reserves)` and a
+                        // deposit/withdraw to `fee_budget == 0` plus a virtual
+                        // invariant that rounds toward the pool — and fee_budget
+                        // is never negative. So on chain `total_lp <= L`, the gap
+                        // being fee income accrued since it was last claimed.
+                        // Draw total_lp as a fraction of the supported liquidity
+                        // so every generated pool is one that could exist: 1000‰
+                        // is a pool right after a value-neutral op, lower values
+                        // carry more accrued fees. (Drawing it independently, as
+                        // this once did, produced pools already in DEFICIT at
+                        // rest — `L < total_lp`, unreachable through any contract
+                        // path — and the router "failures" that fell out of it
+                        // were artifacts of that impossible state. The malformed
+                        // case still has deterministic coverage in
+                        // `underfunded_cl_pool_is_excluded_from_routing`.)
+                        let supported = swap_math::cl_fee_budget(
+                            &BigInt::from(*ra), &BigInt::from(*rb), &BigInt::from(0),
+                            &BigInt::from(san), &BigInt::from(sad),
+                            &BigInt::from(sbn), &BigInt::from(sbd),
+                        );
+                        // Tight ranges make L enormous (L ≫ reserves); clamping
+                        // to i64 only lowers total_lp, which stays reachable.
+                        let want = &(&supported * &BigInt::from(*lp_permille as u64))
+                            / &BigInt::from(1000u64);
+                        let ceiling = BigInt::from(i64::MAX);
+                        let lp = if want > ceiling { ceiling } else { want }
+                            .unwrap()
+                            .to_i64()
+                            .unwrap_or(i64::MAX)
+                            .max(1);
+                        let pool = make_cl_pool(&env, id, token_a(), *ra, token_b(), *rb, lp,
+                                                san, sad, sbn, sbd, 30, 10000);
+                        prop_assert!(
+                            !swap_math::cl_fee_budget(
+                                &BigInt::from(*ra), &BigInt::from(*rb), &BigInt::from(lp),
+                                &BigInt::from(san), &BigInt::from(sad),
+                                &BigInt::from(sbn), &BigInt::from(sbd),
+                            ).is_negative(),
+                            "generator built an unreachable pool (in deficit at rest): \
+                             a={ra} b={rb} lp={lp} range={san}/{sad}..{sbn}/{sbd}"
+                        );
+                        pool
                     }
                 };
                 pool_map.insert(pool.pool_datum.identifier.clone(), pool);
@@ -1911,3 +2033,5 @@ mod prop_tests {
         }
     }
 }
+
+
