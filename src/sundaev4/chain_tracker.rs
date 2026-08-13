@@ -272,6 +272,31 @@ impl ChainTracker {
         affected.len()
     }
 
+    /// Discard every chain containing the given tx, cascading to related
+    /// pools. Returns the number of pools whose chains were discarded.
+    ///
+    /// For a tx of *ours* that left the mempool without ever confirming.
+    /// Its predicted pool state will never exist, so anything chained on it
+    /// is dead too — waiting out the TTL just keeps the pool pinned behind
+    /// a prediction that isn't coming.
+    pub fn discard_by_tx_hash(&mut self, tx_hash: &Hash<32>) -> usize {
+        let affected: Vec<Ident> = self
+            .chains
+            .iter()
+            .filter(|(_, chain)| chain.iter().any(|tx| &tx.tx_hash == tx_hash))
+            .map(|(ident, _)| ident.clone())
+            .collect();
+        for ident in &affected {
+            info!(
+                pool = %ident,
+                tx_hash = %hex::encode(tx_hash),
+                "discarding chain whose own tx left the mempool unconfirmed"
+            );
+            self.discard_chain_and_related(ident);
+        }
+        affected.len()
+    }
+
     /// Discard all chains (e.g. on rollback).
     pub fn discard_all(&mut self) {
         let count: usize = self.chains.values().map(|c| c.len()).sum();
@@ -295,6 +320,11 @@ impl ChainTracker {
     /// Discard chains whose first (oldest) tx TTL has passed.
     /// If the first tx expired, the entire chain is invalid.
     /// Uses cascade discard for multi-pool awareness.
+    ///
+    /// Dropping a chain here does not free the orders its txs spend: the
+    /// node may still hold the expired tx, and resubmitting the same order
+    /// into that would be rejected as a conflict. `ProvisionalState` releases
+    /// them on its own once the node's mempool lets go.
     pub fn expire_stale(&mut self, current_slot: u64) {
         let stale_pools: Vec<Ident> = self
             .chains
@@ -645,6 +675,35 @@ mod tests {
         assert!(tracker.latest_predicted_pool(&ident_a).is_none());
         assert!(tracker.latest_predicted_pool(&ident_b).is_none());
         assert!(!tracker.has_in_flight());
+    }
+
+    #[test]
+    fn discard_by_tx_hash_takes_the_chain_and_its_cascade() {
+        // Our tx AA spans pools A and B; tx CC chains on B. AA vanishes from
+        // the mempool without confirming, so both pools' chains must go —
+        // CC was built on a predicted state that will never exist.
+        let mut tracker = ChainTracker::new();
+        let ident_a = Ident::new(&[0x01]);
+        let ident_b = Ident::new(&[0x02]);
+        tracker.record_submission(make_multi_pool_in_flight(&[0x01, 0x02], 0xaa, 9000, 0));
+        tracker.record_submission(make_in_flight(0x02, 0xcc, 9000, 1));
+
+        let pools = tracker.discard_by_tx_hash(&[0xaa; 32].into());
+
+        assert_eq!(pools, 2);
+        assert!(tracker.latest_predicted_pool(&ident_a).is_none());
+        assert!(tracker.latest_predicted_pool(&ident_b).is_none());
+        assert!(!tracker.has_in_flight());
+    }
+
+    #[test]
+    fn discard_by_tx_hash_ignores_txs_we_never_tracked() {
+        let mut tracker = ChainTracker::new();
+        let ident = Ident::new(&[0x01]);
+        tracker.record_submission(make_in_flight(0x01, 0xaa, 9000, 0));
+
+        assert_eq!(tracker.discard_by_tx_hash(&[0xff; 32].into()), 0);
+        assert!(tracker.latest_predicted_pool(&ident).is_some());
     }
 
     #[test]

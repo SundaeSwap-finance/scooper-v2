@@ -873,6 +873,25 @@ impl SlotConfig {
     pub fn slot_to_posix_ms(&self, slot: u64) -> u64 {
         self.zero_time + (slot.saturating_sub(self.zero_slot)) * self.slot_length
     }
+
+    /// Inverse of [`slot_to_posix_ms`](Self::slot_to_posix_ms).
+    pub fn posix_ms_to_slot(&self, posix_ms: u64) -> u64 {
+        self.zero_slot + posix_ms.saturating_sub(self.zero_time) / self.slot_length.max(1)
+    }
+
+    /// The slot the chain is at *right now*, by wall clock.
+    ///
+    /// The observed tip only advances when a block arrives, so it lags by
+    /// however long the current block gap has run. Anything that means "now"
+    /// — a transaction's TTL, chain-expiry, quarantine windows — wants this,
+    /// not the tip. See [`ValidityWindow`](crate::sundaev4::tx_builder::ValidityWindow).
+    pub fn wall_clock_slot(&self) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(self.zero_time);
+        self.posix_ms_to_slot(now_ms)
+    }
 }
 
 // Execution configuration
@@ -1227,6 +1246,52 @@ pub struct SundaeV4Protocol {
 
 #[cfg(test)]
 mod tests {
+    /// Preview's real anchor: slot 0 at 2022-10-25T00:00:00Z, 1s slots.
+    fn preview_slots() -> super::SlotConfig {
+        super::SlotConfig { zero_slot: 0, zero_time: 1_666_656_000_000, slot_length: 1000 }
+    }
+
+    #[test]
+    fn slot_and_posix_ms_round_trip() {
+        let sc = preview_slots();
+        // The slot the live investigation turned on: the block that would
+        // have carried scoop f6fdb185… if its TTL hadn't closed first.
+        assert_eq!(sc.slot_to_posix_ms(118_726_081), 1_785_382_081_000);
+        assert_eq!(sc.posix_ms_to_slot(1_785_382_081_000), 118_726_081);
+        // Sub-slot remainders floor, so the round trip never reports a slot
+        // the chain hasn't reached.
+        assert_eq!(sc.posix_ms_to_slot(1_785_382_081_999), 118_726_081);
+        for slot in [0u64, 1, 208, 118_725_900, u32::MAX as u64] {
+            assert_eq!(sc.posix_ms_to_slot(sc.slot_to_posix_ms(slot)), slot);
+        }
+    }
+
+    #[test]
+    fn posix_ms_to_slot_survives_degenerate_configs() {
+        use super::SlotConfig;
+        // A zero slot_length would divide by zero; times before the anchor
+        // would underflow. Neither can arise from a sane genesis file, but
+        // both come from operator config.
+        let sc = SlotConfig { zero_slot: 42, zero_time: 1_000_000, slot_length: 0 };
+        assert_eq!(sc.posix_ms_to_slot(2_000_000), 42 + 1_000_000);
+        let sc = preview_slots();
+        assert_eq!(sc.posix_ms_to_slot(0), 0);
+    }
+
+    #[test]
+    fn wall_clock_slot_tracks_real_time() {
+        let sc = preview_slots();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let slot = sc.wall_clock_slot();
+        // Within a second of the slot derived from the same clock, and well
+        // past the preview slots that were live when this was written.
+        assert!(slot.abs_diff(sc.posix_ms_to_slot(now_ms)) <= 1);
+        assert!(slot > 118_726_081, "wall clock slot {slot} is before 2026-07-30");
+    }
+
     #[test]
     fn route_whitelist_parses_idents() {
         use super::*;

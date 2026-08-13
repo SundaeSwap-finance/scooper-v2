@@ -199,8 +199,17 @@ impl Scooper {
 
             // 2. Expire stale in-flight chains, prune quarantine & sync metrics
             if let Some(tip_slot) = self.current_tip_slot().await {
-                self.v4_chain_tracker.expire_stale(tip_slot);
-                self.prune_expired_quarantine(tip_slot);
+                // Expiry is judged against wall clock, matching the clock the
+                // TTLs were stamped from. Note we deliberately do NOT free
+                // the orders these chains hold: while the node still has the
+                // tx, re-scooping the same order is a mempool conflict, and
+                // the reject would temp-quarantine the order we're trying to
+                // rescue. `ProvisionalState::spent_inputs` releases them the
+                // moment the node drops the tx, which is the earliest point
+                // a resubmit can succeed.
+                let now_slot = self.now_slot(tip_slot);
+                self.v4_chain_tracker.expire_stale(now_slot);
+                self.prune_expired_quarantine(now_slot);
             }
             self.sync_in_flight_metrics();
             self.sync_quarantine_metrics();
@@ -300,6 +309,20 @@ impl Scooper {
         match &self.v4_state {
             Some(s) => Some(s.lock().await.latest().tip_slot),
             None => None,
+        }
+    }
+
+    /// Wall-clock slot, floored at the observed tip.
+    ///
+    /// Use this for anything that means "now" — chain expiry, quarantine
+    /// windows, a transaction's TTL. `tip` alone stands still between blocks,
+    /// so during a block gap it reads as far in the past as the gap is long.
+    /// Falling back to `tip` when the local clock reads earlier keeps a
+    /// skewed clock from ever making a window *shorter* than it is today.
+    fn now_slot(&self, tip: u64) -> u64 {
+        match &self.v4_execution {
+            Some(exec) => tip.max(exec.slot_config.wall_clock_slot()),
+            None => tip,
         }
     }
 
@@ -483,6 +506,26 @@ impl Scooper {
                             pools = n,
                             "mempool parent evicted; discarded chained in-flight txs",
                         );
+                    }
+                    // The dropped tx may be one of ours. By the time this
+                    // event fires the correlator has waited out the eviction
+                    // window without seeing it in a block (a confirmation
+                    // retires the entry silently instead), so its predicted
+                    // pool state is never going to exist. Without this the
+                    // pool stays pinned behind that prediction until TTL —
+                    // five minutes, since VALIDITY_RANGE went to 300.
+                    let own = <[u8; 32]>::try_from(tx_hash.as_slice())
+                        .ok()
+                        .map(|h| self.v4_chain_tracker.discard_by_tx_hash(&h.into()))
+                        .unwrap_or(0);
+                    if own > 0 {
+                        warn!(
+                            tx_hash = %hex::encode(&tx_hash),
+                            pools = own,
+                            "our in-flight tx vanished from the mempool; discarded its chain",
+                        );
+                    }
+                    if n > 0 || own > 0 {
                         self.sync_in_flight_metrics();
                     }
                 }
@@ -563,9 +606,12 @@ impl Scooper {
             }
         };
 
-        // Use the network tip slot (actual chain tip) for the validity interval,
-        // falling back to the last processed block slot.
-        let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
+        // The network tip (actual chain tip, falling back to the last block we
+        // processed) anchors the validity interval's *start*; wall clock
+        // anchors everything that means "now", including the TTL.
+        let tip_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
+        let current_slot = self.now_slot(tip_slot);
+        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(tip_slot, current_slot);
 
         // Select collateral. Must cover total_collateral (= final tx_fee * 1.5)
         // plus min UTxO on the collateral return output. We size against
@@ -739,10 +785,8 @@ impl Scooper {
             use crate::sundaev4::intents;
             // The on-chain check is interval.includes(execution, tx_range):
             // the intent's window must contain the tx's whole validity range.
-            let tx_start_ms = exec.slot_config.slot_to_posix_ms(current_slot);
-            let tx_end_ms = exec
-                .slot_config
-                .slot_to_posix_ms(current_slot + crate::sundaev4::tx_builder::VALIDITY_RANGE);
+            let tx_start_ms = exec.slot_config.slot_to_posix_ms(validity.start);
+            let tx_end_ms = exec.slot_config.slot_to_posix_ms(validity.ttl);
             let store = intents.store.lock().await;
             let now = intents::now_ms();
             for order in v4_state.orders.iter() {
@@ -1483,7 +1527,7 @@ impl Scooper {
         let within_limits = |accum: &Accumulator| -> Fitness {
             let plan = accum.clone().into_plan();
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                &plan, &settings, &exec, current_slot, &language_views,
+                &plan, &settings, &exec, validity, &language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs, &strategy_executions,
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
@@ -1641,7 +1685,7 @@ impl Scooper {
                 let diag_plan = diag.clone().into_plan();
                 let (quarantine_reason, eval_bug_reason): (Option<String>, Option<String>) =
                     match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                    &diag_plan, &settings, &exec, current_slot, &language_views,
+                    &diag_plan, &settings, &exec, validity, &language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs, &strategy_executions,
                     funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
@@ -1812,14 +1856,20 @@ impl Scooper {
                     .chain(b.claims.iter().map(|o| o.order.input.clone()))
             })
             .collect();
-        // Refresh current_slot — the binary search phase may have taken many
-        // seconds, so the slot captured at the start of the cycle could be stale.
-        let current_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
+        // Refresh the validity window — the binary search phase may have taken
+        // many seconds, so the window captured at the start of the cycle could
+        // be stale. Wall clock moves even when the tip doesn't, so this is
+        // where a long search pass actually buys back its TTL.
+        let tip_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
+        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(
+            tip_slot,
+            self.now_slot(tip_slot),
+        );
 
         // Build → evaluate → rebuild with exact budgets.
 
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan, &settings, &exec, current_slot, language_views,
+            &final_plan, &settings, &exec, validity, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             None, &v4_state.order_configs, &strategy_executions,
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
@@ -1920,7 +1970,7 @@ impl Scooper {
         ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
 
         let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan, &settings, &exec, current_slot, language_views,
+            &final_plan, &settings, &exec, validity, language_views,
             &collateral_input.0, &collateral_value, Some(&padded_budgets),
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
@@ -2178,7 +2228,7 @@ impl Scooper {
                     if node_reject_hex.is_some() {
                         self.last_node_reject = Some((final_tx.tx_hash_hex.clone(), repeat_count));
                     }
-                    let until_slot = current_slot + TEMP_QUARANTINE_SLOTS;
+                    let until_slot = self.now_slot(tip_slot) + TEMP_QUARANTINE_SLOTS;
                     let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
                     if !bad_refs.is_empty() {
                         // Quarantine only the orders the error implicates.

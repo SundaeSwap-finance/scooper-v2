@@ -135,6 +135,7 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
 
 pub async fn admin_server(
     config: ServerConfig,
+    network: String,
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
@@ -149,6 +150,7 @@ pub async fn admin_server(
 ) {
     let base = AdminServer {
         visibility: Visibility::Private,
+        network,
         v3_state,
         v4_state,
         v4_fee,
@@ -266,6 +268,9 @@ enum Visibility {
 #[derive(Clone)]
 struct AdminServer {
     visibility: Visibility,
+    /// Network name from config, e.g. "preview". Reported in `/status` so
+    /// the dashboard can convert slots to wall-clock times.
+    network: String,
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
@@ -949,6 +954,7 @@ impl AdminServer {
         };
 
         serde_json::to_string(&serde_json::json!({
+            "network": self.network,
             "v3": v3_info,
             "v4": v4_info,
             "paused": self.paused.load(Ordering::Relaxed),

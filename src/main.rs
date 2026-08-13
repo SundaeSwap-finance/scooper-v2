@@ -272,6 +272,7 @@ async fn main() -> Result<()> {
     );
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
+        config.network_name(),
         v3_state.clone(),
         v4_state.clone(),
         v4_fee,

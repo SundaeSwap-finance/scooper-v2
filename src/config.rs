@@ -38,6 +38,17 @@ impl AppConfig {
             .build()?;
         Ok(Arc::new(config))
     }
+
+    /// The Cardano network we're indexing ("mainnet", "preprod", "preview",
+    /// or a custom name like "devnet"). Same key the genesis bootstrapper
+    /// reads, with the same default; surfaced over the API so clients can map
+    /// slots to wall-clock times.
+    pub fn network_name(&self) -> String {
+        self.acropolis_config()
+            .ok()
+            .and_then(|c| c.get_string("global.startup.network-name").ok())
+            .unwrap_or_else(|| "mainnet".to_string())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -159,6 +159,10 @@ struct TxEffects {
     created_orders: Vec<crate::cardano_types::TransactionInput>,
     spent_orders: Vec<crate::cardano_types::TransactionInput>,
     predicted_pools: Vec<crate::sundaev3::Ident>,
+    /// True once the node's mempool no longer holds this tx. Mirrors the
+    /// per-order/per-pool `gone` flags so a spend mark can be checked the
+    /// same way — see [`ProvisionalState::spent_inputs`].
+    gone: bool,
 }
 
 /// Shared between the mempool monitor (writer) and the scooper (reader).
@@ -227,18 +231,22 @@ impl ProvisionalState {
     /// The source tx left the mempool: suspend its orders immediately.
     /// (If it reappears — a re-add after a brief eviction — un-suspend.)
     pub fn set_gone(&mut self, tx_hash: &[u8], gone: bool) {
-        if let Some(effects) = self.by_tx.get(tx_hash) {
-            for input in &effects.created_orders {
-                if let Some(p) = self.orders.get_mut(input) {
-                    p.gone = gone;
-                }
+        // Split the borrow: `by_tx` is read while `orders`/`pools` are written.
+        let Self { orders, pools, by_tx, .. } = self;
+        let Some(effects) = by_tx.get_mut(tx_hash) else {
+            return;
+        };
+        effects.gone = gone;
+        for input in &effects.created_orders {
+            if let Some(p) = orders.get_mut(input) {
+                p.gone = gone;
             }
-            for ident in &effects.predicted_pools {
-                if let Some(fp) = self.pools.get_mut(ident) {
-                    if fp.source_tx.as_slice() == tx_hash {
-                        fp.gone = gone;
-                    }
-                }
+        }
+        for ident in &effects.predicted_pools {
+            if let Some(fp) = pools.get_mut(ident)
+                && fp.source_tx.as_slice() == tx_hash
+            {
+                fp.gone = gone;
             }
         }
     }
@@ -272,15 +280,41 @@ impl ProvisionalState {
     ) -> Vec<(Arc<crate::sundaev4::SundaeV4Order>, Vec<u8>)> {
         self.orders
             .values()
-            .filter(|p| !p.gone && !self.spent.contains_key(&p.order.input))
+            .filter(|p| {
+                !p.gone
+                    && self
+                        .spent
+                        .get(&p.order.input)
+                        .is_none_or(|tx_hash| !self.spend_is_live(tx_hash))
+            })
             .map(|p| (p.order.clone(), p.source_tx.clone()))
             .collect()
     }
 
     /// Order inputs that some unconfirmed tx already spends — the scooper
     /// must not dispatch these even if they're still unspent on-chain.
+    ///
+    /// Spends by a tx the node's mempool no longer holds don't count. That
+    /// tx either confirmed (the indexer is about to say so, and the order
+    /// leaves the book anyway) or died, and in neither case is there
+    /// anything left to conflict with. Waiting for [`EVICTION_WINDOW`] here
+    /// instead cost order `f4a29320…#0` five minutes on preview
+    /// (2026-07-30): our own scoop of it expired on TTL, left the mempool
+    /// three seconds later, and the order still sat out of the candidate
+    /// set until the eviction grace period ran out — while newer orders
+    /// were scooped past it. That grace period exists to absorb *indexer*
+    /// lag on confirmation, which is not a reason to keep blocking dispatch.
     pub fn spent_inputs(&self) -> BTreeSet<crate::cardano_types::TransactionInput> {
-        self.spent.keys().cloned().collect()
+        self.spent
+            .iter()
+            .filter(|(_, tx_hash)| self.spend_is_live(tx_hash))
+            .map(|(input, _)| input.clone())
+            .collect()
+    }
+
+    /// Whether a spend recorded by `tx_hash` still blocks dispatch.
+    fn spend_is_live(&self, tx_hash: &[u8]) -> bool {
+        self.by_tx.get(tx_hash).map(|e| !e.gone).unwrap_or(false)
     }
 
     /// Inputs of currently-tracked provisional orders (for classification).
@@ -947,6 +981,75 @@ mod tests {
         let removed = state.remove_tx(&parent_a);
         assert_eq!(removed, vec![in_a]);
         assert_eq!(state.counts(), (0, 0));
+    }
+
+    /// Replays the live stall (preview, 2026-07-30). Our scoop of an order
+    /// expired on TTL and left the node's mempool, but the order stayed out
+    /// of the candidate set until the 5-minute eviction grace period ran
+    /// out — five minutes during which newer orders were scooped past it.
+    #[test]
+    fn a_spend_by_a_vanished_tx_stops_blocking_dispatch() {
+        use crate::cardano_types::TransactionInput;
+        let mut state = ProvisionalState::default();
+        let our_scoop = vec![0x5C; 32];
+        let order_input = TransactionInput::new([0xF4; 32].into(), 0);
+
+        state.note_tx(our_scoop.clone(), vec![], vec![order_input.clone()], vec![]);
+        assert!(
+            state.spent_inputs().contains(&order_input),
+            "while the node holds our scoop, re-dispatching would conflict",
+        );
+
+        // The node drops it (TTL passed, revalidated out on the next block).
+        state.set_gone(&our_scoop, true);
+        assert!(
+            !state.spent_inputs().contains(&order_input),
+            "nothing left to conflict with — the order is free now, not in 5 minutes",
+        );
+
+        // It reappears (brief absence, re-added): blocking resumes.
+        state.set_gone(&our_scoop, false);
+        assert!(state.spent_inputs().contains(&order_input));
+
+        // And the eventual removal is still clean.
+        state.remove_tx(&our_scoop);
+        assert!(state.spent_inputs().is_empty());
+    }
+
+    /// The same release has to reach `dispatchable_orders`, which applies the
+    /// spend check separately — a provisional order spent by a vanished tx is
+    /// dispatchable again too.
+    #[test]
+    fn a_provisional_order_spent_by_a_vanished_tx_is_dispatchable_again() {
+        use crate::cardano_types::TransactionInput;
+        let input = TransactionInput::new([0xA1; 32].into(), 0);
+        let asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
+            input.clone(),
+            Default::default(),
+            crate::multisig::Multisig::Signature(vec![0xAA; 28]),
+            crate::sundaev4::Destination::SelfDestination,
+            (asset.clone(), crate::bigint::BigInt::from(1)),
+            (asset, crate::bigint::BigInt::from(1)),
+            crate::bigint::BigInt::from(1_000_000),
+            1,
+        ));
+
+        let mut state = ProvisionalState::default();
+        let creator = vec![0xA1; 32];
+        let spender = vec![0xB2; 32];
+        state.note_tx(creator.clone(), vec![(input.clone(), order)], vec![], vec![]);
+        state.note_tx(spender.clone(), vec![], vec![input.clone()], vec![]);
+        assert_eq!(state.dispatchable_orders().len(), 0);
+
+        state.set_gone(&spender, true);
+        let dispatchable = state.dispatchable_orders();
+        assert_eq!(dispatchable.len(), 1);
+        assert_eq!(dispatchable[0].1, creator);
+
+        // The creating tx vanishing is a different matter: nothing to build on.
+        state.set_gone(&creator, true);
+        assert_eq!(state.dispatchable_orders().len(), 0);
     }
 
     #[test]

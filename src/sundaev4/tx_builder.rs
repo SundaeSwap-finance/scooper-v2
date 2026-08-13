@@ -142,7 +142,44 @@ pub fn compute_tx_fee(
     size_fee + mem_fee + step_fee + ref_fee
 }
 const POOL_MIN_ADA: u64 = 2_000_000;
-pub const VALIDITY_RANGE: u64 = 180;
+/// How long a scoop stays valid, in slots (= seconds), measured from wall
+/// clock. Five minutes: long enough to survive a multi-block gap on preview.
+pub const VALIDITY_RANGE: u64 = 300;
+
+/// A transaction's validity interval, in slots.
+///
+/// The two ends are anchored to different clocks on purpose:
+///
+/// - `start` is the last slot the chain is *known* to have reached (the
+///   observed tip). A start in the future makes the tx unusable until the
+///   chain catches up, so this end must never be a guess.
+/// - `ttl` is anchored to wall clock, because the tip only advances when a
+///   block arrives. During a block gap the tip is stale by the length of the
+///   gap, and a TTL measured from it burns that gap out of the tx's life
+///   before it is even submitted.
+///
+/// That second point cost a live execution on preview (2026-07-30): a scoop
+/// built 75s into a 3-minute block gap was stamped from the pre-gap tip, so
+/// its window closed one slot before the next block — the only block that
+/// could have carried it.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidityWindow {
+    pub start: u64,
+    pub ttl: u64,
+}
+
+impl ValidityWindow {
+    /// `tip`: last slot the chain is known to have reached.
+    /// `now`: wall-clock slot estimate.
+    ///
+    /// A `now` behind `tip` (slow local clock) degrades to tip-anchored
+    /// behaviour rather than shortening the window; a `now` ahead of `tip`
+    /// (the normal case, mid-block-gap) extends the TTL without ever moving
+    /// `start` past a slot the chain has reached.
+    pub fn new(tip: u64, now: u64) -> Self {
+        Self { start: tip.min(now), ttl: tip.max(now) + VALIDITY_RANGE }
+    }
+}
 
 // Conway-era coinsPerUtxoByte (preview/mainnet, stable). Used to compute
 // minUtxo for outputs whose datum size varies — e.g. pools post-governance
@@ -201,7 +238,7 @@ pub fn build_multi_pool_scoop_tx(
     plan: &ScoopPlan,
     settings: &SundaeV4Settings,
     exec: &ScooperExecution,
-    current_slot: u64,
+    validity: ValidityWindow,
     language_views: &[u8],
     collateral_utxo: &TransactionInput,
     collateral_value: &crate::cardano_types::Value,
@@ -2264,7 +2301,7 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 11: Assemble TransactionBody ──────────────────────────────────
 
-    let ttl = current_slot + VALIDITY_RANGE;
+    let ttl = validity.ttl;
 
     let body = conway::PseudoTransactionBody {
         inputs: sorted_inputs.into(),
@@ -2279,7 +2316,7 @@ pub fn build_multi_pool_scoop_tx(
                 .collect(),
         )),
         auxiliary_data_hash: None,
-        validity_interval_start: Some(current_slot),
+        validity_interval_start: Some(validity.start),
         mint,
         script_data_hash: Some(script_data_hash),
         collateral: pallas_primitives::NonEmptySet::from_vec(vec![collateral_utxo.clone()]),
@@ -2548,7 +2585,7 @@ pub fn build_multi_pool_scoop_tx(
             value: predicted_value,
             pool_datum: per_pool[out_idx].updated_datum.clone(),
             pool_type: batch.pool.pool_type.clone(),
-            slot: current_slot,
+            slot: validity.start,
             fee_split_config: batch.pool.fee_split_config.clone(),
         };
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
@@ -3240,4 +3277,65 @@ fn legacy_value_to_internal(
         }
     }
     out
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+
+    #[test]
+    fn ttl_is_measured_from_wall_clock_not_the_stale_tip() {
+        // The live case (preview, 2026-07-30). Last block: slot 118_725_900.
+        // Scoop built 75s into the gap, at wall-clock slot 118_725_975. The
+        // next block — the first one that could have carried it — was
+        // 118_726_081, 106s after the build.
+        let tip = 118_725_900;
+        let now = 118_725_975;
+        let next_block = 118_726_081;
+
+        // Tip-anchored, as it shipped: dead one slot before that block.
+        let old_ttl = tip + 180;
+        assert!(old_ttl < next_block, "the bug being fixed");
+
+        let w = ValidityWindow::new(tip, now);
+        assert!(
+            w.ttl > next_block,
+            "wall-clock TTL {} must outlive the next block at {next_block}",
+            w.ttl,
+        );
+        // Start stays on a slot the chain has actually reached.
+        assert_eq!(w.start, tip);
+    }
+
+    #[test]
+    fn start_never_leads_the_chain() {
+        // A clock running fast must not stamp a start the chain hasn't hit —
+        // the tx would be rejected as not-yet-valid until it caught up.
+        let w = ValidityWindow::new(1_000, 1_500);
+        assert_eq!(w.start, 1_000);
+        assert_eq!(w.ttl, 1_500 + VALIDITY_RANGE);
+    }
+
+    #[test]
+    fn slow_clock_degrades_to_tip_anchoring() {
+        // A clock running slow (or a tip we somehow read from the future)
+        // must never yield a *shorter* window than tip-anchoring gave us.
+        let w = ValidityWindow::new(2_000, 1_400);
+        assert_eq!(w.start, 1_400);
+        assert_eq!(w.ttl, 2_000 + VALIDITY_RANGE);
+        assert!(w.ttl >= 2_000 + VALIDITY_RANGE);
+    }
+
+    #[test]
+    fn window_covers_a_full_preview_block_gap() {
+        // Five minutes of TTL, and the observed gap that broke us was three.
+        assert!(
+            VALIDITY_RANGE >= 300,
+            "TTL must outlast a multi-block preview gap",
+        );
+        let w = ValidityWindow::new(500, 500);
+        assert_eq!(w.ttl - w.start, VALIDITY_RANGE);
+    }
 }

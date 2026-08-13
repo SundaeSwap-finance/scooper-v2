@@ -346,7 +346,7 @@
     <div class="section-title">Spent Orders</div>
     <div class="search-bar"><input type="text" data-filter="v3-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v3-spent-orders-table">
-      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
+      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Time</th></tr></thead>
       <tbody id="v3-spent-orders-body"></tbody>
     </table>
   </div>
@@ -375,7 +375,7 @@
     <div class="section-title">Spent Orders</div>
     <div class="search-bar"><input type="text" data-filter="v4-spent-orders-body" placeholder="Filter spent orders..."></div>
     <table id="v4-spent-orders-table">
-      <thead><tr><th>Order Ref</th><th>Pool(s)</th><th>Reason</th><th>Tx</th><th>Slot</th></tr></thead>
+      <thead><tr><th>Order Ref</th><th>Pool(s)</th><th>Reason</th><th>Tx</th><th>Time</th></tr></thead>
       <tbody id="v4-spent-orders-body"></tbody>
     </table>
   </div>
@@ -400,7 +400,7 @@
       <button class="pause-btn" id="mineToggle" style="font-size:10px;padding:2px 8px;text-transform:none;letter-spacing:0">Mine</button>
     </div>
     <table id="health-recent-table">
-      <thead><tr><th>Tx ID</th><th>Slot</th><th>Pool</th><th>Orders</th><th>Scooper</th></tr></thead>
+      <thead><tr><th>Tx ID</th><th>Time</th><th>Pool</th><th>Orders</th><th>Scooper</th></tr></thead>
       <tbody id="health-recent-body"></tbody>
     </table>
   </div>
@@ -440,6 +440,65 @@
 
   function timeStr() {
     return new Date().toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  // --- Slots <-> wall clock ---
+  // Slot-to-time is pure arithmetic per network: Byron slots are 20s, every
+  // era since is 1s. Mirrors acropolis_common::calculations::slot_to_timestamp
+  // (byron_timestamp = genesis systemStart, shelley_epoch = the Byron epoch
+  // count before the Shelley hard fork). Custom networks (devnet) aren't in
+  // the table, so we fall back to showing the raw slot.
+  var BYRON_SLOTS_PER_EPOCH = 21600;
+  var NETWORK_GENESIS = {
+    mainnet: { byronStart: 1506203091, shelleyEpoch: 208 },
+    preprod: { byronStart: 1654041600, shelleyEpoch: 4 },
+    preview: { byronStart: 1666656000, shelleyEpoch: 0 }
+  };
+
+  function slotToDate(slot) {
+    if (!slot) return null;
+    var g = NETWORK_GENESIS[status.network];
+    if (!g) return null;
+    var shelleyStartSlot = g.shelleyEpoch * BYRON_SLOTS_PER_EPOCH;
+    var unix = slot < shelleyStartSlot
+      ? g.byronStart + slot * 20
+      : g.byronStart + shelleyStartSlot * 20 + (slot - shelleyStartSlot);
+    return new Date(unix * 1000);
+  }
+
+  function clockStr(d) {
+    return d.toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  // Compact duration, for "how long ago / how far behind".
+  function durStr(secs) {
+    secs = Math.max(0, Math.round(secs));
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+    return Math.floor(secs / 86400) + 'd ' + Math.floor((secs % 86400) / 3600) + 'h';
+  }
+
+  // Tooltip text for anything slot-stamped: exact slot, full local timestamp,
+  // and age — the details you want when reading a row, without the noise.
+  function slotTitle(slot) {
+    var d = slotToDate(slot);
+    var t = 'slot ' + Number(slot).toLocaleString();
+    if (d) t += ' · ' + d.toLocaleString() + ' · ' + durStr((Date.now() - d) / 1000) + ' ago';
+    return t;
+  }
+
+  // Table cell contents for a slot: local clock time (date prefixed once it's
+  // not today), with the slot itself on hover.
+  function slotCell(slot) {
+    if (!slot) return '';
+    var d = slotToDate(slot);
+    if (!d) return Number(slot).toLocaleString();
+    var label = clockStr(d);
+    if (d.toDateString() !== new Date().toDateString()) {
+      label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + label;
+    }
+    return '<span title="' + escapeHtml(slotTitle(slot)) + '">' + label + '</span>';
   }
 
   // Copy-to-clipboard: renders truncated text + a small copy icon
@@ -685,8 +744,17 @@
     const netSlot = v4.network_tip_slot || 0;
     const pct = v4.sync_pct || 0;
 
-    document.getElementById('syncSlots').textContent =
-      slot.toLocaleString() + ' / ' + (netSlot || '?').toLocaleString();
+    var el = document.getElementById('syncSlots');
+    var tipDate = slotToDate(slot);
+    if (tipDate) {
+      // Slots are 1s, so the tip/network-tip gap is literally seconds behind.
+      var lag = netSlot > slot ? netSlot - slot : 0;
+      el.textContent = clockStr(tipDate) + (lag ? ' · ' + durStr(lag) + ' behind' : ' · at tip');
+    } else {
+      el.textContent = slot.toLocaleString() + ' / ' + (netSlot || '?').toLocaleString();
+    }
+    el.title = 'slot ' + slot.toLocaleString() +
+      ' / network tip ' + (netSlot ? netSlot.toLocaleString() : '?');
     document.getElementById('syncPct').textContent = pct.toFixed(1) + '%';
     document.getElementById('syncFill').style.width = Math.min(pct, 100) + '%';
   }
@@ -756,7 +824,7 @@
         + (inFlightCount > 0 ? statCard('\u23f3 In-Flight', inFlightCount) : '')
         + (quarantineCount > 0 ? statCard('\u26d4 Quarantined', quarantineCount) : '')
         + (malformedCount > 0 ? statCard('\u26a0 Malformed', malformedCount) : '')
-        + statCard('Tip Slot', (v4.tip_slot || 0).toLocaleString());
+        + tipCard(v4.tip_slot || 0);
     } else {
       v4s.innerHTML = '<div class="not-configured">V4 indexer not configured</div>';
     }
@@ -765,6 +833,15 @@
   function statCard(label, value) {
     return '<div class="stat-card"><div class="label">' + label +
       '</div><div class="value">' + value + '</div></div>';
+  }
+
+  // Chain tip as a clock time, with the slot on hover. Falls back to the raw
+  // slot on networks we can't date (devnet).
+  function tipCard(slot) {
+    var d = slotToDate(slot);
+    if (!d) return statCard('Tip Slot', Number(slot).toLocaleString());
+    return '<div class="stat-card" title="' + escapeHtml(slotTitle(slot)) + '">' +
+      '<div class="label">Chain Tip</div><div class="value">' + clockStr(d) + '</div></div>';
   }
 
   // --- Row limiting ---
@@ -1133,7 +1210,7 @@
         '<td>' + copyable(truncate(r.poolId, 16), r.poolId) + '</td>' +
         '<td><span class="badge ' + r.badge + '">' + r.text + '</span>' + typeBadges + '</td>' +
         '<td>' + copyable(truncate(txId, 16), txId) + '</td>' +
-        '<td>' + (entry.slot || '') + '</td>';
+        '<td>' + slotCell(entry.slot) + '</td>';
       return row;
     });
   }
@@ -1239,7 +1316,7 @@
       if (isOurs) scooperLabel += ' <span class="badge badge-accent">You</span>';
       var poolIds = (s.pool_ids || []).join(', ');
       row.innerHTML = '<td>' + copyable(truncate(s.tx_id, 16), s.tx_id) + '</td>' +
-        '<td>' + s.slot + '</td>' +
+        '<td>' + slotCell(s.slot) + '</td>' +
         '<td>' + copyable(truncate(poolIds, 12), poolIds) + '</td>' +
         '<td>' + s.n_orders + '</td>' +
         '<td>' + copyable(scooperLabel, s.scooper) + '</td>';
