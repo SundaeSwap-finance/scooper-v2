@@ -28,15 +28,25 @@ use crate::sundaev4::types::{
 /// prove authority over an *order*, not over the scooper), so the store must
 /// stay bounded no matter what arrives.
 const MAX_TOTAL_INTENTS: usize = 10_000;
-/// Hard cap per target order. An order can only be scooped once per intent
-/// window, so there is no legitimate reason to hold many candidates.
+// There is no per-order cap: an order holds at most one live intent, so the
+// total cap above is the only bound needed.
+//
 // One live intent per order: a new (valid) intent replaces the previous
-// one. The winner is deterministic in the intent *content* — max by
-// (validity lower bound, expiry, intent_id) — so peers converge on the same
-// intent no matter what order gossip delivers them in. The lower bound acts
-// as the signing timestamp: a replacement signed later carries a later
-// valid-from (the CLI signs valid-from ≈ now), so it beats the standing
-// intent even when both are open-ended.
+// one. The winner is ranked by the intent *content* first — max by
+// (validity lower bound, expiry) — so peers converge on the same intent no
+// matter what order gossip delivers them in. The lower bound acts as the
+// signing timestamp: a replacement signed later carries a later valid-from
+// (the CLI signs valid-from ≈ now), so it beats the standing intent even
+// when both are open-ended.
+//
+// When content ties — signers that leave valid-from unset (it reads as 0)
+// and reuse the same expiry produce exact ties — receipt time breaks it, so
+// the intent posted last replaces the one already held. Ranking straight on
+// intent_id there (as this once did) meant a freshly posted replacement
+// could silently lose to the intent it was meant to supersede, with no way
+// for the poster to force it through. Only when receipt times also tie (same
+// millisecond) does the id decide, which keeps the outcome deterministic for
+// simultaneous arrivals.
 
 /// Optional client-provided hint about how to execute an intent. Extensible
 /// by adding variants; unknown `type` values are rejected at the API boundary
@@ -190,17 +200,22 @@ impl IntentStore {
     ///
     /// Does NOT persist — the caller persists on `newly_stored` (persistence
     /// is async and the store sits behind a sync mutex).
-    /// Replacement rank of an intent: (validity lower bound, expiry, id).
-    /// Later-signed intents (later valid-from) win; the id breaks exact ties
-    /// deterministically across gossiping peers.
-    fn replacement_rank(sse: &SignedStrategyExecution, expiry_ms: u64, id: &[u8])
-        -> (u64, u64, Vec<u8>)
-    {
+    /// Replacement rank of an intent: (validity lower bound, expiry,
+    /// received-at, id). Later-signed intents (later valid-from) win; when
+    /// the signed window is identical the intent received later wins, so a
+    /// re-post always replaces what it targets; the id breaks same-millisecond
+    /// ties deterministically across gossiping peers.
+    fn replacement_rank(
+        sse: &SignedStrategyExecution,
+        expiry_ms: u64,
+        received_at_ms: u64,
+        id: &[u8],
+    ) -> (u64, u64, u64, Vec<u8>) {
         let lower_ms = match &sse.execution.validity_range.lower_bound.bound_type {
             IntervalBoundType::Finite(t) => big_to_u64(t).unwrap_or(0),
             _ => 0,
         };
-        (lower_ms, expiry_ms, id.to_vec())
+        (lower_ms, expiry_ms, received_at_ms, id.to_vec())
     }
 
     pub fn submit(
@@ -326,10 +341,10 @@ impl IntentStore {
         }
 
         // One live intent per order — see replacement_rank for who wins.
-        let new_rank = Self::replacement_rank(&sse, expiry_ms, &intent_id);
+        let new_rank = Self::replacement_rank(&sse, expiry_ms, now_ms, &intent_id);
         if let Some(best) = entry
             .iter()
-            .map(|i| Self::replacement_rank(&i.sse, i.expiry_ms, &i.intent_id))
+            .map(|i| Self::replacement_rank(&i.sse, i.expiry_ms, i.received_at_ms, &i.intent_id))
             .max()
         {
             if best > new_rank {
@@ -1145,6 +1160,53 @@ mod tests {
         assert!(r1.superseded);
         assert_eq!(store2.len(), 1);
         assert_eq!(r2.intent_id, o2.intent_id);
+    }
+
+    /// Signers that leave valid-from unset (it reads as 0) or reuse a window
+    /// produce intents that tie on content. The one posted last must still
+    /// replace what's held, whichever order they arrive in — ranking on
+    /// intent_id alone used to let a standing intent beat the replacement
+    /// that was meant to supersede it, and tombstone the replacement.
+    #[test]
+    fn tied_windows_replace_in_arrival_order() {
+        let sk = key();
+        let order = strategy_order(&sk);
+
+        // Identical windows (no lower bound, same expiry); only the ask differs.
+        let tied = |min: u64| {
+            let mut e = test_execution(NOW_MS + 60_000);
+            e.validity_range.lower_bound = IntervalBound {
+                bound_type: IntervalBoundType::NegativeInfinity,
+                is_inclusive: true,
+            };
+            e.min_received = vec![(
+                AssetClass { policy: vec![0xCC; 28], token: b"TOK".to_vec() },
+                BigInt::from(min),
+            )];
+            e
+        };
+        let a = signed_sse_cbor(&sk, tied(1_000_000));
+        let b = signed_sse_cbor(&sk, tied(2_000_000));
+
+        // Both arrival orders: whichever lands second wins, so the id order
+        // (fixed by the bytes) can't decide the outcome.
+        for (first, second) in [(a.clone(), b.clone()), (b, a)] {
+            let mut store = IntentStore::default();
+            let (o1, _) = store
+                .submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS)
+                .unwrap();
+            let (o2, _) = store
+                .submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS + 1)
+                .unwrap();
+            assert!(o2.newly_stored, "the intent posted second replaces the standing one");
+            assert!(!o2.superseded);
+            assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
+            assert_eq!(store.len(), 1);
+            assert!(matches!(
+                store.find(&o1.intent_id),
+                Some(IntentLookup::Terminal(t)) if t.status == "replaced"
+            ));
+        }
     }
 
     #[test]
