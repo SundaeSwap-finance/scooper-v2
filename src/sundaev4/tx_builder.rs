@@ -1876,7 +1876,14 @@ pub fn build_multi_pool_scoop_tx(
                         ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
                         ShelleyDelegationPart::Null,
                     );
-                    (order_addr.to_vec(), Some(order.datum.clone().to_plutus()))
+                    // Continuation fee accounting (strategy.ak): the ONE
+                    // datum field allowed to change is service_budget, and
+                    // its decrease IS this fill's fee allowance. An identical
+                    // datum reads as fee_deducted = 0, so any ADA taken from
+                    // the order then fails the gross value check on-chain.
+                    let mut cont = order.datum.clone();
+                    cont.service_budget = &cont.service_budget - &BigInt::from(actual_fee);
+                    (order_addr.to_vec(), Some(cont.to_plutus()))
                 }
                 crate::sundaev4::Destination::Fixed(_, maybe_datum) => (
                     resolve_destination(&order.datum.destination, &order.datum.owner)?,

@@ -603,15 +603,21 @@ pub struct ClaimShape {
 
 /// Resolve which trade a claim intent implies against `reserves`/`prices`.
 ///
+/// The signed entries are per-asset DELTAS (destination output − order
+/// input; SUN-310's `min_deltas`, bounded on-chain since SUN-109). This
+/// resolver's math lives in absolute-holdings space, so the deltas are
+/// re-based ONCE here — `floor = holding + delta` — and everything
+/// downstream speaks absolute floors: a delta > 0 is a receive target
+/// (floor above holdings), a delta ≤ 0 caps that asset's outflow (minimum
+/// final holding), an absent asset is unconstrained.
+///
 /// Orders may hold several assets (a wallet's mixed holdings ride along
-/// untouched into the fulfillment). The receive asset is the min_received
-/// entry; the swap input is chosen as the order-held pool asset (≠ receive)
-/// with the LARGEST positive deficit — the most rebalancing, and therefore
-/// most claimable, direction. Explicit min_received pins on held assets cap
-/// how much of them may be consumed.
+/// untouched into the fulfillment). The swap input is chosen as the
+/// order-held pool asset (≠ receive) with the LARGEST positive deficit —
+/// the most rebalancing, and therefore most claimable, direction.
 pub fn resolve_claim_shape(
     order_value: &crate::cardano_types::Value,
-    min_received: &[(AssetClass, BigInt)],
+    min_deltas: &[(AssetClass, BigInt)],
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
 ) -> Result<ResolvedShape, &'static str> {
@@ -625,55 +631,67 @@ pub fn resolve_claim_shape(
             .cloned()
             .unwrap_or_else(|| BigInt::from(0))
     };
+    // Re-base signed deltas to absolute final-holding floors, clamped at 0
+    // (an outflow bound below the physical minimum is just "unconstrained").
+    let floors: Vec<(AssetClass, BigInt)> = min_deltas
+        .iter()
+        .map(|(a, d)| {
+            let f = &holding(a) + d;
+            (a.clone(), if f.is_negative() { BigInt::from(0) } else { f })
+        })
+        .collect();
     let pin = |asset: &AssetClass| -> BigInt {
-        min_received
+        floors
             .iter()
             .find(|(a, _)| a == asset)
             .map(|(_, m)| m.clone())
             .unwrap_or_else(|| BigInt::from(0))
     };
 
-    // Partition min_received: pool assets act as receive floors / spend
-    // pins; non-pool assets are "carry floors" — the fulfillment carries the
-    // order's holdings through unchanged, so they're satisfiable iff already
-    // held. An ADA entry is the signer's floor on retained lovelace (a cap
-    // on cumulative fee takes), recorded for the caller to enforce.
+    // Partition the floors: pool assets act as receive floors / spend pins;
+    // non-pool assets are "carry floors" — the fulfillment carries the
+    // order's holdings through unchanged, so they're satisfiable iff the
+    // delta was ≤ 0. The on-chain ADA check is GROSS (fee_deducted is added
+    // back before the comparison), so an ADA delta ≤ 0 is vacuous when the
+    // only ADA outflow is the fee — record no floor for it, or the caller's
+    // fee cushion would decline every fill the chain accepts. A positive ADA
+    // delta demands net inflow and keeps its re-based floor.
     let mut receives: Vec<(usize, BigInt)> = Vec::new();
     let mut min_ada: Option<BigInt> = None;
-    for (asset, amount) in min_received {
+    for (asset, floor) in &floors {
         let Some(idx) = reserves.iter().position(|(a, _)| a == asset) else {
             if asset.policy.is_empty() && asset.token.is_empty() {
-                min_ada = Some(amount.clone());
+                if *floor > holding(asset) {
+                    min_ada = Some(floor.clone());
+                }
                 continue;
             }
-            if holding(asset) >= *amount {
+            if holding(asset) >= *floor {
                 continue; // carried through untouched — floor already met
             }
             return Err(
-                "min_received floors an asset this pool can't produce and the \
-                 order doesn't hold enough of to carry through",
+                "min_deltas demands inflow of an asset this pool can't \
+                 produce",
             );
         };
-        // An entry can be a leftover pin (asset the order holds and might
-        // spend) or a receive floor. Entries with a shortfall vs current
-        // holdings are receive targets.
-        let short = amount - &holding(asset);
+        // A floor above current holdings is a receive target; at-or-below
+        // is an outflow cap handled via pin().
+        let short = floor - &holding(asset);
         if short.is_positive() {
-            receives.push((idx, amount.clone()));
+            receives.push((idx, floor.clone()));
         }
     }
     if receives.is_empty() {
         return Err(
-            "no receive target: every min_received floor is already met by \
-             the order's current holdings",
+            "no receive target: no min_deltas entry demands a positive delta",
         );
     }
 
     // Single-op rebalance when the trade can't be expressed as one pair:
     // several receive targets, or several offer-capable assets (pool assets
-    // with spendable holdings beyond their pin). min_received then acts as
-    // the exact desired final holdings vector — unpinned pool assets are
-    // forfeit to the pool, per the signed execution.
+    // with spendable holdings beyond their pin). The re-based floors then act
+    // as the exact desired final holdings vector — unmentioned pool assets
+    // are forfeit to the pool, per the signed execution.
     let receive_idxs: Vec<usize> = receives.iter().map(|(i, _)| *i).collect();
     let offer_capable = reserves
         .iter()
@@ -1130,12 +1148,12 @@ mod tests {
         for (i, (asset, _)) in reserves.iter().enumerate() {
             value.insert(asset, held[i].clone());
         }
-        let min_received: Vec<(AssetClass, BigInt)> = reserves
+        let min_deltas: Vec<(AssetClass, BigInt)> = reserves
             .iter()
             .enumerate()
-            .map(|(i, (a, _))| (a.clone(), targets[i].clone()))
+            .map(|(i, (a, _))| (a.clone(), &targets[i] - &held[i]))
             .collect();
-        let shape = resolve_claim_shape(&value, &min_received, &reserves, &prices)
+        let shape = resolve_claim_shape(&value, &min_deltas, &reserves, &prices)
             .expect("shape must resolve");
         match shape {
             ResolvedShape::Rebalance(r) => {
@@ -1225,5 +1243,45 @@ mod tests {
         // Same plan, judged against a fee-charging pool → rejected by the pin.
         let bf = (BigInt::from(10), BigInt::from(10000));
         assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &waived, 0, 1));
+    }
+
+    /// min_deltas re-basing (SUN-310): entries are deltas over the order's
+    /// holdings, not absolute floors. A +delta on an asset the order already
+    /// holds plenty of is still a receive target (floor = holding + delta);
+    /// −deltas cap outflow via the pin. This is the preprod claim shape that
+    /// the absolute reading resolved to "no receive target".
+    #[test]
+    fn resolve_claim_shape_rebases_deltas_over_holdings() {
+        let reserves = pool(&[3_250_000_000_000u64 as i64, 4_900_000_000_000, 6_850_000_000_000]);
+        let prices = ones(3);
+        let mut value = crate::cardano_types::Value::default();
+        // Order already holds 10G of asset 1 (the receive target) and 10G of
+        // asset 2 (the spend side); asset 3 unheld.
+        value.insert(&reserves[0].0, BigInt::from(10_000_000_000u64));
+        value.insert(&reserves[1].0, BigInt::from(10_000_000_000u64));
+        let min_deltas = vec![
+            (reserves[0].0.clone(), BigInt::from(1_500_000_000)),  // receive ≥ +1.5G
+            (reserves[1].0.clone(), BigInt::from(-600_000_000)),   // spend ≤ 0.6G
+        ];
+        let shape = resolve_claim_shape(&value, &min_deltas, &reserves, &prices)
+            .expect("delta mins must resolve");
+        match shape {
+            ResolvedShape::Pair(c) => {
+                assert_eq!(c.in_idx, 1);
+                assert_eq!(c.out_idx, 0);
+                // Floor = holding + delta, counted gross of what's already held.
+                assert_eq!(c.min_recv, BigInt::from(11_500_000_000u64));
+                assert_eq!(c.already_held, BigInt::from(10_000_000_000u64));
+                // Spendable = −delta, not the full holding.
+                assert_eq!(c.spendable, BigInt::from(600_000_000));
+            }
+            other => panic!("expected Pair, got {other:?}"),
+        }
+
+        // No positive delta anywhere → nothing to receive.
+        let no_positive = vec![(reserves[1].0.clone(), BigInt::from(-600_000_000))];
+        let err = resolve_claim_shape(&value, &no_positive, &reserves, &prices)
+            .expect_err("no positive delta → no receive target");
+        assert!(err.contains("no receive target"), "got: {err}");
     }
 }

@@ -585,8 +585,8 @@ pub fn window_covers(sse: &SignedStrategyExecution, start_ms: u64, end_ms: u64) 
 /// Synthesize a swap-shaped [`Constraint`] for a strategy order from an
 /// authorized execution, so the ordinary batching/routing pipeline can
 /// handle it. Phase 1 supports the common shape: the order offers a single
-/// non-ADA asset; the execution's `min_received` optionally pins a leftover
-/// of that asset (unconsumed offer) plus what must be received in exchange.
+/// non-ADA asset; the execution's `min_deltas` optionally bounds that
+/// asset's outflow (a ≤ 0 delta) plus what must be received in exchange.
 ///
 /// Returns `None` when the shape isn't (yet) supported: ADA-only or
 /// multi-asset offers, nothing consumable, or nothing to receive.
@@ -617,13 +617,21 @@ pub fn synthesize_swap_constraint(
     }
     let (offer_asset, balance) = offered?;
 
-    // Split min_received into "leftover of the offer" (not consumed) and
-    // the actual receive targets.
-    let mut leftover = crate::bigint::BigInt::from(0);
+    // min_deltas entries are per-asset DELTAS (output − input) since SUN-109
+    // bounded settlement by signed deltas. The offered asset's entry is ≤ 0
+    // and bounds the outflow: at most (−amount) may leave the order. An
+    // absent entry leaves the offer unconstrained (full balance consumable).
+    // Receive-side entries are lower bounds on inflow, which for assets the
+    // order doesn't already hold equals the absolute received amount (the
+    // only shape this phase-1 synthesizer supports).
+    let mut consumable = balance.clone();
     let mut swap_min: Vec<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = Vec::new();
     for (asset, amount) in &sse.execution.min_received {
         if *asset == offer_asset {
-            leftover = amount.clone();
+            let cap = -amount.clone();
+            if cap < consumable {
+                consumable = cap;
+            }
         } else {
             swap_min.push((asset.clone(), amount.clone()));
         }
@@ -631,9 +639,8 @@ pub fn synthesize_swap_constraint(
     if swap_min.is_empty() {
         return None; // nothing to receive — nothing for a swap to do
     }
-    let consumable = &balance - &leftover;
     if !consumable.is_positive() {
-        return None; // whole offer pinned as leftover
+        return None; // outflow bound pins the whole offer
     }
 
     Some(crate::sundaev4::types::Constraint::Swap {
@@ -1076,9 +1083,9 @@ mod tests {
             o.value.insert(&offer_asset, BigInt::from(5_000_000));
         }
 
-        // Leftover entry pins 2M of the offer: consumable = 3M.
+        // Offered-asset delta bound −3M: at most 3M may leave, consumable = 3M.
         let mut exec = test_execution(NOW_MS + 60_000);
-        exec.min_received.push((offer_asset.clone(), BigInt::from(2_000_000)));
+        exec.min_received.push((offer_asset.clone(), BigInt::from(-3_000_000)));
         let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
         let c = synthesize_swap_constraint(&order, &sse).expect("synthesizable");
         match c {
@@ -1092,15 +1099,16 @@ mod tests {
             other => panic!("expected Swap, got {other:?}"),
         }
 
-        // Whole offer pinned → nothing consumable → not synthesizable.
+        // Zero outflow bound (pure-claim shape) → nothing consumable → not
+        // synthesizable as a swap.
         let mut exec = test_execution(NOW_MS + 60_000);
-        exec.min_received.push((offer_asset.clone(), BigInt::from(5_000_000)));
+        exec.min_received.push((offer_asset.clone(), BigInt::from(0)));
         let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
 
-        // Only-leftover min_received (nothing to receive) → None.
+        // Only an offered-asset bound (nothing to receive) → None.
         let mut exec = test_execution(NOW_MS + 60_000);
-        exec.min_received = vec![(offer_asset.clone(), BigInt::from(1))];
+        exec.min_received = vec![(offer_asset.clone(), BigInt::from(-1_000_000))];
         let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
     }
