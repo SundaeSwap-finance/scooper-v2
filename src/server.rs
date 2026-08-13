@@ -717,8 +717,16 @@ impl AdminServer {
                         );
                     }
                     Err(reason) => {
+                        // cap_b is a wait-and-see: the pool just isn't
+                        // imbalanced enough yet (on a fee-charging pool, that
+                        // is the neutral zone doing its job). A claim that
+                        // can't be declared at all means the order's own
+                        // targets don't leave room for the pool's fee — the
+                        // signer has to move them, same as any below-floor.
                         let state = if reason.contains("cap_b") {
                             "awaiting-imbalance"
+                        } else if reason.contains("no bounty to claim") {
+                            "below-floor"
                         } else {
                             "shape-unsupported"
                         };

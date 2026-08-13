@@ -316,14 +316,25 @@ pub struct RebalancePlan {
     pub final_assets: Vec<(AssetClass, BigInt)>,
 }
 
-/// Plan a single-op multi-receive rebalance claim (CLI parity: sundae-v4
-/// commit 8ba6491). The order contributes ALL its pool-asset holdings and
-/// takes back exactly `targets`; the pool moves to `before + held − target`
-/// per asset. The order's net value gain `c = Σ(target−held)·p` must be
-/// positive and is accounted as a bounty claim on one receive asset (price
-/// divides the claim value, reserve covers it; deepest reserve preferred).
+/// Plan a single-op multi-leg rebalance claim (CLI parity: sundae-v4 commit
+/// 8ba6491). The order contributes ALL its pool-asset holdings and takes back
+/// exactly `targets`; the pool moves to `before + held − target` per asset.
+/// Any number of legs may move each way in the one op — several assets in,
+/// several out, or both.
+///
+/// The declared bounty claim is `net_gain + the balance_fee the op portion
+/// owes`, carried on one receive asset (its price must divide the claim
+/// value and its reserve must cover it; deepest reserve preferred), where
+/// `net_gain = Σ(target−held)·p` is what the order actually takes out of the
+/// pool. On a waived pool (`balance_fee = 0`) that collapses to claim ==
+/// net_gain, the value-neutral shape. On a fee-charging pool the order's
+/// payout absorbs the fee — it takes back less than it puts in, so `net_gain`
+/// may be zero or negative — exactly as `dy` absorbs it in the pair shape.
+///
 /// The op portion (claim restored) must move ≥1 reserve up and ≥1 down, and
-/// cap_b must admit the claim on the aggregate imbalance improvement.
+/// cap_b must admit the declared claim on the aggregate imbalance
+/// improvement. On a fee pool that makes rebalancing a net loss until the
+/// imbalance is worth more than the fee — the neutral zone the fee creates.
 pub fn plan_rebalance_claim(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
@@ -332,7 +343,7 @@ pub fn plan_rebalance_claim(
     held: &[BigInt],
     targets: &[BigInt],
 ) -> Result<RebalancePlan, &'static str> {
-    use num_traits::{Signed, Zero};
+    use num_traits::Signed;
 
     let (k_num, k_den) = bounty_k;
     let (bf_num, bf_den) = balance_fee;
@@ -351,34 +362,34 @@ pub fn plan_rebalance_claim(
         return Err("pool reserve would go negative (insufficient liquidity)");
     }
 
-    // The order's net value gain — the claim, in value units.
-    let c_value: BigInt = (0..n)
+    // What the order takes out of the pool. Positive when it profits; zero or
+    // negative when its payout is funding the pool's balance_fee.
+    let net_gain: BigInt = (0..n)
         .map(|i| &(&targets[i] - &held[i]) * &prices[i])
         .fold(BigInt::from(0), |acc, d| acc + d);
-    if !c_value.is_positive() {
-        return Err(
-            "rebalance nets the order no value gain: not representable as a \
-             waived claim (claim must be > 0)",
-        );
-    }
 
-    // Claim asset: a receive target whose price divides the claim value and
-    // whose reserve covers the claim amount; deepest reserve first.
-    let mut candidates: Vec<usize> = (0..n)
-        .filter(|&i| {
-            targets[i] > held[i]
-                && (&c_value % &prices[i]).is_zero()
-                && reserves[i].1 >= &c_value / &prices[i]
-        })
-        .collect();
+    // Claim asset: a receive target, deepest reserve first. The claim VALUE is
+    // the same whichever leg carries it; legs differ only in whether their
+    // price divides it and their reserve covers it, so try them in turn.
+    let mut candidates: Vec<usize> = (0..n).filter(|&i| targets[i] > held[i]).collect();
     candidates.sort_by(|&a, &b| reserves[b].1.cmp(&reserves[a].1));
-    let Some(&claim_idx) = candidates.first() else {
-        return Err(
-            "no receive asset can carry the claim (its price must divide the \
-             claim value and its reserve must cover it)",
-        );
+    if candidates.is_empty() {
+        return Err("rebalance has no receive leg to carry the bounty claim");
+    }
+    let mut solved: Option<(usize, BigInt, BigInt)> = None;
+    let mut why = "no receive asset can carry the claim";
+    for &idx in &candidates {
+        match solve_claim_value(reserves, prices, balance_fee, &after, &net_gain, idx) {
+            Ok((claim, claim_value)) => {
+                solved = Some((idx, claim, claim_value));
+                break;
+            }
+            Err(e) => why = e,
+        }
+    }
+    let Some((claim_idx, claim, c_value)) = solved else {
+        return Err(why);
     };
-    let claim = &c_value / &prices[claim_idx];
 
     // Op-portion shape: with the claim restored, ≥1 reserve up and ≥1 down.
     let has_inc = (0..n).any(|i| {
@@ -393,7 +404,9 @@ pub fn plan_rebalance_claim(
         return Err("rebalance op portion must move at least one reserve each way");
     }
 
-    // cap_b on the aggregate imbalance improvement.
+    // cap_b on the aggregate imbalance improvement, against the DECLARED claim
+    // (net gain plus the fee the op portion pays in) — that's the bounty the
+    // pool is being asked to underwrite.
     let v_b = compute_v(reserves, prices);
     let q_b = compute_q(reserves, prices, &v_b);
     let after_assets: Vec<(AssetClass, BigInt)> = reserves
@@ -411,7 +424,7 @@ pub fn plan_rebalance_claim(
     let rhs = &(&(&c_value * k_den) * &(&n_big * &n_big)) * &(&v_a * &v_b);
     if lhs < rhs {
         return Err(
-            "the pool isn't imbalanced enough to fund the requested net gain \
+            "the pool isn't imbalanced enough to fund the requested claim \
              (cap_b rejects the claim)",
         );
     }
@@ -424,14 +437,13 @@ pub fn plan_rebalance_claim(
         );
     }
 
-    // Op-portion fee pin at balance_fee. The rebalance shape is structurally
-    // value-neutral (v_increase_op = v(after_op) − V_b is 0 by the held/target
-    // accounting identity), so on a fee-charging pool (balance_fee > 0) the
-    // pin `(v_increase_op + 1)·bf_den > input_value_op·bf_num` can only hold
-    // for a trivial trade — a real rebalance can't fund the pool's fee. Such
-    // orders must use the pair shape (single receive asset, dy absorbs the
-    // fee) instead. At balance_fee = 0 the pin reduces to v_increase_op == 0,
-    // which the shape satisfies by construction.
+    // Op-portion fee pin at balance_fee, re-checked on the assembled plan:
+    // `v_increase_op == floor(input_value_op · bf)`. `solve_claim_value` sized
+    // the claim to land exactly here (`v_increase_op = claim_value − net_gain`
+    // by the held/target accounting identity), so this is verification rather
+    // than a filter — but it is the clause the validator enforces, so no plan
+    // leaves without passing it. At balance_fee = 0 it reduces to
+    // v_increase_op == 0, which claim == net_gain satisfies by construction.
     let after_op: Vec<(AssetClass, BigInt)> = after_assets
         .iter()
         .enumerate()
@@ -450,14 +462,96 @@ pub fn plan_rebalance_claim(
         return Err("rebalance op portion underpays the pool's balance_fee");
     }
     if !(&(&(&v_increase_op + &BigInt::from(1)) * bf_den) > &(&input_value_op * bf_num)) {
-        return Err(
-            "pool charges balance_fee; a value-neutral rebalance can't fund it \
-             — use a single-receive (pair) claim shape instead",
-        );
+        return Err("rebalance op portion overpays the pool's balance_fee");
     }
 
     let deltas: Vec<BigInt> = (0..n).map(|i| &held[i] - &targets[i]).collect();
     Ok(RebalancePlan { deltas, claim_idx, claim, final_assets: after_assets })
+}
+
+/// Size the declared claim for one receive leg of a rebalance, returning
+/// `(claim amount, claim value)`.
+///
+/// The validator pins the op portion's value increase to the pool's fee:
+/// `v_increase_op == floor(input_value_op · balance_fee)`. The claim is what
+/// the op portion hands back, so `v_increase_op = claim_value − net_gain`,
+/// which fixes `claim_value = net_gain + fee`. The fee itself moves with the
+/// claim once the claim asset's op-portion delta turns positive (a claim
+/// larger than what the order receives of that asset), so iterate to the
+/// least fixed point: `fee` is monotone in the claim and bounded by
+/// `bf · input`, so it settles in a round or two. The caller re-checks the
+/// pin on the assembled plan, which catches anything that didn't converge.
+fn solve_claim_value(
+    reserves: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+    balance_fee: (&BigInt, &BigInt),
+    after: &[BigInt],
+    net_gain: &BigInt,
+    claim_idx: usize,
+) -> Result<(BigInt, BigInt), &'static str> {
+    use num_traits::{Signed, Zero};
+
+    let price = &prices[claim_idx];
+    let mut claim_value = net_gain.clone();
+    for _ in 0..8 {
+        let claim = if claim_value.is_positive() {
+            &claim_value / price
+        } else {
+            BigInt::from(0)
+        };
+        let next = net_gain
+            + &op_portion_fee(reserves, prices, after, claim_idx, &claim, balance_fee);
+        if next == claim_value {
+            break;
+        }
+        claim_value = next;
+    }
+
+    if !claim_value.is_positive() {
+        return Err(
+            "rebalance leaves no bounty to claim: the order's payout is short of \
+             what balance_fee costs (raise its min_received targets)",
+        );
+    }
+    if !(&claim_value % price).is_zero() {
+        return Err(
+            "no receive asset can carry the claim (its price must divide the \
+             claim value and its reserve must cover it)",
+        );
+    }
+    let claim = &claim_value / price;
+    if reserves[claim_idx].1 < claim {
+        return Err(
+            "no receive asset can carry the claim (its price must divide the \
+             claim value and its reserve must cover it)",
+        );
+    }
+    Ok((claim, claim_value))
+}
+
+/// `floor(input_value_op · balance_fee)` — the value the op portion must leave
+/// in the pool, measured on the op-portion state (claim restored).
+fn op_portion_fee(
+    reserves: &[(AssetClass, BigInt)],
+    prices: &[BigInt],
+    after: &[BigInt],
+    claim_idx: usize,
+    claim: &BigInt,
+    balance_fee: (&BigInt, &BigInt),
+) -> BigInt {
+    use num_traits::Signed;
+
+    let (bf_num, bf_den) = balance_fee;
+    let input_value_op: BigInt = (0..reserves.len())
+        .map(|i| {
+            let after_op = if i == claim_idx { &after[i] + claim } else { after[i].clone() };
+            &after_op - &reserves[i].1
+        })
+        .zip(prices.iter())
+        .filter(|(d, _)| d.is_positive())
+        .map(|(d, p)| &d * p)
+        .fold(BigInt::from(0), |acc, x| acc + x);
+    &(&input_value_op * bf_num) / bf_den
 }
 
 /// What kind of claim an intent's min_received implies.
@@ -466,10 +560,11 @@ pub enum ResolvedShape {
     /// One receive target: a pair-wise claim (dx of one asset in, dy + bounty
     /// of another out), dx chosen by [`plan_claim_meeting_floor`].
     Pair(ClaimShape),
-    /// Several receive targets: a single-op rebalance. min_received is the
-    /// order's exact desired final holdings per pool asset (0 when unpinned
-    /// — those holdings are forfeit to the pool), and the net value gain is
-    /// captured as one bounty claim. See [`plan_rebalance_claim`].
+    /// Several receive targets, or several assets to offer: a single-op
+    /// rebalance. min_received is the order's exact desired final holdings
+    /// per pool asset (0 when unpinned — those holdings are forfeit to the
+    /// pool), and its net value gain plus the pool's balance_fee is declared
+    /// as one bounty claim. See [`plan_rebalance_claim`].
     Rebalance(RebalanceShape),
 }
 
@@ -771,6 +866,232 @@ mod tests {
         let plan =
             plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &BigInt::from(50_000_000));
         assert!(plan.is_none());
+    }
+
+    /// Brute-force verifier for a multi-leg plan — the same
+    /// `cs_check.ak::check_swap_with_claim` clauses as [`contract_accepts`],
+    /// reconstructed from an arbitrary reserve-delta vector instead of a
+    /// single dx/dy pair.
+    fn contract_accepts_rebalance(
+        before: &[(AssetClass, BigInt)],
+        prices: &[BigInt],
+        k: (&BigInt, &BigInt),
+        bf: (&BigInt, &BigInt),
+        plan: &RebalancePlan,
+    ) -> bool {
+        use num_traits::Signed;
+        let n = before.len();
+        let after: Vec<(AssetClass, BigInt)> = (0..n)
+            .map(|i| (before[i].0.clone(), &before[i].1 + &plan.deltas[i]))
+            .collect();
+        if after != plan.final_assets || after.iter().any(|(_, a)| a.is_negative()) {
+            return false;
+        }
+        // Op portion: the claim restored to its asset.
+        let after_op: Vec<(AssetClass, BigInt)> = after
+            .iter()
+            .enumerate()
+            .map(|(i, (a, amt))| {
+                (a.clone(), if i == plan.claim_idx { amt + &plan.claim } else { amt.clone() })
+            })
+            .collect();
+        let has_inc = (0..n).any(|i| after_op[i].1 > before[i].1);
+        let has_dec = (0..n).any(|i| after_op[i].1 < before[i].1);
+        if !has_inc || !has_dec {
+            return false;
+        }
+        // Fee-exact pin: v_increase_op == floor(input_value_op · bf).
+        let mut input_value_op = BigInt::from(0);
+        for i in 0..n {
+            let d = &after_op[i].1 - &before[i].1;
+            if d.is_positive() {
+                input_value_op = &input_value_op + &(&d * &prices[i]);
+            }
+        }
+        let v_b = compute_v(before, prices);
+        let v_increase_op = &compute_v(&after_op, prices) - &v_b;
+        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+            return false;
+        }
+        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+            return false;
+        }
+        // Claim well-formedness, no-overshoot guard, cap_b.
+        if !plan.claim.is_positive() || before[plan.claim_idx].1 < plan.claim {
+            return false;
+        }
+        let v_a = compute_v(&after, prices);
+        if !v_a.is_positive() || !no_flip(before, &after, prices, &v_b) {
+            return false;
+        }
+        let q_b = compute_q(before, prices, &v_b);
+        let q_a = compute_q(&after, prices, &v_a);
+        let n_big = BigInt::from(n as u64);
+        let c_value = &plan.claim * &prices[plan.claim_idx];
+        let lhs = k.0 * &(&(&v_a * &q_b) - &(&v_b * &q_a));
+        let rhs = &(&(&c_value * k.1) * &(&n_big * &n_big)) * &(&v_a * &v_b);
+        lhs >= rhs
+    }
+
+    fn big(x: u64) -> BigInt {
+        BigInt::from(x)
+    }
+
+    /// Multi-leg rebalances on a fee-charging pool: several legs in and/or
+    /// several out in one op, with the order's payout absorbing balance_fee
+    /// (exactly how `dy` absorbs it in the pair shape). The claim declared is
+    /// `net_gain + fee`, which puts `v_increase_op` on the validator's pin —
+    /// the shape itself is not what a fee pool rules out.
+    #[test]
+    fn fee_paying_multi_leg_rebalance_contract_accepts() {
+        let prices = ones(3);
+        let k = (big(75), big(100_000));
+        let bf = (big(10), big(10_000)); // 0.1%
+        // 10,000 in (6-decimal stables) ⇒ fee = 10.00.
+        let fee = big(10_000_000);
+
+        // One scarce asset in, a mix of the two abundant ones out.
+        let before = pool(&[800_000_000_000, 1_200_000_000_000, 1_100_000_000_000]);
+        let held = vec![big(10_000_000_000), big(0), big(0)];
+        let targets = vec![big(0), big(4_995_500_000), big(4_995_500_000)];
+        let plan = plan_rebalance_claim(
+            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &targets,
+        )
+        .expect("1-in/2-out rebalance is valid on a fee pool when the payout absorbs the fee");
+        // The order nets −9.00: it pays 10.00 of fee and earns a 1.00 bounty.
+        assert_eq!(plan.claim, big(1_000_000));
+        assert_eq!(plan.claim_idx, 1, "deepest receive leg carries the claim");
+        let net_gain: BigInt = (0..3)
+            .map(|i| &(&targets[i] - &held[i]) * &prices[i])
+            .fold(big(0), |acc, d| acc + d);
+        assert_eq!(&net_gain + &fee, &plan.claim * &prices[plan.claim_idx]);
+        assert!(contract_accepts_rebalance(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan));
+
+        // Two scarce assets in, the abundant one out.
+        let before = pool(&[800_000_000_000, 900_000_000_000, 1_400_000_000_000]);
+        let held = vec![big(6_000_000_000), big(4_000_000_000), big(0)];
+        let targets = vec![big(0), big(0), big(9_992_000_000)];
+        let plan = plan_rebalance_claim(
+            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &targets,
+        )
+        .expect("2-in/1-out rebalance is valid on a fee pool too");
+        assert_eq!(plan.claim, big(2_000_000));
+        assert_eq!(plan.claim_idx, 2);
+        assert!(contract_accepts_rebalance(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan));
+    }
+
+    /// The fee pool's neutral zone: near equilibrium cap_b admits less bounty
+    /// than balance_fee costs, so a rebalance that asks to come out ahead is
+    /// refused — by cap_b, on the declared claim, not by the shape.
+    #[test]
+    fn fee_pool_neutral_zone_is_enforced_by_cap_b() {
+        let before = pool(&[800_000_000_000, 1_200_000_000_000, 1_100_000_000_000]);
+        let prices = ones(3);
+        let k = (big(75), big(100_000));
+        let bf = (big(10), big(10_000));
+        let held = vec![big(10_000_000_000), big(0), big(0)];
+
+        // Asking for 1.00 of profit on top of the 10.00 fee needs an 11.00
+        // claim — far past what this pool's imbalance underwrites.
+        let greedy = vec![big(0), big(5_000_500_000), big(5_000_500_000)];
+        let err = plan_rebalance_claim(
+            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &greedy,
+        )
+        .expect_err("profit on a fee pool must be refused near equilibrium");
+        assert!(err.contains("cap_b"), "got: {err}");
+
+        // Paying in more than the fee leaves nothing to declare as a bounty,
+        // which the validator's `amount > 0` clause forbids.
+        let underpaid = vec![big(0), big(4_990_000_000), big(4_990_000_000)];
+        let err = plan_rebalance_claim(
+            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &underpaid,
+        )
+        .expect_err("a payout below fee-neutral has no claim to declare");
+        assert!(err.contains("no bounty to claim"), "got: {err}");
+    }
+
+    /// A waived pool is unchanged: claim == the order's net value gain and the
+    /// op portion stays value-neutral.
+    #[test]
+    fn waived_pool_rebalance_claims_exactly_the_net_gain() {
+        let before = pool(&[800_000_000_000, 1_200_000_000_000, 1_100_000_000_000]);
+        let prices = ones(3);
+        let k = (big(75), big(100_000));
+        let waived = (big(0), big(1));
+        let held = vec![big(10_000_000_000), big(0), big(0)];
+        let targets = vec![big(0), big(5_000_500_000), big(5_000_500_000)];
+        let plan = plan_rebalance_claim(
+            &before, &prices, (&k.0, &k.1), (&waived.0, &waived.1), &held, &targets,
+        )
+        .expect("waived pools admit the value-neutral rebalance as before");
+        assert_eq!(plan.claim, big(1_000_000), "claim == net gain when the fee is waived");
+        assert!(contract_accepts_rebalance(
+            &before, &prices, (&k.0, &k.1), (&waived.0, &waived.1), &plan
+        ));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(3000))]
+
+        /// INVARIANT: every plan we emit must satisfy the deployed validator.
+        /// The fee-paying path sizes the claim by a fixed-point solve, so this
+        /// is the guard that a solve which didn't converge — or a leg whose
+        /// op-portion delta flipped sign under its own claim — can never leave
+        /// as a plan the node would reject.
+        ///
+        /// Targets are drawn around the order's own holdings so the generator
+        /// lands on fillable shapes (a uniform draw is almost always rejected
+        /// before the claim math runs).
+        #[test]
+        fn emitted_rebalance_plans_always_satisfy_the_contract(
+            r0 in 1_000_000i64..2_000_000_000i64,
+            r1 in 1_000_000i64..2_000_000_000i64,
+            r2 in 1_000_000i64..2_000_000_000i64,
+            p0 in 1i64..4i64,
+            p1 in 1i64..4i64,
+            p2 in 1i64..4i64,
+            h0 in 0i64..20_000_000i64,
+            h1 in 0i64..20_000_000i64,
+            h2 in 0i64..20_000_000i64,
+            share0 in 0i64..100i64,
+            share1 in 0i64..100i64,
+            // How much of the pool's fee the payout gives up, plus a hair of
+            // profit/loss on top — the band where a rebalance is fillable.
+            fee_frac in 0i64..120i64,
+            extra_bp in -5i64..6i64,
+            k_num in 1i64..500i64,
+            bf_num in 0i64..100i64,
+        ) {
+            let before = pool(&[r0, r1, r2]);
+            let prices = vec![big(p0 as u64), big(p1 as u64), big(p2 as u64)];
+            let k = (big(k_num as u64), big(100_000));
+            let bf = (big(bf_num as u64), big(10_000));
+            let held = vec![big(h0 as u64), big(h1 as u64), big(h2 as u64)];
+
+            // Take back roughly what was paid in (plus `delta`), split across
+            // the first two legs — the shape a rebalancing order actually has.
+            let in_value = h0 * p0 + h1 * p1 + h2 * p2;
+            let fee = in_value * bf_num / 10_000;
+            let out_value =
+                (in_value - fee * fee_frac / 100 + in_value * extra_bp / 100_000).max(0);
+            let t0 = out_value * share0 / 100 / p0;
+            let t1 = (out_value - t0 * p0).max(0) * share1 / 100 / p1;
+            let t2 = (out_value - t0 * p0 - t1 * p1).max(0) / p2;
+            let targets = vec![big(t0 as u64), big(t1 as u64), big(t2 as u64)];
+
+            if let Ok(plan) = plan_rebalance_claim(
+                &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &targets,
+            ) {
+                proptest::prop_assert!(
+                    contract_accepts_rebalance(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan),
+                    "planner emitted a plan the validator rejects: reserves={:?} \
+                     prices={:?} held={:?} targets={:?} bf={}/10000 k={}/100000 \
+                     claim={} idx={}",
+                    [r0, r1, r2], [p0, p1, p2], [h0, h1, h2], [t0, t1, t2],
+                    bf_num, k_num, plan.claim, plan.claim_idx,
+                );
+            }
+        }
     }
 
     /// SUN-310 behaviour change: the manual multi-offer rebalance from preview
