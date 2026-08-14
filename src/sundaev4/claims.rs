@@ -640,12 +640,17 @@ pub fn resolve_claim_shape(
             (a.clone(), if f.is_negative() { BigInt::from(0) } else { f })
         })
         .collect();
+    // An asset with no signed entry is FROZEN on-chain (check_consumption:
+    // assets present in the order input and not named in min_deltas must not
+    // decrease), so its pin is its full holding — never 0/forfeit. Treating
+    // missing as forfeit built plans the validator rejects and forced signers
+    // to write explicit 0-deltas for every untouched asset.
     let pin = |asset: &AssetClass| -> BigInt {
         floors
             .iter()
             .find(|(a, _)| a == asset)
             .map(|(_, m)| m.clone())
-            .unwrap_or_else(|| BigInt::from(0))
+            .unwrap_or_else(|| holding(asset))
     };
 
     // Partition the floors: pool assets act as receive floors / spend pins;
@@ -691,7 +696,7 @@ pub fn resolve_claim_shape(
     // several receive targets, or several offer-capable assets (pool assets
     // with spendable holdings beyond their pin). The re-based floors then act
     // as the exact desired final holdings vector — unmentioned pool assets
-    // are forfeit to the pool, per the signed execution.
+    // stay at their current holding (frozen, matching check_consumption).
     let receive_idxs: Vec<usize> = receives.iter().map(|(i, _)| *i).collect();
     let offer_capable = reserves
         .iter()
@@ -1283,5 +1288,36 @@ mod tests {
         let err = resolve_claim_shape(&value, &no_positive, &reserves, &prices)
             .expect_err("no positive delta → no receive target");
         assert!(err.contains("no receive target"), "got: {err}");
+    }
+
+    /// A held pool asset with NO signed entry is frozen (check_consumption),
+    /// not forfeit: it must stay out of the trade entirely. Treating it as a
+    /// 0-target forced the whole holding into the pool, turning a simple
+    /// pair claim into a huge value donation the planner then rejected —
+    /// which made signers write explicit 0-deltas for every untouched asset.
+    #[test]
+    fn resolve_claim_shape_freezes_unnamed_assets() {
+        let reserves = pool(&[3_250_000_000_000u64 as i64, 4_900_000_000_000, 6_850_000_000_000]);
+        let prices = ones(3);
+        let mut value = crate::cardano_types::Value::default();
+        value.insert(&reserves[0].0, BigInt::from(10_000_000_000u64)); // receive target
+        value.insert(&reserves[1].0, BigInt::from(1_000_000_000u64));  // named spend
+        value.insert(&reserves[2].0, BigInt::from(10_000_000_000u64)); // UNNAMED — frozen
+        let min_deltas = vec![
+            (reserves[0].0.clone(), BigInt::from(1_000_324_661)),
+            (reserves[1].0.clone(), BigInt::from(-1_000_000_000)),
+        ];
+        let shape = resolve_claim_shape(&value, &min_deltas, &reserves, &prices)
+            .expect("unnamed asset must not force a rebalance");
+        match shape {
+            ResolvedShape::Pair(c) => {
+                assert_eq!(c.in_idx, 1);
+                assert_eq!(c.out_idx, 0);
+                assert_eq!(c.spendable, BigInt::from(1_000_000_000));
+            }
+            ResolvedShape::Rebalance(r) => {
+                panic!("frozen asset was forfeited into a rebalance: {r:?}")
+            }
+        }
     }
 }

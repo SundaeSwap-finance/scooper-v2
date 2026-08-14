@@ -624,14 +624,16 @@ pub fn synthesize_swap_constraint(
     // Receive-side entries are lower bounds on inflow, which for assets the
     // order doesn't already hold equals the absolute received amount (the
     // only shape this phase-1 synthesizer supports).
-    let mut consumable = balance.clone();
+    // An offered asset with no signed entry is FROZEN on-chain
+    // (check_consumption: input assets not named in min_deltas must not
+    // decrease), so the execution authorizes no consumption at all — not the
+    // full balance. The signed entry (≤ 0) caps outflow at −amount.
+    let mut consumable = crate::bigint::BigInt::from(0);
     let mut swap_min: Vec<(crate::cardano_types::AssetClass, crate::bigint::BigInt)> = Vec::new();
     for (asset, amount) in &sse.execution.min_received {
         if *asset == offer_asset {
             let cap = -amount.clone();
-            if cap < consumable {
-                consumable = cap;
-            }
+            consumable = if cap < balance { cap } else { balance.clone() };
         } else {
             swap_min.push((asset.clone(), amount.clone()));
         }
@@ -640,7 +642,7 @@ pub fn synthesize_swap_constraint(
         return None; // nothing to receive — nothing for a swap to do
     }
     if !consumable.is_positive() {
-        return None; // outflow bound pins the whole offer
+        return None; // no (or zero) signed outflow for the offer — frozen
     }
 
     Some(crate::sundaev4::types::Constraint::Swap {
@@ -1109,6 +1111,14 @@ mod tests {
         // Only an offered-asset bound (nothing to receive) → None.
         let mut exec = test_execution(NOW_MS + 60_000);
         exec.min_received = vec![(offer_asset.clone(), BigInt::from(-1_000_000))];
+        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        assert!(synthesize_swap_constraint(&order, &sse).is_none());
+
+        // No offered-asset entry at all → the offer is FROZEN on-chain
+        // (check_consumption), so nothing is consumable → None. The old
+        // unconstrained default built full-balance fills the validator
+        // rejected.
+        let exec = test_execution(NOW_MS + 60_000); // receive entry only
         let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
     }
