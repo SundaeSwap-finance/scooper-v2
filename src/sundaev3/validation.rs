@@ -75,7 +75,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
     let scoop_fee = datum.scoop_fee.clone();
     match &datum.action {
         Order::Strategy(_) => Ok(()),
-        Order::Swap(gives, _takes) => {
+        Order::Swap(gives, takes) => {
             let minimum_ada = BigInt::from(ADA_RIDER) + scoop_fee.clone();
             let gives_asset = gives.asset_class();
             let gives_ada = if gives_asset == ADA_ASSET_CLASS {
@@ -84,7 +84,7 @@ pub fn validate_order_value(datum: &OrderDatum, value: &Value) -> Result<(), Val
                 BigInt::ZERO
             };
 
-            if !gives.amount.is_positive() {
+            if !gives.amount.is_positive() || !takes.amount.is_positive() {
                 return Err(ValueError::GivesZeroTokens);
             }
 
@@ -411,6 +411,21 @@ mod tests {
                 scoop_fee: 1_000_000,
                 sberry_offered: 1_000_000,
                 rberry_offered: -1_000_000,
+                actual_ada: 3_000_000,
+                actual_sberry: 10_000_000,
+                actual_rberry: 1_000_000,
+            }),
+            Err(ValueError::GivesZeroTokens)
+        );
+    }
+
+    #[test]
+    fn test_validate_rberry_sberry_takes_zero_tokens() {
+        assert_eq!(
+            test_validate_rberry_sberry_swap_schema(ValidateRBerrySBerrySwapTestCase {
+                scoop_fee: 1_000_000,
+                sberry_offered: 0,
+                rberry_offered: 1_000_000,
                 actual_ada: 3_000_000,
                 actual_sberry: 10_000_000,
                 actual_rberry: 1_000_000,
