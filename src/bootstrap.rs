@@ -1617,6 +1617,11 @@ async fn bootstrap_v4(
         .await
         .context("bootstrap v4: fetch settings UTxOs")?;
     let mut settings = None;
+    let mut fee_settings: Option<Arc<sundaev4::SundaeV4FeeSettings>> = None;
+    let fee_token: Option<Vec<u8>> = protocol
+        .fee_settings_token
+        .as_ref()
+        .and_then(|t| hex::decode(t).ok());
     let mut order_configs: std::collections::BTreeMap<Vec<u8>, Arc<sundaev4::SundaeV4OrderConfig>> =
         std::collections::BTreeMap::new();
     for utxo in &settings_utxos {
@@ -1634,6 +1639,35 @@ async fn bootstrap_v4(
                 }));
             }
             continue;
+        }
+        // The FeeSettings node (docs/fee-system.md): matched by its
+        // configured entry token; datum is `FeeSettings { base_fee }`.
+        if let Some(want) = &fee_token {
+            let has_token = utxo
+                .value
+                .0
+                .get(&protocol.settings_nft.policy)
+                .map(|tokens| {
+                    tokens
+                        .iter()
+                        .any(|(name, qty)| name.as_slice() == want.as_slice() && qty.is_positive())
+                })
+                .unwrap_or(false);
+            if has_token {
+                if let Ok(fs) = sundaev4::FeeSettingsDatum::from_plutus(data.clone()) {
+                    use num_traits::ToPrimitive;
+                    if let Some(base_fee) = fs.base_fee.unwrap().to_u64() {
+                        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                        info!(base_fee, "bootstrap v4: hydrated FeeSettings node");
+                        fee_settings = Some(Arc::new(sundaev4::SundaeV4FeeSettings {
+                            input,
+                            base_fee,
+                            slot: utxo.slot,
+                        }));
+                    }
+                }
+                continue;
+            }
         }
         // Non-global settings entry: try OrderConfig (PR #11). Other shapes
         // (e.g. PoolConfig minted by mint-pool-config) are ignored — the
@@ -1879,6 +1913,34 @@ async fn bootstrap_v4(
             });
         }
 
+        // The FeeSettings node must survive restarts the same way (the
+        // loader's "fee_settings" arm re-parses it from the persisted txo).
+        if let Some(fs) = &fee_settings {
+            let settings_addr = ShelleyAddress::new(
+                Network::Testnet,
+                ShelleyPaymentPart::Script(protocol.settings_script_hash),
+                ShelleyDelegationPart::Null,
+            ).to_vec();
+            let datum_bytes = sundaev4::FeeSettingsDatum {
+                base_fee: crate::bigint::BigInt::from(fs.base_fee),
+            }.to_plutus_bytes();
+            let mut value = crate::cardano_types::Value::default();
+            if let Some(want) = &fee_token {
+                value.0.entry(protocol.settings_nft.policy.clone())
+                    .or_default()
+                    .insert(want.clone().into(), crate::bigint::BigInt::from(1u64));
+            }
+            persisted_txos.push(PersistedTxo {
+                txo_id: fs.input.clone(),
+                txo_type: "fee_settings".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(&settings_addr, &value, Some(&datum_bytes)),
+                address: settings_addr,
+                datum: None,
+            });
+        }
+
         for (input, value) in &wallet_utxos {
             persisted_txos.push(PersistedTxo {
                 txo_id: input.clone(),
@@ -1957,6 +2019,7 @@ async fn bootstrap_v4(
         }
         s.invalid_orders = invalid_orders;
         s.settings = settings;
+        s.fee_settings = fee_settings;
         s.order_configs = order_configs;
         s.wallet_utxos = wallet_utxos;
         s.ref_utxo_outputs = ref_utxo_outputs;
