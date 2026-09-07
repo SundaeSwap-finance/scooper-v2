@@ -41,6 +41,17 @@ mod hex_ser {
     }
 }
 
+
+/// Void / unit as PlutusData — `Constr 0 []`. The audit-final PoolDatum's
+/// `extension` field is Void on every pool the CLI creates.
+pub fn plutus_void() -> PlutusData {
+    PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121,
+        any_constructor: None,
+        fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Pool types
 // ──────────────────────────────────────────────────────────────────────────────
@@ -55,6 +66,12 @@ pub struct PoolDatum {
     pub actions: Vec<ActionEntry>,
     #[serde(serialize_with = "hex_ser::vec_bytes_pair_as_map")]
     pub module_state: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Lovelace surplus floor pinned from PoolConfig.min_surplus at Create
+    /// (ADR-0012; audit-final addition). Preserved verbatim on every spend.
+    pub min_surplus: BigInt,
+    /// Reserved scooper-writable scratch (audit-final addition). The datum-
+    /// preserving paths carry it through unchanged.
+    pub extension: PlutusData,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -531,9 +548,24 @@ pub enum OrderRedeemer {
 pub struct SettingsDatum {
     pub settings_admin: Multisig,
     pub treasury_admin: Multisig,
-    #[serde(serialize_with = "hex_ser::opt_vec_bytes")]
-    pub authorized_scoopers: Option<Vec<Vec<u8>>>,
+    // Audit-final shape: entries are MultisigScript (usually Signature),
+    // not raw key hashes; security_council added by GH #198.
+    pub authorized_scoopers: Option<Vec<Multisig>>,
+    pub security_council: Multisig,
     pub extension: PlutusData,
+}
+
+impl SettingsDatum {
+    /// Position of `keyhash` in authorized_scoopers, matching plain
+    /// Signature entries only. Multi-sig scooper entries never match a
+    /// single key.
+    pub fn scooper_index(&self, keyhash: &[u8]) -> Option<u64> {
+        self.authorized_scoopers.as_ref().and_then(|list| {
+            list.iter()
+                .position(|m| matches!(m, Multisig::Signature(kh) if kh.as_slice() == keyhash))
+                .map(|i| i as u64)
+        })
+    }
 }
 // SUN-301 removed `treasury_address` (unused), `order_modules`, and
 // `min_share_batcher` from the global settings: order dispatch is
@@ -844,11 +876,12 @@ pub enum FairnessRedeemer {
     Destroy { entries: Vec<PlutusData> },
 }
 
+// Audit-final shape: names the signing scooper by index into the settings'
+// authorized_scoopers list instead of (pool_ident, raw key).
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct FairnessOperateEntry {
     pub pool_oref: OutputRef,
-    pub pool_ident: Ident,
-    pub scooper: Vec<u8>,
+    pub scooper_idx: BigInt,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1049,7 +1082,10 @@ impl ScooperExecution {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ModuleScripts {
-    pub constant_product: ScriptRefInfo,
+    /// Optional: only required when scooping constant-product pools (the
+    /// audit-final cs-launch deployment does not publish CP).
+    #[serde(default)]
+    pub constant_product: Option<ScriptRefInfo>,
     pub fee_split: ScriptRefInfo,
     pub fairness: ScriptRefInfo,
     pub pool: ScriptRefInfo,
@@ -1394,6 +1430,8 @@ mod tests {
             "9f",                               // List: module_state
             "9f41aa41bbff",                     // (0xaa, 0xbb)
             "ff",
+            "00",                               // min_surplus = 0 (audit-final)
+            "d87980",                           // extension = Void (audit-final)
             "ff"
         ))
         .unwrap();
@@ -1556,7 +1594,8 @@ mod tests {
         let datum = SettingsDatum {
             settings_admin: Multisig::Signature(vec![0xaa; 28]),
             treasury_admin: Multisig::Signature(vec![0xbb; 28]),
-            authorized_scoopers: Some(vec![vec![0xdd; 28]]),
+            authorized_scoopers: Some(vec![Multisig::Signature(vec![0xdd; 28])]),
+            security_council: Multisig::Signature(vec![0xcc; 28]),
             extension: PlutusData::Constr(pallas_primitives::Constr {
                 tag: 121,
                 any_constructor: None,
@@ -1620,6 +1659,8 @@ mod tests {
             identifier: Ident::new(&[0xab]),
             actions: vec![],
             module_state: vec![],
+            min_surplus: BigInt::from(0),
+            extension: crate::sundaev4::types::plutus_void(),
         };
         let state = PoolState::from_pool(&pool);
         assert_eq!(state.assets, pool.assets);

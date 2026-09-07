@@ -1104,7 +1104,8 @@ fn needs_cp_lookup(
     cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
 ) -> bool {
     let Some(exec) = execution else { return false; };
-    let cp_hash = exec.module_scripts.constant_product.hash;
+    let Some(cp) = exec.module_scripts.constant_product.as_ref() else { return false; };
+    let cp_hash = cp.hash;
     let is_cp = pool_datum.actions.iter().any(|a| {
         a.enabled
             && a.modules
@@ -1175,7 +1176,7 @@ async fn lookup_pool_module_configs(
         .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
     let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash);
-    let cp_hash = exec.module_scripts.constant_product.hash;
+    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
     let fs_hash = exec.module_scripts.fee_split.hash;
 
     let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
@@ -1204,7 +1205,9 @@ async fn lookup_pool_module_configs(
         }
     }
     if want_cp {
-        out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, &cp_hash);
+        if let Some(h) = cp_hash.as_ref() {
+            out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, h);
+        }
     }
     if want_cl {
         if let Some(h) = cl_hash.as_ref() {
@@ -1249,7 +1252,9 @@ async fn lookup_pool_module_configs(
                 }
             }
             if want_cp && out.cp.is_none() {
-                out.cp = sundaev4::extract_cp_config_from_tx(&tx, &cp_hash);
+                if let Some(h) = cp_hash.as_ref() {
+                    out.cp = sundaev4::extract_cp_config_from_tx(&tx, h);
+                }
             }
             if want_cl && out.cl.is_none() {
                 if let Some(h) = cl_hash.as_ref() {
@@ -1296,7 +1301,8 @@ async fn bootstrap_v4(
     let cp_module_hash: Option<Vec<u8>> = protocol
         .execution
         .as_ref()
-        .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
+        .and_then(|e| e.module_scripts.constant_product.as_ref())
+        .map(|cp| cp.hash.as_ref().to_vec());
     let cl_module_hash: Option<Vec<u8>> = protocol
         .execution
         .as_ref()
@@ -1719,7 +1725,6 @@ async fn bootstrap_v4(
         info!("bootstrap: fetching V4 reference script UTxOs...");
         let scripts = &exec.module_scripts;
         let mut all_refs: Vec<&crate::sundaev4::ScriptRefInfo> = vec![
-            &scripts.constant_product,
             &scripts.fee_split,
             &scripts.fairness,
             &scripts.pool,
@@ -1727,6 +1732,9 @@ async fn bootstrap_v4(
             &scripts.pool_mint,
             &scripts.settings,
         ];
+        if let Some(ref cp) = scripts.constant_product {
+            all_refs.push(cp);
+        }
         if let Some(ref cs) = scripts.constant_sum {
             all_refs.push(cs);
         }

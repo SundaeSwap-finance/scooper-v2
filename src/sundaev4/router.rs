@@ -1372,6 +1372,8 @@ mod tests {
                 identifier: ident.clone(),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: crate::sundaev4::types::PoolType::ConstantProduct {
                 fee: crate::sundaev4::types::Rational {
@@ -1562,6 +1564,8 @@ mod tests {
                 identifier: ident.clone(),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: crate::sundaev4::types::PoolType::ConstantSum {
                 prices: prices.iter().map(|&p| BigInt::from(p)).collect(),

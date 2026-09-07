@@ -493,10 +493,10 @@ pub(crate) mod test_harness {
             let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
 
             // Fairness module has no config — empty CBOR array
-            let fairness_hash = Hasher::<256>::hash(&[0x80]).to_vec();
+            let fairness_hash = vec![0x80];
 
             vec![
-                (self.exec.module_scripts.constant_product.hash.to_vec(), cp_hash),
+                (self.exec.module_scripts.constant_product.as_ref().expect("harness blueprint includes constantProduct").hash.to_vec(), cp_hash),
                 (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
                 (self.exec.module_scripts.fairness.hash.to_vec(), fairness_hash),
             ]
@@ -505,7 +505,7 @@ pub(crate) mod test_harness {
         /// The action entry modules list: [cp_hash, fs_hash, fairness_hash].
         pub fn action_modules(&self) -> Vec<Vec<u8>> {
             vec![
-                self.exec.module_scripts.constant_product.hash.to_vec(),
+                self.exec.module_scripts.constant_product.as_ref().expect("harness blueprint includes constantProduct").hash.to_vec(),
                 self.exec.module_scripts.fee_split.hash.to_vec(),
                 self.exec.module_scripts.fairness.hash.to_vec(),
             ]
@@ -536,7 +536,7 @@ pub(crate) mod test_harness {
             let fs_cbor = minicbor::to_vec(&fs_config.to_plutus()).unwrap();
             let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
 
-            let fairness_hash = Hasher::<256>::hash(&[0x80]).to_vec();
+            let fairness_hash = vec![0x80];
 
             vec![
                 (cs_script.hash.to_vec(), cs_hash),
@@ -667,6 +667,8 @@ pub(crate) mod test_harness {
                     },
                 ],
                 module_state: env.module_state(),
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
                 fee: Rational {
@@ -739,6 +741,8 @@ pub(crate) mod test_harness {
                     modules: env.action_modules(),
                 }],
                 module_state: env.module_state(),
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConcentratedLiquidity {
                 sqrt_price_a: Rational { num: BigInt::from(spa_num), den: BigInt::from(spa_den) },
@@ -815,6 +819,8 @@ pub(crate) mod test_harness {
                     },
                 ],
                 module_state: env.cs_module_state(&prices, &fee),
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantSum {
                 prices,
@@ -1221,7 +1227,8 @@ pub(crate) mod test_harness {
             datum: SettingsDatum {
                 settings_admin: Multisig::Signature(vec![0xFF; 28]),
                 treasury_admin: Multisig::Signature(vec![0xFF; 28]),
-                authorized_scoopers: Some(vec![scooper_keyhash.to_vec()]),
+                authorized_scoopers: Some(vec![Multisig::Signature(scooper_keyhash.to_vec())]),
+                security_council: Multisig::Signature(vec![0xFF; 28]),
                 extension: PlutusData::Constr(pallas_primitives::Constr {
                     tag: 121,
                     any_constructor: None,

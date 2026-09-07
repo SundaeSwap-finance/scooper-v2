@@ -220,7 +220,7 @@ impl Blueprint {
         ).ok();
 
         Ok(ModuleScripts {
-            constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2)?,
+            constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
             fairness: make_info(self, mappings[2].0, mappings[2].1, mappings[2].2)?,
             pool: make_info(self, mappings[3].0, mappings[3].1, mappings[3].2)?,
@@ -319,9 +319,13 @@ mod tests {
         assert_eq!(modules.order.hash.as_slice().len(), 28);
         assert_eq!(modules.settings.hash.as_slice().len(), 28);
         assert_eq!(modules.pool_mint.hash.as_slice().len(), 28);
-        assert!(modules.constant_product.script_cbor.is_some());
-        assert!(modules.constant_sum.is_some(), "constant_sum optional but present in preview");
-        assert!(modules.swap_order.is_some(), "swap_order required for new order dispatch");
+        // The audit-final cs-launch deployment publishes CS + basic/strategy
+        // only — CP and the swap constraint are absent by design.
+        assert!(modules.constant_sum.is_some(), "constant_sum must be present in the cs-launch blueprint");
+        assert!(modules.constant_sum.as_ref().unwrap().script_cbor.is_some());
+        assert!(modules.basic_order.is_some(), "basic_order required for order dispatch");
+        assert!(modules.strategy_order.is_some(), "strategy_order required for strategy scoops");
+        assert!(modules.constant_product.is_none(), "cs-launch scope does not publish CP");
     }
 
     #[test]

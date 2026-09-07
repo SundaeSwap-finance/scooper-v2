@@ -1071,6 +1071,8 @@ mod tests {
                     identifier: ident.clone(),
                     actions: vec![],
                     module_state: vec![],
+                    min_surplus: BigInt::from(0),
+                    extension: crate::sundaev4::plutus_void(),
                 },
                 pool_type: PoolType::ConstantProduct {
                     fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },

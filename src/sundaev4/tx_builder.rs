@@ -782,6 +782,8 @@ pub fn build_multi_pool_scoop_tx(
             identifier: pool.pool_datum.identifier.clone(),
             actions: pool.pool_datum.actions.clone(),
             module_state: pool.pool_datum.module_state.clone(),
+            min_surplus: pool.pool_datum.min_surplus.clone(),
+            extension: pool.pool_datum.extension.clone(),
         };
 
         per_pool.push(PerPoolData {
@@ -1050,8 +1052,12 @@ pub fn build_multi_pool_scoop_tx(
                 transaction_id: pool_oref.transaction_id.to_vec(),
                 output_index: pool_oref.index,
             },
-            pool_ident: batch.pool.pool_datum.identifier.clone(),
-            scooper: scooper_keyhash.to_vec(),
+            scooper_idx: BigInt::from(
+                settings
+                    .datum
+                    .scooper_index(scooper_keyhash.as_ref())
+                    .unwrap_or(0),
+            ),
         });
     }
 
@@ -1177,7 +1183,9 @@ pub fn build_multi_pool_scoop_tx(
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
     if has_cp {
-        all_ref_inputs.push(exec.module_scripts.constant_product.ref_utxo.0.clone());
+        if let Some(cp) = &exec.module_scripts.constant_product {
+            all_ref_inputs.push(cp.ref_utxo.0.clone());
+        }
     }
     if has_cs {
         if let Some(cs) = &exec.module_scripts.constant_sum {
@@ -1316,16 +1324,12 @@ pub fn build_multi_pool_scoop_tx(
         entries: order_validator_redeemer.entries,
     };
     // Compute the scooper's slot in `authorized_scoopers` for the
-    // fairness_order constraint's redeemer (PR #11).
+    // fairness_order constraint's redeemer (PR #11). Entries are
+    // MultisigScript in the audit-final settings; only Signature entries
+    // can match a single key.
     let authorized_scooper_index: u64 = settings
         .datum
-        .authorized_scoopers
-        .as_ref()
-        .and_then(|list| {
-            list.iter()
-                .position(|kh| kh.as_slice() == scooper_keyhash.as_ref())
-        })
-        .map(|i| i as u64)
+        .scooper_index(scooper_keyhash.as_ref())
         .unwrap_or(0);
 
     // Legacy compatibility helpers — kept for the unit-redeemer paths below
@@ -1363,11 +1367,13 @@ pub fn build_multi_pool_scoop_tx(
 
     // Conditionally add CP withdrawal
     if has_cp {
-        let cp_redeemer = ConstantProductRedeemer::Operate { entries: cp_entries };
-        withdrawals.push((
-            reward_account(&exec.module_scripts.constant_product.hash),
-            cp_redeemer.to_plutus(),
-        ));
+        if let Some(cp_script) = &exec.module_scripts.constant_product {
+            let cp_redeemer = ConstantProductRedeemer::Operate { entries: cp_entries };
+            withdrawals.push((
+                reward_account(&cp_script.hash),
+                cp_redeemer.to_plutus(),
+            ));
+        }
     }
 
     // Conditionally add CS withdrawal

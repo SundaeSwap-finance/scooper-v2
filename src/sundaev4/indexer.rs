@@ -142,7 +142,6 @@ impl SundaeV4Indexer {
                 let mut set = [
                     &scripts.pool,
                     &scripts.order,
-                    &scripts.constant_product,
                     &scripts.fee_split,
                     &scripts.fairness,
                     &scripts.pool_mint,
@@ -151,6 +150,9 @@ impl SundaeV4Indexer {
                 .iter()
                 .map(|s| s.ref_utxo.clone())
                 .collect::<BTreeSet<_>>();
+                if let Some(cp) = &scripts.constant_product {
+                    set.insert(cp.ref_utxo.clone());
+                }
                 if let Some(cs) = &scripts.constant_sum {
                     set.insert(cs.ref_utxo.clone());
                 }
@@ -215,7 +217,8 @@ impl SundaeV4Indexer {
         let cp_module_hash: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
-            .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
+            .and_then(|e| e.module_scripts.constant_product.as_ref())
+            .map(|cp| cp.hash.as_ref().to_vec());
         let cl_module_hash: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -867,7 +870,8 @@ impl ChainIndex for SundaeV4Indexer {
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| extract_cp_config_from_tx(&tx, &e.module_scripts.constant_product.hash));
+            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
+            .and_then(|h| extract_cp_config_from_tx(&tx, &h));
         let cl_config_from_tx = self
             .protocol
             .execution
@@ -905,7 +909,8 @@ impl ChainIndex for SundaeV4Indexer {
         let cp_module_hash_bytes: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
-            .map(|e| e.module_scripts.constant_product.hash.as_ref().to_vec());
+            .and_then(|e| e.module_scripts.constant_product.as_ref())
+            .map(|cp| cp.hash.as_ref().to_vec());
         let cl_module_hash_bytes: Option<Vec<u8>> = self.protocol
             .execution
             .as_ref()
@@ -1676,16 +1681,18 @@ pub fn detect_pool_type(
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cp_hash = exec.module_scripts.constant_product.hash.as_ref().to_vec();
+    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
         if !action.enabled { continue; }
         let Some(first) = action.modules.first() else { continue; };
-        if first.as_slice() == cp_hash.as_slice() {
-            matched_action = Some(action);
-            matched_kind = Some("cp");
-            break;
+        if let Some(h) = &cp_hash {
+            if first.as_slice() == h.as_slice() {
+                matched_action = Some(action);
+                matched_kind = Some("cp");
+                break;
+            }
         }
         if let Some(h) = &cs_hash {
             if first.as_slice() == h.as_slice() {

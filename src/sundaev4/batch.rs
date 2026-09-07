@@ -982,6 +982,8 @@ mod tests {
                 identifier: Ident::new(&[0xde, 0xad]),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
@@ -1052,6 +1054,8 @@ mod tests {
                 identifier: Ident::new(&[0xde, 0xad]),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConcentratedLiquidity {
                 sqrt_price_a: Rational { num: BigInt::from(spa.0), den: BigInt::from(spa.1) },
@@ -1261,6 +1265,8 @@ mod tests {
                 identifier: Ident::new(&[0xbe, 0xef]),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
@@ -1295,6 +1301,8 @@ mod tests {
                 identifier: Ident::new(&[0xca, 0xfe]),
                 actions: vec![],
                 module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
                 fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
