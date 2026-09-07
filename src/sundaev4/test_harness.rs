@@ -389,6 +389,7 @@ pub(crate) mod test_harness {
                 None, // fee_override
                 &self.order_configs,
                 &std::collections::BTreeMap::new(), // strategy_executions
+                None, // fee_settings (harness configs are fee-less)
                 Some((self.funding_utxo.clone(), &self.funding_value)),
                 self.butane.as_ref(),
             )?;

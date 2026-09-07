@@ -1530,6 +1530,7 @@ impl Scooper {
                 &plan, &settings, &exec, validity, &language_views,
                 &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                 None, &v4_state.order_configs, &strategy_executions,
+                v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1688,6 +1689,7 @@ impl Scooper {
                     &diag_plan, &settings, &exec, validity, &language_views,
                     &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
                     None, &v4_state.order_configs, &strategy_executions,
+                v4_state.fee_settings.as_deref(),
                     funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
                     Err(e) => (Some(format!("build: {e}")), None),
                     Ok(build) => {
@@ -1872,6 +1874,7 @@ impl Scooper {
             &final_plan, &settings, &exec, validity, language_views,
             &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
             None, &v4_state.order_configs, &strategy_executions,
+                v4_state.fee_settings.as_deref(),
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
             Ok(r) => r,
             Err(e) => {
@@ -1976,6 +1979,7 @@ impl Scooper {
             Some(computed_fee),
             &v4_state.order_configs,
             &strategy_executions,
+            v4_state.fee_settings.as_deref(),
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
             Ok(r) => r,
             Err(e) => {

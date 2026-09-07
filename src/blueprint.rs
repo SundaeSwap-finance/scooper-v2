@@ -211,6 +211,13 @@ impl Blueprint {
             "strategy_order.withdraw",
             "strategy_order",
         ).ok();
+        // Fee constraint (optional — the once-per-scoop service-fee aggregator).
+        let fee_constraint = make_info(
+            self,
+            &["fee_constraint.withdraw", "fee.fee_constraint", "fee_constraint", "feeConstraint"],
+            "fee_constraint.withdraw",
+            "fee_constraint",
+        ).ok();
         // Concentrated liquidity module (optional — only present when CL pools exist).
         let concentrated_liquidity = make_info(
             self,
@@ -228,6 +235,7 @@ impl Blueprint {
             pool_mint: make_info(self, mappings[5].0, mappings[5].1, mappings[5].2)?,
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
             constant_sum,
+            fee_constraint,
             concentrated_liquidity,
             swap_order,
             basic_order,

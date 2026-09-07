@@ -1121,6 +1121,11 @@ pub struct ModuleScripts {
     /// optional until strategy execution ingestion is designed.
     #[serde(default)]
     pub strategy_order: Option<ScriptRefInfo>,
+    /// `fee_constraint` — the once-per-scoop service-fee aggregator
+    /// (docs/fee-system.md). Optional: absent = fee-bearing OrderConfigs
+    /// can't be scooped.
+    #[serde(default)]
+    pub fee_constraint: Option<ScriptRefInfo>,
 }
 
 #[serde_with::serde_as]
@@ -1251,6 +1256,22 @@ pub struct SundaeV4Settings {
     pub slot: u64,
 }
 
+/// The FeeSettings settings node (docs/fee-system.md):
+/// `FeeSettings { base_fee: Int }` under the configured entry token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SundaeV4FeeSettings {
+    pub input: TransactionInput,
+    pub base_fee: u64,
+    pub slot: u64,
+}
+
+/// FeeSettings node datum. Kept minimal: base_fee is the only field the
+/// launch fee system reads (flat per-execution pricing, ADR-0009).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FeeSettingsDatum {
+    pub base_fee: BigInt,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Protocol configuration
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1264,6 +1285,11 @@ pub struct SundaeV4Protocol {
     pub settings_script_hash: ScriptHash,
     pub settings_nft: AssetClass,
     pub pool_nft_policy: ScriptHash,
+    /// Token name (hex) of the FeeSettings settings node (docs/fee-system.md).
+    /// Required to scoop fee-bearing OrderConfigs; the indexer tracks the
+    /// node's UTxO + base_fee under this token at the settings address.
+    #[serde(default)]
+    pub fee_settings_token: Option<String>,
     #[serde_as(as = "serde_with::DisplayFromStr")]
     pub starting_point: Point,
     pub execution: Option<ScooperExecution>,

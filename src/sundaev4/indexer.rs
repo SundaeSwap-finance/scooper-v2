@@ -41,6 +41,9 @@ pub struct SundaeV4State {
     /// indexes into this map. Populated from `settings`-typed UTxOs whose
     /// datum decodes as `OrderConfig` (PR #11 modular order constraints).
     pub order_configs: BTreeMap<Vec<u8>, Arc<SundaeV4OrderConfig>>,
+    /// The FeeSettings node (docs/fee-system.md): tracked when the config
+    /// names its entry token. Required to scoop fee-bearing OrderConfigs.
+    pub fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>>,
     pub spent_orders: Vec<SpentOrder<SundaeV4Order>>,
     pub spent_pools: Vec<SpentPool<SundaeV4Pool>>,
     pub invalid_orders: Vec<InvalidOrder>,
@@ -433,6 +436,24 @@ impl SundaeV4Indexer {
                         warn!(input = %txo.txo_id, "v4: order_config txo could not be reparsed on load");
                     }
                 }
+                "fee_settings" => {
+                    let parsed: Option<crate::sundaev4::types::FeeSettingsDatum> =
+                        output.datum.parse(&datums);
+                    if let Some(fs) = parsed {
+                        use num_traits::ToPrimitive;
+                        if let Some(base_fee) = fs.base_fee.unwrap().to_u64() {
+                            state.fee_settings = Some(Arc::new(
+                                crate::sundaev4::types::SundaeV4FeeSettings {
+                                    input: txo.txo_id,
+                                    base_fee,
+                                    slot: txo.created_slot,
+                                },
+                            ));
+                        }
+                    } else {
+                        warn!(input = %txo.txo_id, "v4: fee_settings txo could not be reparsed on load");
+                    }
+                }
                 "wallet" => {
                     state.wallet_utxos.insert(txo.txo_id, output.value);
                 }
@@ -588,6 +609,34 @@ impl SundaeV4Indexer {
         } else {
             None
         }
+    }
+
+    /// Try to parse a settings-address UTxO as the FeeSettings node: it must
+    /// carry the configured fee-settings entry token under the settings
+    /// policy and a `FeeSettings { base_fee }` datum.
+    fn parse_fee_settings(
+        &self,
+        tx_out: &TransactionOutput,
+        datums: &ScopedDatumLookup,
+    ) -> Option<u64> {
+        use num_traits::ToPrimitive;
+        let want_token = hex::decode(self.protocol.fee_settings_token.as_ref()?).ok()?;
+        let settings_policy = &self.protocol.settings_nft.policy;
+        let has_token = tx_out
+            .value
+            .0
+            .get(settings_policy)
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .any(|(name, qty)| name.as_slice() == want_token.as_slice() && qty.is_positive())
+            })
+            .unwrap_or(false);
+        if !has_token {
+            return None;
+        }
+        let fs: crate::sundaev4::types::FeeSettingsDatum = tx_out.datum.parse(datums)?;
+        fs.base_fee.unwrap().to_u64()
     }
 
     /// Try to parse a `settings`-typed UTxO as an `OrderConfig` settings entry.
@@ -840,6 +889,7 @@ impl ChainIndex for SundaeV4Indexer {
         let mut new_settings = None;
         /// (token_name, OrderConfigEntry) — newly-discovered OrderConfig
         /// settings entries in this tx.
+        let mut new_fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>> = None;
         let mut new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)> = vec![];
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
@@ -1137,6 +1187,23 @@ impl ChainIndex for SundaeV4Indexer {
                         datum: sd,
                         slot,
                     }));
+                } else if let Some(base_fee) = self.parse_fee_settings(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "fee_settings".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+                    new_fee_settings = Some(Arc::new(
+                        crate::sundaev4::types::SundaeV4FeeSettings {
+                            input: this_input,
+                            base_fee,
+                            slot,
+                        },
+                    ));
                 } else if let Some((token_name, oc)) = self.parse_order_config(&tx_out, &datums) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
@@ -1389,6 +1456,18 @@ impl ChainIndex for SundaeV4Indexer {
             state.settings = None;
         }
 
+        // Remove the FeeSettings node if spent (admin fee update); the
+        // replacement is re-added via the settings-address branch above.
+        if let Some(fs) = &state.fee_settings
+            && spent_inputs.contains(&fs.input)
+        {
+            changes.spent_txos.push(SpentTxo {
+                input: fs.input.clone(),
+                spending_tx_id: this_tx_hash.to_vec(),
+            });
+            state.fee_settings = None;
+        }
+
         // Remove any OrderConfig entries whose UTxO was spent (admin updated
         // or burned). The replacement entry, if any, is detected via the
         // settings-script-hash output branch above and re-added.
@@ -1446,6 +1525,11 @@ impl ChainIndex for SundaeV4Indexer {
                 settings: settings.clone(),
             });
             state.settings = Some(settings);
+        }
+
+        if let Some(fs) = new_fee_settings {
+            info!(base_fee = fs.base_fee, "v4: FeeSettings node updated");
+            state.fee_settings = Some(fs);
         }
 
         for (token_name, oc) in new_order_configs.drain(..) {

@@ -254,6 +254,11 @@ pub fn build_multi_pool_scoop_tx(
     // strategy_order constraint must have an entry; the strategy_order
     // withdrawal redeemer is the list of these in canonical input order.
     strategy_executions: &BTreeMap<crate::cardano_types::TransactionInput, pallas_primitives::PlutusData>,
+    // The FeeSettings node (docs/fee-system.md) — required when any order in
+    // the plan binds a fee-bearing OrderConfig. Its base_fee prices every
+    // continuation execution; the collected total (net of the declared tx
+    // fee) lands as exact surplus on the designated pool (ADR-0010).
+    fee_settings: Option<&crate::sundaev4::types::SundaeV4FeeSettings>,
     // Optional wallet UTxO that funds any min-ada gap on pool outputs (datum
     // growth from upgrades can push pool outputs above their current ada
     // buffer). When present, the input is included and net excess flows back
@@ -1222,6 +1227,25 @@ pub fn build_multi_pool_scoop_tx(
             required_constraint_hashes.insert(h.clone());
         }
     }
+    // Fee-constraint mode (docs/fee-system.md): active when any order's
+    // OrderConfig requires the fee constraint. Every continuation execution
+    // is charged exactly base_fee; terminal fills keep terminal settlement.
+    let fee_sri = exec.module_scripts.fee_constraint.as_ref();
+    let fee_active = fee_sri
+        .map(|sri| required_constraint_hashes.contains(&sri.hash.as_ref().to_vec()))
+        .unwrap_or(false);
+    let fee_base: Option<u64> = if fee_active {
+        if m_pools == 0 {
+            bail!("fee-bearing orders need a designated pool but the plan has no pool batches");
+        }
+        let fs = fee_settings.context(
+            "fee-bearing OrderConfig in scoop but no FeeSettings node tracked              (set fee-settings-token in the v4 config)",
+        )?;
+        Some(fs.base_fee)
+    } else {
+        None
+    };
+
     let constraint_script_refs = |hash: &[u8]| -> Option<&ScriptRefInfo> {
         for slot in [
             &exec.module_scripts.swap_order,
@@ -1229,6 +1253,7 @@ pub fn build_multi_pool_scoop_tx(
             &exec.module_scripts.route_order,
             &exec.module_scripts.fairness_order,
             &exec.module_scripts.strategy_order,
+            &exec.module_scripts.fee_constraint,
         ] {
             if let Some(sri) = slot {
                 if sri.hash.as_ref() == hash {
@@ -1255,6 +1280,11 @@ pub fn build_multi_pool_scoop_tx(
         all_ref_inputs.push(oc.input.0.clone());
     }
     all_ref_inputs.push(settings.input.0.clone());
+    if fee_active {
+        if let Some(fs) = fee_settings {
+            all_ref_inputs.push(fs.input.0.clone());
+        }
+    }
 
     // Sort the reference inputs canonically — (txId bytes, output_index) —
     // and dedupe. The ledger treats reference_inputs as a Set and presents
@@ -1421,6 +1451,7 @@ pub fn build_multi_pool_scoop_tx(
         else if matches(&exec.module_scripts.route_order) { Some("route_order") }
         else if matches(&exec.module_scripts.fairness_order) { Some("fairness_order") }
         else if matches(&exec.module_scripts.strategy_order) { Some("strategy_order") }
+        else if matches(&exec.module_scripts.fee_constraint) { Some("fee_constraint") }
         else { None }
     };
     // Precompute the route_order redeemer if needed. It's a per-order
@@ -1607,6 +1638,15 @@ pub fn build_multi_pool_scoop_tx(
                 pallas_primitives::PlutusData::Array(
                     pallas_codec::utils::MaybeIndefArray::Indef(sses),
                 )
+            }
+            Some("fee_constraint") => {
+                // The designated pool (ADR-0010): the first pool input in
+                // canonical order. Verified on-chain (NFT + treasury tag),
+                // economically indifferent among eligible pools.
+                let designated = pool_sorted_indices[pool_output_order[0]] as i64;
+                pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                    designated.into(),
+                ))
             }
             None => {
                 tracing::warn!(
@@ -1823,16 +1863,52 @@ pub fn build_multi_pool_scoop_tx(
             .max_per_execution
             .clone()
             .min(order.datum.service_budget.clone());
+        // Fee-constraint mode (fee_lib.accumulate_fees): a continuation
+        // execution (partial fill, or a Self destination returning to the
+        // order address) must decrement service_budget by EXACTLY base_fee;
+        // terminal fills settle terminal_settlement as before. The inclusion
+        // gate (base_fee <= max_per_execution) is enforced on-chain; bail
+        // here so the plan fails with a diagnosable error instead.
+        let is_partial = matches!(&swap_fill, Some(fill) if fill < order.swap_offered().1);
+        let is_continuation = is_partial
+            || matches!(&order.datum.destination, crate::sundaev4::Destination::SelfDestination);
         let actual_fee: u64 = {
             use num_traits::ToPrimitive;
-            let fee_big = match &swap_fill {
-                Some(fill) if fill < order.swap_offered().1 => {
-                    let (_, remaining) = order.swap_offered();
-                    let prorata = &(fill * &order.datum.service_budget) / remaining;
-                    prorata.min(order.datum.max_per_execution.clone())
+            let fee_big = if let (Some(bf), true) = (fee_base, is_continuation) {
+                let bf_big = BigInt::from(bf);
+                if bf_big > order.datum.max_per_execution {
+                    bail!(
+                        "order {}: base_fee {bf} exceeds max_per_execution — unscoopable at current fee rates",
+                        hex::encode(order.input.0.transaction_id.as_ref()),
+                    );
                 }
-                _ => terminal_settlement.clone(),
+                if bf_big > order.datum.service_budget {
+                    bail!(
+                        "order {}: base_fee {bf} exceeds remaining service_budget",
+                        hex::encode(order.input.0.transaction_id.as_ref()),
+                    );
+                }
+                bf_big
+            } else {
+                match &swap_fill {
+                    Some(fill) if fill < order.swap_offered().1 => {
+                        let (_, remaining) = order.swap_offered();
+                        let prorata = &(fill * &order.datum.service_budget) / remaining;
+                        prorata.min(order.datum.max_per_execution.clone())
+                    }
+                    _ => terminal_settlement.clone(),
+                }
             };
+            if let Some(bf) = fee_base {
+                // Terminal fills are charged terminal_settlement on-chain;
+                // the inclusion gate still applies.
+                if !is_continuation && BigInt::from(bf) > order.datum.max_per_execution {
+                    bail!(
+                        "order {}: base_fee {bf} exceeds max_per_execution — unscoopable at current fee rates",
+                        hex::encode(order.input.0.transaction_id.as_ref()),
+                    );
+                }
+            }
             fee_big
                 .unwrap()
                 .to_u64()
@@ -2061,6 +2137,35 @@ pub fn build_multi_pool_scoop_tx(
     // with any native tokens carried by the funding UTxO. If no funding
     // was provided but a bump was needed, bail — the scooper must retry
     // once a suitable UTxO is available.
+    // ── Fee-constraint delivery (ADR-0010) ─────────────────────────────────
+    // The collected total, net of the declared tx fee, must land as an EXACT
+    // surplus delta on the designated pool — outputs[0] (the first pool in
+    // pool_output_order, the same input the withdrawal redeemer named).
+    let designated_required: u64 = if fee_active {
+        total_fee_deducted.saturating_sub(tx_fee)
+    } else {
+        0
+    };
+    if designated_required > 0 {
+        if pool_output_bumps[0] != 0 {
+            bail!(
+                "designated pool received a min-ada bump ({}); the fee                  constraint's exact-surplus check would fail — resubmit with                  a different batch composition",
+                pool_output_bumps[0],
+            );
+        }
+        let out = outputs
+            .get_mut(0)
+            .context("fee delivery: no pool output at index 0")?;
+        if let TransactionOutput::PostAlonzo(b) = out {
+            b.value = match &b.value {
+                ConwayValue::Coin(c) => ConwayValue::Coin(c + designated_required),
+                ConwayValue::Multiasset(c, ma) => {
+                    ConwayValue::Multiasset(c + designated_required, ma.clone())
+                }
+            };
+        }
+    }
+
     let total_funding_draw = total_pool_bump + total_fulfillment_subsidy;
     let mut wallet_change: Option<(u64, crate::cardano_types::Value)> = None;
     if funding_value_opt.is_none() && total_funding_draw > 0 {
@@ -2070,7 +2175,7 @@ pub fn build_multi_pool_scoop_tx(
              no funding UTxO was provided"
         );
     }
-    if funding_value_opt.is_none() && total_fee_deducted != tx_fee {
+    if funding_value_opt.is_none() && total_fee_deducted != tx_fee + designated_required {
         // Without a change output there is nowhere for the deduction pot's
         // surplus (or shortfall) vs the tx fee to go — the ledger would
         // reject the tx as ValueNotConservedUTxO.
@@ -2092,7 +2197,7 @@ pub fn build_multi_pool_scoop_tx(
         // deductions (SUNDAE-2587) pay the network fee and the remainder is
         // the scooper's compensation, landing here.
         let change_ada = (funding_ada + total_fee_deducted)
-            .checked_sub(total_funding_draw + tx_fee)
+            .checked_sub(total_funding_draw + tx_fee + designated_required)
             .with_context(|| format!(
                 "funding UTxO ada ({funding_ada}) + fee deductions ({total_fee_deducted}) \
                  insufficient for min-ada support ({total_funding_draw}) + tx fee ({tx_fee})"
