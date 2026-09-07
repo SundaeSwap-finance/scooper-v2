@@ -2676,6 +2676,48 @@ pub fn build_multi_pool_scoop_tx(
             script_ref: None,
         });
     }
+    // The FeeSettings node — the fee constraint locates it among reference
+    // inputs by its entry token, then reads base_fee from its datum.
+    if fee_active {
+        if let Some(fs) = fee_settings {
+            let mut value = crate::cardano_types::Value::default();
+            value.insert(
+                &AssetClass { policy: vec![], token: vec![] },
+                BigInt::from(2_000_000u64),
+            );
+            // The settings-mint policy: read it off the global settings
+            // UTxO's value (the empty-name settings NFT).
+            use num_traits::Signed;
+            let settings_policy: Vec<u8> = settings
+                .value
+                .0
+                .iter()
+                .find_map(|(policy, tokens)| {
+                    tokens
+                        .iter()
+                        .any(|(name, qty)| name.is_empty() && qty.is_positive())
+                        .then(|| policy.clone())
+                })
+                .unwrap_or_default();
+            value.insert(
+                &AssetClass {
+                    policy: settings_policy,
+                    token: fs.token.clone(),
+                },
+                BigInt::from(1u64),
+            );
+            resolved_ref_inputs.insert(fs.input.clone(), ResolvedTxOut {
+                address: settings_addr_bytes.clone(),
+                value,
+                datum: DatumOption::InlineDatum(
+                    crate::sundaev4::types::FeeSettingsDatum {
+                        base_fee: BigInt::from(fs.base_fee),
+                    }.to_plutus(),
+                ),
+                script_ref: None,
+            });
+        }
+    }
 
     // ── Step 14: Build predicted pool UTxOs ─────────────────────────────────
 

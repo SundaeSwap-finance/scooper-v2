@@ -1661,6 +1661,7 @@ async fn bootstrap_v4(
                         info!(base_fee, "bootstrap v4: hydrated FeeSettings node");
                         fee_settings = Some(Arc::new(sundaev4::SundaeV4FeeSettings {
                             input,
+                            token: want.clone(),
                             base_fee,
                             slot: utxo.slot,
                         }));

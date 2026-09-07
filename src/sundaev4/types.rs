@@ -1261,6 +1261,9 @@ pub struct SundaeV4Settings {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV4FeeSettings {
     pub input: TransactionInput,
+    /// The node's entry-token name under the settings policy — needed to
+    /// reconstruct the node's value for local evaluation.
+    pub token: Vec<u8>,
     pub base_fee: u64,
     pub slot: u64,
 }

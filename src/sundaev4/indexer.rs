@@ -442,9 +442,16 @@ impl SundaeV4Indexer {
                     if let Some(fs) = parsed {
                         use num_traits::ToPrimitive;
                         if let Some(base_fee) = fs.base_fee.unwrap().to_u64() {
+                            let token = self
+                                .protocol
+                                .fee_settings_token
+                                .as_ref()
+                                .and_then(|t| hex::decode(t).ok())
+                                .unwrap_or_default();
                             state.fee_settings = Some(Arc::new(
                                 crate::sundaev4::types::SundaeV4FeeSettings {
                                     input: txo.txo_id,
+                                    token,
                                     base_fee,
                                     slot: txo.created_slot,
                                 },
@@ -1200,6 +1207,12 @@ impl ChainIndex for SundaeV4Indexer {
                     new_fee_settings = Some(Arc::new(
                         crate::sundaev4::types::SundaeV4FeeSettings {
                             input: this_input,
+                            token: self
+                                .protocol
+                                .fee_settings_token
+                                .as_ref()
+                                .and_then(|t| hex::decode(t).ok())
+                                .unwrap_or_default(),
                             base_fee,
                             slot,
                         },
