@@ -373,14 +373,52 @@ pub fn cl_max_dx_value_preserving(
     lo
 }
 
-/// Fee budget for constant-sum pools:
-/// v0 = Σ(before_i * prices_i), v1 = Σ(after_i * prices_i)
-/// fee_budget = floor(v1 * lp_before / v0) - lp_before
+/// The CS fee-carve dock for one swap step (cs_check.check_swap, ADR-0013):
+/// the bounty-obligation accrual the step must leave in the pool,
+/// ⌈k·(Q_a·V_b − Q_b·V_a) / (k_den·n²·V_a·V_b)⌉ clamped at 0, where
+/// Q = Σ_i (n·p_i·a_i − V)². Zero when the bounty is off or the swap
+/// moves toward balance.
+pub fn cs_dock(
+    assets_before: &[BigInt],
+    assets_after: &[BigInt],
+    prices: &[BigInt],
+    v_b: &BigInt,
+    v_a: &BigInt,
+    bounty_k: &super::types::Rational,
+) -> BigInt {
+    if bounty_k.num.is_zero() {
+        return BigInt::from(0);
+    }
+    let n = BigInt::from(prices.len() as u64);
+    let q_of = |assets: &[BigInt], v: &BigInt| -> BigInt {
+        assets
+            .iter()
+            .zip(prices.iter())
+            .fold(BigInt::from(0), |acc, (a, p)| {
+                let dev = &(&(&n * p) * a) - v;
+                &acc + &(&dev * &dev)
+            })
+    };
+    let q_b = q_of(assets_before, v_b);
+    let q_a = q_of(assets_after, v_a);
+    let accrual_num = &bounty_k.num * &(&(&q_a * v_b) - &(&q_b * v_a));
+    if !accrual_num.is_positive() {
+        return BigInt::from(0);
+    }
+    let den = &(&(&bounty_k.den * &n) * &n) * &(v_a * v_b);
+    (&(&accrual_num + &den) - &BigInt::from(1)) / &den
+}
+
+/// Fee budget for constant-sum pools (cs_check.check_swap bound 4, exact):
+/// v_b = Σ(before_i·p_i), v_a = Σ(after_i·p_i),
+/// fee_budget = floor((v_a − dock) · lp_before / v_b) − lp_before,
+/// where `dock` is the bounty-obligation accrual (ADR-0013).
 pub fn cs_fee_budget(
     assets_before: &[BigInt],
     assets_after: &[BigInt],
     lp_before: &BigInt,
     prices: &[BigInt],
+    bounty_k: &super::types::Rational,
 ) -> BigInt {
     let v0: BigInt = assets_before
         .iter()
@@ -394,7 +432,8 @@ pub fn cs_fee_budget(
         warn!("cs_fee_budget: zero denominator (v0=0)");
         return BigInt::from(0);
     }
-    &v1 * lp_before / &v0 - lp_before
+    let dock = cs_dock(assets_before, assets_after, prices, &v0, &v1, bounty_k);
+    &(&(&v1 - &dock) * lp_before) / &v0 - lp_before
 }
 
 /// Dispatch fee budget computation by pool type.
@@ -418,10 +457,10 @@ pub fn compute_fee_budget(
                 lp_before,
             )
         }
-        super::types::PoolType::ConstantSum { prices, .. } => {
+        super::types::PoolType::ConstantSum { prices, bounty_k, .. } => {
             let before: Vec<BigInt> = assets_before.iter().map(|(_, a)| a.clone()).collect();
             let after: Vec<BigInt> = assets_after.iter().map(|(_, a)| a.clone()).collect();
-            cs_fee_budget(&before, &after, lp_before, prices)
+            cs_fee_budget(&before, &after, lp_before, prices, bounty_k)
         }
         super::types::PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, .. } => {
             // The CL fee budget is a pure function of the after-state and
@@ -735,6 +774,7 @@ mod tests {
             &[BigInt::from(1_010_000), BigInt::from(1_000_000), BigInt::from(990_030)],
             &BigInt::from(1_000_000),
             &[BigInt::from(1), BigInt::from(1), BigInt::from(1)],
+            &crate::sundaev4::types::Rational { num: BigInt::from(0), den: BigInt::from(1) },
         );
         assert_eq!(fb, BigInt::from(10));
     }
@@ -750,6 +790,7 @@ mod tests {
             &[BigInt::from(1_010_000), BigInt::from(990_030)],
             &BigInt::from(1_000_000),
             &[BigInt::from(1), BigInt::from(1)],
+            &crate::sundaev4::types::Rational { num: BigInt::from(0), den: BigInt::from(1) },
         );
         assert_eq!(fb, BigInt::from(15));
     }
