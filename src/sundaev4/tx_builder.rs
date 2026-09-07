@@ -2693,9 +2693,13 @@ pub fn build_multi_pool_scoop_tx(
                 .0
                 .iter()
                 .find_map(|(policy, tokens)| {
-                    tokens
-                        .iter()
-                        .any(|(name, qty)| name.is_empty() && qty.is_positive())
+                    // Skip the lovelace entry (empty policy, empty name) —
+                    // the settings NFT is the empty-NAME token under the
+                    // 28-byte settings-mint policy.
+                    (!policy.is_empty()
+                        && tokens
+                            .iter()
+                            .any(|(name, qty)| name.is_empty() && qty.is_positive()))
                         .then(|| policy.clone())
                 })
                 .unwrap_or_default();

@@ -394,3 +394,44 @@ fn extract_payment_script_hash(address_bytes: &[u8]) -> Option<Hash<28>> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod debug_eval {
+    /// Offline debug harness: apply a (traced) script to a dumped script
+    /// context and print traces. Ignored by default; run with
+    ///   SCRIPT_HEX_FILE=… CTX_FILE=… cargo test debug_eval -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn eval_dumped_context() {
+        use uplc_turbo::arena::Arena;
+        use uplc_turbo::binder::DeBruijn;
+        use uplc_turbo::data::PlutusData as UplcPlutusData;
+        use uplc_turbo::machine::{ExBudget, PlutusVersion};
+        use uplc_turbo::term::Term;
+
+        let script_hex = std::fs::read_to_string(std::env::var("SCRIPT_HEX_FILE").unwrap()).unwrap();
+        let wrapped = hex::decode(script_hex.trim()).unwrap();
+        let flat = super::cbor_unwrap_bytes(&wrapped)
+            .and_then(|inner| super::cbor_unwrap_bytes(&inner).or(Ok(inner)))
+            .unwrap();
+        let ctx = std::fs::read(std::env::var("CTX_FILE").unwrap()).unwrap();
+
+        let arena = Arena::new();
+        let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat).unwrap();
+        let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
+        let applied = program.apply(&arena, Term::data(&arena, context_pd));
+        let budget = ExBudget { cpu: 10_000_000_000, mem: 14_000_000 };
+        let cost_model: Vec<i64> = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
+        ).unwrap();
+        let result = applied.eval_with_params(&arena, PlutusVersion::V3, &cost_model, budget);
+        println!("logs ({}):", result.info.logs.len());
+        for log in &result.info.logs {
+            println!("  trace: {log}");
+        }
+        match result.term {
+            Ok(t) => println!("OK: {t:?}"),
+            Err(e) => println!("FAILED: {e:?}"),
+        }
+    }
+}
