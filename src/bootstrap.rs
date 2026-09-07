@@ -1790,6 +1790,9 @@ async fn bootstrap_v4(
         if let Some(ref so) = scripts.strategy_order {
             all_refs.push(so);
         }
+        if let Some(ref fc) = scripts.fee_constraint {
+            all_refs.push(fc);
+        }
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {
