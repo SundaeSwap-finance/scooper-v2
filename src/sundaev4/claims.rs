@@ -119,9 +119,10 @@ pub fn plan_claim(
     }
     let p_out = &prices[out_idx];
 
-    // Op portion: a plain CS swap at balance_fee. `cs_swap_result` returns 0
-    // when the resulting dy isn't integer (swap impossible for this dx). At
-    // balance_fee = 0 this is the value-neutral waiver (dy·p_out = dx·p_in).
+    // Op portion: a plain CS swap at balance_fee, floor-filled — any sub-p_out
+    // division remainder stays with the pool, which the validator's one-out-
+    // unit fee window admits. At balance_fee = 0 this is the (up to a crumb)
+    // value-neutral waiver.
     let dy = super::swap_math::cs_swap_result(dx, prices, in_idx, out_idx, bf_num, bf_den);
     if !dy.is_positive() || dy > reserves[out_idx].1 {
         return None;

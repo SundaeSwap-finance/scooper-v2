@@ -649,6 +649,38 @@ mod tests {
     }
 
     #[test]
+    fn cs_floor_fill_unaligned_evaluates() {
+        // The real shape the scooper refused on preview (order 4d0d9a9f…#0):
+        // prices 4:5, fee 3/1000, dx = 100_300_903. The fill numerator leaves
+        // remainder 2 mod 5, so no zero-remainder dy exists; the floor fill
+        // pays 80_000_000 and the 2-value-unit crumb stays in the pool, which
+        // the validator's one-out-unit fee window must accept. This evaluates
+        // the actual scripts — the proof the window semantics are real.
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xCD,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(4), BigInt::from(5)],
+            fee.clone(),
+        );
+        let orders = vec![make_order(token_a(), 100_300_903, token_b(), 80_000_000, 1)];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("unaligned CS batch assembly should succeed");
+
+        assert_eq!(batch.swaps.len(), 1, "the unaligned order must be admitted");
+        assert_eq!(batch.swaps[0].dy, BigInt::from(80_000_000));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("floor fill with a crumb should evaluate on-chain");
+        assert!(!eval.budgets.is_empty(), "should have evaluated at least one script");
+    }
+
+    #[test]
     fn cs_multiple_orders() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let fee = crate::sundaev4::types::Rational {

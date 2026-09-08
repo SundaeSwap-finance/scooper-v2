@@ -60,14 +60,17 @@ pub fn cp_fee_budget(
     isqrt(&quotient) - lp_before
 }
 
-/// Constant-sum swap: dy such that v_increase = floor(input_value * fee_num / fee_den).
+/// Constant-sum swap: the floor fill.
 ///
-/// The on-chain CS validator checks that the pool value increase (v_increase)
-/// is exactly floor(input_value * fee_num / fee_den). Working backwards:
-///   v_increase = dx * prices[input] - dy * prices[output]
-///   dy = (dx * prices[input] - v_increase) / prices[output]
-///
-/// Returns 0 if dy is not integer (swap impossible for this dx).
+/// The on-chain CS validator (cs_check.ak, invariant 2) admits any pool value
+/// increase in a window one output-unit wide:
+///   floor(input_value·fee_num/fee_den) ≤ v_increase < floor(…) + p_out
+/// so EVERY dx has a valid fill: pay out
+///   dy = floor((input_value − floor(input_value·fee_num/fee_den)) / p_out)
+/// and the sub-p_out division remainder stays with the pool inside
+/// v_increase. (An earlier revision demanded the zero-remainder case only and
+/// returned 0 otherwise — that stranded most wallet-built orders as "no
+/// route" forever, e.g. preview order 4d0d9a9f…#0.)
 pub fn cs_swap_result(
     dx: &BigInt,
     prices: &[BigInt],
@@ -77,13 +80,9 @@ pub fn cs_swap_result(
     fee_den: &BigInt,
 ) -> BigInt {
     let input_value = dx * &prices[input_idx];
-    let v_increase = &input_value * fee_num / fee_den;
-    let numerator = &input_value - &v_increase;
+    let v_increase_min = &input_value * fee_num / fee_den;
+    let numerator = &input_value - &v_increase_min;
     let price_out = &prices[output_idx];
-    let rem = &numerator % price_out;
-    if !rem.is_zero() {
-        return BigInt::from(0); // swap impossible: dy not integer
-    }
     &numerator / price_out
 }
 
@@ -662,6 +661,41 @@ mod tests {
             cs_max_dx_for_reserve(&reserve_out, &prices, 0, 1, &BigInt::from(1000), &BigInt::from(1000)),
             None // fee_den == fee_num
         );
+    }
+
+    #[test]
+    fn test_cs_swap_result_floor_fill_unaligned() {
+        // The order the scooper refused for an hour on preview (4d0d9a9f…#0):
+        // 100.300903 ADA → STRW at prices [4, 5], fee 3/1000. The numerator
+        // (input_value − floor(fee)) = 400_000_002 leaves remainder 2 mod 5 —
+        // no zero-remainder dy exists, but the validator's one-out-unit fee
+        // window admits the floor fill with the crumb staying in the pool.
+        let prices = [BigInt::from(4), BigInt::from(5)];
+        let (fee_num, fee_den) = (BigInt::from(3), BigInt::from(1000));
+        let dx = BigInt::from(100_300_903u64);
+        let dy = cs_swap_result(&dx, &prices, 0, 1, &fee_num, &fee_den);
+        assert_eq!(dy, BigInt::from(80_000_000u64));
+
+        // The fill must land inside the validator's window:
+        //   floor(iv·fee) ≤ v_increase < floor(iv·fee) + p_out
+        let iv = &dx * &prices[0];
+        let fee_floor = &iv * &fee_num / &fee_den;
+        let v_increase = &iv - &(&dy * &prices[1]);
+        assert!(v_increase >= fee_floor);
+        assert!(v_increase < &fee_floor + &prices[1]);
+
+        // And across a sweep of arbitrary dx, never a zero fill, always
+        // in-window (the old code returned 0 for ~4 of 5 of these).
+        for i in 1u64..500 {
+            let dx = BigInt::from(999_983u64 * i);
+            let dy = cs_swap_result(&dx, &prices, 0, 1, &fee_num, &fee_den);
+            assert!(dy.is_positive(), "dx={dx} produced no fill");
+            let iv = &dx * &prices[0];
+            let fee_floor = &iv * &fee_num / &fee_den;
+            let v_increase = &iv - &(&dy * &prices[1]);
+            assert!(v_increase >= fee_floor, "dx={dx} underpays the fee");
+            assert!(v_increase < &fee_floor + &prices[1], "dx={dx} overpays past the window");
+        }
     }
 
     #[test]
