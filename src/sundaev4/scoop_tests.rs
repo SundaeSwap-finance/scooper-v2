@@ -649,6 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn scoop_ref_inputs_omit_settings_validator() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env, 0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            fee,
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("CS batch assembly should succeed");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _eval) = env.build_and_eval(&[batch], &settings, 1000)
+            .expect("CS build_and_eval should succeed");
+
+        let ref_inputs = result.tx_body.reference_inputs
+            .as_ref()
+            .expect("scoop has reference inputs");
+        let ms = &env.exec.module_scripts;
+        assert!(!ref_inputs.contains(&ms.settings.ref_utxo.0), "settings validator ref script attached but never executed");
+        let executed = [
+            ("pool", &ms.pool),
+            ("order", &ms.order),
+            ("fee_split", &ms.fee_split),
+            ("fairness", &ms.fairness),
+            ("constant_sum", ms.constant_sum.as_ref().unwrap()),
+        ];
+        for (name, info) in executed {
+            assert!(ref_inputs.contains(&info.ref_utxo.0), "{name} ref script missing");
+        }
+        assert!(ref_inputs.contains(&settings.input.0), "settings UTxO must still be read as a reference input");
+    }
+
+    #[test]
     fn cs_floor_fill_unaligned_evaluates() {
         // The real shape the scooper refused on preview (order 4d0d9a9f…#0):
         // prices 4:5, fee 3/1000, dx = 100_300_903. The fill numerator leaves
