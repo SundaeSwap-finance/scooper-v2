@@ -14,6 +14,18 @@ impl BigInt {
     pub fn to_f64(&self) -> Option<f64> {
         self.0.to_f64()
     }
+
+    /// Greatest common divisor (Euclidean). Returns `|a|` when `b == 0`.
+    pub fn gcd(&self, other: &BigInt) -> BigInt {
+        let mut a = self.0.clone();
+        let mut b = other.0.clone();
+        while !b.is_zero() {
+            let r = &a % &b;
+            a = b;
+            b = r;
+        }
+        BigInt(a.abs())
+    }
 }
 
 impl fmt::Display for BigInt {

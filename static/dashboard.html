@@ -1,0 +1,1491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SundaeSwap Scooper Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text-dim: #8b90a0;
+    --accent: #6c5ce7;
+    --green: #00b894;
+    --red: #e17055;
+    --yellow: #fdcb6e;
+    --blue: #74b9ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .conn-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .conn-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+  }
+  .conn-dot.connected { background: var(--green); }
+
+  .pause-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 4px 12px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .pause-btn:hover { border-color: var(--accent); }
+  .pause-btn.paused {
+    background: var(--red);
+    border-color: var(--red);
+    color: #fff;
+  }
+
+  .paused-banner {
+    display: none;
+    padding: 8px 20px;
+    background: rgba(225, 112, 85, 0.15);
+    border-bottom: 1px solid var(--red);
+    color: var(--red);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: center;
+  }
+  .paused-banner.visible { display: block; }
+
+  .sync-bar-container {
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .sync-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .sync-bar {
+    height: 6px;
+    background: var(--surface2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .sync-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.5s ease;
+    width: 0%;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+  }
+  .tab {
+    padding: 8px 20px;
+    cursor: pointer;
+    color: var(--text-dim);
+    border-bottom: 2px solid transparent;
+    font-size: 13px;
+    transition: color 0.2s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .content { padding: 16px 20px; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .section-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 16px 0 8px;
+  }
+  .section-title:first-child { margin-top: 0; }
+
+  .stats {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    min-width: 120px;
+  }
+  .stat-card .label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .stat-card .value {
+    font-size: 20px;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-green { background: rgba(0,184,148,0.15); color: var(--green); }
+  .badge-red { background: rgba(225,112,85,0.15); color: var(--red); }
+  .badge-yellow { background: rgba(253,203,110,0.15); color: var(--yellow); }
+  .badge-blue { background: rgba(116,185,255,0.15); color: var(--blue); }
+  .badge-accent { background: rgba(108,92,231,0.15); color: var(--accent); }
+  .badge-in-flight { background: rgba(253,203,110,0.10); color: var(--yellow); font-size: 13px; }
+  .badge-quarantine { background: rgba(225,112,85,0.10); color: var(--red); font-size: 13px; }
+  .badge-strategy { background: rgba(162,155,254,0.15); color: var(--purple, #a29bfe); }
+  .badge-malformed { background: rgba(225,112,85,0.18); color: var(--red); }
+  tr.our-row td { background: rgba(108,92,231,0.06); }
+
+  .event-log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  .event-entry {
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+  }
+  .event-entry:last-child { border-bottom: none; }
+  .event-time { color: var(--text-dim); flex-shrink: 0; }
+  .event-type { color: var(--accent); flex-shrink: 0; min-width: 140px; }
+  .event-detail { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .empty-state {
+    text-align: center;
+    padding: 32px;
+    color: var(--text-dim);
+  }
+  .not-configured {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .search-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+  .search-bar input {
+    width: 100%;
+    max-width: 360px;
+    padding: 5px 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+  }
+  .search-bar input:focus {
+    border-color: var(--accent);
+  }
+  .search-bar input::placeholder {
+    color: var(--text-dim);
+  }
+  .show-all-link {
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .show-all-link:hover {
+    text-decoration: underline;
+  }
+
+  .copy-btn {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 2px;
+    cursor: pointer;
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity 0.15s;
+    vertical-align: middle;
+    font-size: 11px;
+    line-height: 1;
+  }
+  td:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { color: var(--accent); }
+  .copy-btn.copied { color: var(--green); opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SundaeSwap Scooper <span id="scooperIdent" style="font-size:11px;color:var(--text-dim);font-weight:400"></span></h1>
+  <div class="conn-status">
+    <button class="pause-btn" id="pauseBtn">Pause</button>
+    <div class="conn-dot" id="connDot"></div>
+    <span id="connLabel">Connecting...</span>
+  </div>
+</header>
+
+<div class="sync-bar-container">
+  <div class="sync-label">
+    <span id="syncSlots">-- / --</span>
+    <span id="syncPct">--%</span>
+  </div>
+  <div class="sync-bar"><div class="sync-fill" id="syncFill"></div></div>
+</div>
+
+<div class="paused-banner" id="pausedBanner">Scooping paused</div>
+
+<div class="tabs">
+  <div class="tab" data-tab="v3">V3</div>
+  <div class="tab active" data-tab="v4">V4</div>
+  <div class="tab" data-tab="health">Health</div>
+  <div class="tab" data-tab="events">Event Log</div>
+</div>
+
+<div class="content">
+  <!-- V3 Tab -->
+  <div class="tab-panel" id="panel-v3">
+    <div class="stats" id="v3-stats"></div>
+    <div class="section-title">Pools</div>
+    <div class="search-bar"><input type="text" data-filter="v3-pools-body" placeholder="Filter pools..."></div>
+    <table id="v3-pools-table">
+      <thead><tr><th>Pool ID</th><th>Assets</th><th>LP</th></tr></thead>
+      <tbody id="v3-pools-body"></tbody>
+    </table>
+    <div class="section-title">Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v3-orders-body" placeholder="Filter orders..."></div>
+    <table id="v3-orders-table">
+      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Direction</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody id="v3-orders-body"></tbody>
+    </table>
+    <div class="section-title">Spent Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v3-spent-orders-body" placeholder="Filter spent orders..."></div>
+    <table id="v3-spent-orders-table">
+      <thead><tr><th>Order Ref</th><th>Pool ID</th><th>Reason</th><th>Tx</th><th>Time</th></tr></thead>
+      <tbody id="v3-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- V4 Tab -->
+  <div class="tab-panel active" id="panel-v4">
+    <div class="stats" id="v4-stats"></div>
+    <div class="section-title">Pools</div>
+    <div class="search-bar"><input type="text" data-filter="v4-pools-body" placeholder="Filter pools..."></div>
+    <table id="v4-pools-table">
+      <thead><tr><th>Pool ID</th><th>Type</th><th>Assets</th><th>LP</th><th>Protocol Equity</th></tr></thead>
+      <tbody id="v4-pools-body"></tbody>
+    </table>
+    <div class="section-title">Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v4-orders-body" placeholder="Filter orders..."></div>
+    <table id="v4-orders-table">
+      <thead><tr><th>Pool ID</th><th>Order Ref</th><th>Status</th><th>Detail</th></tr></thead>
+      <tbody id="v4-orders-body"></tbody>
+    </table>
+    <div class="section-title">Strategy Intents</div>
+    <div class="stats" id="v4-intent-stats"></div>
+    <table id="v4-intents-table">
+      <thead><tr><th>Intent</th><th>Order</th><th>Hint</th><th>Dispatch</th><th>Expires</th><th>Received</th></tr></thead>
+      <tbody id="v4-intents-body"></tbody>
+    </table>
+    <div class="section-title">Spent Orders</div>
+    <div class="search-bar"><input type="text" data-filter="v4-spent-orders-body" placeholder="Filter spent orders..."></div>
+    <table id="v4-spent-orders-table">
+      <thead><tr><th>Order Ref</th><th>Pool(s)</th><th>Reason</th><th>Tx</th><th>Time</th></tr></thead>
+      <tbody id="v4-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Health Tab -->
+  <div class="tab-panel" id="panel-health">
+    <div class="stats" id="health-cards"></div>
+    <div class="section-title">Operator</div>
+    <div class="stats" id="ops-cards"></div>
+    <div class="section-title">Recent Failures</div>
+    <table id="ops-failures-table">
+      <thead><tr><th>Time</th><th>Stage</th><th>Tx</th><th>Orders</th><th>Detail</th></tr></thead>
+      <tbody id="ops-failures-body"><tr><td colspan="5" class="empty-state">No recent failures</td></tr></tbody>
+    </table>
+    <div class="section-title">Scooper Leaderboard</div>
+    <table id="health-leaderboard-table">
+      <thead><tr><th>Scooper</th><th>Scoops</th><th>Orders</th></tr></thead>
+      <tbody id="health-leaderboard-body"></tbody>
+    </table>
+    <div class="section-title" style="display:flex;align-items:center;gap:10px">
+      Recent Scoops
+      <button class="pause-btn" id="mineToggle" style="font-size:10px;padding:2px 8px;text-transform:none;letter-spacing:0">Mine</button>
+    </div>
+    <table id="health-recent-table">
+      <thead><tr><th>Tx ID</th><th>Time</th><th>Pool</th><th>Orders</th><th>Scooper</th></tr></thead>
+      <tbody id="health-recent-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Event Log Tab -->
+  <div class="tab-panel" id="panel-events">
+    <div class="event-log" id="eventLog">
+      <div class="empty-state">Waiting for events...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // --- Tab switching ---
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabs.forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
+  // --- Helpers ---
+  function truncate(s, n) {
+    if (!s) return '';
+    return s.length > n ? s.slice(0, n) + '...' : s;
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function timeStr() {
+    return new Date().toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  // --- Slots <-> wall clock ---
+  // Slot-to-time is pure arithmetic per network: Byron slots are 20s, every
+  // era since is 1s. Mirrors acropolis_common::calculations::slot_to_timestamp
+  // (byron_timestamp = genesis systemStart, shelley_epoch = the Byron epoch
+  // count before the Shelley hard fork). Custom networks (devnet) aren't in
+  // the table, so we fall back to showing the raw slot.
+  var BYRON_SLOTS_PER_EPOCH = 21600;
+  var NETWORK_GENESIS = {
+    mainnet: { byronStart: 1506203091, shelleyEpoch: 208 },
+    preprod: { byronStart: 1654041600, shelleyEpoch: 4 },
+    preview: { byronStart: 1666656000, shelleyEpoch: 0 }
+  };
+
+  function slotToDate(slot) {
+    if (!slot) return null;
+    var g = NETWORK_GENESIS[status.network];
+    if (!g) return null;
+    var shelleyStartSlot = g.shelleyEpoch * BYRON_SLOTS_PER_EPOCH;
+    var unix = slot < shelleyStartSlot
+      ? g.byronStart + slot * 20
+      : g.byronStart + shelleyStartSlot * 20 + (slot - shelleyStartSlot);
+    return new Date(unix * 1000);
+  }
+
+  function clockStr(d) {
+    return d.toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  // Compact duration, for "how long ago / how far behind".
+  function durStr(secs) {
+    secs = Math.max(0, Math.round(secs));
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+    return Math.floor(secs / 86400) + 'd ' + Math.floor((secs % 86400) / 3600) + 'h';
+  }
+
+  // Tooltip text for anything slot-stamped: exact slot, full local timestamp,
+  // and age — the details you want when reading a row, without the noise.
+  function slotTitle(slot) {
+    var d = slotToDate(slot);
+    var t = 'slot ' + Number(slot).toLocaleString();
+    if (d) t += ' · ' + d.toLocaleString() + ' · ' + durStr((Date.now() - d) / 1000) + ' ago';
+    return t;
+  }
+
+  // Table cell contents for a slot: local clock time (date prefixed once it's
+  // not today), with the slot itself on hover.
+  function slotCell(slot) {
+    if (!slot) return '';
+    var d = slotToDate(slot);
+    if (!d) return Number(slot).toLocaleString();
+    var label = clockStr(d);
+    if (d.toDateString() !== new Date().toDateString()) {
+      label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + label;
+    }
+    return '<span title="' + escapeHtml(slotTitle(slot)) + '">' + label + '</span>';
+  }
+
+  // Copy-to-clipboard: renders truncated text + a small copy icon
+  var copySvg = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M5.5 10.5h-1a1.5 1.5 0 01-1.5-1.5v-5a1.5 1.5 0 011.5-1.5h5a1.5 1.5 0 011.5 1.5v1"/></svg>';
+
+  function copyable(display, fullValue) {
+    if (!fullValue) return display || '';
+    var escaped = fullValue.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    return '<span title="' + escaped + '">' + display +
+      '<span class="copy-btn" data-copy="' + escaped + '">' + copySvg + '</span></span>';
+  }
+
+  function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    // Fallback for non-HTTPS contexts
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Promise.resolve();
+  }
+
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.copy-btn');
+    if (!btn) return;
+    var text = btn.getAttribute('data-copy');
+    if (!text) return;
+    copyToClipboard(text).then(function() {
+      btn.classList.add('copied');
+      setTimeout(function() { btn.classList.remove('copied'); }, 1000);
+    });
+  });
+
+  // --- Asset name resolution via SundaeSwap GraphQL API ---
+  var assetNameCache = { 'lovelace': 'ADA', '': 'ADA' };
+  var assetNamePending = new Set();
+  var assetNameCallbacks = [];
+
+  function getGraphQLUrl() {
+    var host = window.location.hostname;
+    var m = host.match(/scooper\.(\w+)\.sundae\.fi/);
+    if (m) return 'https://api.' + m[1] + '.sundae.fi/graphql';
+    return 'https://api.preview.sundae.fi/graphql';
+  }
+
+  async function resolveAssetNames(assetIds) {
+    var toFetch = assetIds.filter(function(id) { return id && !assetNameCache[id] && !assetNamePending.has(id); });
+    if (toFetch.length === 0) return;
+    toFetch.forEach(function(id) { assetNamePending.add(id); });
+
+    // Batch into groups of 20 to avoid query size limits
+    for (var i = 0; i < toFetch.length; i += 20) {
+      var batch = toFetch.slice(i, i + 20);
+      var fragments = batch.map(function(id, j) {
+        return 'a' + j + ': assets { byId(id: "' + id + '") { id ticker name } }';
+      });
+      try {
+        var res = await fetch(getGraphQLUrl(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: '{ ' + fragments.join(' ') + ' }' }),
+        });
+        var data = await res.json();
+        if (data && data.data) {
+          for (var key in data.data) {
+            var asset = data.data[key] && data.data[key].byId;
+            if (asset && asset.id) {
+              assetNameCache[asset.id] = asset.ticker || asset.name || asset.id;
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+      batch.forEach(function(id) { assetNamePending.delete(id); });
+    }
+  }
+
+  function formatAssetClass(ac) {
+    if (!ac) return 'ADA';
+    if (typeof ac === 'string') {
+      if (ac === '' || ac === 'lovelace') return 'ADA';
+      if (assetNameCache[ac]) return assetNameCache[ac];
+      return truncate(ac, 16);
+    }
+    if (ac.policy_id === '' || (ac.policy_id === '0'.repeat(56))) return 'ADA';
+    var fullId = ac.policy_id + '.' + (ac.asset_name || '');
+    if (assetNameCache[fullId]) return assetNameCache[fullId];
+    return truncate(ac.policy_id, 8) + '.' + truncate(ac.asset_name || '', 8);
+  }
+
+  // --- In-flight tracking ---
+  var inFlightPools = new Set();
+  var inFlightOrders = new Set();
+  // --- Quarantine tracking ---
+  var quarantinedOrders = new Set();
+  // --- Malformed tracking (count of unparseable orders from /v4/orders) ---
+  var malformedCount = 0;
+
+  // --- Status / sync bar ---
+  let status = {};
+
+  // order ref ("txid#idx") -> live intent count, for the orders table.
+  var strategyIntentLive = {};
+
+  function renderStrategyIntents(si) {
+    const stats = document.getElementById('v4-intent-stats');
+    const body = document.getElementById('v4-intents-body');
+    if (!si || !stats || !body) return;
+    strategyIntentLive = {};
+    (si.live || []).forEach(function(i) {
+      strategyIntentLive[i.order] = (strategyIntentLive[i.order] || 0) + 1;
+    });
+    const terminal = si.terminal || {};
+    const cards = [
+      ['Live', (si.live || []).length],
+      ['Executed', terminal.executed || 0],
+      ['Expired', terminal.expired || 0],
+      ['Order gone', terminal['order-gone'] || 0],
+    ];
+    stats.innerHTML = cards.map(function(c) {
+      return '<div class="stat-card"><div class="stat-value">' + c[1] +
+             '</div><div class="stat-label">' + c[0] + ' intents</div></div>';
+    }).join('');
+    // u64::MAX means "no upper bound"; anything past ~year 33k is "never"
+    // (the exact MAX loses precision through JSON number parsing).
+    body.innerHTML = (si.live || []).map(function(i) {
+      const exp = Number(i.expiry_ms) > 1e15
+        ? 'never'
+        : new Date(Number(i.expiry_ms)).toISOString().replace('T', ' ').slice(0, 19);
+      const rcv = new Date(Number(i.received_at_ms)).toISOString().replace('T', ' ').slice(0, 19);
+      // Dispatch cell keyed by intent id; filled asynchronously by the probe.
+      return '<tr><td class="mono">' + copyable(truncate(i.intent_id, 16), i.intent_id) + '</td>' +
+             '<td class="mono">' + copyable(truncate(i.order, 20), i.order) + '</td>' +
+             '<td>' + (i.hint || 'swap') + '</td>' +
+             '<td id="dispatch-' + escapeHtml(i.intent_id) + '"><span style="opacity:.5">probing…</span></td>' +
+             '<td>' + exp + '</td><td>' + rcv + '</td></tr>';
+    }).join('') || '<tr><td colspan="6" style="opacity:.5">none</td></tr>';
+    // Probe each live intent's dispatchability and fill its cell.
+    (si.live || []).forEach(function(i) { loadIntentDispatch(i.intent_id); });
+  }
+
+  // Map a probe `dispatch` object to a badge + human detail. The probe
+  // reports a `state` (e.g. dispatchable / below-floor / pool-not-claimable /
+  // pool-not-found / order-not-indexed) plus a `detail` string.
+  function dispatchCellHtml(dispatch) {
+    if (dispatch == null) return '<span style="opacity:.5">—</span>';
+    // `order-not-indexed` comes back as a bare string, not an object.
+    if (typeof dispatch === 'string') {
+      return '<span class="badge badge-yellow">' + escapeHtml(dispatch) + '</span>';
+    }
+    var state = dispatch.state || 'unknown';
+    var detail = dispatch.detail || '';
+    // green = ready to fire; red = structurally blocked; yellow = waiting
+    // (close-but-not-yet, e.g. below-floor / awaiting a more imbalanced pool).
+    var green = { dispatchable: 1, claimable: 1 };
+    var red = { 'pool-not-found': 1, 'pool-not-claimable': 1, 'no-route': 1, 'shape-unsupported': 1 };
+    var cls = green[state] ? 'badge-green' : (red[state] ? 'badge-red' : 'badge-yellow');
+    var badge = '<span class="badge ' + cls + '" title="' + escapeHtml(detail) + '">' + escapeHtml(state) + '</span>';
+    return badge + (detail ? ' <span title="' + escapeHtml(detail) + '" style="opacity:.7">' + escapeHtml(truncate(detail, 60)) + '</span>' : '');
+  }
+
+  async function loadIntentDispatch(intentId) {
+    try {
+      const res = await fetch('/v4/strategy-intents/' + intentId);
+      if (!res.ok) return;
+      const data = await res.json();
+      const cell = document.getElementById('dispatch-' + intentId);
+      if (cell) cell.innerHTML = dispatchCellHtml(data.dispatch);
+    } catch (e) { /* leave the "probing…" placeholder */ }
+  }
+
+  async function fetchStatus() {
+    try {
+      const res = await fetch('/status');
+      status = await res.json();
+      // Update in-flight sets
+      var v4 = status.v4 || {};
+      inFlightPools = new Set(v4.in_flight_pools || []);
+      inFlightOrders = new Set(v4.in_flight_orders || []);
+      // Update quarantine set
+      var q = v4.quarantine || {};
+      var qOrders = (q.permanent || []).concat(q.temporary || []).map(function(e) { return e.order; });
+      quarantinedOrders = new Set(qOrders);
+      updateSyncBar();
+      updateStats();
+      updatePauseBtn(status.paused);
+    } catch (e) { /* ignore */ }
+  }
+
+  function updatePauseBtn(paused) {
+    var btn = document.getElementById('pauseBtn');
+    var banner = document.getElementById('pausedBanner');
+    if (paused) {
+      btn.textContent = 'Resume';
+      btn.classList.add('paused');
+      banner.classList.add('visible');
+    } else {
+      btn.textContent = 'Pause';
+      btn.classList.remove('paused');
+      banner.classList.remove('visible');
+    }
+  }
+
+  async function togglePause() {
+    try {
+      var res = await fetch('/pause', { method: 'POST' });
+      var data = await res.json();
+      updatePauseBtn(data.paused);
+    } catch (e) { /* ignore */ }
+  }
+
+  document.getElementById('pauseBtn').addEventListener('click', togglePause);
+
+  var mineOnly = false;
+  document.getElementById('mineToggle').addEventListener('click', function() {
+    mineOnly = !mineOnly;
+    var btn = document.getElementById('mineToggle');
+    btn.style.background = mineOnly ? 'var(--accent)' : '';
+    btn.style.borderColor = mineOnly ? 'var(--accent)' : '';
+    btn.style.color = mineOnly ? '#fff' : '';
+    applyMineFilter();
+  });
+
+  function applyMineFilter() {
+    var rows = document.querySelectorAll('#health-recent-body tr');
+    rows.forEach(function(row) {
+      if (mineOnly && !row.classList.contains('our-row')) {
+        row.style.display = 'none';
+      } else {
+        row.style.display = '';
+      }
+    });
+  }
+
+  function updateSyncBar() {
+    const v4 = status.v4 || {};
+    const slot = v4.tip_slot || 0;
+    const netSlot = v4.network_tip_slot || 0;
+    const pct = v4.sync_pct || 0;
+
+    var el = document.getElementById('syncSlots');
+    var tipDate = slotToDate(slot);
+    if (tipDate) {
+      // Slots are 1s, so the tip/network-tip gap is literally seconds behind.
+      var lag = netSlot > slot ? netSlot - slot : 0;
+      el.textContent = clockStr(tipDate) + (lag ? ' · ' + durStr(lag) + ' behind' : ' · at tip');
+    } else {
+      el.textContent = slot.toLocaleString() + ' / ' + (netSlot || '?').toLocaleString();
+    }
+    el.title = 'slot ' + slot.toLocaleString() +
+      ' / network tip ' + (netSlot ? netSlot.toLocaleString() : '?');
+    document.getElementById('syncPct').textContent = pct.toFixed(1) + '%';
+    document.getElementById('syncFill').style.width = Math.min(pct, 100) + '%';
+  }
+
+  function renderOpsCards() {
+    var el = document.getElementById('ops-cards');
+    if (!el) return;
+    var v4 = status.v4 || {};
+    var ops = v4.ops;
+    var mp = v4.mempool || {};
+    if (!ops) { el.innerHTML = '<div class="not-configured">No operator data yet</div>'; return; }
+    var mpAge = mp.last_snapshot_unix ? Math.max(0, Math.round(Date.now()/1000 - mp.last_snapshot_unix)) : null;
+    var mpLabel = !mp.connected ? 'down' : (mpAge != null && mpAge > 90 ? 'stale ' + mpAge + 's' : 'live');
+    el.innerHTML =
+      statCard('Wallet UTxOs', ops.wallet_spendable_utxos + (ops.wallet_consumed_in_flight ? ' (+' + ops.wallet_consumed_in_flight + ' in-flight)' : '')) +
+      statCard('Wallet ADA', (ops.wallet_total_ada / 1e6).toFixed(1)) +
+      statCard('Funding OK', ops.funding_candidates > 0 ? ops.funding_candidates : 'NONE') +
+      statCard('Collateral', ops.collateral_available ? 'ok' : 'MISSING') +
+      statCard('Pending Orders', ops.pending_orders) +
+      statCard('Provisional', ops.provisional_orders + (ops.provisional_spent ? ' / ' + ops.provisional_spent + ' spent' : '')) +
+      statCard('Foreign Pools', ops.foreign_pools) +
+      statCard('Mempool Mon', mpLabel) +
+      statCard('Node Rejects', mp.node_rejects || 0) +
+      statCard('Backoff', ops.backoff_active ? 'ACTIVE' : 'no');
+  }
+
+  async function loadFailures() {
+    try {
+      var res = await fetch('/failures');
+      var rows = await res.json();
+      var body = document.getElementById('ops-failures-body');
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="5" class="empty-state">No recent failures</td></tr>';
+        return;
+      }
+      var esc = function(x) {
+        return String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      };
+      body.innerHTML = rows.slice(0, 25).map(function(f) {
+        var t = new Date(f.at_unix * 1000).toLocaleTimeString();
+        return '<tr><td>' + t + '</td><td>' + esc(f.stage) + '</td><td>' +
+          (f.tx_hash ? copyable(truncate(f.tx_hash, 12), f.tx_hash) : '—') +
+          '</td><td>' + (f.orders || []).map(function(o) { return copyable(truncate(o, 14), o); }).join(' ') +
+          '</td><td title="' + esc(f.detail) + '">' + esc(truncate(f.detail, 90)) + '</td></tr>';
+      }).join('');
+    } catch (e) { /* ignore */ }
+  }
+
+  function updateStats() {
+    renderOpsCards();
+    const v3s = document.getElementById('v3-stats');
+    renderStrategyIntents(status.v4 && status.v4.strategy_intents);
+    const v4s = document.getElementById('v4-stats');
+    const v3 = status.v3 || {};
+    const v4 = status.v4 || {};
+
+    if (v3.configured) {
+      v3s.innerHTML = statCard('Pools', v3.pool_count) + statCard('Orders', v3.order_count);
+    } else {
+      v3s.innerHTML = '<div class="not-configured">V3 indexer not configured</div>';
+    }
+    if (v4.configured) {
+      var inFlightCount = (v4.in_flight_orders || []).length;
+      var quarantineCount = quarantinedOrders.size;
+      v4s.innerHTML = statCard('Pools', v4.pool_count) + statCard('Orders', v4.order_count)
+        + (inFlightCount > 0 ? statCard('\u23f3 In-Flight', inFlightCount) : '')
+        + (quarantineCount > 0 ? statCard('\u26d4 Quarantined', quarantineCount) : '')
+        + (malformedCount > 0 ? statCard('\u26a0 Malformed', malformedCount) : '')
+        + tipCard(v4.tip_slot || 0);
+    } else {
+      v4s.innerHTML = '<div class="not-configured">V4 indexer not configured</div>';
+    }
+  }
+
+  function statCard(label, value) {
+    return '<div class="stat-card"><div class="label">' + label +
+      '</div><div class="value">' + value + '</div></div>';
+  }
+
+  // Chain tip as a clock time, with the slot on hover. Falls back to the raw
+  // slot on networks we can't date (devnet).
+  function tipCard(slot) {
+    var d = slotToDate(slot);
+    if (!d) return statCard('Tip Slot', Number(slot).toLocaleString());
+    return '<div class="stat-card" title="' + escapeHtml(slotTitle(slot)) + '">' +
+      '<div class="label">Chain Tip</div><div class="value">' + clockStr(d) + '</div></div>';
+  }
+
+  // --- Row limiting ---
+  var TABLE_LIMIT = 10;
+  // Track which tables the user has expanded
+  var expandedTables = {};
+
+  function renderLimited(tbodyId, rows) {
+    var tbody = document.getElementById(tbodyId);
+    tbody.innerHTML = '';
+    var expanded = expandedTables[tbodyId];
+    var limit = expanded ? rows.length : TABLE_LIMIT;
+    for (var i = 0; i < Math.min(rows.length, limit); i++) {
+      tbody.appendChild(rows[i]);
+    }
+    updateShowAllLink(tbodyId, rows.length);
+    applyFilter(tbodyId);
+  }
+
+  function updateShowAllLink(tbodyId, total) {
+    var input = document.querySelector('input[data-filter="' + tbodyId + '"]');
+    if (!input) return;
+    var bar = input.parentElement;
+    var existing = bar.querySelector('.show-all-link');
+    if (existing) existing.remove();
+    if (total <= TABLE_LIMIT) return;
+    var link = document.createElement('span');
+    link.className = 'show-all-link';
+    var expanded = expandedTables[tbodyId];
+    link.textContent = expanded ? 'Show first ' + TABLE_LIMIT : 'Show all (' + total + ')';
+    link.onclick = function() {
+      expandedTables[tbodyId] = !expanded;
+      // Re-trigger the load for this table
+      var loaders = {
+        'v3-pools-body': loadV3Pools, 'v3-orders-body': loadV3Orders,
+        'v3-spent-orders-body': loadV3SpentOrders,
+        'v4-pools-body': loadV4Pools, 'v4-orders-body': loadV4Orders,
+        'v4-spent-orders-body': loadV4SpentOrders,
+      };
+      if (loaders[tbodyId]) loaders[tbodyId]();
+    };
+    bar.appendChild(link);
+  }
+
+  // --- V3 data loading ---
+  async function loadV3Pools() {
+    try {
+      const res = await fetch('/v3/pools');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+
+      // Collect asset IDs and resolve names
+      var assetIds = [];
+      for (const pool of Object.values(data)) {
+        var pd = pool.pool_datum;
+        if (pd && Array.isArray(pd.assets)) {
+          pd.assets.forEach(function(a) { if (a && a !== 'lovelace') assetIds.push(a); });
+        }
+      }
+      await resolveAssetNames(assetIds);
+
+      var entries = Object.entries(data);
+      entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
+      var rows = entries.map(function(e) {
+        var id = e[0], pool = e[1];
+        var row = document.createElement('tr');
+        var assets = pool.pool_datum || {};
+        row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + '</td>' +
+          '<td>' + formatPoolAssets(assets) + '</td>' +
+          '<td>' + (assets.circulating_lp || '?') + '</td>';
+        return row;
+      });
+      renderLimited('v3-pools-body', rows);
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV3Orders() {
+    try {
+      const res = await fetch('/v3/orders');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+
+      // Collect unique pool IDs from orders
+      var poolIds = new Set();
+      for (const order of Object.values(data)) {
+        var ident = order.datum && order.datum.ident;
+        if (ident) poolIds.add(ident);
+      }
+
+      // Fetch executability info per pool
+      var execInfo = {};
+      await Promise.all([...poolIds].map(async function(poolId) {
+        try {
+          var pres = await fetch('/v3/pool/' + poolId);
+          var pdata = await pres.json();
+          for (var ref of (pdata.valid || [])) {
+            execInfo[ref] = { executable: true, detail: '' };
+          }
+          for (var oor of (pdata.out_of_range || [])) {
+            var prices = Array.isArray(oor.reason) ? 'swap: ' + oor.reason[0].toFixed(4) + ' pool: ' + oor.reason[1].toFixed(4) : '';
+            execInfo[oor.order] = { executable: false, detail: 'Out of range (' + prices + ')' };
+          }
+          for (var ur of (pdata.unrecoverable || [])) {
+            execInfo[ur.order] = { executable: false, detail: ur.reason || 'unrecoverable' };
+          }
+        } catch (e) { /* ignore */ }
+      }));
+
+      var flat = [];
+      for (const [poolId, order] of Object.entries(data)) {
+        flat.push({ poolId: poolId, order: order });
+      }
+      flat.sort(function(a, b) { return (b.order.slot || 0) - (a.order.slot || 0); });
+      var rows = flat.map(function(e) {
+        var row = document.createElement('tr');
+        var input = e.order.input || '';
+        var datum = e.order.datum || {};
+        var ref = typeof input === 'string' ? input : (input.transaction_id || '') + '#' + (input.index || 0);
+        var info = execInfo[ref];
+        var statusBadge, detail;
+        if (!info) {
+          statusBadge = '<span class="badge badge-yellow">unknown</span>';
+          detail = '';
+        } else if (info.executable) {
+          statusBadge = '<span class="badge badge-green">executable</span>';
+          detail = info.detail;
+        } else {
+          statusBadge = '<span class="badge badge-red">blocked</span>';
+          detail = info.detail;
+        }
+        row.innerHTML = '<td>' + copyable(truncate(e.poolId, 16), e.poolId) + '</td>' +
+          '<td>' + copyable(truncate(ref, 20), ref) + '</td>' +
+          '<td>' + (datum.action ? Object.keys(datum.action)[0] : (datum.direction || '?')) + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + truncate(detail, 60) + '</td>';
+        return row;
+      });
+      renderLimited('v3-orders-body', rows);
+    } catch (e) { /* ignore */ }
+  }
+
+  // --- V4 data loading ---
+  async function loadV4Pools() {
+    try {
+      const res = await fetch('/v4/pools');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+
+      // Collect asset IDs and resolve names
+      var assetIds = [];
+      for (const pool of Object.values(data)) {
+        var pd = pool.pool_datum;
+        if (pd && Array.isArray(pd.assets)) {
+          pd.assets.forEach(function(pair) {
+            if (Array.isArray(pair) && pair[0] && pair[0] !== 'lovelace') assetIds.push(pair[0]);
+          });
+        }
+      }
+      await resolveAssetNames(assetIds);
+
+      var entries = Object.entries(data);
+      entries.sort(function(a, b) { return (b[1].slot || 0) - (a[1].slot || 0); });
+      var rows = entries.map(function(e) {
+        var id = e[0], pool = e[1];
+        var row = document.createElement('tr');
+        var pd = pool.pool_datum || {};
+        var pt = formatPoolType(pool.pool_type);
+        var flightBadge = inFlightPools.has(id) ? ' <span class="badge badge-in-flight" title="Transaction in mempool">\u23f3</span>' : '';
+        row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + flightBadge + '</td>' +
+          '<td>' + pt + '</td>' +
+          '<td>' + formatV4PoolAssets(pd) + '</td>' +
+          '<td>' + formatBigint(pd.total_lp) + '</td>' +
+          '<td>' + formatProtocolEquity(pd) + '</td>';
+        return row;
+      });
+      renderLimited('v4-pools-body', rows);
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV4Orders() {
+    try {
+      const res = await fetch('/v4/orders');
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return; }
+
+      // Track malformed-order count for the V4 stat card.
+      malformedCount = Array.isArray(data.invalid) ? data.invalid.length : 0;
+
+      // Fetch executability info per pool
+      var execInfo = {};
+      var poolIds = Object.keys(data).filter(function(k) { return k !== 'unmatched'; });
+      await Promise.all(poolIds.map(async function(poolId) {
+        try {
+          var pres = await fetch('/v4/pool/' + poolId);
+          var pdata = await pres.json();
+          for (var e of (pdata.executable || [])) {
+            execInfo[e.order] = { executable: true, detail: 'output: ' + e.output_amount };
+          }
+          for (var ne of (pdata.non_executable || [])) {
+            execInfo[ne.order] = { executable: false, detail: ne.reason || '' };
+          }
+        } catch (e) { /* ignore */ }
+      }));
+
+      // Flatten and sort by slot descending
+      var flat = [];
+      for (const [poolId, orders] of Object.entries(data)) {
+        if (!Array.isArray(orders)) continue;
+        for (const order of orders) {
+          flat.push({ poolId: poolId, order: order });
+        }
+      }
+      flat.sort(function(a, b) { return (b.order.slot || 0) - (a.order.slot || 0); });
+
+      var rows = flat.map(function(e) {
+        var row = document.createElement('tr');
+        var orderRef = typeof e.order.input === 'string' ? e.order.input : '';
+        var isInFlight = inFlightOrders.has(orderRef);
+        var isQuarantined = quarantinedOrders.has(orderRef);
+        var info = execInfo[orderRef];
+        var statusBadge, detail, detailHtml = null;
+        if (e.order.reason) {
+          // Malformed / unparseable order (the `invalid` array from /v4/orders):
+          // its datum didn't decode into a supported constraint. Show why.
+          statusBadge = '<span class="badge badge-malformed" title="Order datum could not be decoded into a supported constraint">\u26a0 malformed</span>';
+          detailHtml = '<span title="' + escapeHtml(e.order.reason) + '">' + escapeHtml(truncate(e.order.reason, 72)) + '</span>';
+        } else if (isInFlight) {
+          statusBadge = '<span class="badge badge-in-flight" title="Transaction in mempool">\u23f3 in-flight</span>';
+          detail = 'awaiting settlement';
+        } else if (isQuarantined) {
+          statusBadge = '<span class="badge badge-quarantine" title="Order quarantined">\u26d4 quarantined</span>';
+          detail = 'skipped — see quarantine';
+        } else if (!info && e.order.constraint && e.order.constraint.Strategy) {
+          var liveCount = strategyIntentLive[orderRef] || 0;
+          statusBadge = '<span class="badge badge-strategy" title="Executes only via signed strategy intents">strategy</span>';
+          detail = liveCount
+            ? liveCount + ' live intent' + (liveCount > 1 ? 's' : '')
+            : 'awaiting intent';
+        } else if (!info) {
+          statusBadge = '<span class="badge badge-yellow">unknown</span>';
+          detail = '';
+        } else if (info.executable) {
+          statusBadge = '<span class="badge badge-green">executable</span>';
+          detail = info.detail;
+        } else {
+          statusBadge = '<span class="badge badge-red">blocked</span>';
+          detail = info.detail;
+        }
+        var poolCell = e.order.reason ? '—' : copyable(truncate(e.poolId, 16), e.poolId);
+        row.innerHTML = '<td>' + poolCell + '</td>' +
+          '<td>' + copyable(truncate(orderRef, 24), orderRef) + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + (detailHtml !== null ? detailHtml : escapeHtml(truncate(detail, 50))) + '</td>';
+        return row;
+      });
+      renderLimited('v4-orders-body', rows);
+      updateStats(); // reflect the fresh malformed count in the V4 stat card
+    } catch (e) { /* ignore */ }
+  }
+
+  function formatPoolAssets(datum) {
+    if (!datum) return '?';
+    if (Array.isArray(datum.assets) && datum.assets.length >= 2) {
+      return datum.assets.map(function(a) { return formatAssetClass(a); }).join(' / ');
+    }
+    const a = datum.coin_a || datum.asset_a;
+    const b = datum.coin_b || datum.asset_b;
+    return formatAssetClass(a) + ' / ' + formatAssetClass(b);
+  }
+
+  function formatPoolType(pt) {
+    if (!pt) return '<span class="badge badge-yellow">?</span>';
+    if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
+    if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
+    var keys = Object.keys(pt);
+    return '<span class="badge badge-yellow">' + (keys[0] || '?') + '</span>';
+  }
+
+  function formatV4PoolAssets(pd) {
+    if (!pd || !pd.assets) return '?';
+    const assets = pd.assets;
+    if (Array.isArray(assets) && assets.length >= 2) {
+      return assets.map(function(pair) {
+        if (!Array.isArray(pair)) return '?';
+        return formatAssetClass(pair[0]) + ': ' + formatBigint(pair[1]);
+      }).join(' / ');
+    }
+    return JSON.stringify(assets).slice(0, 60);
+  }
+
+  function parseBigint(v) {
+    if (v == null) return 0;
+    if (typeof v === 'object' && v.Int) return Number(v.Int);
+    if (typeof v === 'object' && v.BigInt) return Number(v.BigInt);
+    return Number(v) || 0;
+  }
+
+  function formatProtocolEquity(pd) {
+    if (!pd || !pd.assets || !Array.isArray(pd.assets)) return '?';
+    var totalLp = parseBigint(pd.total_lp);
+    var circLp = parseBigint(pd.circulating_lp);
+    if (totalLp === 0) return '?';
+    var protocolLp = totalLp - circLp;
+    if (protocolLp <= 0) return '-';
+    var parts = pd.assets.map(function(pair) {
+      if (!Array.isArray(pair)) return '';
+      var reserve = parseBigint(pair[1]);
+      var equity = Math.floor(reserve * protocolLp / totalLp);
+      return formatAssetClass(pair[0]) + ': ' + equity.toLocaleString();
+    });
+    return parts.join(' / ');
+  }
+
+  function formatBigint(v) {
+    if (v == null) return '?';
+    if (typeof v === 'object' && v.Int) return Number(v.Int).toLocaleString();
+    if (typeof v === 'object' && v.BigInt) return v.BigInt;
+    return String(v);
+  }
+
+  function spentOrderRefFull(order) {
+    var input = (order || {}).input || '';
+    if (typeof input === 'string') return input;
+    return (input.transaction_id || '') + '#' + (input.index || 0);
+  }
+
+  function formatSpentReason(reason) {
+    if (reason === 'Cancelled') return { text: 'Cancelled', poolId: '', poolIds: [], badge: 'badge-red' };
+    if (reason && reason.Scooped) {
+      var ids = reason.Scooped.pool_ids || [];
+      var pids = ids.join(', ');
+      return { text: 'Scooped', poolId: pids, poolIds: ids, badge: 'badge-green' };
+    }
+    return { text: 'Unknown', poolId: '', poolIds: [], badge: 'badge-yellow' };
+  }
+
+  // Derive a subtle HSL background color from a hex string (e.g. tx hash).
+  function hashColor(hex) {
+    if (!hex) return 'transparent';
+    var h = 0;
+    for (var i = 0; i < hex.length; i++) h = ((h << 5) - h + hex.charCodeAt(i)) | 0;
+    var hue = ((h % 360) + 360) % 360;
+    return 'hsla(' + hue + ', 50%, 50%, 0.12)';
+  }
+
+  function spentOrderRows(data, poolTypes) {
+    var sorted = data.slice().sort(function(a, b) { return (b.slot || 0) - (a.slot || 0); });
+    return sorted.map(function(entry) {
+      var row = document.createElement('tr');
+      var r = formatSpentReason(entry.reason);
+      var ref = spentOrderRefFull(entry.order);
+      var txId = entry.tx_id || '';
+      var typeBadges = '';
+      if (poolTypes && r.poolIds) {
+        typeBadges = r.poolIds.map(function(pid) {
+          var pt = poolTypes[pid];
+          return pt ? ' ' + formatPoolType(pt) : '';
+        }).join('');
+      }
+      row.style.backgroundColor = hashColor(txId);
+      row.innerHTML = '<td>' + copyable(truncate(ref, 24), ref) + '</td>' +
+        '<td>' + copyable(truncate(r.poolId, 16), r.poolId) + '</td>' +
+        '<td><span class="badge ' + r.badge + '">' + r.text + '</span>' + typeBadges + '</td>' +
+        '<td>' + copyable(truncate(txId, 16), txId) + '</td>' +
+        '<td>' + slotCell(entry.slot) + '</td>';
+      return row;
+    });
+  }
+
+  async function loadV3SpentOrders() {
+    try {
+      const res = await fetch('/v3/spent-orders');
+      const data = await res.json();
+      renderLimited('v3-spent-orders-body', spentOrderRows(data));
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadV4SpentOrders() {
+    try {
+      var [spentRes, poolsRes] = await Promise.all([fetch('/v4/spent-orders'), fetch('/v4/pools')]);
+      var data = await spentRes.json();
+      var poolTypes = {};
+      try {
+        var pools = await poolsRes.json();
+        for (var pid in pools) {
+          if (pools[pid].pool_type) poolTypes[pid] = pools[pid].pool_type;
+        }
+      } catch (e) { /* ignore */ }
+      renderLimited('v4-spent-orders-body', spentOrderRows(data, poolTypes));
+    } catch (e) { /* ignore */ }
+  }
+
+  // --- Health tab ---
+  var healthData = null;
+
+  async function loadHealthStats() {
+    try {
+      var res = await fetch('/health');
+      var data = await res.json();
+      if (data.error) {
+        document.getElementById('health-cards').innerHTML =
+          '<div class="not-configured">' + data.error + '</div>';
+        return;
+      }
+      healthData = data;
+      if (data.our_keyhash) {
+        document.getElementById('scooperIdent').textContent = '(' + data.our_keyhash.slice(0, 8) + '...)';
+      }
+      renderHealthCards(data);
+      renderLeaderboard(data);
+      renderRecentScoops(data);
+    } catch (e) { /* ignore */ }
+  }
+
+  function renderHealthCards(data) {
+    var sync = data.sync || {};
+    var pools = data.pools || {};
+    var wallet = data.wallet || {};
+    var syncPct = (sync.sync_pct || 0).toFixed(1);
+    var adaBal = (wallet.ada_balance || 0).toFixed(2);
+    var html = statCard('Sync', syncPct + '%') +
+      statCard('Wallet', adaBal + ' ADA') +
+      statCard('UTxOs', wallet.utxo_count || 0) +
+      statCard('Pools', pools.count || 0) +
+      statCard('Pending', pools.orders_pending || 0);
+    document.getElementById('health-cards').innerHTML = html;
+  }
+
+  function renderLeaderboard(data) {
+    var tbody = document.getElementById('health-leaderboard-body');
+    tbody.innerHTML = '';
+    var totals = (data.scooper_totals || []).slice();
+    totals.sort(function(a, b) { return b.scoop_txs - a.scoop_txs; });
+    var ourKey = data.our_keyhash || '';
+    if (totals.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--text-dim)">No scoops recorded yet</td></tr>';
+      return;
+    }
+    for (var i = 0; i < totals.length; i++) {
+      var t = totals[i];
+      var row = document.createElement('tr');
+      var isOurs = ourKey && t.scooper === ourKey;
+      if (isOurs) row.className = 'our-row';
+      var label = truncate(t.scooper, 16);
+      if (isOurs) label += ' <span class="badge badge-accent">You</span>';
+      row.innerHTML = '<td>' + copyable(label, t.scooper) + '</td>' +
+        '<td>' + t.scoop_txs + '</td>' +
+        '<td>' + t.orders_processed + '</td>';
+      tbody.appendChild(row);
+    }
+  }
+
+  function renderRecentScoops(data) {
+    var tbody = document.getElementById('health-recent-body');
+    tbody.innerHTML = '';
+    var scoops = data.recent_scoops || [];
+    var ourKey = data.our_keyhash || '';
+    if (scoops.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-dim)">No scoops recorded yet</td></tr>';
+      return;
+    }
+    for (var i = 0; i < scoops.length; i++) {
+      var s = scoops[i];
+      var row = document.createElement('tr');
+      var isOurs = ourKey && s.scooper === ourKey;
+      if (isOurs) row.className = 'our-row';
+      var scooperLabel = truncate(s.scooper, 12);
+      if (isOurs) scooperLabel += ' <span class="badge badge-accent">You</span>';
+      var poolIds = (s.pool_ids || []).join(', ');
+      row.innerHTML = '<td>' + copyable(truncate(s.tx_id, 16), s.tx_id) + '</td>' +
+        '<td>' + slotCell(s.slot) + '</td>' +
+        '<td>' + copyable(truncate(poolIds, 12), poolIds) + '</td>' +
+        '<td>' + s.n_orders + '</td>' +
+        '<td>' + copyable(scooperLabel, s.scooper) + '</td>';
+      tbody.appendChild(row);
+    }
+    applyMineFilter();
+  }
+
+  function formatV4OrderDetail(datum) {
+    if (!datum) return '';
+    const details = datum.details || datum.action || '';
+    if (typeof details === 'string') return truncate(details, 40);
+    return truncate(JSON.stringify(details), 40);
+  }
+
+  // --- SSE ---
+  let eventSource = null;
+  const MAX_LOG_ENTRIES = 200;
+
+  // Any traffic (including heartbeats) proves the stream is alive; a silent
+  // EventSource under a green dot is a zombie connection. The watchdog kills
+  // and reconnects it, and every (re)connect reloads full state so panels
+  // catch up on whatever the dead stream missed.
+  let lastSseActivity = Date.now();
+
+  function fullReload() {
+    fetchStatus();
+    loadV3Pools(); loadV3Orders(); loadV3SpentOrders();
+    loadV4Pools(); loadV4Orders(); loadV4SpentOrders();
+    loadHealthStats();
+    loadFailures();
+  }
+
+  setInterval(function() {
+    if (Date.now() - lastSseActivity > 45000) {
+      lastSseActivity = Date.now();
+      document.getElementById('connLabel').textContent = 'Stale — reconnecting...';
+      connectSSE();
+    }
+  }, 10000);
+
+  function connectSSE() {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource('/events');
+
+    eventSource.onopen = function() {
+      document.getElementById('connDot').classList.add('connected');
+      document.getElementById('connLabel').textContent = 'Connected';
+      lastSseActivity = Date.now();
+      fullReload();
+    };
+    eventSource.onerror = function() {
+      document.getElementById('connDot').classList.remove('connected');
+      document.getElementById('connLabel').textContent = 'Reconnecting...';
+    };
+
+    eventSource.addEventListener('heartbeat', function() {
+      lastSseActivity = Date.now();
+    });
+
+    eventSource.addEventListener('tip', function(e) {
+      lastSseActivity = Date.now();
+      try {
+        const d = JSON.parse(e.data);
+        const v4 = status.v4 || {};
+        v4.tip_slot = d.slot;
+        if (d.network_tip_slot) v4.network_tip_slot = d.network_tip_slot;
+        if (v4.network_tip_slot && v4.network_tip_slot > 0) {
+          v4.sync_pct = (d.slot / v4.network_tip_slot) * 100;
+        }
+        status.v4 = v4;
+        updateSyncBar();
+      } catch (ex) { /* ignore */ }
+      addLogEntry('tip', e.data);
+    });
+
+    const refreshEvents = [
+      'v3_pool_created', 'v3_pool_updated', 'v3_pool_removed',
+      'v3_order_created', 'v3_order_scooped', 'v3_order_cancelled',
+      'v4_pool_created', 'v4_pool_updated', 'v4_pool_removed',
+      'v4_order_created', 'v4_order_scooped', 'v4_order_cancelled',
+      'v4_mempool_order_seen', 'v4_mempool_tx_dropped',
+      'v3_settings_updated', 'v4_settings_updated', 'rollback'
+    ];
+
+    // Track pending refreshes to debounce
+    let refreshTimer = null;
+
+    refreshEvents.forEach(function(evtType) {
+      eventSource.addEventListener(evtType, function(e) {
+        lastSseActivity = Date.now();
+        addLogEntry(evtType, e.data);
+        // Debounced refresh
+        if (!refreshTimer) {
+          refreshTimer = setTimeout(function() {
+            refreshTimer = null;
+            fetchStatus();
+            if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
+            if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
+            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); loadFailures(); }
+            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); }
+          }, 500);
+        }
+      });
+    });
+  }
+
+  function addLogEntry(type, dataStr) {
+    const log = document.getElementById('eventLog');
+    // Remove empty state message
+    const empty = log.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    const entry = document.createElement('div');
+    entry.className = 'event-entry';
+
+    let summary = dataStr;
+    try {
+      const d = JSON.parse(dataStr);
+      if (d.id) summary = 'id=' + truncate(d.id, 16);
+      else if (d.order) summary = 'ref=' + truncate(d.order, 20);
+      else if (d.slot) summary = 'slot=' + d.slot;
+      else if (d.to_slot != null) summary = 'to_slot=' + d.to_slot;
+      else summary = truncate(dataStr, 60);
+    } catch { summary = truncate(dataStr, 60); }
+
+    entry.innerHTML =
+      '<span class="event-time">' + timeStr() + '</span>' +
+      '<span class="event-type">' + type + '</span>' +
+      '<span class="event-detail">' + summary + '</span>';
+
+    log.insertBefore(entry, log.firstChild);
+
+    // Trim log
+    while (log.children.length > MAX_LOG_ENTRIES) {
+      log.removeChild(log.lastChild);
+    }
+  }
+
+  // --- Table filtering ---
+  function applyFilter(tbodyId) {
+    var input = document.querySelector('input[data-filter="' + tbodyId + '"]');
+    if (!input) return;
+    var term = input.value.toLowerCase();
+    var rows = document.getElementById(tbodyId).querySelectorAll('tr');
+    rows.forEach(function(row) {
+      var text = row.textContent.toLowerCase();
+      // Also search full (untruncated) values stored in data-copy attributes
+      var copyEls = row.querySelectorAll('[data-copy]');
+      for (var i = 0; i < copyEls.length; i++) {
+        text += ' ' + copyEls[i].getAttribute('data-copy').toLowerCase();
+      }
+      row.style.display = text.includes(term) ? '' : 'none';
+    });
+  }
+
+  document.querySelectorAll('.search-bar input').forEach(function(input) {
+    input.addEventListener('input', function() {
+      applyFilter(input.dataset.filter);
+    });
+  });
+
+  // --- Init ---
+  // connectSSE's onopen runs fullReload (which covers everything the old
+  // init loaded, plus the failures panel), but load once eagerly anyway so
+  // the page isn't blank if the SSE connection is slow to establish.
+  fullReload();
+  connectSSE();
+})();
+</script>
+</body>
+</html>

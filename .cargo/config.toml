@@ -1,0 +1,5 @@
+[env]
+# The local UPLC evaluator recurses deeply on post-audit (traced) validators;
+# the default 2MB test-thread stack overflows in script-evaluating tests
+# (first seen on basic_order_pure_adab_mint). 32MB clears everything.
+RUST_MIN_STACK = "33554432"

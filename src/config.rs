@@ -5,11 +5,21 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 
 use crate::{
-    instrumentation::LogConfig, persistence::PersistenceConfig, server::ServerConfig,
-    sundaev3::SundaeV3Protocol,
+    bootstrap::BootstrapConfig, instrumentation::LogConfig, persistence::PersistenceConfig,
+    server::ServerConfig, sundaev3::SundaeV3Protocol, sundaev4::SundaeV4Protocol,
 };
 
 pub const ROLLBACK_LIMIT: u64 = 2160;
+
+/// Maximum number of malformed (unparseable) order UTxOs retained for API
+/// reporting. Unlike spent-order/pool history (which ages out by slot), an
+/// invalid order stays relevant for as long as its UTxO is unspent on chain
+/// — V4 orders never expire, so a slot window would drop still-live records
+/// (and bootstrap reloads them anyway, ignoring age). We therefore bound the
+/// set by count, keeping the newest entries, so it can't grow without bound
+/// under a spray of malformed orders while still answering "why is this order
+/// malformed?" for anything recent.
+pub const INVALID_ORDER_CAP: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -28,11 +38,25 @@ impl AppConfig {
             .build()?;
         Ok(Arc::new(config))
     }
+
+    /// The Cardano network we're indexing ("mainnet", "preprod", "preview",
+    /// or a custom name like "devnet"). Same key the genesis bootstrapper
+    /// reads, with the same default; surfaced over the API so clients can map
+    /// slots to wall-clock times.
+    pub fn network_name(&self) -> String {
+        self.acropolis_config()
+            .ok()
+            .and_then(|c| c.get_string("global.startup.network-name").ok())
+            .unwrap_or_else(|| "mainnet".to_string())
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ProtocolConfig {
-    pub v3: SundaeV3Protocol,
+    pub v3: Option<SundaeV3Protocol>,
+    pub v4: Option<SundaeV4Protocol>,
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapConfig>,
 }
 
 pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> Result<AppConfig> {
@@ -43,8 +67,15 @@ pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> 
     for config_file in config_files {
         builder = builder.add_source(File::with_name(config_file.as_ref()));
     }
+    // `SCOOPER_V2_PERSISTENCE__SQLITE__FILENAME` overrides
+    // `persistence.sqlite.filename`. Pinning prefix_separator keeps the prefix
+    // `SCOOPER_V2_`; config-rs would otherwise take it from `separator`.
     let config = builder
-        .add_source(Environment::with_prefix("SCOOPER_V2"))
+        .add_source(
+            Environment::with_prefix("SCOOPER_V2")
+                .prefix_separator("_")
+                .separator("__"),
+        )
         .build()?;
     Ok(config.try_deserialize()?)
 }

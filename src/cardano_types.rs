@@ -13,11 +13,17 @@ use std::str::FromStr;
 
 use plutus_parser::AsPlutus;
 
+/// CIP-67 asset label prefix for reference tokens (label 222).
+pub const CIP_67_ASSET_LABEL_222: &[u8] = &[0x00, 0x0d, 0xe1, 0x40];
+
+/// Metadata key used for datum-in-metadata pattern.
+pub const METADATA_DATUM_KEY: u64 = 103251;
+
 use crate::bigint::BigInt;
 use crate::datum_lookup::ScopedDatumLookup;
 pub type Bytes = Vec<u8>;
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ScriptRef {
     Native(NativeScript),
     PlutusV1(PlutusScript<1>),
@@ -83,13 +89,30 @@ impl serde::Serialize for AssetClass {
 
 impl AsPlutus for AssetClass {
     fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
-        let (policy, token) = AsPlutus::from_plutus(data)?;
-        Ok(AssetClass { policy, token })
+        match &data {
+            PlutusData::Constr(_) => {
+                // Aiken encodes AssetClass as Constr(0, [policy, token])
+                let (variant, fields) = plutus_parser::parse_constr(data)?;
+                if variant != 0 {
+                    return Err(plutus_parser::DecodeError::unexpected_variant(variant));
+                }
+                let [policy_data, token_data] =
+                    plutus_parser::parse_variant(variant, fields)?;
+                let policy = AsPlutus::from_plutus(policy_data)?;
+                let token = AsPlutus::from_plutus(token_data)?;
+                Ok(AssetClass { policy, token })
+            }
+            _ => {
+                // Legacy encoding: Array([policy, token])
+                let (policy, token) = AsPlutus::from_plutus(data)?;
+                Ok(AssetClass { policy, token })
+            }
+        }
     }
 
     fn to_plutus(self) -> PlutusData {
-        let tuple = (self.policy, self.token);
-        tuple.to_plutus()
+        // Aiken encodes AssetClass as Constr(0, [policy, token])
+        plutus_parser::create_constr(0, vec![self.policy.to_plutus(), self.token.to_plutus()])
     }
 }
 
@@ -229,7 +252,7 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RawDatum {
     None,
     Inline(PlutusData),
@@ -241,6 +264,13 @@ impl RawDatum {
         T::from_plutus(self.plutus_data(datums)?.clone()).ok()
     }
 
+    pub fn try_parse<T: AsPlutus>(&self, datums: &ScopedDatumLookup) -> Result<T, String> {
+        let pd = self
+            .plutus_data(datums)
+            .ok_or_else(|| "no datum (neither inline nor in witness set)".to_string())?;
+        T::from_plutus(pd.clone()).map_err(|e| format!("{e}"))
+    }
+
     pub fn plutus_data<'a>(&'a self, datums: &'a ScopedDatumLookup<'a>) -> Option<&'a PlutusData> {
         match self {
             Self::None => None,
@@ -250,7 +280,7 @@ impl RawDatum {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TransactionOutput {
     pub address: Address,
     pub value: Value,
@@ -291,6 +321,17 @@ impl serde::ser::Serialize for TransactionInput {
 impl fmt::Display for TransactionInput {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}#{}", hex::encode(self.0.transaction_id), self.0.index)
+    }
+}
+
+impl FromStr for TransactionInput {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (tx_hex, idx_str) = s.split_once('#').ok_or_else(|| anyhow::anyhow!("missing '#'"))?;
+        let tx_bytes = hex::decode(tx_hex)?;
+        let tx_id: [u8; 32] = tx_bytes.try_into().map_err(|_| anyhow::anyhow!("tx hash not 32 bytes"))?;
+        let index: u64 = idx_str.parse()?;
+        Ok(TransactionInput::new(tx_id.into(), index))
     }
 }
 

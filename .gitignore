@@ -1,3 +1,7 @@
 /target
 /downloads
 /logs
+.mcp.json
+*.db
+logs.txt
+config/*.bak

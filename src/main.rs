@@ -15,24 +15,34 @@ use tokio_util::sync::CancellationToken;
 
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 mod bigint;
+mod blueprint;
+mod bootstrap;
 mod cardano_types;
 mod config;
 mod datum_lookup;
+mod events;
 mod historical_state;
 mod instrumentation;
+mod mempool;
+mod metrics;
 mod multisig;
 mod persistence;
 mod scooper;
 mod server;
 mod sundaev3;
+mod sundaev4;
 
+use crate::config::ProtocolConfig;
+use crate::events::IndexEvent;
 use crate::persistence::Persistence;
 use crate::scooper::Scooper;
-use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Protocol, SundaeV3Update};
+use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update};
+use crate::sundaev4::{SundaeV4HistoricalState, SundaeV4Indexer};
 
 #[derive(clap::Parser, Clone, Debug)]
 struct Args {
@@ -45,41 +55,242 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
     instrumentation::init(&config.log)?;
-    info!("Started scooper");
+    info!(
+        v3_enabled = config.protocol.v3.is_some(),
+        v4_enabled = config.protocol.v4.is_some(),
+        server_address = %config.server.address,
+        "configuration loaded"
+    );
 
     let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<(u64, Vec<IndexEvent>)>(256);
     let shutdown = CancellationToken::new();
 
     let persistence = persistence::connect(&config.persistence).await?;
 
-    let index = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
+    let v3_state = config
+        .protocol
+        .v3
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(SundaeV3HistoricalState::new())));
+    let v4_state = config
+        .protocol
+        .v4
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(SundaeV4HistoricalState::new())));
     let broadcaster = tokio::sync::watch::Sender::default();
 
+    // Resolve the secret key file early so both manager_loop (bootstrap) and
+    // scooper see the resolved key.
+    let mut protocol = config.protocol.clone();
+    if let Some(ref mut v4) = protocol.v4 {
+        if let Some(ref mut exec) = v4.execution {
+            exec.resolve_secret_key()
+                .expect("failed to resolve scooper secret key");
+        }
+    }
+    let v4_execution = protocol
+        .v4
+        .as_ref()
+        .and_then(|v4| v4.execution.clone());
+
+    // Strategy intent service: ingest via the admin server, execution by the
+    // scooper, hygiene via the prune loop below. Only meaningful with a v4
+    // execution config (we can't validate intents without module hashes).
+    let intents: Option<sundaev4::intents::IntentServiceHandle> = match &v4_execution {
+        Some(exec) => Some(Arc::new(
+            sundaev4::intents::IntentService::load(
+                persistence.strategy_intent_dao(),
+                exec.strategy_peers.clone(),
+            )
+            .await?,
+        )),
+        None => None,
+    };
+    if let (Some(intents), Some(v4_state)) = (intents.clone(), v4_state.clone()) {
+        let shutdown = shutdown.child_token();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                // Only trust "order not in state" as evidence of a spent
+                // order once the indexer is at the network tip — before
+                // that, the state is incomplete and pruning on it would
+                // wipe intents that are still live.
+                let (live_orders, spent_orders, at_tip) = {
+                    let state = v4_state.lock().await;
+                    let latest = state.latest();
+                    let at_tip = latest
+                        .network_tip_slot
+                        .map(|net| latest.tip_slot + 10 >= net)
+                        .unwrap_or(false);
+                    let live: std::collections::BTreeSet<(Vec<u8>, u64)> = latest
+                        .orders
+                        .iter()
+                        .map(|o| (o.input.0.transaction_id.as_ref().to_vec(), o.input.0.index))
+                        .collect();
+                    // Spending tx per recently-spent order — lets the intent
+                    // status report "executed by tx T" (whoever scooped it).
+                    let spent: std::collections::BTreeMap<(Vec<u8>, u64), Vec<u8>> = latest
+                        .spent_orders
+                        .iter()
+                        .filter_map(|so| {
+                            let tx = hex::decode(&so.tx_id).ok()?;
+                            Some((
+                                (
+                                    so.order.input.0.transaction_id.as_ref().to_vec(),
+                                    so.order.input.0.index,
+                                ),
+                                tx,
+                            ))
+                        })
+                        .collect();
+                    (live, spent, at_tip)
+                };
+                use sundaev4::intents::OrderDisposition;
+                let result = intents
+                    .prune(|key| {
+                        if !at_tip || live_orders.contains(key) {
+                            OrderDisposition::Live
+                        } else {
+                            OrderDisposition::Spent(spent_orders.get(key).cloned())
+                        }
+                    })
+                    .await;
+                if let Err(e) = result {
+                    tracing::warn!("strategy intent prune failed: {e}");
+                }
+            }
+        });
+    }
+
+    // Captured before `protocol` moves into manager_loop.
+    let mempool_spawn = protocol.v4.as_ref().and_then(|v4| {
+        v4.mempool.clone().map(|cfg| {
+            let module_hash = |s: &Option<crate::sundaev4::ScriptRefInfo>| {
+                s.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default()
+            };
+            let watch = mempool::ProtocolWatch {
+                pool_script_hash: v4.pool_script_hash,
+                order_script_hashes: v4.order_script_hashes.clone(),
+                swap_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.swap_order))
+                    .unwrap_or_default(),
+                basic_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.basic_order))
+                    .unwrap_or_default(),
+                strategy_order_hash: v4
+                    .execution
+                    .as_ref()
+                    .map(|e| module_hash(&e.module_scripts.strategy_order))
+                    .unwrap_or_default(),
+            };
+            // Chained execution needs both the execute flag and an execution
+            // config (we can't decode constraints without module hashes).
+            let provisional: Option<mempool::SharedProvisional> =
+                if cfg.execute && v4.execution.is_some() {
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(
+                        mempool::ProvisionalState::default(),
+                    )))
+                } else {
+                    if cfg.execute {
+                        tracing::warn!(
+                            "mempool.execute set but no v4 execution config; observing only"
+                        );
+                    }
+                    None
+                };
+            (cfg, watch, provisional)
+        })
+    });
+    let scooper_provisional = mempool_spawn
+        .as_ref()
+        .and_then(|(_, _, p)| p.clone());
+    let scooper_node_submit = mempool_spawn
+        .as_ref()
+        .filter(|(_, _, p)| p.is_some())
+        .map(|(cfg, _, _)| (cfg.socket_path.clone(), cfg.network_magic));
     let manager_handle = tokio::spawn(manager_loop(
-        index.clone(),
+        v3_state.clone(),
+        v4_state.clone(),
         resync_tx.clone(),
         broadcaster.clone(),
+        event_tx.clone(),
         config.acropolis_config()?,
-        config.protocol.v3.clone(),
+        protocol,
         persistence.clone(),
         shutdown.child_token(),
     ));
+    let v4_fee = v4_execution.as_ref().map(|e| e.fee);
+    let v4_routing_costs = v4_execution
+        .as_ref()
+        .map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
+    let v4_module_preimages = v4_execution
+        .as_ref()
+        .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
+        .unwrap_or_default();
+    let paused = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(metrics::Metrics::new());
+    // Mempool monitor (phase 1: observation only): mirrors the local node's
+    // mempool and measures how far pre-block we see relevant txs. Config
+    // absent → not spawned.
+    if let (Some((mempool_cfg, watch, provisional)), Some(v4_state_ref)) =
+        (mempool_spawn, v4_state.as_ref())
+    {
+        tokio::spawn(mempool::run_mempool_monitor(
+            mempool_cfg,
+            watch,
+            v4_state_ref.clone(),
+            event_tx.subscribe(),
+            event_tx.clone(),
+            provisional,
+            metrics.clone(),
+            shutdown.child_token(),
+        ));
+    }
     let scooper_handle = tokio::spawn(
-        Scooper::new(config.log.trace_directory.clone(), broadcaster.subscribe())?
-            .run(shutdown.child_token()),
+        Scooper::new(
+            config.log.trace_directory.clone(),
+            event_tx.subscribe(),
+            v3_state.clone(),
+            v4_state.clone(),
+            v4_execution,
+            paused.clone(),
+            metrics.clone(),
+            intents.clone(),
+            scooper_provisional,
+            scooper_node_submit,
+        )?
+        .run(shutdown.child_token()),
     );
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
-        index.clone(),
+        config.network_name(),
+        v3_state.clone(),
+        v4_state.clone(),
+        v4_fee,
+        v4_routing_costs,
+        v4_module_preimages,
         resync_tx,
+        event_tx.clone(),
+        paused.clone(),
+        metrics.clone(),
+        intents.clone(),
         shutdown.child_token(),
     ));
 
     tokio::spawn(async move {
-        let _ = ctrl_c().await;
+        shutdown_signal().await;
         info!("shutdown requested");
         shutdown.cancel();
-        let _ = ctrl_c().await;
+        shutdown_signal().await;
         warn!("force shutdown requested");
         process::exit(0);
     });
@@ -88,23 +299,51 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve on SIGINT or SIGTERM. PID 1 gets no default SIGTERM action, so
+/// without this `docker stop` SIGKILLs us instead of shutting down cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                select! {
+                    _ = ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!("could not install SIGTERM handler, Ctrl-C only: {err}");
+                let _ = ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c().await;
+    }
+}
+
 async fn manager_loop(
-    index: Arc<Mutex<SundaeV3HistoricalState>>,
+    v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
+    v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     broadcaster: tokio::sync::watch::Sender<SundaeV3Update>,
+    event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     config: Arc<::config::Config>,
-    protocol: SundaeV3Protocol,
+    protocol: ProtocolConfig,
     persistence: Arc<dyn Persistence>,
     shutdown: CancellationToken,
 ) {
     let mut force_restart = false;
     loop {
-        let index = index.clone();
+        let v3_state = v3_state.clone();
+        let v4_state = v4_state.clone();
         let mut resync_tx = resync_tx.subscribe();
         let config = config.clone();
         let protocol = protocol.clone();
-        let default_start = protocol.starting_point.clone();
         let broadcaster = broadcaster.clone();
+        let event_tx = event_tx.clone();
 
         let mut process = Process::<Message>::create(config).await;
         GenesisBootstrapper::register(&mut process);
@@ -115,19 +354,149 @@ async fn manager_loop(
         let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
 
-        let mut v3_index = SundaeV3Indexer::new(
-            index,
-            broadcaster,
-            protocol,
-            config::ROLLBACK_LIMIT,
-            persistence.sundae_v3_dao(),
-        );
-        v3_index.load().await.unwrap();
+        // Load indexer state from DB, then optionally bootstrap from external source.
+        let mut v3_index_and_config = None;
+        if let (Some(v3_config), Some(v3_state)) = (&protocol.v3, &v3_state) {
+            let mut v3_index = SundaeV3Indexer::new(
+                v3_state.clone(),
+                broadcaster.clone(),
+                event_tx.clone(),
+                v3_config.clone(),
+                config::ROLLBACK_LIMIT,
+                persistence.indexer_dao("sundae_v3"),
+            );
+            v3_index.load().await.unwrap();
+            v3_index_and_config = Some((v3_index, v3_config));
+        }
 
-        indexer
-            .add_index(v3_index, default_start, force_restart)
-            .await
-            .unwrap();
+        let mut v4_index_and_config = None;
+        if let (Some(v4_config), Some(v4_state)) = (&protocol.v4, &v4_state) {
+            let mut v4_index = SundaeV4Indexer::new(
+                v4_state.clone(),
+                event_tx.clone(),
+                v4_config.clone(),
+                config::ROLLBACK_LIMIT,
+                persistence.indexer_dao("sundae_v4"),
+            );
+            v4_index.load().await.unwrap();
+            v4_index_and_config = Some((v4_index, v4_config));
+        }
+
+        // Warn if DB has data but starting-point is origin (common after devnet reset)
+        if let Some((_, v4_config)) = &v4_index_and_config {
+            if matches!(v4_config.starting_point, acropolis_common::Point::Origin) {
+                if let Some(ref s) = v4_state {
+                    let slot = s.lock().await.latest().tip_slot;
+                    if slot > 0 {
+                        warn!(
+                            slot,
+                            "DB contains v4 data at slot {slot} but starting-point is 'origin' \
+                             — if the devnet was reset, delete the database file and restart"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some((_, v3_config)) = &v3_index_and_config {
+            if matches!(v3_config.starting_point, acropolis_common::Point::Origin) {
+                if let Some(ref s) = v3_state {
+                    let n_pools = s.lock().await.latest().pools.len();
+                    if n_pools > 0 {
+                        warn!(
+                            n_pools,
+                            "DB contains v3 data ({n_pools} pools) but starting-point is 'origin' \
+                             — if the devnet was reset, delete the database file and restart"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Bootstrap from Kupo/Blockfrost if configured and DB has no data.
+        // We check tip_slot == 0 (no blocks indexed yet) rather than pools.is_empty(),
+        // because a protocol can legitimately have 0 pools while still having
+        // indexed blocks, settings, orders, etc.
+        let mut bootstrap_point: Option<acropolis_common::Point> = None;
+        if let Some(ref bootstrap_config) = protocol.bootstrap {
+            let v3_needs_bootstrap = match &v3_state {
+                Some(s) => s.lock().await.latest().pools.is_empty(),
+                None => false,
+            };
+            let v4_needs_bootstrap = match &v4_state {
+                Some(s) => s.lock().await.latest().tip_slot == 0,
+                None => false,
+            };
+            if v3_needs_bootstrap || v4_needs_bootstrap {
+                match bootstrap::run_bootstrap(
+                    bootstrap_config,
+                    if v3_needs_bootstrap { protocol.v3.as_ref() } else { None },
+                    if v4_needs_bootstrap { protocol.v4.as_ref() } else { None },
+                    &v3_state,
+                    &v4_state,
+                    &persistence,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if !result.tip_hash.is_empty() {
+                            let point_str =
+                                format!("{}.{}", result.tip_slot, result.tip_hash);
+                            match point_str.parse() {
+                                Ok(point) => bootstrap_point = Some(point),
+                                Err(e) => {
+                                    warn!("Bootstrap: could not parse tip as Point: {e:#}")
+                                }
+                            }
+                        }
+                        // Set loaded_slot on both indexers so blocks before
+                        // the bootstrap tip are skipped during chain sync.
+                        if let Some((ref mut v3_index, _)) = v3_index_and_config {
+                            v3_index.set_loaded_slot(result.tip_slot);
+                        }
+                        if let Some((ref mut v4_index, _)) = v4_index_and_config {
+                            v4_index.set_loaded_slot(result.tip_slot);
+                            // Bootstrap recovers per-pool module configs from
+                            // tx history and persists them AFTER load()
+                            // hydrated the cache from the pre-bootstrap DB.
+                            // Re-hydrate, or the first live update of each
+                            // bootstrapped pool falls back to default configs
+                            // (wrong module_state hash → eval failures).
+                            if let Err(e) = v4_index.rehydrate_module_configs().await {
+                                warn!("v4: post-bootstrap module-config rehydrate failed: {e:#}");
+                            }
+                        }
+                        if bootstrap_point.is_some() {
+                            info!("Bootstrap succeeded, starting chain sync from tip");
+                        } else {
+                            info!("Bootstrap succeeded but no block hash available; using configured starting point");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Bootstrap failed, falling back to chain sync: {e:#}");
+                    }
+                }
+            }
+        }
+
+        if let Some((v3_index, v3_config)) = v3_index_and_config {
+            let start = bootstrap_point
+                .clone()
+                .unwrap_or_else(|| v3_config.starting_point.clone());
+            indexer
+                .add_index(v3_index, start, force_restart)
+                .await
+                .unwrap();
+        }
+
+        if let Some((v4_index, v4_config)) = v4_index_and_config {
+            let start = bootstrap_point
+                .clone()
+                .unwrap_or_else(|| v4_config.starting_point.clone());
+            indexer
+                .add_index(v4_index, start, force_restart)
+                .await
+                .unwrap();
+        }
 
         match process.start().await {
             Ok(running_process) => {
@@ -147,11 +516,11 @@ async fn manager_loop(
                 }
             }
             Err(err) => {
-                warn!("could not start acropolis process: {err:#}");
+                error!("could not start acropolis process: {err:#}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         };
 
-        warn!("Restarting Scooper indexer");
+        warn!("restarting indexer — resync requested or connection lost");
     }
 }

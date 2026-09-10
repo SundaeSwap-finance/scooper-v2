@@ -13,6 +13,10 @@ impl<T: Default + Clone> HistoricalState<T> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     pub fn latest(&self) -> Cow<'_, T> {
         match self.slots.last_key_value() {
             Some((_, v)) => Cow::Borrowed(v),

@@ -25,8 +25,41 @@ impl Default for PersistenceConfig {
 }
 
 pub trait Persistence: Send + Sync {
-    fn sundae_v3_dao(&self) -> Box<dyn SundaeV3Dao>;
+    fn indexer_dao(&self, namespace: &str) -> Box<dyn IndexerDao>;
     fn cursor_store(&self) -> CursorDao;
+    fn strategy_intent_dao(&self) -> Box<dyn StrategyIntentDao>;
+}
+
+/// A posted strategy intent, as persisted. `sse_cbor` is the wire-format
+/// SignedStrategyExecution; `hint` is the optional execution hint as JSON.
+#[derive(Debug, Clone)]
+pub struct PersistedStrategyIntent {
+    pub intent_id: Vec<u8>,
+    pub order_tx_id: Vec<u8>,
+    pub order_index: u64,
+    pub sse_cbor: Vec<u8>,
+    pub hint: Option<String>,
+    pub expiry_ms: u64,
+    pub received_at_ms: u64,
+    /// Terminal status ("executed" / "expired" / "order-gone"); None = live.
+    pub status: Option<String>,
+    /// For "executed": the spending tx hash.
+    pub status_tx: Option<Vec<u8>>,
+}
+
+#[async_trait]
+pub trait StrategyIntentDao: Send + Sync + 'static {
+    async fn save_intent(&self, intent: &PersistedStrategyIntent) -> Result<()>;
+    async fn delete_intents(&self, intent_ids: &[Vec<u8>]) -> Result<()>;
+    async fn load_intents(&self) -> Result<Vec<PersistedStrategyIntent>>;
+    /// Mark intents terminal: set status (+ optional tx) and blank the SSE
+    /// bytes — the tombstone only answers status queries.
+    async fn mark_terminal(
+        &self,
+        intent_ids: &[Vec<u8>],
+        status: &str,
+        status_tx: Option<&[u8]>,
+    ) -> Result<()>;
 }
 
 pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>> {
@@ -35,14 +68,30 @@ pub async fn connect(config: &PersistenceConfig) -> Result<Arc<dyn Persistence>>
     })
 }
 
-pub struct SundaeV3TxChanges {
+pub struct SpentTxo {
+    pub input: TransactionInput,
+    pub spending_tx_id: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoopRecord {
+    pub tx_id: Vec<u8>,
+    pub slot: u64,
+    pub pool_id: Vec<u8>,
+    pub n_orders: u32,
+    pub scooper: Vec<u8>,
+}
+
+pub struct TxChanges {
     pub slot: u64,
     pub height: u64,
     pub created_txos: Vec<PersistedTxo>,
-    pub spent_txos: Vec<TransactionInput>,
+    pub spent_txos: Vec<SpentTxo>,
     pub metadata_datums: Vec<PersistedDatum>,
+    pub scoop_records: Vec<ScoopRecord>,
+    pub module_configs: Vec<PersistedModuleConfig>,
 }
-impl SundaeV3TxChanges {
+impl TxChanges {
     pub fn new(slot: u64, height: u64) -> Self {
         Self {
             slot,
@@ -50,22 +99,29 @@ impl SundaeV3TxChanges {
             created_txos: vec![],
             spent_txos: vec![],
             metadata_datums: vec![],
+            scoop_records: vec![],
+            module_configs: vec![],
         }
     }
     pub fn is_empty(&self) -> bool {
         self.created_txos.is_empty()
             && self.spent_txos.is_empty()
             && self.metadata_datums.is_empty()
+            && self.scoop_records.is_empty()
+            && self.module_configs.is_empty()
     }
 }
 
 #[async_trait]
-pub trait SundaeV3Dao: Send + Sync + 'static {
-    async fn apply_tx_changes(&self, changes: SundaeV3TxChanges) -> Result<()>;
+pub trait IndexerDao: Send + Sync + 'static {
+    async fn apply_tx_changes(&self, changes: TxChanges) -> Result<()>;
     async fn rollback(&self, slot: u64) -> Result<()>;
     async fn load_txos(&self) -> Result<Vec<PersistedTxo>>;
+    async fn load_spent_txos(&self, since_slot: u64) -> Result<Vec<SpentPersistedTxo>>;
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
+    async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>>;
+    async fn load_module_configs(&self) -> Result<Vec<PersistedModuleConfig>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +133,27 @@ pub struct PersistedTxo {
     pub txo: Vec<u8>,
     pub address: Vec<u8>,
     pub datum: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentPersistedTxo {
+    pub txo: PersistedTxo,
+    pub spent_slot: u64,
+    pub spent_tx_id: Option<Vec<u8>>,
+}
+
+/// CBOR-encoded module config keyed by `(pool_id, module_hash)`.
+///
+/// Each pool's `module_state` stores `(module_credential, blake2b_256(config))`
+/// for every module that contributes to scoop validation (CS, fee_split, CL,
+/// …). We persist the on-chain config recovered from the module's `Create`
+/// withdrawal so we can re-send it in `Operate` redeemers across restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedModuleConfig {
+    pub pool_id: Vec<u8>,
+    pub module_hash: Vec<u8>,
+    pub config_cbor: Vec<u8>,
+    pub created_slot: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
