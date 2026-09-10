@@ -974,7 +974,9 @@ pub struct ScooperExecution {
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
-    /// Default: (6, 5) i.e. 20% padding.
+    /// Budgets are evaluated on the first-pass tx; the final rebuild shifts
+    /// output values (~0.2% on a redeemer) and uplc-turbo's step accounting
+    /// differs from cardano-node's (~0.04%). Default: (21, 20), 5%.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
     /// Pool idents (hex) to exclude from scooping. Useful as an operator
@@ -1028,7 +1030,7 @@ fn default_partial_fill_fee_estimate() -> u64 {
 fn default_max_tx_ex_mem() -> u64 { 14_000_000 }
 fn default_max_tx_ex_steps() -> u64 { 10_000_000_000 }
 fn default_max_tx_size() -> usize { 16_384 }
-fn default_budget_padding() -> (u64, u64) { (6, 5) }
+pub(crate) fn default_budget_padding() -> (u64, u64) { (21, 20) }
 
 impl ScooperExecution {
     /// If `scooper_secret_key_file` is set, read the file and populate

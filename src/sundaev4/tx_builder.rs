@@ -1184,7 +1184,6 @@ pub fn build_multi_pool_scoop_tx(
         exec.module_scripts.order.ref_utxo.0.clone(),
         exec.module_scripts.fee_split.ref_utxo.0.clone(),
         exec.module_scripts.fairness.ref_utxo.0.clone(),
-        exec.module_scripts.settings.ref_utxo.0.clone(),
     ];
     if has_lp_mint_or_burn {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
