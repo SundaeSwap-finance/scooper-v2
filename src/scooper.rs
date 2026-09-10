@@ -1916,12 +1916,9 @@ impl Scooper {
                 Some(&mut failure),
             ) {
                 Ok(r) => {
-                    // Inflate the evaluator's exact budgets by `budget_padding`
-                    // before submitting. uplc-turbo's CEK step accounting
-                    // doesn't always match cardano-node's exactly (we've seen
-                    // ~0.04% under-estimates), and a node rejection for budget
-                    // overrun aborts the whole scoop cycle — cheap insurance.
-                    // Padding-vs-max-budget gating already happens in
+                    // `budget_padding`'s doc says what the margin covers; the
+                    // final tx is re-evaluated against these budgets before
+                    // submit. Padding-vs-max-budget gating happens in
                     // `within_limits` during the fitness binary search.
                     let (pad_num, pad_den) = exec.budget_padding;
                     r.budgets.iter().map(|(k, eu)| {
@@ -1989,11 +1986,57 @@ impl Scooper {
             }
         };
 
-
+        // The declared budgets come from the first-pass tx and the rebuild
+        // can shift a script's cost. The node rejects any script that runs
+        // past its declared budget, and that rejection is indistinguishable
+        // from a lost race at submit time.
+        let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+            &final_tx.tx_body,
+            &final_tx.redeemers,
+            &final_tx.resolved_inputs,
+            &final_tx.resolved_ref_inputs,
+            self.v4_script_store.as_ref().unwrap(),
+            &exec.plutus_v3_cost_model,
+            exec.plutus_v2_cost_model.as_deref(),
+            final_tx.tx_hash,
+            &exec.slot_config,
+            None,
+        ) {
+            Ok(r) => r.budgets.iter().filter_map(|(k, raw)| {
+                let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
+                (raw.mem > declared.mem || raw.steps > declared.steps).then(|| format!(
+                    "{:?}#{}: raw mem {} steps {} > declared mem {} steps {}",
+                    k.tag, k.index, raw.mem, raw.steps, declared.mem, declared.steps,
+                ))
+            }).collect(),
+            Err(e) => {
+                warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "final tx eval failed — aborting scoop cycle");
+                self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                return false;
+            }
+        };
+        if !over_budget.is_empty() {
+            warn!(
+                tx_hash = %final_tx.tx_hash_hex,
+                over_budget = ?over_budget,
+                "final tx exceeds declared budgets — aborting scoop cycle",
+            );
+            self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+            return false;
+        }
 
         let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
         let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
         let final_size = final_tx.cbor.len();
+        if submitted_mem > exec.max_tx_ex_mem || submitted_steps > exec.max_tx_ex_steps {
+            warn!(
+                tx_hash = %final_tx.tx_hash_hex,
+                submitted_mem, submitted_steps,
+                "final tx exceeds max tx budget — aborting scoop cycle",
+            );
+            self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+            return false;
+        }
         info!(
             tx_hash = %final_tx.tx_hash_hex,
             n_orders,
