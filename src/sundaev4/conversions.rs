@@ -58,7 +58,9 @@ pub enum ConversionMechanism {
     /// pot UTxO, mint the synthetic at the params ratio. Contention-free
     /// (params UTxO is a reference input; every deposit creates a new pot).
     /// Tx composition NOT yet implemented — carried here so preview configs
-    /// can already describe the deployment while the builder lands.
+    /// can already describe the deployment while the builder lands, which is
+    /// also why nothing reads these fields yet.
+    #[expect(dead_code)]
     ButaneUnderlyingDeposit {
         /// The synthetic's name on the mint policy, e.g. "ADAb".
         synthetic: String,

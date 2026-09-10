@@ -433,7 +433,7 @@ pub fn build_multi_pool_scoop_tx(
     // Per-pool operation_tag for swap entries. CS dispatches on tag==3
     // (`tag_swap` in cs_check.ak); CP/CL infer from asset deltas.
     let per_pool_swap_tag: Vec<BigInt> = batches.iter().map(|b| match &b.pool.pool_type {
-        PoolType::ConstantSum { .. } => BigInt::from(3),
+        PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_SWAP),
         PoolType::ConstantProduct { .. } => BigInt::from(100),
         PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
     }).collect();
@@ -668,7 +668,9 @@ pub fn build_multi_pool_scoop_tx(
                 per_pool_lp_minted[batch_idx] =
                     &per_pool_lp_minted[batch_idx] + &d.lp_minted;
                 let dep_tag = match &pool_type {
-                    PoolType::ConstantSum { .. } => BigInt::from(6),
+                    PoolType::ConstantSum { .. } => {
+                        BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
+                    }
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
                 };
@@ -1809,7 +1811,7 @@ pub fn build_multi_pool_scoop_tx(
     let mut fulfillment_order: Vec<usize> = (0..n_orders).collect();
     fulfillment_order.sort_by_key(|i| order_filtered_indices[*i]);
 
-    for (out_pos, &fi) in fulfillment_order.iter().enumerate() {
+    for &fi in fulfillment_order.iter() {
         let fo_meta = &flat_orders[fi];
         let order = match &fo_meta.kind {
             FlatOrderKind::Swap(i) => &batches[fo_meta.batch_idx].swaps[*i].order,
@@ -2088,7 +2090,7 @@ pub fn build_multi_pool_scoop_tx(
                 build_fulfillment_value_with_moves(&c.order.value, &moves, actual_fee)?
             }
         };
-        let mut out = TransactionOutput::PostAlonzo(
+        let out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
                 value: fulfillment_value,

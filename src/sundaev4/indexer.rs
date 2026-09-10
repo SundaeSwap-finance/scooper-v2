@@ -87,7 +87,6 @@ pub struct SundaeV4Indexer {
     protocol: SundaeV4Protocol,
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
-    scooper_address: Option<Address>,
     scooper_keyhash: Option<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
     tip_event_counter: u64,
@@ -127,13 +126,6 @@ impl SundaeV4Indexer {
             fee = ?protocol.execution.as_ref().map(|e| e.fee),
             "V4 indexer created"
         );
-        let scooper_address = protocol.execution.as_ref().and_then(|exec| {
-            derive_scooper_pallas_address_with_stake(
-                &exec.scooper_secret_key,
-                exec.scooper_stake_keyhash.as_deref(),
-            )
-            .ok()
-        });
         let scooper_keyhash = protocol.execution.as_ref().and_then(|exec| {
             derive_scooper_keyhash(&exec.scooper_secret_key).ok()
         });
@@ -186,7 +178,6 @@ impl SundaeV4Indexer {
             protocol,
             rollback_limit,
             dao,
-            scooper_address,
             scooper_keyhash,
             ref_utxo_inputs,
             tip_event_counter: 0,
@@ -894,8 +885,8 @@ impl ChainIndex for SundaeV4Indexer {
         let mut new_orders = vec![];
         let mut new_invalid_orders = vec![];
         let mut new_settings = None;
-        /// (token_name, OrderConfigEntry) — newly-discovered OrderConfig
-        /// settings entries in this tx.
+        // (token_name, OrderConfigEntry) — newly-discovered OrderConfig
+        // settings entries in this tx.
         let mut new_fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>> = None;
         let mut new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)> = vec![];
         let mut changes = TxChanges::new(info.slot, info.number);
@@ -1704,10 +1695,6 @@ fn build_scoop_stats(
     }
 }
 
-pub(crate) fn derive_scooper_pallas_address(secret_key_hex: &str) -> Result<Address> {
-    derive_scooper_pallas_address_with_stake(secret_key_hex, None)
-}
-
 /// Build the scooper's Shelley address. If `stake_keyhash_hex` is `Some`, a
 /// base address (payment + staking) is produced — required to match base
 /// addresses used by CIP-1852 wallets. Without it, an enterprise (payment-
@@ -1735,10 +1722,6 @@ pub(crate) fn derive_scooper_pallas_address_with_stake(
         delegation,
     );
     Ok(Address::from(shelley))
-}
-
-fn address_equals(a: &Address, b: &Address) -> bool {
-    a.to_vec() == b.to_vec()
 }
 
 fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {

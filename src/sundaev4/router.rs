@@ -1032,8 +1032,6 @@ pub fn find_optimal_route(
     Some(plan)
 }
 
-/// Check whether a route is "interesting" (multi-hop or split).
-/// Returns true if the route has >1 hop or any hop has >1 split.
 /// A portfolio of parallel routes for one order: the input splits across
 /// pool-disjoint paths (e.g. 70% ADA→NIGHT direct, 30% ADA→ADAb→NIGHT via a
 /// conversion edge). Every branch is a complete RoutingPlan for its
@@ -1043,6 +1041,8 @@ pub fn find_optimal_route(
 pub struct BlendedRoute {
     /// Branches with positive allocation, best-output first.
     pub branches: Vec<RoutingPlan>,
+    /// Not read: consumers take each branch's own `total_input`.
+    #[expect(dead_code)]
     pub total_input: BigInt,
     pub total_output: BigInt,
 }
@@ -1323,6 +1323,10 @@ pub fn find_blended_route(
     })
 }
 
+/// Check whether a route is "interesting" (multi-hop or split).
+/// Returns true if the route has >1 hop or any hop has >1 split.
+/// Used in tests.
+#[cfg(test)]
 pub fn is_routed(plan: &RoutingPlan) -> bool {
     if plan.hops.len() > 1 {
         return true;

@@ -33,17 +33,13 @@ mod hex_ser {
         map.end()
     }
 
-    pub fn opt_vec_bytes<S: Serializer>(v: &Option<Vec<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {
-        match v {
-            Some(list) => vec_bytes(list, s),
-            None => s.serialize_none(),
-        }
-    }
 }
 
 
 /// Void / unit as PlutusData — `Constr 0 []`. The audit-final PoolDatum's
-/// `extension` field is Void on every pool the CLI creates.
+/// `extension` field is Void on every pool the CLI creates. Used in tests
+/// to build pool datums.
+#[cfg(test)]
 pub fn plutus_void() -> PlutusData {
     PlutusData::Constr(pallas_primitives::Constr {
         tag: 121,
@@ -455,19 +451,6 @@ impl Constraint {
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
 
-    /// Constraint tag (0=Deposit, 1=Withdraw, 2=Swap, 3=Claim). Matches the
-    /// `settings.order_modules` lookup key.
-    pub fn tag(&self) -> u64 {
-        match self {
-            Constraint::Deposit { .. } => 0,
-            Constraint::Withdraw { .. } => 1,
-            Constraint::Swap { .. } => 2,
-            Constraint::Claim { .. } => 3,
-            // Strategy constraints have no ctor-tag dispatch — they're
-            // selected by script hash. No caller should route on this.
-            Constraint::Strategy { .. } => u64::MAX,
-        }
-    }
 
     /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
     /// the constraint. Returns `None` for non-Swap orders — the scooper's

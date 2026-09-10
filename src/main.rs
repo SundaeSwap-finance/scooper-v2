@@ -287,16 +287,41 @@ async fn main() -> Result<()> {
     ));
 
     tokio::spawn(async move {
-        let _ = ctrl_c().await;
+        shutdown_signal().await;
         info!("shutdown requested");
         shutdown.cancel();
-        let _ = ctrl_c().await;
+        shutdown_signal().await;
         warn!("force shutdown requested");
         process::exit(0);
     });
 
     tokio::try_join!(manager_handle, scooper_handle, server_handle)?;
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM. PID 1 gets no default SIGTERM action, so
+/// without this `docker stop` SIGKILLs us instead of shutting down cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                select! {
+                    _ = ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!("could not install SIGTERM handler, Ctrl-C only: {err}");
+                let _ = ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c().await;
+    }
 }
 
 async fn manager_loop(

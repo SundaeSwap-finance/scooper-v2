@@ -104,7 +104,9 @@ pub struct ResolvedDeposit {
     /// LP tokens minted to the user.
     pub lp_minted: BigInt,
     /// Excess offered by the user that didn't fit the proportional unit and
-    /// is returned alongside their LP tokens. Empty if exact-fit.
+    /// is returned alongside their LP tokens. Empty if exact-fit. Not read:
+    /// the tx builder rebuilds it as `order.value - dx`.
+    #[expect(dead_code)]
     pub surplus: Vec<(AssetClass, BigInt)>,
     /// CS pools: the declared value delta `t` for the target-pinned deposit
     /// (cs_check tag 6 reads it from the entry's operation_data). None for
@@ -210,6 +212,8 @@ pub struct Batch {
     /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
     pub ops_order: Vec<BatchOp>,
+    /// Reserves after the whole batch. Used in accumulator comparison tests.
+    #[allow(dead_code)]
     pub final_assets: Vec<(AssetClass, BigInt)>,
     /// Total LP after applying protocol share. Used in accumulator comparison tests.
     #[allow(dead_code)]
@@ -480,6 +484,9 @@ pub fn assemble_batch(
 /// Try to execute a single order against the current running pool state.
 /// Returns a `ResolvedSwap` if the swap produces positive output and
 /// satisfies min_received constraints, or `None` otherwise.
+///
+/// Used by the test-only `assemble_batch` and accumulator comparison tests.
+#[cfg(test)]
 pub fn try_execute_order(
     order: &Arc<SundaeV4Order>,
     running_assets: &[(AssetClass, BigInt)],
@@ -637,19 +644,6 @@ pub fn detect_swap_direction(
         return None;
     }
     Some((input_idx, output_idx))
-}
-
-/// Check if dy satisfies the order's min_received constraint.
-fn satisfies_min_received(
-    order: &SundaeV4Order,
-    output_asset: &AssetClass,
-    dy: &BigInt,
-) -> bool {
-    let (ask_asset, min_qty) = order.swap_min_received();
-    if ask_asset != output_asset {
-        return false;
-    }
-    dy >= min_qty
 }
 
 /// Resolve a CP Deposit against the current pool reserves.
@@ -945,7 +939,6 @@ mod tests {
     use super::*;
     use crate::cardano_types::{TransactionInput, Value};
     use crate::multisig::Multisig;
-    use pallas_codec::utils::MaybeIndefArray;
 
     fn ada() -> AssetClass {
         AssetClass { policy: vec![], token: vec![] }
@@ -953,14 +946,6 @@ mod tests {
 
     fn token_a() -> AssetClass {
         AssetClass { policy: vec![0x01], token: vec![0x02] }
-    }
-
-    fn unit_pd() -> pallas_primitives::PlutusData {
-        pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
-            tag: 121,
-            any_constructor: None,
-            fields: MaybeIndefArray::Def(vec![]),
-        })
     }
 
     fn make_pool(ada_reserve: i64, token_reserve: i64) -> Arc<SundaeV4Pool> {
