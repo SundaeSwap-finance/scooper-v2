@@ -67,8 +67,15 @@ pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> 
     for config_file in config_files {
         builder = builder.add_source(File::with_name(config_file.as_ref()));
     }
+    // `SCOOPER_V2_PERSISTENCE__SQLITE__FILENAME` overrides
+    // `persistence.sqlite.filename`. Pinning prefix_separator keeps the prefix
+    // `SCOOPER_V2_`; config-rs would otherwise take it from `separator`.
     let config = builder
-        .add_source(Environment::with_prefix("SCOOPER_V2"))
+        .add_source(
+            Environment::with_prefix("SCOOPER_V2")
+                .prefix_separator("_")
+                .separator("__"),
+        )
         .build()?;
     Ok(config.try_deserialize()?)
 }
