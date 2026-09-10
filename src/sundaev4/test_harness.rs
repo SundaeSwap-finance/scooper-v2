@@ -588,14 +588,6 @@ pub(crate) mod test_harness {
         token(0x0B, 0x0C)
     }
 
-    pub fn unit_pd() -> pallas_primitives::PlutusData {
-        pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
-            tag: 121,
-            any_constructor: None,
-            fields: MaybeIndefArray::Def(vec![]),
-        })
-    }
-
     /// Create a token-to-token pool with the proper module pipeline (CP + FS + fairness).
     ///
     /// The pool's `actions` and `module_state` reference the real module script

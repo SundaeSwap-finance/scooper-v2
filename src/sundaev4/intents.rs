@@ -421,11 +421,6 @@ impl IntentStore {
             .unwrap_or_default()
     }
 
-    /// All stored intents (for the observability endpoint).
-    pub fn all(&self) -> impl Iterator<Item = &StoredIntent> {
-        self.by_order.values().flatten()
-    }
-
     pub fn len(&self) -> usize {
         self.total
     }

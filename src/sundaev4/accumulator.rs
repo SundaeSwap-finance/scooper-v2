@@ -176,6 +176,10 @@ impl Accumulator {
     ///
     /// Returns `Ok(())` if the order was successfully executed against the
     /// pool's running reserves, or `Err(reason)` if it couldn't execute.
+    ///
+    /// Only reached from tests: production admission goes through
+    /// `add_route_branch_inner`.
+    #[cfg(test)]
     pub fn try_add_order(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,
@@ -876,7 +880,6 @@ mod tests {
     use crate::cardano_types::{TransactionInput, Value};
     use crate::multisig::Multisig;
     use crate::sundaev4::types::{Destination, PoolDatum, PoolType, Rational, SundaeV4Order};
-    use pallas_codec::utils::MaybeIndefArray;
 
     fn ada() -> AssetClass {
         AssetClass { policy: vec![], token: vec![] }
@@ -888,14 +891,6 @@ mod tests {
 
     fn token_b() -> AssetClass {
         AssetClass { policy: vec![0x03], token: vec![0x04] }
-    }
-
-    fn unit_pd() -> pallas_primitives::PlutusData {
-        pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
-            tag: 121,
-            any_constructor: None,
-            fields: MaybeIndefArray::Def(vec![]),
-        })
     }
 
     fn make_pool(ident_byte: u8, ada_reserve: i64, token: AssetClass, token_reserve: i64) -> Arc<SundaeV4Pool> {

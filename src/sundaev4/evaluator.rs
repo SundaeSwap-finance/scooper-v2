@@ -98,10 +98,6 @@ impl ScriptStore {
         Ok(ScriptStore { scripts: store })
     }
 
-    pub fn get(&self, hash: &Hash<28>) -> Option<&[u8]> {
-        self.scripts.get(hash).map(|(v, _)| v.as_slice())
-    }
-
     pub fn get_with_version(&self, hash: &Hash<28>) -> Option<(&[u8], u8)> {
         self.scripts.get(hash).map(|(v, ver)| (v.as_slice(), *ver))
     }
@@ -139,6 +135,8 @@ pub struct FailedScriptContext {
     pub script_hash: Hash<28>,
     pub redeemer_key: RedeemersKey,
     pub context_cbor: Vec<u8>,
+    /// Not read: callers surface the same message from the `Err` value.
+    #[expect(dead_code)]
     pub error: String,
 }
 

@@ -476,7 +476,9 @@ pub fn compute_fee_budget(
     }
 }
 
-/// Protocol LP = floor(fee_budget * ps_num / ps_den)
+/// Protocol LP = floor(fee_budget * ps_num / ps_den). Used in tests; the
+/// production walk computes the per-entry share in `tx_builder`.
+#[cfg(test)]
 pub fn compute_protocol_lp(fee_budget: &BigInt, ps_num: u64, ps_den: u64) -> BigInt {
     fee_budget * &BigInt::from(ps_num) / &BigInt::from(ps_den)
 }

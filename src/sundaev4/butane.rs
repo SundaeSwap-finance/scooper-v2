@@ -213,7 +213,7 @@ impl ButaneRuntime {
 
         let registry_utxo = parse_outref(&config.registry_utxo)?;
         let mut extra_resolved = Vec::new();
-        let mut decode_output = |label: &str, hex_cbor: &str| -> Result<conway::TransactionOutput> {
+        let decode_output = |label: &str, hex_cbor: &str| -> Result<conway::TransactionOutput> {
             let bytes = hex::decode(hex_cbor)
                 .with_context(|| format!("{label} output cbor not hex"))?;
             minicbor::decode(&bytes)
