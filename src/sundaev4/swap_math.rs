@@ -142,6 +142,7 @@ pub fn cs_max_dx_for_reserve(
 /// VA = a·spb_num + L·spb_den, VB = b·spa_den + L·spa_num
 ///   A→B: dy = floor(VB · dVA_eff / ((VA + dVA_eff) · spa_den))   with dVA_eff = dx_eff·spb_num
 ///   B→A: dy = floor(VA · dVB_eff / ((VB + dVB_eff) · spb_num))   with dVB_eff = dx_eff·spa_num
+#[allow(clippy::too_many_arguments)]
 pub fn cl_swap_result(
     a: &BigInt,
     b: &BigInt,
@@ -185,6 +186,7 @@ pub fn cl_swap_result(
 ///
 /// Returns `None` if the pool can't absorb any positive dx (e.g. reserve_out
 /// already zero, or the pool is at its price boundary).
+#[allow(clippy::too_many_arguments)]
 pub fn cl_max_dx_for_reserve(
     a: &BigInt,
     b: &BigInt,
@@ -390,13 +392,10 @@ pub fn cs_dock(
     }
     let n = BigInt::from(prices.len() as u64);
     let q_of = |assets: &[BigInt], v: &BigInt| -> BigInt {
-        assets
-            .iter()
-            .zip(prices.iter())
-            .fold(BigInt::from(0), |acc, (a, p)| {
-                let dev = &(&(&n * p) * a) - v;
-                &acc + &(&dev * &dev)
-            })
+        assets.iter().zip(prices.iter()).fold(BigInt::from(0), |acc, (a, p)| {
+            let dev = &(&(&n * p) * a) - v;
+            &acc + &(&dev * &dev)
+        })
     };
     let q_b = q_of(assets_before, v_b);
     let q_a = q_of(assets_after, v_a);
@@ -423,10 +422,8 @@ pub fn cs_fee_budget(
         .iter()
         .zip(prices.iter())
         .fold(BigInt::from(0), |acc, (a, p)| &acc + &(a * p));
-    let v1: BigInt = assets_after
-        .iter()
-        .zip(prices.iter())
-        .fold(BigInt::from(0), |acc, (a, p)| &acc + &(a * p));
+    let v1: BigInt =
+        assets_after.iter().zip(prices.iter()).fold(BigInt::from(0), |acc, (a, p)| &acc + &(a * p));
     if v0.is_zero() {
         warn!("cs_fee_budget: zero denominator (v0=0)");
         return BigInt::from(0);
@@ -448,29 +445,45 @@ pub fn compute_fee_budget(
             let changed: Vec<usize> = (0..assets_before.len())
                 .filter(|&i| assets_before[i].1 != assets_after[i].1)
                 .collect();
-            assert!(changed.len() == 2, "CP swap must change exactly 2 assets, got {}", changed.len());
+            assert!(
+                changed.len() == 2,
+                "CP swap must change exactly 2 assets, got {}",
+                changed.len()
+            );
             let (i, j) = (changed[0], changed[1]);
             cp_fee_budget(
-                &assets_before[i].1, &assets_before[j].1,
-                &assets_after[i].1, &assets_after[j].1,
+                &assets_before[i].1,
+                &assets_before[j].1,
+                &assets_after[i].1,
+                &assets_after[j].1,
                 lp_before,
             )
         }
-        super::types::PoolType::ConstantSum { prices, bounty_k, .. } => {
+        super::types::PoolType::ConstantSum {
+            prices, bounty_k, ..
+        } => {
             let before: Vec<BigInt> = assets_before.iter().map(|(_, a)| a.clone()).collect();
             let after: Vec<BigInt> = assets_after.iter().map(|(_, a)| a.clone()).collect();
             cs_fee_budget(&before, &after, lp_before, prices, bounty_k)
         }
-        super::types::PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, .. } => {
+        super::types::PoolType::ConcentratedLiquidity {
+            sqrt_price_a,
+            sqrt_price_b,
+            ..
+        } => {
             // The CL fee budget is a pure function of the after-state and
             // the pool's sqrt-price bounds; the before-state determines
             // lp_before for callers that want the *delta* over a sequence
             // of swaps, but here we compute it as `formula − lp_after`
             // which already encodes both the achievable and tight bounds.
             cl_fee_budget(
-                &assets_after[0].1, &assets_after[1].1, lp_before,
-                &sqrt_price_a.num, &sqrt_price_a.den,
-                &sqrt_price_b.num, &sqrt_price_b.den,
+                &assets_after[0].1,
+                &assets_after[1].1,
+                lp_before,
+                &sqrt_price_a.num,
+                &sqrt_price_a.den,
+                &sqrt_price_b.num,
+                &sqrt_price_b.den,
             )
         }
     }
@@ -536,8 +549,8 @@ mod tests {
                 &a, &b, &lp, is_a_input,
                 &spa_num, &spa_den, &spb_num, &spb_den, &fee_num, &fee_den,
             );
-            if let Some(max_dx) = max_dx {
-                if max_dx.is_positive() {
+            if let Some(max_dx) = max_dx
+                && max_dx.is_positive() {
                     // Sample dx across [0, max_dx].
                     let dx = &max_dx * BigInt::from(dx_permille) / BigInt::from(1000u64);
                     if dx.is_positive() {
@@ -554,7 +567,6 @@ mod tests {
                         );
                     }
                 }
-            }
         }
     }
 
@@ -639,7 +651,10 @@ mod tests {
         // The huge order overshoots the reserve → must be capped/rejected.
         let huge = BigInt::from(1_503_764_146_505_130u64);
         let dy_huge = cs_swap_result(&huge, &prices, 0, 1, &fee_num, &fee_den);
-        assert!(dy_huge > reserve_out, "precondition: huge fill overshoots reserve");
+        assert!(
+            dy_huge > reserve_out,
+            "precondition: huge fill overshoots reserve"
+        );
 
         let cap = cs_max_dx_for_reserve(&reserve_out, &prices, 0, 1, &fee_num, &fee_den)
             .expect("cap defined for a sane fee");
@@ -660,7 +675,14 @@ mod tests {
             Some(BigInt::from(0))
         );
         assert_eq!(
-            cs_max_dx_for_reserve(&reserve_out, &prices, 0, 1, &BigInt::from(1000), &BigInt::from(1000)),
+            cs_max_dx_for_reserve(
+                &reserve_out,
+                &prices,
+                0,
+                1,
+                &BigInt::from(1000),
+                &BigInt::from(1000)
+            ),
             None // fee_den == fee_num
         );
     }
@@ -696,7 +718,10 @@ mod tests {
             let fee_floor = &iv * &fee_num / &fee_den;
             let v_increase = &iv - &(&dy * &prices[1]);
             assert!(v_increase >= fee_floor, "dx={dx} underpays the fee");
-            assert!(v_increase < &fee_floor + &prices[1], "dx={dx} overpays past the window");
+            assert!(
+                v_increase < &fee_floor + &prices[1],
+                "dx={dx} overpays past the window"
+            );
         }
     }
 
@@ -725,24 +750,65 @@ mod tests {
         // After: [1_010_000, 500_000, 1_980_258]  (k1 > k0 due to fee)
         use crate::cardano_types::AssetClass;
         let assets_before = vec![
-            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(500_000)),
-            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(2_000_000)),
+            (
+                AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![1],
+                    token: vec![1],
+                },
+                BigInt::from(500_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![2],
+                    token: vec![2],
+                },
+                BigInt::from(2_000_000),
+            ),
         ];
         let assets_after = vec![
-            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_010_000)),
-            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(500_000)),
-            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_980_258)),
+            (
+                AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                BigInt::from(1_010_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![1],
+                    token: vec![1],
+                },
+                BigInt::from(500_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![2],
+                    token: vec![2],
+                },
+                BigInt::from(1_980_258),
+            ),
         ];
         let lp = BigInt::from(1_000_000);
         let pool_type = super::super::types::PoolType::ConstantProduct {
-            fee: super::super::types::Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            fee: super::super::types::Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
         };
         let fb = super::compute_fee_budget(&pool_type, &assets_before, &assets_after, &lp);
         // Same as direct cp_fee_budget on just the changed pair
         let fb_direct = cp_fee_budget(
-            &BigInt::from(1_000_000), &BigInt::from(2_000_000),
-            &BigInt::from(1_010_000), &BigInt::from(1_980_258),
+            &BigInt::from(1_000_000),
+            &BigInt::from(2_000_000),
+            &BigInt::from(1_010_000),
+            &BigInt::from(1_980_258),
             &lp,
         );
         assert_eq!(fb, fb_direct);
@@ -754,26 +820,79 @@ mod tests {
         // 4-asset pool: swap assets [1] and [3], assets [0] and [2] unchanged
         use crate::cardano_types::AssetClass;
         let assets_before = vec![
-            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![3], token: vec![3] }, BigInt::from(1_000_000)),
+            (
+                AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![1],
+                    token: vec![1],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![2],
+                    token: vec![2],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![3],
+                    token: vec![3],
+                },
+                BigInt::from(1_000_000),
+            ),
         ];
         let assets_after = vec![
-            (AssetClass { policy: vec![], token: vec![] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![1], token: vec![1] }, BigInt::from(1_010_000)),
-            (AssetClass { policy: vec![2], token: vec![2] }, BigInt::from(1_000_000)),
-            (AssetClass { policy: vec![3], token: vec![3] }, BigInt::from(990_129)),
+            (
+                AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![1],
+                    token: vec![1],
+                },
+                BigInt::from(1_010_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![2],
+                    token: vec![2],
+                },
+                BigInt::from(1_000_000),
+            ),
+            (
+                AssetClass {
+                    policy: vec![3],
+                    token: vec![3],
+                },
+                BigInt::from(990_129),
+            ),
         ];
         let lp = BigInt::from(1_000_000);
         let pool_type = super::super::types::PoolType::ConstantProduct {
-            fee: super::super::types::Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            fee: super::super::types::Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
         };
         let fb = super::compute_fee_budget(&pool_type, &assets_before, &assets_after, &lp);
         // Should match direct call on just the [1],[3] pair
         let fb_direct = cp_fee_budget(
-            &BigInt::from(1_000_000), &BigInt::from(1_000_000),
-            &BigInt::from(1_010_000), &BigInt::from(990_129),
+            &BigInt::from(1_000_000),
+            &BigInt::from(1_000_000),
+            &BigInt::from(1_010_000),
+            &BigInt::from(990_129),
             &lp,
         );
         assert_eq!(fb, fb_direct);
@@ -806,11 +925,22 @@ mod tests {
         // v0 = 3M, v1 = 1_010_000 + 1_000_000 + 990_030 = 3_000_030
         // fee_budget = floor(3_000_030 * 1M / 3M) - 1M = 1_000_010 - 1_000_000 = 10
         let fb = cs_fee_budget(
-            &[BigInt::from(1_000_000), BigInt::from(1_000_000), BigInt::from(1_000_000)],
-            &[BigInt::from(1_010_000), BigInt::from(1_000_000), BigInt::from(990_030)],
+            &[
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+            ],
+            &[
+                BigInt::from(1_010_000),
+                BigInt::from(1_000_000),
+                BigInt::from(990_030),
+            ],
             &BigInt::from(1_000_000),
             &[BigInt::from(1), BigInt::from(1), BigInt::from(1)],
-            &crate::sundaev4::types::Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            &crate::sundaev4::types::Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
         );
         assert_eq!(fb, BigInt::from(10));
     }
@@ -826,7 +956,10 @@ mod tests {
             &[BigInt::from(1_010_000), BigInt::from(990_030)],
             &BigInt::from(1_000_000),
             &[BigInt::from(1), BigInt::from(1)],
-            &crate::sundaev4::types::Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            &crate::sundaev4::types::Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
         );
         assert_eq!(fb, BigInt::from(15));
     }

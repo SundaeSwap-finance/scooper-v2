@@ -13,8 +13,8 @@ use tracing::warn;
 use crate::{
     cardano_types::TransactionInput,
     persistence::{
-        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo, Persistence,
-        ScoopRecord, SpentPersistedTxo, TxChanges,
+        CursorDaoImpl, IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo,
+        Persistence, ScoopRecord, SpentPersistedTxo, TxChanges,
     },
 };
 
@@ -33,10 +33,7 @@ impl SqliteConfig {
             warn!(
                 "No sqlite filename specified, storing in memory by default. Set persistence.sqlite.filename in configuration to fix this."
             );
-            pool_opts = pool_opts
-                .max_connections(1)
-                .idle_timeout(None)
-                .max_lifetime(None);
+            pool_opts = pool_opts.max_connections(1).idle_timeout(None).max_lifetime(None);
             conn_opts = conn_opts.in_memory(true);
         }
         (pool_opts, conn_opts)
@@ -106,9 +103,8 @@ impl super::StrategyIntentDao for SqliteStrategyIntentDao {
             return Ok(());
         }
         let placeholders = vec!["?"; intent_ids.len()].join(",");
-        let query = format!(
-            "DELETE FROM sundae_v4_strategy_intents WHERE intent_id IN ({placeholders});"
-        );
+        let query =
+            format!("DELETE FROM sundae_v4_strategy_intents WHERE intent_id IN ({placeholders});");
         let mut q = sqlx::query(&query);
         for id in intent_ids {
             q = q.bind(id);
@@ -252,10 +248,7 @@ impl IndexerDao for SqliteIndexerDao {
             let mut query = sqlx::query(&insert_datum_query);
 
             for datum in changes.metadata_datums {
-                query = query
-                    .bind(datum.hash)
-                    .bind(datum.datum)
-                    .bind(datum.created_slot as i64)
+                query = query.bind(datum.hash).bind(datum.datum).bind(datum.created_slot as i64)
             }
 
             query.execute(&mut *tx).await?;
@@ -381,10 +374,7 @@ impl IndexerDao for SqliteIndexerDao {
         let query = format!(
             "SELECT tx_id, txo_index, txo_type, created_slot, era, txo, address, datum, spent_slot, spent_tx_id FROM {txos_table} WHERE spent_slot IS NOT NULL AND spent_slot >= ? ORDER BY spent_slot, tx_id, txo_index;"
         );
-        Ok(sqlx::query_as(&query)
-            .bind(since_slot as i64)
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(sqlx::query_as(&query).bind(since_slot as i64).fetch_all(&self.pool).await?)
     }
 
     async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>> {
@@ -406,12 +396,10 @@ impl IndexerDao for SqliteIndexerDao {
     async fn prune_txos(&self, min_height: u64) -> Result<()> {
         let txos_table = self.txos_table();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(&format!(
-            "DELETE FROM {txos_table} WHERE spent_height < ?"
-        ))
-        .bind(min_height as i64)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(&format!("DELETE FROM {txos_table} WHERE spent_height < ?"))
+            .bind(min_height as i64)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -509,10 +497,7 @@ impl CursorDaoImpl for SqliteCursorDaoImpl {
             SELECT id, bytes
             FROM acropolis_cursors;
         ";
-        let entries = sqlx::query(query)
-            .try_map(parse_cursor_entry)
-            .fetch_all(&self.pool)
-            .await?;
+        let entries = sqlx::query(query).try_map(parse_cursor_entry).fetch_all(&self.pool).await?;
         let mut result = HashMap::new();
         for (id, bytes) in entries {
             let cursor = serde_json::from_slice(&bytes)?;
@@ -522,11 +507,7 @@ impl CursorDaoImpl for SqliteCursorDaoImpl {
     }
 
     async fn save(&self, entries: &HashMap<String, CursorEntry>) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("could not open transaction")?;
+        let mut tx = self.pool.begin().await.context("could not open transaction")?;
         sqlx::query("DELETE FROM acropolis_cursors;")
             .execute(&mut *tx)
             .await
@@ -737,7 +718,8 @@ mod tests {
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![earlier.clone()],
-        }).await?;
+        })
+        .await?;
 
         dao.apply_tx_changes(TxChanges {
             slot: later.created_slot,
@@ -747,7 +729,8 @@ mod tests {
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![later.clone()],
-        }).await?;
+        })
+        .await?;
 
         let loaded = dao.load_module_configs().await?;
         assert_eq!(loaded.len(), 1);
@@ -771,7 +754,8 @@ mod tests {
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![cfg.clone()],
-        }).await?;
+        })
+        .await?;
 
         dao.rollback(400).await?;
         assert!(dao.load_module_configs().await?.is_empty());
@@ -911,7 +895,10 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
+            spent_txos: vec![SpentTxo {
+                input: order.txo_id.clone(),
+                spending_tx_id: vec![0xAB; 32],
+            }],
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![],
@@ -995,7 +982,10 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
+            spent_txos: vec![SpentTxo {
+                input: order.txo_id.clone(),
+                spending_tx_id: vec![0xAB; 32],
+            }],
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![],
@@ -1048,7 +1038,10 @@ mod tests {
             slot: order.created_slot + 10,
             height: 3,
             created_txos: vec![],
-            spent_txos: vec![SpentTxo { input: order.txo_id.clone(), spending_tx_id: vec![0xAB; 32] }],
+            spent_txos: vec![SpentTxo {
+                input: order.txo_id.clone(),
+                spending_tx_id: vec![0xAB; 32],
+            }],
             metadata_datums: vec![],
             scoop_records: vec![],
             module_configs: vec![],

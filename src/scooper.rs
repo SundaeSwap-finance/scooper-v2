@@ -4,7 +4,10 @@ use std::{
     fs,
     io::{BufWriter, Write as _},
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -23,7 +26,7 @@ use crate::{
         ValueError, estimate_whether_in_range, validate_order_for_pool, validate_order_value,
     },
     sundaev4::{
-        SundaeV4HistoricalState, ScooperExecution,
+        ScooperExecution, SundaeV4HistoricalState,
         accumulator::Accumulator,
         batch::{self, BatchLimits},
         chain_tracker::{ChainTracker, InFlightTx, PredictedPoolUtxo},
@@ -91,6 +94,7 @@ pub struct Scooper {
 }
 
 impl Scooper {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_directory: Option<PathBuf>,
         event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
@@ -106,9 +110,8 @@ impl Scooper {
         if let Some(dir) = &trace_directory {
             fs::create_dir_all(dir)?;
         }
-        let v4_butane = v4_execution
-            .as_ref()
-            .and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
+        let v4_butane =
+            v4_execution.as_ref().and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
         Ok(Self {
             event_rx,
             v3_state,
@@ -152,22 +155,25 @@ impl Scooper {
                 } else {
                     (0, 0)
                 };
-                info!(n_pools, n_orders, "scooper synced with chain tip, batch processing enabled");
+                info!(
+                    n_pools,
+                    n_orders, "scooper synced with chain tip, batch processing enabled"
+                );
                 break;
             }
 
             sync_log_counter += 1;
-            if sync_log_counter % SYNC_LOG_INTERVAL == 1 {
-                if let Some(s) = &self.v4_state {
-                    let state = s.lock().await;
-                    let latest = state.latest();
-                    info!(
-                        tip_slot = latest.tip_slot,
-                        network_tip = latest.network_tip_slot.unwrap_or(0),
-                        gap = latest.network_tip_slot.unwrap_or(0).saturating_sub(latest.tip_slot),
-                        "waiting for indexer to catch up"
-                    );
-                }
+            if sync_log_counter % SYNC_LOG_INTERVAL == 1
+                && let Some(s) = &self.v4_state
+            {
+                let state = s.lock().await;
+                let latest = state.latest();
+                info!(
+                    tip_slot = latest.tip_slot,
+                    network_tip = latest.network_tip_slot.unwrap_or(0),
+                    gap = latest.network_tip_slot.unwrap_or(0).saturating_sub(latest.tip_slot),
+                    "waiting for indexer to catch up"
+                );
             }
 
             // Wait for next event
@@ -223,10 +229,7 @@ impl Scooper {
             let did_work = if paused {
                 const PAUSED_WARN_INTERVAL: std::time::Duration =
                     std::time::Duration::from_secs(300);
-                if self
-                    .last_paused_warn
-                    .is_none_or(|t| t.elapsed() >= PAUSED_WARN_INTERVAL)
-                {
+                if self.last_paused_warn.is_none_or(|t| t.elapsed() >= PAUSED_WARN_INTERVAL) {
                     let n_orders = match &self.v4_state {
                         Some(s) => s.lock().await.latest().orders.len(),
                         None => 0,
@@ -244,7 +247,10 @@ impl Scooper {
                         self.backoff_until_after_slot = None;
                         self.run_v4_batch_cycle().await
                     } else {
-                        trace!(tip, backoff_slot, "waiting for tip to advance past lost-race slot");
+                        trace!(
+                            tip,
+                            backoff_slot, "waiting for tip to advance past lost-race slot"
+                        );
                         false
                     }
                 } else {
@@ -296,7 +302,10 @@ impl Scooper {
                     if n < 50 {
                         debug!("scooper lagged behind by {n} event batches during drain");
                     } else {
-                        warn!(n, "scooper lagged behind by {n} event batches during drain — possible processing bottleneck");
+                        warn!(
+                            n,
+                            "scooper lagged behind by {n} event batches during drain — possible processing bottleneck"
+                        );
                     }
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -363,7 +372,10 @@ impl Scooper {
                 }
             }
         }
-        QuarantineSnapshot { permanent, temporary }
+        QuarantineSnapshot {
+            permanent,
+            temporary,
+        }
     }
 
     /// Check if we've caught up with the network tip.
@@ -399,28 +411,37 @@ impl Scooper {
                 IndexEvent::V3PoolCreated { id, pool } => {
                     let summary = pool_summary(&pool);
                     trace!(slot, pool = %id, "pool created");
-                    updates.push(serde_json::to_value(PoolState {
-                        slot,
-                        pool: id,
-                        action: PoolAction::Added { summary },
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(PoolState {
+                            slot,
+                            pool: id,
+                            action: PoolAction::Added { summary },
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3PoolUpdated { id, pool, .. } => {
                     let summary = pool_summary(&pool);
                     trace!(slot, pool = %id, "pool updated");
-                    updates.push(serde_json::to_value(PoolState {
-                        slot,
-                        pool: id,
-                        action: PoolAction::Changed { summary },
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(PoolState {
+                            slot,
+                            pool: id,
+                            action: PoolAction::Changed { summary },
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "pool removed");
-                    updates.push(serde_json::to_value(PoolState {
-                        slot,
-                        pool: id,
-                        action: PoolAction::Removed,
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(PoolState {
+                            slot,
+                            pool: id,
+                            action: PoolAction::Removed,
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3OrderCreated { order } => {
                     let pools = v3_state.as_ref().map(|s| &s.pools);
@@ -431,27 +452,36 @@ impl Scooper {
                         },
                     };
                     trace!(slot, order = %order.input, "order created");
-                    updates.push(serde_json::to_value(OrderState {
-                        slot,
-                        order: order.input.clone(),
-                        action: OrderAction::Added { valid: validity },
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(OrderState {
+                            slot,
+                            order: order.input.clone(),
+                            action: OrderAction::Added { valid: validity },
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3OrderScooped { order, pool_id, .. } => {
                     trace!(slot, order = %order.input, pool = %pool_id, "order scooped");
-                    updates.push(serde_json::to_value(OrderState {
-                        slot,
-                        order: order.input.clone(),
-                        action: OrderAction::Scooped { pool_id },
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(OrderState {
+                            slot,
+                            order: order.input.clone(),
+                            action: OrderAction::Scooped { pool_id },
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3OrderCancelled { order, .. } => {
                     trace!(slot, order = %order.input, "order cancelled");
-                    updates.push(serde_json::to_value(OrderState {
-                        slot,
-                        order: order.input.clone(),
-                        action: OrderAction::Cancelled,
-                    }).unwrap());
+                    updates.push(
+                        serde_json::to_value(OrderState {
+                            slot,
+                            order: order.input.clone(),
+                            action: OrderAction::Cancelled,
+                        })
+                        .unwrap(),
+                    );
                 }
                 IndexEvent::V3SettingsUpdated { .. } => {
                     trace!(slot, "settings updated");
@@ -480,7 +510,9 @@ impl Scooper {
                     trace!(slot, order = %order.input, "v4 order created");
                     // No immediate action — batch cycle picks it up
                 }
-                IndexEvent::V4OrderScooped { order, pool_ids, .. } => {
+                IndexEvent::V4OrderScooped {
+                    order, pool_ids, ..
+                } => {
                     trace!(slot, order = %order.input, pools = ?pool_ids, "v4 order scooped");
                     self.quarantine.remove(&order.input);
                 }
@@ -497,9 +529,7 @@ impl Scooper {
                     trace!(slot, order = %order.input, "provisional order seen in mempool");
                 }
                 IndexEvent::V4MempoolTxDropped { tx_hash } => {
-                    let n = self
-                        .v4_chain_tracker
-                        .discard_by_provisional_parent(&tx_hash);
+                    let n = self.v4_chain_tracker.discard_by_provisional_parent(&tx_hash);
                     if n > 0 {
                         warn!(
                             parent = %hex::encode(&tx_hash),
@@ -540,10 +570,10 @@ impl Scooper {
             }
         }
 
-        if !updates.is_empty() {
-            if let Err(err) = self.write_updates(&updates) {
-                warn!("could not log updates: {err:#}");
-            }
+        if !updates.is_empty()
+            && let Err(err) = self.write_updates(&updates)
+        {
+            warn!("could not log updates: {err:#}");
         }
     }
 
@@ -618,7 +648,10 @@ impl Scooper {
         // `MAX_REAL_TX_FEE` (not the first-pass `TX_FEE` placeholder), since
         // the rebuild writes the real fee via fee_override — and a too-small
         // collateral input makes collateral_return drop below min_utxo.
-        let ada_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let ada_asset = crate::cardano_types::AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
         // Wallet UTxOs already spent by in-flight txs are gone as far as the
         // mempool is concerned — offering them to this build would produce a
         // guaranteed node reject (this is how chained tx f0fc5876… died:
@@ -626,14 +659,13 @@ impl Scooper {
         let consumed_wallet = self.v4_chain_tracker.consumed_wallet_inputs();
         let min_collateral_ada =
             crate::sundaev4::tx_builder::MAX_REAL_TX_FEE * 3 / 2 + MIN_COLLATERAL_RETURN;
-        let collateral = v4_state
-            .wallet_utxos
-            .iter()
-            .filter(|(i, _)| !consumed_wallet.contains(i))
-            .find(|(_, v)| {
-                use num_traits::ToPrimitive;
-                v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
-            });
+        let collateral =
+            v4_state.wallet_utxos.iter().filter(|(i, _)| !consumed_wallet.contains(i)).find(
+                |(_, v)| {
+                    use num_traits::ToPrimitive;
+                    v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= min_collateral_ada
+                },
+            );
         let (collateral_input, collateral_value) = match collateral {
             Some((input, value)) => (input.clone(), value.clone()),
             None => {
@@ -682,7 +714,10 @@ impl Scooper {
                 use num_traits::ToPrimitive;
                 // Prefer confirmed UTxOs at equal size; predicted only when
                 // nothing confirmed qualifies.
-                (*is_predicted, v.get(&ada_asset).unwrap().to_u64().unwrap_or(0))
+                (
+                    *is_predicted,
+                    v.get(&ada_asset).unwrap().to_u64().unwrap_or(0),
+                )
             });
         let funding_is_predicted = funding.map(|(_, _, p)| p).unwrap_or(false);
         let funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> =
@@ -724,12 +759,14 @@ impl Scooper {
             // isn't yet supported. Deposits that don't fit a proportional
             // unit against any indexed pool get filtered out in the matching
             // step below; CS withdraws fall out at resolve time.
-            .filter(|o| matches!(
-                o.constraint,
-                crate::sundaev4::Constraint::Swap { .. }
-                    | crate::sundaev4::Constraint::Deposit { .. }
-                    | crate::sundaev4::Constraint::Withdraw { .. },
-            ))
+            .filter(|o| {
+                matches!(
+                    o.constraint,
+                    crate::sundaev4::Constraint::Swap { .. }
+                        | crate::sundaev4::Constraint::Deposit { .. }
+                        | crate::sundaev4::Constraint::Withdraw { .. },
+                )
+            })
             .filter(|o| !in_flight_inputs.contains(&o.input))
             .filter(|o| {
                 use num_traits::ToPrimitive;
@@ -774,10 +811,8 @@ impl Scooper {
         // so the ordinary routing/batching/fee pipeline handles it; the SSE
         // itself rides to the tx_builder as the strategy_order withdrawal
         // redeemer (in canonical input order).
-        let mut strategy_executions: BTreeMap<
-            TransactionInput,
-            pallas_primitives::PlutusData,
-        > = BTreeMap::new();
+        let mut strategy_executions: BTreeMap<TransactionInput, pallas_primitives::PlutusData> =
+            BTreeMap::new();
         // A claim-hinted intent that matched: executes as a dedicated
         // single-order plan, short-circuiting the normal accumulation cycle.
         let mut pending_claim_plan: Option<crate::sundaev4::batch::ScoopPlan> = None;
@@ -790,7 +825,10 @@ impl Scooper {
             let store = intents.store.lock().await;
             let now = intents::now_ms();
             for order in v4_state.orders.iter() {
-                if !matches!(order.constraint, crate::sundaev4::Constraint::Strategy { .. }) {
+                if !matches!(
+                    order.constraint,
+                    crate::sundaev4::Constraint::Strategy { .. }
+                ) {
                     continue;
                 }
                 if in_flight_inputs.contains(&order.input)
@@ -827,7 +865,12 @@ impl Scooper {
                             continue;
                         }
                         match self.plan_claim_for_intent(
-                            order, intent, pool_hex, &v4_state, &in_flight_pools, &exec,
+                            order,
+                            intent,
+                            pool_hex,
+                            &v4_state,
+                            &in_flight_pools,
+                            &exec,
                         ) {
                             Some((plan, sse_pd)) => {
                                 info!(
@@ -857,8 +900,7 @@ impl Scooper {
                         );
                         continue;
                     }
-                    let Some(constraint) =
-                        intents::synthesize_swap_constraint(order, &intent.sse)
+                    let Some(constraint) = intents::synthesize_swap_constraint(order, &intent.sse)
                     else {
                         debug!(
                             order = %order.input,
@@ -994,10 +1036,7 @@ impl Scooper {
                 wallet_spendable_utxos: spendable.len(),
                 wallet_total_ada: spendable.iter().sum(),
                 wallet_consumed_in_flight: consumed_wallet.len(),
-                funding_candidates: spendable
-                    .iter()
-                    .filter(|ada| **ada >= MIN_FUNDING_ADA)
-                    .count()
+                funding_candidates: spendable.iter().filter(|ada| **ada >= MIN_FUNDING_ADA).count()
                     + predicted_wallet.len(),
                 collateral_available: true, // we bailed above if not
                 pending_orders: candidates.len(),
@@ -1024,7 +1063,9 @@ impl Scooper {
                 );
                 self.quarantine.insert(
                     input,
-                    Quarantine::Permanent { reason: "budget == 0".into() },
+                    Quarantine::Permanent {
+                        reason: "budget == 0".into(),
+                    },
                 );
             }
         }
@@ -1056,9 +1097,7 @@ impl Scooper {
                                 Ok(h) => tracing::debug!(
                                     role, hash = %hex::encode(h), "butane script in store",
                                 ),
-                                Err(e) => tracing::warn!(
-                                    role, "butane script unusable: {e:#}",
-                                ),
+                                Err(e) => tracing::warn!(role, "butane script unusable: {e:#}",),
                             }
                         }
                     }
@@ -1078,14 +1117,22 @@ impl Scooper {
         // very first cycle.
         if pending_claim_plan.is_some() {
             let claim_plan = pending_claim_plan.take().unwrap();
-            return self.build_and_submit_plan(
-                claim_plan, &settings, &exec, &v4_state, &language_views,
-                &collateral_input, &collateral_value, &funding_owned,
-                &strategy_executions,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                funding_is_predicted,
-            ).await;
+            return self
+                .build_and_submit_plan(
+                    claim_plan,
+                    &settings,
+                    &exec,
+                    &v4_state,
+                    &language_views,
+                    &collateral_input,
+                    &collateral_value,
+                    &funding_owned,
+                    &strategy_executions,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    funding_is_predicted,
+                )
+                .await;
         }
 
         // ── Phase 1: Accumulate valid orders (cheap, no tx eval) ──────────
@@ -1114,7 +1161,11 @@ impl Scooper {
         let own_tx_hashes = self.v4_chain_tracker.in_flight_tx_hashes();
         let mut foreign_pools: BTreeMap<
             crate::sundaev3::Ident,
-            (Arc<crate::sundaev4::SundaeV4Pool>, Vec<u8>, TransactionInput),
+            (
+                Arc<crate::sundaev4::SundaeV4Pool>,
+                Vec<u8>,
+                TransactionInput,
+            ),
         > = BTreeMap::new();
         if let Some(prov) = &self.v4_provisional {
             for (ident, fp) in prov.lock().unwrap().foreign_pools() {
@@ -1130,24 +1181,25 @@ impl Scooper {
         // discard our chain now and rebuild on theirs, instead of waiting
         // for the block to tell us.
         for (ident, (_, source, spent_input)) in &foreign_pools {
-            if self.v4_chain_tracker.latest_predicted_pool(ident).is_some() {
-                if let Some(base) = v4_state.pools.get(ident) {
-                    if &base.input == spent_input {
-                        warn!(
-                            pool = %ident,
-                            foreign = %hex::encode(source),
-                            "foreign mempool scoop conflicts with our in-flight chain; rebuilding on theirs",
-                        );
-                        self.v4_chain_tracker.discard_chain_and_related(ident);
-                    }
-                }
+            if self.v4_chain_tracker.latest_predicted_pool(ident).is_some()
+                && let Some(base) = v4_state.pools.get(ident)
+                && &base.input == spent_input
+            {
+                warn!(
+                    pool = %ident,
+                    foreign = %hex::encode(source),
+                    "foreign mempool scoop conflicts with our in-flight chain; rebuilding on theirs",
+                );
+                self.v4_chain_tracker.discard_chain_and_related(ident);
             }
         }
         // Effective pool per ident: our chain tip normally; the foreign
         // prediction when it IS the tip (it spends our latest predicted
         // output — someone chained on us) or when we have no chain.
         let mut foreign_pool_parent: BTreeMap<crate::sundaev3::Ident, Vec<u8>> = BTreeMap::new();
-        let pools_filtered: std::collections::BTreeMap<_, _> = v4_state.pools.iter()
+        let pools_filtered: std::collections::BTreeMap<_, _> = v4_state
+            .pools
+            .iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes())))
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
@@ -1175,8 +1227,7 @@ impl Scooper {
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
 
-        let mut conversion_edges =
-            crate::sundaev4::conversions::routable_edges(&exec.conversions);
+        let mut conversion_edges = crate::sundaev4::conversions::routable_edges(&exec.conversions);
         if let Some(rt) = &self.v4_butane {
             if exec.plutus_v2_cost_model.is_some() {
                 conversion_edges.extend(rt.edges());
@@ -1213,13 +1264,20 @@ impl Scooper {
             let mut candidate = accum.clone();
             let added = match &order.constraint {
                 crate::sundaev4::Constraint::Deposit { .. } => {
-                    let Some(pool_ident) = batch::find_pool_for_deposit_order(order, &pools_filtered) else {
+                    let Some(pool_ident) =
+                        batch::find_pool_for_deposit_order(order, &pools_filtered)
+                    else {
                         tracing::info!(order = %order.input, "order dispatch: deposit, no pool match");
                         skip_no_pool += 1;
                         continue;
                     };
                     tracing::info!(order = %order.input, kind = "deposit", matched_pool = %pool_ident, "order dispatch");
-                    let effective_pool = pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, &pool_ident);
+                    let effective_pool = pick_effective_pool(
+                        &candidate,
+                        &self.v4_chain_tracker,
+                        &v4_state,
+                        &pool_ident,
+                    );
                     let Some(effective_pool) = effective_pool else {
                         skip_no_pool += 1;
                         continue;
@@ -1275,13 +1333,20 @@ impl Scooper {
                     }
                 }
                 crate::sundaev4::Constraint::Withdraw { .. } => {
-                    let Some(pool_ident) = batch::find_pool_for_withdraw_order(order, &pools_filtered) else {
+                    let Some(pool_ident) =
+                        batch::find_pool_for_withdraw_order(order, &pools_filtered)
+                    else {
                         tracing::info!(order = %order.input, "order dispatch: withdraw, no pool match");
                         skip_no_pool += 1;
                         continue;
                     };
                     tracing::info!(order = %order.input, kind = "withdraw", matched_pool = %pool_ident, "order dispatch");
-                    let effective_pool = pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, &pool_ident);
+                    let effective_pool = pick_effective_pool(
+                        &candidate,
+                        &self.v4_chain_tracker,
+                        &v4_state,
+                        &pool_ident,
+                    );
                     let Some(effective_pool) = effective_pool else {
                         skip_no_pool += 1;
                         continue;
@@ -1326,14 +1391,13 @@ impl Scooper {
                     // full-flow chain. Plain swap-constraint orders may
                     // blend across parallel paths (min_received is their
                     // only on-chain output check).
-                    let route_constraint_data = exec
-                        .module_scripts
-                        .route_order
-                        .as_ref()
-                        .and_then(|m| {
-                            order.datum.constraints.iter().find_map(|(h, d)| {
-                                (h.as_slice() == m.hash.as_ref()).then_some(d)
-                            })
+                    let route_constraint_data =
+                        exec.module_scripts.route_order.as_ref().and_then(|m| {
+                            order
+                                .datum
+                                .constraints
+                                .iter()
+                                .find_map(|(h, d)| (h.as_slice() == m.hash.as_ref()).then_some(d))
                         });
                     let has_route_module = route_constraint_data.is_some();
                     // The route constraint's payload is a pool whitelist;
@@ -1370,7 +1434,11 @@ impl Scooper {
                     // unrepresentable in it — so route-module orders route
                     // through pools alone.
                     let conversion_edges: &[crate::sundaev4::conversions::ConversionEdge] =
-                        if has_route_module { &[] } else { &conversion_edges };
+                        if has_route_module {
+                            &[]
+                        } else {
+                            &conversion_edges
+                        };
                     let Some(blend) = router::find_blended_route(
                         &pool_view,
                         conversion_edges,
@@ -1413,8 +1481,7 @@ impl Scooper {
                                     limits,
                                 ),
                             };
-                            match single
-                                .and_then(|p| router::collapse_to_serial(&p, offer_amount))
+                            match single.and_then(|p| router::collapse_to_serial(&p, offer_amount))
                             {
                                 Some(serial) => crate::sundaev4::router::BlendedRoute {
                                     total_input: serial.total_input.clone(),
@@ -1462,9 +1529,11 @@ impl Scooper {
                             .swap_order
                             .as_ref()
                             .map(|m| {
-                                order.datum.constraints.iter().any(|(h, _)| {
-                                    h.as_slice() == m.hash.as_ref()
-                                })
+                                order
+                                    .datum
+                                    .constraints
+                                    .iter()
+                                    .any(|(h, _)| h.as_slice() == m.hash.as_ref())
                             })
                             .unwrap_or(false);
                         // SUNDAE-2613: min_received is measured gross of
@@ -1473,36 +1542,34 @@ impl Scooper {
                         if e.contains("below min_received")
                             && is_swap_module
                             && exec.partial_fill_margin.is_some()
-                        {
-                            if let Some(dx) = self.find_partial_fill_dx(
+                            && let Some(dx) = self.find_partial_fill_dx(
                                 order,
                                 &pool_view,
                                 conversion_edges,
                                 &exec,
                                 limits,
-                            ) {
-                                if let Some(pblend) = router::find_blended_route(
-                                    &pool_view,
-                                    conversion_edges,
-                                    offer_asset,
-                                    ask_asset,
-                                    &dx,
-                                    limits,
-                                ) {
-                                    tracing::info!(
-                                        order = %order.input,
-                                        fill = %dx,
-                                        remaining = %order.swap_offered().1,
-                                        "partial fill dispatch",
-                                    );
-                                    add_result = match pblend.as_single() {
-                                        Some(single) => candidate
-                                            .try_add_routed_order(order, single, &pool_view),
-                                        None => candidate
-                                            .try_add_blended_order(order, &pblend, &pool_view),
-                                    };
+                            )
+                            && let Some(pblend) = router::find_blended_route(
+                                &pool_view,
+                                conversion_edges,
+                                offer_asset,
+                                ask_asset,
+                                &dx,
+                                limits,
+                            )
+                        {
+                            tracing::info!(
+                                order = %order.input,
+                                fill = %dx,
+                                remaining = %order.swap_offered().1,
+                                "partial fill dispatch",
+                            );
+                            add_result = match pblend.as_single() {
+                                Some(single) => {
+                                    candidate.try_add_routed_order(order, single, &pool_view)
                                 }
-                            }
+                                None => candidate.try_add_blended_order(order, &pblend, &pool_view),
+                            };
                         }
                     }
                     match add_result {
@@ -1535,8 +1602,7 @@ impl Scooper {
         if n_provisional_added > 0 {
             info!(
                 n_provisional_added,
-                n_confirmed_added,
-                "batch includes mempool-chained (provisional) orders",
+                n_confirmed_added, "batch includes mempool-chained (provisional) orders",
             );
         }
 
@@ -1568,18 +1634,29 @@ impl Scooper {
         let within_limits = |accum: &Accumulator| -> Fitness {
             let plan = accum.clone().into_plan();
             let build = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                &plan, &settings, &exec, validity, &language_views,
-                &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                None, &v4_state.order_configs, &strategy_executions,
+                &plan,
+                &settings,
+                &exec,
+                validity,
+                &language_views,
+                &collateral_input.0,
+                &collateral_value,
+                None,
+                &v4_state.ref_utxo_outputs,
+                None,
+                &v4_state.order_configs,
+                &strategy_executions,
                 v4_state.fee_settings.as_deref(),
-                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
+                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+                self.v4_butane.as_ref(),
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     // Build failures here mean the tx couldn't be assembled
                     // (e.g. tx_builder hit an internal invariant). Bail — it's
                     // a scooper bug, not a too-many-orders issue.
                     return Fitness::Bail(format!("build: {e}"));
-                },
+                }
             };
 
             // Cheap pre-check: if the tx is already over the chain's size
@@ -1637,7 +1714,11 @@ impl Scooper {
             let fits = padded_mem <= exec.max_tx_ex_mem
                 && padded_steps <= exec.max_tx_ex_steps
                 && tx_size <= exec.max_tx_size;
-            if fits { Fitness::Fits } else { Fitness::Overbudget }
+            if fits {
+                Fitness::Fits
+            } else {
+                Fitness::Overbudget
+            }
         };
 
         // Find the largest checkpoint (prefix of accumulated orders) that builds
@@ -1678,12 +1759,16 @@ impl Scooper {
                                 lo = mid + 1;
                             }
                             Fitness::Overbudget => {
-                                if mid == 0 { break; }
+                                if mid == 0 {
+                                    break;
+                                }
                                 hi = mid - 1;
                             }
                             Fitness::Bail(reason) => {
                                 last_bail = Some(reason);
-                                if mid == 0 { break; }
+                                if mid == 0 {
+                                    break;
+                                }
                                 hi = mid - 1;
                             }
                         }
@@ -1693,15 +1778,15 @@ impl Scooper {
         }
 
         // If we found a valid prefix but had to drop a failing suffix, note it.
-        if let (Some(idx), Some(reason)) = (best, &last_bail) {
-            if idx + 1 < checkpoints.len() {
-                warn!(
-                    kept = idx + 1,
-                    dropped = checkpoints.len() - (idx + 1),
-                    reason = %reason,
-                    "isolated failing suffix from batch; scooping the valid prefix",
-                );
-            }
+        if let (Some(idx), Some(reason)) = (best, &last_bail)
+            && idx + 1 < checkpoints.len()
+        {
+            warn!(
+                kept = idx + 1,
+                dropped = checkpoints.len() - (idx + 1),
+                reason = %reason,
+                "isolated failing suffix from batch; scooping the valid prefix",
+            );
         }
 
         let had_successful_build = best.is_some();
@@ -1727,63 +1812,90 @@ impl Scooper {
                 let diag_plan = diag.clone().into_plan();
                 let (quarantine_reason, eval_bug_reason): (Option<String>, Option<String>) =
                     match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-                    &diag_plan, &settings, &exec, validity, &language_views,
-                    &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-                    None, &v4_state.order_configs, &strategy_executions,
-                v4_state.fee_settings.as_deref(),
-                    funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
-                    Err(e) => (Some(format!("build: {e}")), None),
-                    Ok(build) => {
-                        let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
-                        match crate::sundaev4::evaluator::evaluate_scoop_tx(
-                            &build.tx_body, &build.redeemers, &build.resolved_inputs,
-                            &build.resolved_ref_inputs, script_store, &exec.plutus_v3_cost_model,
-                exec.plutus_v2_cost_model.as_deref(),
-                            build.tx_hash, &exec.slot_config,
-                            Some(&mut failure),
-                        ) {
-                            Err(e) => {
-                                // Eval failure on the minimal batch — definitely a
-                                // scooper bug. Dump the full tx CBOR (shareable
-                                // with partner teams) + context + bail; don't
-                                // penalise the order.
-                                let tx_dump = format!(
-                                    "/tmp/eval-fail-{}.cbor",
-                                    hex::encode(build.tx_hash.as_ref()),
-                                );
-                                if let Err(werr) = std::fs::write(&tx_dump, &build.cbor) {
-                                    warn!(%werr, "couldn't write eval-fail tx dump");
-                                } else {
-                                    warn!(dump = %tx_dump, "eval-fail tx CBOR dumped");
-                                }
-                                if let Some(cap) = failure {
-                                    let ctx_dump = format!(
-                                        "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
-                                        build.tx_hash_hex,
-                                        hex::encode(cap.script_hash),
-                                        cap.redeemer_key.tag,
-                                        cap.redeemer_key.index,
+                        &diag_plan,
+                        &settings,
+                        &exec,
+                        validity,
+                        &language_views,
+                        &collateral_input.0,
+                        &collateral_value,
+                        None,
+                        &v4_state.ref_utxo_outputs,
+                        None,
+                        &v4_state.order_configs,
+                        &strategy_executions,
+                        v4_state.fee_settings.as_deref(),
+                        funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+                        self.v4_butane.as_ref(),
+                    ) {
+                        Err(e) => (Some(format!("build: {e}")), None),
+                        Ok(build) => {
+                            let mut failure: Option<
+                                crate::sundaev4::evaluator::FailedScriptContext,
+                            > = None;
+                            match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                                &build.tx_body,
+                                &build.redeemers,
+                                &build.resolved_inputs,
+                                &build.resolved_ref_inputs,
+                                script_store,
+                                &exec.plutus_v3_cost_model,
+                                exec.plutus_v2_cost_model.as_deref(),
+                                build.tx_hash,
+                                &exec.slot_config,
+                                Some(&mut failure),
+                            ) {
+                                Err(e) => {
+                                    // Eval failure on the minimal batch — definitely a
+                                    // scooper bug. Dump the full tx CBOR (shareable
+                                    // with partner teams) + context + bail; don't
+                                    // penalise the order.
+                                    let tx_dump = format!(
+                                        "/tmp/eval-fail-{}.cbor",
+                                        hex::encode(build.tx_hash.as_ref()),
                                     );
-                                    let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
-                                    let tx_dump = format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
-                                    let _ = std::fs::write(&tx_dump, &build.cbor);
+                                    if let Err(werr) = std::fs::write(&tx_dump, &build.cbor) {
+                                        warn!(%werr, "couldn't write eval-fail tx dump");
+                                    } else {
+                                        warn!(dump = %tx_dump, "eval-fail tx CBOR dumped");
+                                    }
+                                    if let Some(cap) = failure {
+                                        let ctx_dump = format!(
+                                            "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                                            build.tx_hash_hex,
+                                            hex::encode(cap.script_hash),
+                                            cap.redeemer_key.tag,
+                                            cap.redeemer_key.index,
+                                        );
+                                        let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                                        let tx_dump =
+                                            format!("/tmp/scoop-tx-{}.cbor", build.tx_hash_hex);
+                                        let _ = std::fs::write(&tx_dump, &build.cbor);
+                                    }
+                                    (None, Some(format!("eval: {e}")))
                                 }
-                                (None, Some(format!("eval: {e}")))
-                            }
-                            Ok(r) => {
-                                let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
-                                let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
-                                let (pad_num, pad_den) = exec.budget_padding;
-                                (Some(format!(
-                                    "over limits: mem={}/{}, steps={}/{}, size={}/{}",
-                                    total_mem * pad_num / pad_den, exec.max_tx_ex_mem,
-                                    total_steps * pad_num / pad_den, exec.max_tx_ex_steps,
-                                    build.cbor.len(), exec.max_tx_size,
-                                )), None)
+                                Ok(r) => {
+                                    let total_mem: u64 =
+                                        r.budgets.iter().map(|(_, eu)| eu.mem).sum();
+                                    let total_steps: u64 =
+                                        r.budgets.iter().map(|(_, eu)| eu.steps).sum();
+                                    let (pad_num, pad_den) = exec.budget_padding;
+                                    (
+                                        Some(format!(
+                                            "over limits: mem={}/{}, steps={}/{}, size={}/{}",
+                                            total_mem * pad_num / pad_den,
+                                            exec.max_tx_ex_mem,
+                                            total_steps * pad_num / pad_den,
+                                            exec.max_tx_ex_steps,
+                                            build.cbor.len(),
+                                            exec.max_tx_size,
+                                        )),
+                                        None,
+                                    )
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
                 if let Some(reason) = eval_bug_reason {
                     // The smallest (1-order) batch fails eval. It's likely a
@@ -1801,11 +1913,15 @@ impl Scooper {
                         );
                         self.quarantine.insert(
                             input.clone(),
-                            Quarantine::Temporary { reason: reason.clone(), until_slot },
+                            Quarantine::Temporary {
+                                reason: reason.clone(),
+                                until_slot,
+                            },
                         );
                     }
                     self.sync_quarantine_metrics();
-                    self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    self.metrics
+                        .record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                     self.metrics.record_failure_event(
                         "eval-isolation",
                         "",
@@ -1827,16 +1943,18 @@ impl Scooper {
                 );
                 for input in bad_inputs {
                     warn!(order = %input, %reason, "permanently quarantining order");
-                    self.quarantine.insert(input.clone(), Quarantine::Permanent {
-                        reason: reason.clone(),
-                    });
+                    self.quarantine.insert(
+                        input.clone(),
+                        Quarantine::Permanent {
+                            reason: reason.clone(),
+                        },
+                    );
                 }
                 self.sync_quarantine_metrics();
 
                 warn!(
                     n_candidates = checkpoints.len(),
-                    reason,
-                    "no valid batch size found within limits"
+                    reason, "no valid batch size found within limits"
                 );
                 return false;
             }
@@ -1857,13 +1975,20 @@ impl Scooper {
         // Build → evaluate → submit. Shared with the claim path.
         let final_plan = accum.clone().into_plan();
         self.build_and_submit_plan(
-            final_plan, &settings, &exec, &v4_state, &language_views,
-            &collateral_input, &collateral_value, &funding_owned,
+            final_plan,
+            &settings,
+            &exec,
+            &v4_state,
+            &language_views,
+            &collateral_input,
+            &collateral_value,
+            &funding_owned,
             &strategy_executions,
             &provisional_parent,
             &foreign_pool_parent,
             funding_is_predicted,
-        ).await
+        )
+        .await
     }
 
     /// Build the tx for `final_plan`, evaluate, compute the exact fee,
@@ -1885,15 +2010,23 @@ impl Scooper {
         foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
         funding_is_predicted: bool,
     ) -> bool {
-        let n_orders: usize = final_plan.batches.iter()
-            .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len())
+        let n_orders: usize = final_plan
+            .batches
+            .iter()
+            .map(|b| {
+                b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len()
+            })
             .sum();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
             final_plan.batches.iter().map(|b| b.pool_ident.clone()).collect();
-        let plan_order_inputs: Vec<TransactionInput> = final_plan.batches.iter()
+        let plan_order_inputs: Vec<TransactionInput> = final_plan
+            .batches
+            .iter()
             .flat_map(|b| {
-                b.swaps.iter().map(|o| o.order.input.clone())
+                b.swaps
+                    .iter()
+                    .map(|o| o.order.input.clone())
                     .chain(b.deposits.iter().map(|o| o.order.input.clone()))
                     .chain(b.withdraws.iter().map(|o| o.order.input.clone()))
                     .chain(b.zaps.iter().map(|o| o.order.input.clone()))
@@ -1905,19 +2038,28 @@ impl Scooper {
         // be stale. Wall clock moves even when the tip doesn't, so this is
         // where a long search pass actually buys back its TTL.
         let tip_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
-        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(
-            tip_slot,
-            self.now_slot(tip_slot),
-        );
+        let validity =
+            crate::sundaev4::tx_builder::ValidityWindow::new(tip_slot, self.now_slot(tip_slot));
 
         // Build → evaluate → rebuild with exact budgets.
 
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan, &settings, &exec, validity, language_views,
-            &collateral_input.0, &collateral_value, None, &v4_state.ref_utxo_outputs,
-            None, &v4_state.order_configs, &strategy_executions,
-                v4_state.fee_settings.as_deref(),
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
+            &final_plan,
+            settings,
+            exec,
+            validity,
+            language_views,
+            &collateral_input.0,
+            collateral_value,
+            None,
+            &v4_state.ref_utxo_outputs,
+            None,
+            &v4_state.order_configs,
+            strategy_executions,
+            v4_state.fee_settings.as_deref(),
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+            self.v4_butane.as_ref(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx build failed");
@@ -1944,55 +2086,60 @@ impl Scooper {
         // (race condition, builder non-determinism, etc.). Bail and dump on
         // failure rather than guessing a budget.
         let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
-        let padded_budgets: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)>
-            = match crate::sundaev4::evaluator::evaluate_scoop_tx(
-                &first_pass.tx_body,
-                &first_pass.redeemers,
-                &first_pass.resolved_inputs,
-                &first_pass.resolved_ref_inputs,
-                self.v4_script_store.as_ref().unwrap(),
-                &exec.plutus_v3_cost_model,
-                exec.plutus_v2_cost_model.as_deref(),
-                first_pass.tx_hash,
-                &exec.slot_config,
-                Some(&mut failure),
-            ) {
-                Ok(r) => {
-                    // `budget_padding`'s doc says what the margin covers; the
-                    // final tx is re-evaluated against these budgets before
-                    // submit. Padding-vs-max-budget gating happens in
-                    // `within_limits` during the fitness binary search.
-                    let (pad_num, pad_den) = exec.budget_padding;
-                    r.budgets.iter().map(|(k, eu)| {
-                        let mut padded = eu.clone();
+        let padded_budgets: Vec<(
+            pallas_primitives::conway::RedeemersKey,
+            pallas_primitives::ExUnits,
+        )> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+            &first_pass.tx_body,
+            &first_pass.redeemers,
+            &first_pass.resolved_inputs,
+            &first_pass.resolved_ref_inputs,
+            self.v4_script_store.as_ref().unwrap(),
+            &exec.plutus_v3_cost_model,
+            exec.plutus_v2_cost_model.as_deref(),
+            first_pass.tx_hash,
+            &exec.slot_config,
+            Some(&mut failure),
+        ) {
+            Ok(r) => {
+                // `budget_padding`'s doc says what the margin covers; the
+                // final tx is re-evaluated against these budgets before
+                // submit. Padding-vs-max-budget gating happens in
+                // `within_limits` during the fitness binary search.
+                let (pad_num, pad_den) = exec.budget_padding;
+                r.budgets
+                    .iter()
+                    .map(|(k, eu)| {
+                        let mut padded = *eu;
                         padded.mem = eu.mem * pad_num / pad_den;
                         padded.steps = eu.steps * pad_num / pad_den;
                         (k.clone(), padded)
-                    }).collect()
-                }
-                Err(e) => {
-                    if let Some(cap) = failure {
-                        let ctx_dump = format!(
-                            "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
-                            first_pass.tx_hash_hex,
-                            hex::encode(cap.script_hash),
-                            cap.redeemer_key.tag,
-                            cap.redeemer_key.index,
-                        );
-                        let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
-                        let tx_dump = format!("/tmp/scoop-tx-{}.cbor", first_pass.tx_hash_hex);
-                        let _ = std::fs::write(&tx_dump, &first_pass.cbor);
-                    }
-                    warn!(
-                        error = %e,
-                        tx_hash = %first_pass.tx_hash_hex,
-                        "first_pass eval failed after binary-search Ok — likely a scooper bug; \
-                         context dumped to /tmp/script-ctx-* — aborting scoop cycle",
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                if let Some(cap) = failure {
+                    let ctx_dump = format!(
+                        "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                        first_pass.tx_hash_hex,
+                        hex::encode(cap.script_hash),
+                        cap.redeemer_key.tag,
+                        cap.redeemer_key.index,
                     );
-                    self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
-                    return false;
+                    let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                    let tx_dump = format!("/tmp/scoop-tx-{}.cbor", first_pass.tx_hash_hex);
+                    let _ = std::fs::write(&tx_dump, &first_pass.cbor);
                 }
-            };
+                warn!(
+                    error = %e,
+                    tx_hash = %first_pass.tx_hash_hex,
+                    "first_pass eval failed after binary-search Ok — likely a scooper bug; \
+                     context dumped to /tmp/script-ctx-* — aborting scoop cycle",
+                );
+                self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                return false;
+            }
+        };
 
         // Compute the exact protocol fee from the first-pass size and the
         // evaluated ex_units. The final rebuild changes per-order fee share
@@ -2012,14 +2159,22 @@ impl Scooper {
         ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
 
         let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan, &settings, &exec, validity, language_views,
-            &collateral_input.0, &collateral_value, Some(&padded_budgets),
+            &final_plan,
+            settings,
+            exec,
+            validity,
+            language_views,
+            &collateral_input.0,
+            collateral_value,
+            Some(&padded_budgets),
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
             &v4_state.order_configs,
-            &strategy_executions,
+            strategy_executions,
             v4_state.fee_settings.as_deref(),
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)), self.v4_butane.as_ref()) {
+            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+            self.v4_butane.as_ref(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "final multi-pool tx rebuild failed");
@@ -2044,13 +2199,19 @@ impl Scooper {
             &exec.slot_config,
             None,
         ) {
-            Ok(r) => r.budgets.iter().filter_map(|(k, raw)| {
-                let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
-                (raw.mem > declared.mem || raw.steps > declared.steps).then(|| format!(
-                    "{:?}#{}: raw mem {} steps {} > declared mem {} steps {}",
-                    k.tag, k.index, raw.mem, raw.steps, declared.mem, declared.steps,
-                ))
-            }).collect(),
+            Ok(r) => r
+                .budgets
+                .iter()
+                .filter_map(|(k, raw)| {
+                    let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
+                    (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
+                        format!(
+                            "{:?}#{}: raw mem {} steps {} > declared mem {} steps {}",
+                            k.tag, k.index, raw.mem, raw.steps, declared.mem, declared.steps,
+                        )
+                    })
+                })
+                .collect(),
             Err(e) => {
                 warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "final tx eval failed — aborting scoop cycle");
                 self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
@@ -2101,7 +2262,9 @@ impl Scooper {
             .batches
             .iter()
             .flat_map(|b| {
-                b.swaps.iter().map(|s| &s.order)
+                b.swaps
+                    .iter()
+                    .map(|s| &s.order)
                     .chain(b.deposits.iter().map(|d| &d.order))
                     .chain(b.withdraws.iter().map(|w| &w.order))
                     .chain(b.zaps.iter().map(|z| &z.order))
@@ -2153,9 +2316,7 @@ impl Scooper {
                 warn!("chained tx with no node submit path configured");
                 crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
             }
-            None => {
-                crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await
-            }
+            None => crate::sundaev4::submit::submit_tx(&exec.submit_url, &final_tx.cbor).await,
         };
         self.metrics.submit_latency.observe(submit_start.elapsed().as_secs_f64());
         match submit_result {
@@ -2177,9 +2338,13 @@ impl Scooper {
                 use crate::sundaev4::PoolType;
                 for batch in &final_plan.batches {
                     let family = match &batch.pool.pool_type {
-                        PoolType::ConstantProduct { .. } => crate::metrics::PoolFamily::ConstantProduct,
+                        PoolType::ConstantProduct { .. } => {
+                            crate::metrics::PoolFamily::ConstantProduct
+                        }
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
-                        PoolType::ConcentratedLiquidity { .. } => crate::metrics::PoolFamily::ConcentratedLiquidity,
+                        PoolType::ConcentratedLiquidity { .. } => {
+                            crate::metrics::PoolFamily::ConcentratedLiquidity
+                        }
                     };
                     let n = (batch.swaps.len()
                         + batch.deposits.len()
@@ -2192,9 +2357,13 @@ impl Scooper {
                 // and withdraws all sit on real on-chain UTxOs and must be
                 // tracked as in-flight so the next iteration doesn't re-attempt
                 // them.
-                let consumed_orders: Vec<_> = final_plan.batches.iter()
+                let consumed_orders: Vec<_> = final_plan
+                    .batches
+                    .iter()
                     .flat_map(|b| {
-                        b.swaps.iter().map(|s| s.order.clone())
+                        b.swaps
+                            .iter()
+                            .map(|s| s.order.clone())
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
                             .chain(b.withdraws.iter().map(|w| w.order.clone()))
                             .chain(b.zaps.iter().map(|z| z.order.clone()))
@@ -2207,12 +2376,18 @@ impl Scooper {
                     .collect();
 
                 // Build predicted pools for chain tracker
-                let predicted_pools: Vec<_> = final_tx.predicted_pools
+                let predicted_pools: Vec<_> = final_tx
+                    .predicted_pools
                     .into_iter()
-                    .map(|(ident, input, pool)| (ident, PredictedPoolUtxo {
-                        input,
-                        pool: Arc::new(pool),
-                    }))
+                    .map(|(ident, input, pool)| {
+                        (
+                            ident,
+                            PredictedPoolUtxo {
+                                input,
+                                pool: Arc::new(pool),
+                            },
+                        )
+                    })
                     .collect();
 
                 let in_flight = InFlightTx {
@@ -2230,10 +2405,7 @@ impl Scooper {
                         .wallet_change
                         .as_ref()
                         .map(|(idx, value)| {
-                            vec![(
-                                TransactionInput::new(final_tx.tx_hash, *idx),
-                                value.clone(),
-                            )]
+                            vec![(TransactionInput::new(final_tx.tx_hash, *idx), value.clone())]
                         })
                         .unwrap_or_default(),
                 };
@@ -2272,7 +2444,8 @@ impl Scooper {
                     plan_order_inputs.iter().map(|i| i.to_string()).collect(),
                 );
                 if matches!(reason, crate::metrics::BatchFailureReason::RaceLost) {
-                    let pool_strs: Vec<String> = pool_idents.iter().map(|i| i.to_string()).collect();
+                    let pool_strs: Vec<String> =
+                        pool_idents.iter().map(|i| i.to_string()).collect();
                     // Which of our inputs does the reject implicate? For the
                     // external endpoint the error is JSON with explicit bad
                     // inputs; for node rejects, scan the reason hex for each
@@ -2289,15 +2462,18 @@ impl Scooper {
                         for batch in &final_plan.batches {
                             let pin = &batch.pool.input;
                             if hex_reason.contains(&hex::encode(pin.0.transaction_id.as_ref())) {
-                                implicated_kinds.push(format!("pool {} ({})", batch.pool_ident, pin));
+                                implicated_kinds
+                                    .push(format!("pool {} ({})", batch.pool_ident, pin));
                             }
                         }
-                        if let Some((fi, _)) = &funding_owned {
-                            if hex_reason.contains(&hex::encode(fi.0.transaction_id.as_ref())) {
-                                implicated_kinds.push(format!("funding {fi}"));
-                            }
+                        if let Some((fi, _)) = &funding_owned
+                            && hex_reason.contains(&hex::encode(fi.0.transaction_id.as_ref()))
+                        {
+                            implicated_kinds.push(format!("funding {fi}"));
                         }
-                        if hex_reason.contains(&hex::encode(collateral_input.0.transaction_id.as_ref())) {
+                        if hex_reason
+                            .contains(&hex::encode(collateral_input.0.transaction_id.as_ref()))
+                        {
                             implicated_kinds.push(format!("collateral {collateral_input}"));
                         }
                         warn!(
@@ -2329,28 +2505,46 @@ impl Scooper {
                         let mut n_quarantined = 0u32;
                         for input in &order_inputs {
                             if bad_refs.contains(&input.to_string()) {
-                                self.quarantine.insert((*input).clone(), Quarantine::Temporary {
-                                    reason: "spent input (race lost)".into(),
-                                    until_slot,
-                                });
+                                self.quarantine.insert(
+                                    (*input).clone(),
+                                    Quarantine::Temporary {
+                                        reason: "spent input (race lost)".into(),
+                                        until_slot,
+                                    },
+                                );
                                 n_quarantined += 1;
                             }
                         }
-                        info!(n_quarantined, n_bad_inputs = bad_refs.len(), until_slot, "temporarily quarantining spent orders");
+                        info!(
+                            n_quarantined,
+                            n_bad_inputs = bad_refs.len(),
+                            until_slot,
+                            "temporarily quarantining spent orders"
+                        );
                     } else if node_reject_hex.is_some() && repeat_count < 3 {
                         // Node reject implicating none of the orders (pool /
                         // wallet contention): retry next cycle against fresh
                         // state instead of benching innocent orders.
-                        info!(repeat_count, "node reject without implicated orders; retrying next cycle");
+                        info!(
+                            repeat_count,
+                            "node reject without implicated orders; retrying next cycle"
+                        );
                     } else {
                         // Unparseable external error, or the same tx bounced
                         // 3+ times: bench everything briefly.
-                        info!(n_orders = order_inputs.len(), until_slot, "temporarily quarantining all batch orders (unattributable failure)");
+                        info!(
+                            n_orders = order_inputs.len(),
+                            until_slot,
+                            "temporarily quarantining all batch orders (unattributable failure)"
+                        );
                         for input in &order_inputs {
-                            self.quarantine.insert((*input).clone(), Quarantine::Temporary {
-                                reason: "unattributable submit failure".into(),
-                                until_slot,
-                            });
+                            self.quarantine.insert(
+                                (*input).clone(),
+                                Quarantine::Temporary {
+                                    reason: "unattributable submit failure".into(),
+                                    until_slot,
+                                },
+                            );
                         }
                     }
                     self.sync_quarantine_metrics();
@@ -2382,7 +2576,6 @@ impl Scooper {
         }
     }
 
-
     /// Resolve a claim-hinted intent into a dedicated single-order claim
     /// plan (waived-fee CS bounty, cs_check tag 5). Returns the plan plus
     /// the SSE PlutusData for the strategy_order withdrawal redeemer.
@@ -2401,21 +2594,26 @@ impl Scooper {
         v4_state: &crate::sundaev4::SundaeV4State,
         in_flight_pools: &[Ident],
         exec: &ScooperExecution,
-    ) -> Option<(crate::sundaev4::batch::ScoopPlan, pallas_primitives::PlutusData)> {
-        use crate::sundaev4::{batch, claims};
+    ) -> Option<(
+        crate::sundaev4::batch::ScoopPlan,
+        pallas_primitives::PlutusData,
+    )> {
         use crate::sundaev4::PoolType;
+        use crate::sundaev4::{batch, claims};
 
-        let (ident, pool) = v4_state
-            .pools
-            .iter()
-            .find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)?;
+        let (ident, pool) =
+            v4_state.pools.iter().find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)?;
         if in_flight_pools.contains(ident)
             || exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes()))
         {
             return None;
         }
-        let PoolType::ConstantSum { prices, bounty_k, balance_fee, .. } =
-            &pool.pool_type
+        let PoolType::ConstantSum {
+            prices,
+            bounty_k,
+            balance_fee,
+            ..
+        } = &pool.pool_type
         else {
             debug!(pool = %pool_hex, "claim hint targets a non-CS pool; skipping");
             return None;
@@ -2442,7 +2640,10 @@ impl Scooper {
         };
         if let Some(min_ada) = &min_ada_floor {
             use num_traits::ToPrimitive;
-            let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+            let ada = crate::cardano_types::AssetClass {
+                policy: vec![],
+                token: vec![],
+            };
             let order_ada = order.value.get(&ada).unwrap().to_u64().unwrap_or(0);
             let floor = min_ada.clone().unwrap().to_u64().unwrap_or(u64::MAX);
             // Conservative fee cushion — the exact fee is only known after
@@ -2526,15 +2727,16 @@ impl Scooper {
             }
         };
 
-        let sse_pd: pallas_primitives::PlutusData =
-            minicbor::decode(&intent.sse_cbor).ok()?;
+        let sse_pd: pallas_primitives::PlutusData = minicbor::decode(&intent.sse_cbor).ok()?;
 
-        let claim_batch =
-            batch::build_claim_batch(pool, order.clone(), resolved, final_assets);
+        let claim_batch = batch::build_claim_batch(pool, order.clone(), resolved, final_assets);
         let scoop_plan = crate::sundaev4::batch::ScoopPlan {
             batches: vec![claim_batch],
             routes: Vec::new(),
-            global_seq: vec![crate::sundaev4::batch::GlobalOp { batch_idx: 0, op_idx: 0 }],
+            global_seq: vec![crate::sundaev4::batch::GlobalOp {
+                batch_idx: 0,
+                op_idx: 0,
+            }],
             conversions: Vec::new(),
         };
         Some((scoop_plan, sse_pd))
@@ -2560,7 +2762,8 @@ impl Scooper {
 
         let (margin_num, margin_den) = exec.partial_fill_margin?;
         let crate::sundaev4::Constraint::Swap {
-            ref original_offered, ..
+            ref original_offered,
+            ..
         } = order.constraint
         else {
             return None;
@@ -2575,11 +2778,7 @@ impl Scooper {
         // max_per_execution. Require the deduction to cover
         // `margin · fee_est`, i.e. dx ≥ remaining·margin·fee_est/budget.
         let fee_est = BigInt::from(exec.partial_fill_fee_estimate);
-        let budget = order
-            .datum
-            .service_budget
-            .clone()
-            .min(order.datum.max_per_execution.clone());
+        let budget = order.datum.service_budget.clone().min(order.datum.max_per_execution.clone());
         if !budget.is_positive() {
             return None;
         }
@@ -2598,7 +2797,7 @@ impl Scooper {
                 dx,
                 limits,
             )
-            .map(|b| &(&b.total_output * original_offered) >= &(min_qty * dx))
+            .map(|b| (&b.total_output * original_offered) >= (min_qty * dx))
             .unwrap_or(false)
         };
 
@@ -2624,19 +2823,13 @@ impl Scooper {
     }
 
     fn write_updates(&self, updates: &[serde_json::Value]) -> Result<()> {
-        let date = chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
+        let date = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
         let filename = format!("{date}.jsonl");
         let Some(dir) = self.trace_directory.as_ref() else {
             return Ok(());
         };
         let path = dir.join(filename);
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = fs::OpenOptions::new().create(true).append(true).open(path)?;
         let mut file = BufWriter::new(file);
         for update in updates {
             serde_json::to_writer(&mut file, update)?;
@@ -2659,11 +2852,7 @@ fn carries_route_constraint(
     let Some(route) = exec.module_scripts.route_order.as_ref() else {
         return false;
     };
-    order
-        .datum
-        .constraints
-        .iter()
-        .any(|(h, _)| h.as_slice() == route.hash.as_ref())
+    order.datum.constraints.iter().any(|(h, _)| h.as_slice() == route.hash.as_ref())
 }
 
 /// Resolve the effective pool snapshot to scoop against — preferring an
@@ -2700,9 +2889,7 @@ fn parse_bad_inputs(msg: &str) -> std::collections::BTreeSet<String> {
 
     let json_str = msg.find('{').map(|i| &msg[i..]).unwrap_or("");
     match serde_json::from_str::<OgmiosError>(json_str) {
-        Ok(err) => err.data
-            .map(|d| d.bad_inputs.into_iter().collect())
-            .unwrap_or_default(),
+        Ok(err) => err.data.map(|d| d.bad_inputs.into_iter().collect()).unwrap_or_default(),
         Err(_) => std::collections::BTreeSet::new(),
     }
 }
@@ -2831,4 +3018,3 @@ enum OrderInvalidReason {
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
 }
-

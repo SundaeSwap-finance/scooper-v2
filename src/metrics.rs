@@ -80,9 +80,7 @@ pub struct Histogram {
 
 impl Histogram {
     pub fn new(boundaries: &'static [f64]) -> Self {
-        let buckets = (0..=boundaries.len())
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let buckets = (0..=boundaries.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             boundaries,
             buckets,
@@ -95,11 +93,8 @@ impl Histogram {
     /// the sum (sufficient for latency histograms — Prometheus reports
     /// avg = sum/count which doesn't care about sub-µs precision).
     pub fn observe(&self, seconds: f64) {
-        let bucket_idx = self
-            .boundaries
-            .iter()
-            .position(|b| seconds <= *b)
-            .unwrap_or(self.boundaries.len());
+        let bucket_idx =
+            self.boundaries.iter().position(|b| seconds <= *b).unwrap_or(self.boundaries.len());
         self.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
         let micros = (seconds * 1_000_000.0).max(0.0) as u64;
@@ -180,16 +175,12 @@ pub struct Metrics {
     quarantine_snapshot: std::sync::Mutex<QuarantineSnapshot>,
 }
 
-const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[
-    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0,
-];
+const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
 
 /// Mempool lead time: how long before block inclusion the mempool showed us
 /// a tx. Preview/mainnet blocks average 20s, so the interesting range is
 /// 1-60s with a tail for txs that waited out several blocks.
-const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[
-    0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0,
-];
+const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0];
 
 /// Point-in-time operator health, refreshed by the scooper each batch cycle.
 /// Everything an operator needs to answer "why is nothing happening":
@@ -290,7 +281,12 @@ impl Metrics {
     }
 
     /// Update the in-flight snapshot from current chain tracker state.
-    pub fn update_in_flight(&self, pools: &[Ident], order_inputs: &BTreeSet<crate::cardano_types::TransactionInput>, tx_count: usize) {
+    pub fn update_in_flight(
+        &self,
+        pools: &[Ident],
+        order_inputs: &BTreeSet<crate::cardano_types::TransactionInput>,
+        tx_count: usize,
+    ) {
         let snapshot = InFlightSnapshot {
             pool_ids: pools.iter().map(|id| hex::encode(id.to_bytes())).collect(),
             order_refs: order_inputs.iter().map(|i| i.to_string()).collect(),
@@ -370,33 +366,68 @@ pub async fn render_metrics(
 ) -> String {
     let mut out = String::with_capacity(2048);
 
-    write_gauge(&mut out, "scooper_paused", "Whether the scooper is paused (0 or 1)", paused.load(Ordering::Relaxed) as u8);
+    write_gauge(
+        &mut out,
+        "scooper_paused",
+        "Whether the scooper is paused (0 or 1)",
+        paused.load(Ordering::Relaxed) as u8,
+    );
 
     // V4 snapshot gauges
     if let Some(v4) = v4_state {
         let state = v4.lock().await.latest().into_owned();
 
-        write_gauge(&mut out, "scooper_v4_tip_slot", "Last processed block slot", state.tip_slot);
+        write_gauge(
+            &mut out,
+            "scooper_v4_tip_slot",
+            "Last processed block slot",
+            state.tip_slot,
+        );
 
         let network_tip = state.network_tip_slot.unwrap_or(0);
-        write_gauge(&mut out, "scooper_v4_network_tip_slot", "Network tip slot from upstream node", network_tip);
+        write_gauge(
+            &mut out,
+            "scooper_v4_network_tip_slot",
+            "Network tip slot from upstream node",
+            network_tip,
+        );
 
         // sync_lag = chain tip − last processed. Cleaner alert target
         // than sync_pct (which loses precision at high tip values).
         // Zero or negative when caught up. We clamp to 0 so the gauge
         // type stays non-negative.
         let sync_lag = network_tip.saturating_sub(state.tip_slot);
-        write_gauge(&mut out, "scooper_v4_sync_lag_slots", "Slots between our last processed block and the network tip", sync_lag);
+        write_gauge(
+            &mut out,
+            "scooper_v4_sync_lag_slots",
+            "Slots between our last processed block and the network tip",
+            sync_lag,
+        );
 
         let sync_pct = if network_tip > 0 {
             state.tip_slot as f64 / network_tip as f64 * 100.0
         } else {
             0.0
         };
-        write_gauge(&mut out, "scooper_v4_sync_pct", "Sync progress as percentage", format!("{sync_pct:.2}"));
+        write_gauge(
+            &mut out,
+            "scooper_v4_sync_pct",
+            "Sync progress as percentage",
+            format!("{sync_pct:.2}"),
+        );
 
-        write_gauge(&mut out, "scooper_v4_pool_count", "Number of tracked V4 pools", state.pools.len());
-        write_gauge(&mut out, "scooper_v4_order_count", "Number of pending V4 orders", state.orders.len());
+        write_gauge(
+            &mut out,
+            "scooper_v4_pool_count",
+            "Number of tracked V4 pools",
+            state.pools.len(),
+        );
+        write_gauge(
+            &mut out,
+            "scooper_v4_order_count",
+            "Number of pending V4 orders",
+            state.orders.len(),
+        );
 
         // Age of the oldest pending order, in seconds. Computed from
         // `order.slot` (first-seen slot at index time) against the
@@ -405,7 +436,11 @@ pub async fn render_metrics(
         // window — useful when a single stuck order is the symptom of
         // an upstream bug. Zero when no orders pending.
         let oldest_slot = state.orders.iter().map(|o| o.slot).min();
-        let tip_for_age = if state.tip_slot > 0 { state.tip_slot } else { network_tip };
+        let tip_for_age = if state.tip_slot > 0 {
+            state.tip_slot
+        } else {
+            network_tip
+        };
         let oldest_age_secs = match oldest_slot {
             Some(s) if tip_for_age > s => tip_for_age.saturating_sub(s),
             _ => 0,
@@ -417,22 +452,44 @@ pub async fn render_metrics(
             oldest_age_secs,
         );
 
-        let wallet_lovelace: u64 = state.wallet_utxos.values()
+        let wallet_lovelace: u64 = state
+            .wallet_utxos
+            .values()
             .map(|v| {
-                let ada = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+                let ada = crate::cardano_types::AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                };
                 v.get(&ada).to_f64().unwrap_or(0.0) as u64
             })
             .sum();
-        write_gauge(&mut out, "scooper_v4_wallet_lovelace", "Total lovelace in scooper wallet", wallet_lovelace);
-        write_gauge(&mut out, "scooper_v4_wallet_utxo_count", "Number of wallet UTxOs", state.wallet_utxos.len());
+        write_gauge(
+            &mut out,
+            "scooper_v4_wallet_lovelace",
+            "Total lovelace in scooper wallet",
+            wallet_lovelace,
+        );
+        write_gauge(
+            &mut out,
+            "scooper_v4_wallet_utxo_count",
+            "Number of wallet UTxOs",
+            state.wallet_utxos.len(),
+        );
 
         // Scoop stats per scooper
         let our_keyhash = &state.scoop_stats.our_keyhash;
         if !state.scoop_stats.scooper_totals.is_empty() {
-            let _ = writeln!(out, "# HELP scooper_scoop_txs Total scoop transactions by scooper");
+            let _ = writeln!(
+                out,
+                "# HELP scooper_scoop_txs Total scoop transactions by scooper"
+            );
             let _ = writeln!(out, "# TYPE scooper_scoop_txs gauge");
             for total in &state.scoop_stats.scooper_totals {
-                let is_ours = if !our_keyhash.is_empty() && total.scooper == *our_keyhash { "true" } else { "false" };
+                let is_ours = if !our_keyhash.is_empty() && total.scooper == *our_keyhash {
+                    "true"
+                } else {
+                    "false"
+                };
                 let _ = writeln!(
                     out,
                     "scooper_scoop_txs{{scooper=\"{}\",is_ours=\"{}\"}} {}",
@@ -440,10 +497,17 @@ pub async fn render_metrics(
                 );
             }
 
-            let _ = writeln!(out, "# HELP scooper_orders_processed Total orders processed by scooper");
+            let _ = writeln!(
+                out,
+                "# HELP scooper_orders_processed Total orders processed by scooper"
+            );
             let _ = writeln!(out, "# TYPE scooper_orders_processed gauge");
             for total in &state.scoop_stats.scooper_totals {
-                let is_ours = if !our_keyhash.is_empty() && total.scooper == *our_keyhash { "true" } else { "false" };
+                let is_ours = if !our_keyhash.is_empty() && total.scooper == *our_keyhash {
+                    "true"
+                } else {
+                    "false"
+                };
                 let _ = writeln!(
                     out,
                     "scooper_orders_processed{{scooper=\"{}\",is_ours=\"{}\"}} {}",
@@ -456,72 +520,243 @@ pub async fn render_metrics(
     // V3 snapshot gauges
     if let Some(v3) = v3_state {
         let state = v3.lock().await.latest().into_owned();
-        write_gauge(&mut out, "scooper_v3_pool_count", "Number of tracked V3 pools", state.pools.len());
-        write_gauge(&mut out, "scooper_v3_order_count", "Number of pending V3 orders", state.orders.len());
+        write_gauge(
+            &mut out,
+            "scooper_v3_pool_count",
+            "Number of tracked V3 pools",
+            state.pools.len(),
+        );
+        write_gauge(
+            &mut out,
+            "scooper_v3_order_count",
+            "Number of pending V3 orders",
+            state.orders.len(),
+        );
     }
 
     // Scooper-originated counters
-    write_counter(&mut out, "scooper_batches_submitted_total", "Total batches successfully submitted", metrics.batches_submitted.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_orders_scooped_total", "Total orders successfully scooped", metrics.orders_scooped.load(Ordering::Relaxed));
-    write_gauge(&mut out, "scooper_in_flight_txs", "Number of in-flight transactions in chain tracker", metrics.in_flight_txs.load(Ordering::Relaxed));
+    write_counter(
+        &mut out,
+        "scooper_batches_submitted_total",
+        "Total batches successfully submitted",
+        metrics.batches_submitted.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_orders_scooped_total",
+        "Total orders successfully scooped",
+        metrics.orders_scooped.load(Ordering::Relaxed),
+    );
+    write_gauge(
+        &mut out,
+        "scooper_in_flight_txs",
+        "Number of in-flight transactions in chain tracker",
+        metrics.in_flight_txs.load(Ordering::Relaxed),
+    );
 
     // Failure breakdown: one counter, multiple reason labels. Lets
     // operators alert on the dominant failure mode rather than a single
     // opaque rate. `race_lost` is expected to be non-zero at steady
     // state; sustained growth of `submit_error` or `build_error` is a
     // bug signal.
-    let _ = writeln!(out, "# HELP scooper_batches_failed_total Total batches that failed to submit, by reason");
+    let _ = writeln!(
+        out,
+        "# HELP scooper_batches_failed_total Total batches that failed to submit, by reason"
+    );
     let _ = writeln!(out, "# TYPE scooper_batches_failed_total counter");
     for (reason, value) in [
-        (BatchFailureReason::RaceLost.label(),     metrics.failed_race_lost.load(Ordering::Relaxed)),
-        (BatchFailureReason::SubmitError.label(),  metrics.failed_submit_error.load(Ordering::Relaxed)),
-        (BatchFailureReason::BuildError.label(),   metrics.failed_build_error.load(Ordering::Relaxed)),
-        (BatchFailureReason::EvalError.label(),    metrics.failed_eval_error.load(Ordering::Relaxed)),
+        (
+            BatchFailureReason::RaceLost.label(),
+            metrics.failed_race_lost.load(Ordering::Relaxed),
+        ),
+        (
+            BatchFailureReason::SubmitError.label(),
+            metrics.failed_submit_error.load(Ordering::Relaxed),
+        ),
+        (
+            BatchFailureReason::BuildError.label(),
+            metrics.failed_build_error.load(Ordering::Relaxed),
+        ),
+        (
+            BatchFailureReason::EvalError.label(),
+            metrics.failed_eval_error.load(Ordering::Relaxed),
+        ),
     ] {
-        let _ = writeln!(out, "scooper_batches_failed_total{{reason=\"{reason}\"}} {value}");
+        let _ = writeln!(
+            out,
+            "scooper_batches_failed_total{{reason=\"{reason}\"}} {value}"
+        );
     }
 
     let q = metrics.quarantine_snapshot();
-    write_gauge(&mut out, "scooper_quarantined_permanent", "Number of permanently quarantined orders", q.permanent.len());
-    write_gauge(&mut out, "scooper_quarantined_temporary", "Number of temporarily quarantined orders", q.temporary.len());
+    write_gauge(
+        &mut out,
+        "scooper_quarantined_permanent",
+        "Number of permanently quarantined orders",
+        q.permanent.len(),
+    );
+    write_gauge(
+        &mut out,
+        "scooper_quarantined_temporary",
+        "Number of temporarily quarantined orders",
+        q.temporary.len(),
+    );
 
     // Per-pool-family scoop counts. Sum across labels can exceed the
     // unlabeled `orders_scooped_total` since a mixed-pool tx counts
     // against each family it touched.
-    let _ = writeln!(out, "# HELP scooper_orders_scooped_by_pool_type_total Orders scooped, by pool family");
-    let _ = writeln!(out, "# TYPE scooper_orders_scooped_by_pool_type_total counter");
+    let _ = writeln!(
+        out,
+        "# HELP scooper_orders_scooped_by_pool_type_total Orders scooped, by pool family"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE scooper_orders_scooped_by_pool_type_total counter"
+    );
     for (family, value) in [
-        (PoolFamily::ConstantProduct.label(),       metrics.scooped_cp.load(Ordering::Relaxed)),
-        (PoolFamily::ConstantSum.label(),           metrics.scooped_cs.load(Ordering::Relaxed)),
-        (PoolFamily::ConcentratedLiquidity.label(), metrics.scooped_cl.load(Ordering::Relaxed)),
+        (
+            PoolFamily::ConstantProduct.label(),
+            metrics.scooped_cp.load(Ordering::Relaxed),
+        ),
+        (
+            PoolFamily::ConstantSum.label(),
+            metrics.scooped_cs.load(Ordering::Relaxed),
+        ),
+        (
+            PoolFamily::ConcentratedLiquidity.label(),
+            metrics.scooped_cl.load(Ordering::Relaxed),
+        ),
     ] {
-        let _ = writeln!(out, "scooper_orders_scooped_by_pool_type_total{{pool_type=\"{family}\"}} {value}");
+        let _ = writeln!(
+            out,
+            "scooper_orders_scooped_by_pool_type_total{{pool_type=\"{family}\"}} {value}"
+        );
     }
 
     // Operator health gauges (refreshed each batch cycle).
     let ops = metrics.ops_snapshot();
-    write_gauge(&mut out, "scooper_wallet_spendable_utxos", "Confirmed wallet UTxOs not locked by in-flight txs", ops.wallet_spendable_utxos);
-    write_gauge(&mut out, "scooper_wallet_total_ada_lovelace", "Total lovelace across spendable wallet UTxOs", ops.wallet_total_ada);
-    write_gauge(&mut out, "scooper_wallet_consumed_in_flight", "Wallet UTxOs locked by in-flight txs", ops.wallet_consumed_in_flight);
-    write_gauge(&mut out, "scooper_funding_candidates", "UTxOs eligible to fund the next build", ops.funding_candidates);
-    write_gauge(&mut out, "scooper_collateral_available", "1 when a collateral-capable UTxO exists", ops.collateral_available as usize);
-    write_gauge(&mut out, "scooper_pending_orders", "Dispatchable order candidates last cycle", ops.pending_orders);
-    write_gauge(&mut out, "scooper_provisional_orders", "Unconfirmed mempool orders tracked", ops.provisional_orders);
-    write_gauge(&mut out, "scooper_provisional_spent", "Order UTxOs spent by unconfirmed txs", ops.provisional_spent);
-    write_gauge(&mut out, "scooper_foreign_pool_predictions", "Pool states predicted from foreign mempool txs", ops.foreign_pools);
-    write_gauge(&mut out, "scooper_config_missing_orders", "Orders skipped for referencing an unindexed OrderConfig", ops.config_missing_orders);
-    write_gauge(&mut out, "scooper_backoff_active", "1 while sitting out cycles after a lost race", ops.backoff_active as usize);
-    write_gauge(&mut out, "scooper_mempool_monitor_connected", "1 while the mempool monitor holds a node connection", metrics.mempool_connected.load(Ordering::Relaxed));
-    write_gauge(&mut out, "scooper_mempool_last_snapshot_unix", "Unix time of the last processed mempool snapshot", metrics.mempool_last_snapshot_unix.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_node_rejects_total", "Local-node tx rejections (state conflicts)", metrics.node_rejects.load(Ordering::Relaxed));
+    write_gauge(
+        &mut out,
+        "scooper_wallet_spendable_utxos",
+        "Confirmed wallet UTxOs not locked by in-flight txs",
+        ops.wallet_spendable_utxos,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_wallet_total_ada_lovelace",
+        "Total lovelace across spendable wallet UTxOs",
+        ops.wallet_total_ada,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_wallet_consumed_in_flight",
+        "Wallet UTxOs locked by in-flight txs",
+        ops.wallet_consumed_in_flight,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_funding_candidates",
+        "UTxOs eligible to fund the next build",
+        ops.funding_candidates,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_collateral_available",
+        "1 when a collateral-capable UTxO exists",
+        ops.collateral_available as usize,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_pending_orders",
+        "Dispatchable order candidates last cycle",
+        ops.pending_orders,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_provisional_orders",
+        "Unconfirmed mempool orders tracked",
+        ops.provisional_orders,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_provisional_spent",
+        "Order UTxOs spent by unconfirmed txs",
+        ops.provisional_spent,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_foreign_pool_predictions",
+        "Pool states predicted from foreign mempool txs",
+        ops.foreign_pools,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_config_missing_orders",
+        "Orders skipped for referencing an unindexed OrderConfig",
+        ops.config_missing_orders,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_backoff_active",
+        "1 while sitting out cycles after a lost race",
+        ops.backoff_active as usize,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_mempool_monitor_connected",
+        "1 while the mempool monitor holds a node connection",
+        metrics.mempool_connected.load(Ordering::Relaxed),
+    );
+    write_gauge(
+        &mut out,
+        "scooper_mempool_last_snapshot_unix",
+        "Unix time of the last processed mempool snapshot",
+        metrics.mempool_last_snapshot_unix.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_node_rejects_total",
+        "Local-node tx rejections (state conflicts)",
+        metrics.node_rejects.load(Ordering::Relaxed),
+    );
 
     // Mempool monitor (phase 1). All zero when the monitor is disabled.
-    write_counter(&mut out, "scooper_mempool_txs_seen_total", "Transactions observed in the local node mempool", metrics.mempool_txs_seen.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_mempool_order_creates_total", "Order-address outputs observed in mempool txs", metrics.mempool_order_creates.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_mempool_order_spends_total", "Known order UTxOs spent by mempool txs", metrics.mempool_order_spends.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_mempool_pool_spends_total", "Known pool UTxOs spent by mempool txs", metrics.mempool_pool_spends.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_mempool_confirmed_total", "Mempool-seen txs later confirmed in a block", metrics.mempool_confirmed.load(Ordering::Relaxed));
-    write_counter(&mut out, "scooper_mempool_evicted_total", "Mempool-seen txs that vanished without confirming", metrics.mempool_evicted.load(Ordering::Relaxed));
+    write_counter(
+        &mut out,
+        "scooper_mempool_txs_seen_total",
+        "Transactions observed in the local node mempool",
+        metrics.mempool_txs_seen.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_mempool_order_creates_total",
+        "Order-address outputs observed in mempool txs",
+        metrics.mempool_order_creates.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_mempool_order_spends_total",
+        "Known order UTxOs spent by mempool txs",
+        metrics.mempool_order_spends.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_mempool_pool_spends_total",
+        "Known pool UTxOs spent by mempool txs",
+        metrics.mempool_pool_spends.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_mempool_confirmed_total",
+        "Mempool-seen txs later confirmed in a block",
+        metrics.mempool_confirmed.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_mempool_evicted_total",
+        "Mempool-seen txs that vanished without confirming",
+        metrics.mempool_evicted.load(Ordering::Relaxed),
+    );
     metrics.mempool_lead_time.write(
         &mut out,
         "scooper_mempool_lead_time_seconds",
@@ -538,7 +773,12 @@ pub async fn render_metrics(
     // Uptime since process start. Dropping near zero unexpectedly is the
     // canonical crash-loop signal.
     let uptime = metrics.start_instant.elapsed().as_secs();
-    write_gauge(&mut out, "scooper_uptime_seconds", "Seconds since this scooper process started", uptime);
+    write_gauge(
+        &mut out,
+        "scooper_uptime_seconds",
+        "Seconds since this scooper process started",
+        uptime,
+    );
 
     out
 }

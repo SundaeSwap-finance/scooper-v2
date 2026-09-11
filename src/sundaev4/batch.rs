@@ -14,7 +14,6 @@ use crate::sundaev3::Ident;
 use crate::sundaev4::swap_math;
 use crate::sundaev4::types::*;
 
-
 /// A resolved swap with precomputed math.
 ///
 /// For routed orders, the *primary* entry hop split is stored as a
@@ -385,8 +384,12 @@ fn find_pool_by_lp_asset(
 ) -> Option<Ident> {
     const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
     for (asset, _) in assets {
-        if asset.token.len() < LP_LABEL.len() { continue; }
-        if &asset.token[..LP_LABEL.len()] != LP_LABEL { continue; }
+        if asset.token.len() < LP_LABEL.len() {
+            continue;
+        }
+        if &asset.token[..LP_LABEL.len()] != LP_LABEL {
+            continue;
+        }
         let ident_bytes = &asset.token[LP_LABEL.len()..];
         for (ident, _) in pools {
             if ident.to_bytes() == ident_bytes {
@@ -442,12 +445,9 @@ pub fn assemble_batch(
                 continue;
             }
 
-            if let Ok(swap) = try_execute_order(
-                order,
-                &running_assets,
-                &initial_total_lp,
-                &pool.pool_type,
-            ) {
+            if let Ok(swap) =
+                try_execute_order(order, &running_assets, &initial_total_lp, &pool.pool_type)
+            {
                 // Update running reserves
                 let in_idx = swap.input_idx;
                 let out_idx = swap.output_idx;
@@ -486,9 +486,8 @@ pub fn assemble_batch(
         );
         total_fee_budget = &total_fee_budget + &fb;
     }
-    let total_protocol_lp = swap_math::compute_protocol_lp(
-        &total_fee_budget, protocol_share.0, protocol_share.1,
-    );
+    let total_protocol_lp =
+        swap_math::compute_protocol_lp(&total_fee_budget, protocol_share.0, protocol_share.1);
     let final_total_lp = &initial_total_lp + &total_protocol_lp;
 
     let ops_order: Vec<BatchOp> = (0..selected.len()).map(BatchOp::Swap).collect();
@@ -528,7 +527,14 @@ pub fn try_execute_order(
         return Err(format!("offered amount not positive: {dx}"));
     }
 
-    let dy = compute_swap_result(pool_type, running_assets, running_total_lp, input_idx, output_idx, &dx);
+    let dy = compute_swap_result(
+        pool_type,
+        running_assets,
+        running_total_lp,
+        input_idx,
+        output_idx,
+        &dx,
+    );
     if !dy.is_positive() {
         return Err(format!(
             "swap result not positive: dy={dy} dx={dx} reserves=[{}, {}] total_lp={running_total_lp}",
@@ -594,7 +600,11 @@ pub fn compute_swap_result(
             }
             dy
         }
-        PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
+        PoolType::ConcentratedLiquidity {
+            sqrt_price_a,
+            sqrt_price_b,
+            fee,
+        } => {
             // CL pools have exactly 2 assets in positional order [A, B].
             // The validator's virtual-reserve formulas always use the same
             // (a, b, spa, spb) layout regardless of swap direction; only the
@@ -602,10 +612,17 @@ pub fn compute_swap_result(
             let (a, b) = (&assets[0].1, &assets[1].1);
             let is_a_input = input_idx == 0;
             swap_math::cl_swap_result(
-                a, b, total_lp, dx, is_a_input,
-                &sqrt_price_a.num, &sqrt_price_a.den,
-                &sqrt_price_b.num, &sqrt_price_b.den,
-                &fee.num, &fee.den,
+                a,
+                b,
+                total_lp,
+                dx,
+                is_a_input,
+                &sqrt_price_a.num,
+                &sqrt_price_a.den,
+                &sqrt_price_b.num,
+                &sqrt_price_b.den,
+                &fee.num,
+                &fee.den,
             )
         }
     }
@@ -678,16 +695,10 @@ pub fn align_offered_to_pool(
     offered: &[(AssetClass, BigInt)],
     assets: &[(AssetClass, BigInt)],
 ) -> Vec<BigInt> {
-    let by_asset: BTreeMap<&AssetClass, &BigInt> =
-        offered.iter().map(|(a, q)| (a, q)).collect();
+    let by_asset: BTreeMap<&AssetClass, &BigInt> = offered.iter().map(|(a, q)| (a, q)).collect();
     assets
         .iter()
-        .map(|(a, _)| {
-            by_asset
-                .get(a)
-                .map(|q| (*q).clone())
-                .unwrap_or_else(|| BigInt::from(0))
-        })
+        .map(|(a, _)| by_asset.get(a).map(|q| (*q).clone()).unwrap_or_else(|| BigInt::from(0)))
         .collect()
 }
 
@@ -742,9 +753,7 @@ pub fn plan_zap_swap(
                 return Err("CS pool prices not aligned with reserves".into());
             }
             let value_of = |v: &[BigInt]| -> BigInt {
-                v.iter()
-                    .zip(prices.iter())
-                    .fold(BigInt::from(0), |acc, (q, p)| &acc + &(q * p))
+                v.iter().zip(prices.iter()).fold(BigInt::from(0), |acc, (q, p)| &acc + &(q * p))
             };
             let v_pool = reserves
                 .iter()
@@ -798,11 +807,9 @@ pub fn plan_zap_swap(
                         short[i] = &target - &offered_per_pool[i];
                     }
                 }
-                let next_depositable =
-                    &offered_value - &(&value_of(&give) * &fee.num / &fee.den);
-                let next_after: Vec<BigInt> = (0..n)
-                    .map(|i| reserves[i] + &give[i] - &short[i])
-                    .collect();
+                let next_depositable = &offered_value - &(&value_of(&give) * &fee.num / &fee.den);
+                let next_after: Vec<BigInt> =
+                    (0..n).map(|i| reserves[i] + &give[i] - &short[i]).collect();
                 if next_depositable == depositable && next_after == after {
                     break;
                 }
@@ -822,9 +829,7 @@ pub fn plan_zap_swap(
             let input_value = value_of(&give);
             let short_value = value_of(&short);
             if !input_value.is_positive() || !short_value.is_positive() {
-                return Err(
-                    "zap basket is already proportional — a plain deposit fills it".into(),
-                );
+                return Err("zap basket is already proportional — a plain deposit fills it".into());
             }
             // check_swap admits a pool value gain anywhere in a window one
             // out-unit wide above `floor(input_value·fee)`. Pay out everything
@@ -889,17 +894,14 @@ pub fn plan_zap_swap(
             }
             // The over-weighted side funds the swap, compared as
             // `offered_0/r_0` against `offered_1/r_1`.
-            let (i, j) = if &offered_per_pool[0] * reserves[1]
-                > &offered_per_pool[1] * reserves[0]
+            let (i, j) = if &offered_per_pool[0] * reserves[1] > &offered_per_pool[1] * reserves[0]
             {
                 (0usize, 1usize)
             } else {
                 (1usize, 0usize)
             };
             if !offered_per_pool[i].is_positive() {
-                return Err(
-                    "zap basket is already proportional — a plain deposit fills it".into(),
-                );
+                return Err("zap basket is already proportional — a plain deposit fills it".into());
             }
 
             // `minted` is the LP the deposit pin would mint after swapping
@@ -922,7 +924,11 @@ pub fn plan_zap_swap(
                 let cap_i = &(&rem_i * total_lp) / &after_i;
                 let cap_j = &(&rem_j * total_lp) / &after_j;
                 Some(Split {
-                    minted: if cap_i < cap_j { cap_i.clone() } else { cap_j.clone() },
+                    minted: if cap_i < cap_j {
+                        cap_i.clone()
+                    } else {
+                        cap_j.clone()
+                    },
                     dy,
                     side_i_rich: &rem_i * &after_j > &rem_j * &after_i,
                 })
@@ -992,8 +998,7 @@ pub fn resolve_deposit_basket(
         return Err("pool total_lp is zero".into());
     }
 
-    let resolved: (Vec<BigInt>, BigInt, Option<BigInt>) =
-    match pool_type {
+    let resolved: (Vec<BigInt>, BigInt, Option<BigInt>) = match pool_type {
         // Target-pinned deposit (cs_check tag 6): the entry declares a
         // value delta t > 0; every asset's delta is ceil-pinned to
         // `ceil(r_i·t/V_b)` and total_lp is floor-pinned to
@@ -1017,21 +1022,27 @@ pub fn resolve_deposit_basket(
 
             let mut t: Option<BigInt> = None;
             for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
-                if r.is_zero() { continue; }
+                if r.is_zero() {
+                    continue;
+                }
                 let cap = off * &v_b / *r;
                 t = Some(match t.take() {
                     None => cap,
-                    Some(prev) => if cap < prev { cap } else { prev },
+                    Some(prev) => {
+                        if cap < prev {
+                            cap
+                        } else {
+                            prev
+                        }
+                    }
                 });
             }
             let t = t.unwrap_or_else(|| BigInt::from(0));
             if !t.is_positive() {
-                return Err(
-                    "deposit can't be filled — a constant-sum deposit must \
+                return Err("deposit can't be filled — a constant-sum deposit must \
                      offer every pool asset in proportion (asymmetric \
                      deposits are disallowed on-chain)"
-                        .into(),
-                );
+                    .into());
             }
 
             let one = BigInt::from(1);
@@ -1060,27 +1071,31 @@ pub fn resolve_deposit_basket(
         | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
             let mut minted: Option<BigInt> = None;
             for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
-                if r.is_zero() { continue; }
+                if r.is_zero() {
+                    continue;
+                }
                 let cap = off * total_lp / *r;
                 minted = Some(match minted.take() {
                     None => cap,
-                    Some(prev) => if cap < prev { cap } else { prev },
+                    Some(prev) => {
+                        if cap < prev {
+                            cap
+                        } else {
+                            prev
+                        }
+                    }
                 });
             }
             let minted = minted.unwrap_or_else(|| BigInt::from(0));
             if !minted.is_positive() {
-                return Err(
-                    "deposit can't be filled — a constant-product or \
+                return Err("deposit can't be filled — a constant-product or \
                      concentrated-liquidity deposit must offer every pool \
                      asset in proportion"
-                        .into(),
-                );
+                    .into());
             }
             let one = BigInt::from(1);
-            let dx: Vec<BigInt> = reserves
-                .iter()
-                .map(|r| (*r * &minted + total_lp - &one) / total_lp)
-                .collect();
+            let dx: Vec<BigInt> =
+                reserves.iter().map(|r| (*r * &minted + total_lp - &one) / total_lp).collect();
             (dx, minted, None)
         }
     };
@@ -1112,7 +1127,6 @@ pub fn resolve_proportional_deposit(
         &offered_per_pool,
     )?;
 
-
     if !lp_minted.is_positive() {
         return Err("deposit produces zero LP".into());
     }
@@ -1131,11 +1145,20 @@ pub fn resolve_proportional_deposit(
     }
 
     // Surplus = offered - dx for each pool asset (skip zeros).
-    let surplus: Vec<(AssetClass, BigInt)> = pool.pool_datum.assets.iter().enumerate()
+    let surplus: Vec<(AssetClass, BigInt)> = pool
+        .pool_datum
+        .assets
+        .iter()
+        .enumerate()
         .filter_map(|(i, (a, _))| {
             let s = &offered_per_pool[i] - &dx[i];
-            if s.is_positive() { Some((a.clone(), s)) } else { None }
-        }).collect();
+            if s.is_positive() {
+                Some((a.clone(), s))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     Ok(ResolvedDeposit {
         order: order.clone(),
@@ -1170,11 +1193,18 @@ pub fn resolve_proportional_withdraw(
     // and confirm it belongs to this pool.
     const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
     let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
-    let lp_burned = offered.iter()
+    let lp_burned = offered
+        .iter()
         .find_map(|(a, q)| {
-            if a.token.len() < LP_LABEL.len() { return None; }
-            if &a.token[..LP_LABEL.len()] != LP_LABEL { return None; }
-            if &a.token[LP_LABEL.len()..] != pool_ident_bytes { return None; }
+            if a.token.len() < LP_LABEL.len() {
+                return None;
+            }
+            if &a.token[..LP_LABEL.len()] != LP_LABEL {
+                return None;
+            }
+            if &a.token[LP_LABEL.len()..] != pool_ident_bytes {
+                return None;
+            }
             Some(q.clone())
         })
         .ok_or_else(|| "withdraw order doesn't offer this pool's LP token".to_string())?;
@@ -1197,8 +1227,7 @@ pub fn resolve_proportional_withdraw(
         // via the fulfillment (we only burn lp_b - after_lp).
         crate::sundaev4::types::PoolType::ConstantSum { prices, .. } => {
             use num_traits::Zero;
-            let reserves: Vec<&BigInt> =
-                pool.pool_datum.assets.iter().map(|(_, q)| q).collect();
+            let reserves: Vec<&BigInt> = pool.pool_datum.assets.iter().map(|(_, q)| q).collect();
             if prices.len() != reserves.len() {
                 return Err("CS pool prices not aligned with reserves".into());
             }
@@ -1243,15 +1272,19 @@ pub fn resolve_proportional_withdraw(
             })
         }
         _ => {
-            let dy: Vec<BigInt> = pool.pool_datum.assets.iter().map(|(_, r)| {
-                r * &lp_burned / total_lp
-            }).collect();
+            let dy: Vec<BigInt> =
+                pool.pool_datum.assets.iter().map(|(_, r)| r * &lp_burned / total_lp).collect();
 
             if dy.iter().all(|q| !q.is_positive()) {
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
-            Ok(ResolvedWithdraw { order: order.clone(), lp_burned, dy, target_delta_v: None })
+            Ok(ResolvedWithdraw {
+                order: order.clone(),
+                lp_burned,
+                dy,
+                target_delta_v: None,
+            })
         }
     }
 }
@@ -1263,11 +1296,17 @@ mod tests {
     use crate::multisig::Multisig;
 
     fn ada() -> AssetClass {
-        AssetClass { policy: vec![], token: vec![] }
+        AssetClass {
+            policy: vec![],
+            token: vec![],
+        }
     }
 
     fn token_a() -> AssetClass {
-        AssetClass { policy: vec![0x01], token: vec![0x02] }
+        AssetClass {
+            policy: vec![0x01],
+            token: vec![0x02],
+        }
     }
 
     fn make_pool(ada_reserve: i64, token_reserve: i64) -> Arc<SundaeV4Pool> {
@@ -1293,7 +1332,10 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -1365,9 +1407,18 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConcentratedLiquidity {
-                sqrt_price_a: Rational { num: BigInt::from(spa.0), den: BigInt::from(spa.1) },
-                sqrt_price_b: Rational { num: BigInt::from(spb.0), den: BigInt::from(spb.1) },
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                sqrt_price_a: Rational {
+                    num: BigInt::from(spa.0),
+                    den: BigInt::from(spa.1),
+                },
+                sqrt_price_b: Rational {
+                    num: BigInt::from(spb.0),
+                    den: BigInt::from(spb.1),
+                },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -1445,8 +1496,8 @@ mod tests {
         for (ar, br, lp, oa, ob) in cases {
             let pool = make_cl_pool(ar, br, lp, spa, spb);
             let order = make_deposit_order(oa, ob, 1);
-            let resolved = resolve_proportional_deposit(&pool, &order)
-                .expect("CL deposit should resolve");
+            let resolved =
+                resolve_proportional_deposit(&pool, &order).expect("CL deposit should resolve");
             assert!(resolved.lp_minted.is_positive(), "mints LP");
             // Never consumes more than offered.
             assert!(resolved.dx[0] <= BigInt::from(oa));
@@ -1522,9 +1573,7 @@ mod tests {
     #[test]
     fn test_max_orders_limit() {
         let pool = make_pool(1_000_000_000, 1_000_000_000);
-        let orders: Vec<_> = (1..=20u64)
-            .map(|i| make_buy_order(10_000_000, 1, i))
-            .collect();
+        let orders: Vec<_> = (1..=20u64).map(|i| make_buy_order(10_000_000, 1, i)).collect();
 
         let limits = BatchLimits { max_orders: 5 };
         let batch = assemble_batch(&pool, &orders, (3, 1000), (1, 2), &limits);
@@ -1540,11 +1589,17 @@ mod tests {
     }
 
     fn token_b() -> AssetClass {
-        AssetClass { policy: vec![0x03], token: vec![0x04] }
+        AssetClass {
+            policy: vec![0x03],
+            token: vec![0x04],
+        }
     }
 
     fn token_c() -> AssetClass {
-        AssetClass { policy: vec![0x05], token: vec![0x06] }
+        AssetClass {
+            policy: vec![0x05],
+            token: vec![0x06],
+        }
     }
 
     fn make_pool_3asset(
@@ -1576,16 +1631,17 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
         })
     }
 
-    fn make_pool_4asset(
-        r0: i64, r1: i64, r2: i64, r3: i64,
-    ) -> Arc<SundaeV4Pool> {
+    fn make_pool_4asset(r0: i64, r1: i64, r2: i64, r3: i64) -> Arc<SundaeV4Pool> {
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(r0));
         value.insert(&token_a(), BigInt::from(r1));
@@ -1612,7 +1668,10 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -1687,7 +1746,7 @@ mod tests {
         let pool = make_pool_4asset(1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000);
         // Two orders using different pairs within the same 4-asset pool
         let orders = vec![
-            make_order(ada(), 5_000_000, token_a(), 1, 1),     // 0→1
+            make_order(ada(), 5_000_000, token_a(), 1, 1), // 0→1
             make_order(token_b(), 5_000_000, token_c(), 1, 2), // 2→3
         ];
         let batch = assemble_batch(&pool, &orders, (3, 1000), (1, 2), &BatchLimits::default());

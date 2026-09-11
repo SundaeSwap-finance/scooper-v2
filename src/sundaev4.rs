@@ -1,7 +1,7 @@
 pub mod accumulator;
 pub mod batch;
-pub mod chain_tracker;
 pub mod butane;
+pub mod chain_tracker;
 pub mod claims;
 pub mod conversions;
 pub mod evaluator;
@@ -18,6 +18,6 @@ pub use indexer::*;
 pub use types::*;
 
 #[cfg(test)]
-pub(crate) mod test_harness;
-#[cfg(test)]
 mod scoop_tests;
+#[cfg(test)]
+pub(crate) mod test_harness;

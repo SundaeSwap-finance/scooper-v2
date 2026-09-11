@@ -19,9 +19,15 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     cardano_types::{self, AssetClass, TransactionInput, TransactionOutput},
     datum_lookup::{DatumLookup, ScopedDatumLookup},
-    events::{IndexEvent, InvalidOrder, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder, SpentOrderReason, SpentPool},
+    events::{
+        IndexEvent, InvalidOrder, ScoopRecordView, ScoopStats, ScooperTotal, SpentOrder,
+        SpentOrderReason, SpentPool,
+    },
     historical_state::HistoricalState,
-    persistence::{IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo, ScoopRecord, SpentTxo, TxChanges},
+    persistence::{
+        IndexerDao, PersistedDatum, PersistedModuleConfig, PersistedTxo, ScoopRecord, SpentTxo,
+        TxChanges,
+    },
     sundaev3::Ident,
     sundaev4::{
         OrderRedeemer, PoolDatum, PoolRedeemer, SettingsDatum, SundaeV4Order, SundaeV4Pool,
@@ -52,7 +58,8 @@ pub struct SundaeV4State {
     /// `None` until the upstream node reports it (Dolos may not always provide this).
     pub network_tip_slot: Option<u64>,
     pub wallet_utxos: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::Value>,
-    pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
+    pub ref_utxo_outputs:
+        BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub scoop_stats: ScoopStats,
     datums: DatumLookup,
 }
@@ -126,9 +133,10 @@ impl SundaeV4Indexer {
             fee = ?protocol.execution.as_ref().map(|e| e.fee),
             "V4 indexer created"
         );
-        let scooper_keyhash = protocol.execution.as_ref().and_then(|exec| {
-            derive_scooper_keyhash(&exec.scooper_secret_key).ok()
-        });
+        let scooper_keyhash = protocol
+            .execution
+            .as_ref()
+            .and_then(|exec| derive_scooper_keyhash(&exec.scooper_secret_key).ok());
         let ref_utxo_inputs = protocol
             .execution
             .as_ref()
@@ -201,24 +209,30 @@ impl SundaeV4Indexer {
     /// pool re-classifies it with an empty cache and silently falls back
     /// to default configs (wrong module_state hash → on-chain eval fails).
     pub async fn rehydrate_module_configs(&self) -> Result<()> {
-        use crate::sundaev4::types::{ConstantSumConfig, ConstantProductConfig, ConcentratedLiquidityConfig, FeeSplitConfig};
+        use crate::sundaev4::types::{
+            ConcentratedLiquidityConfig, ConstantProductConfig, ConstantSumConfig, FeeSplitConfig,
+        };
         let persisted_configs = self.dao.load_module_configs().await?;
-        let cs_module_hash: Option<Vec<u8>> = self.protocol
+        let cs_module_hash: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash: Option<Vec<u8>> = self.protocol
+        let cp_module_hash: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.constant_product.as_ref())
             .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash: Option<Vec<u8>> = self.protocol
+        let cl_module_hash: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
             .map(|cl| cl.hash.as_ref().to_vec());
-        let fs_module_hash: Option<Vec<u8>> = self.protocol
+        let fs_module_hash: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
@@ -262,9 +276,7 @@ impl SundaeV4Indexer {
         for datum in datums {
             let data = PlutusData::from_plutus_bytes(&datum.datum)
                 .context("could not parse persisted datum")?;
-            state
-                .datums
-                .add_metadata_datum((datum.datum.to_vec(), data));
+            state.datums.add_metadata_datum((datum.datum.to_vec(), data));
         }
 
         // Hydrate the per-module config cache from DB so detect_pool_type
@@ -274,19 +286,22 @@ impl SundaeV4Indexer {
 
         // Constraint script hashes — used to find the right entry in the
         // order datum's `constraints: List<(hash, Data)>` list (PR #11).
-        let swap_order_hash: Vec<u8> = self.protocol
+        let swap_order_hash: Vec<u8> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.swap_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self.protocol
+        let basic_order_hash: Vec<u8> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.basic_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self.protocol
+        let strategy_order_hash: Vec<u8> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.strategy_order.as_ref())
@@ -327,14 +342,17 @@ impl SundaeV4Indexer {
                     );
                 }
                 "order" => {
-                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
-                        .and_then(|datum| {
+                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
+                        |datum| {
                             crate::sundaev4::decode_order_constraint(
-                                &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                                &datum,
+                                &swap_order_hash,
+                                &basic_order_hash,
+                                &strategy_order_hash,
                             )
-                                .map(|c| (datum, c))
-                        })
-                    {
+                            .map(|c| (datum, c))
+                        },
+                    ) {
                         Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
@@ -355,14 +373,17 @@ impl SundaeV4Indexer {
                     }
                 }
                 "invalid_order" => {
-                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
-                        .and_then(|datum| {
+                    match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
+                        |datum| {
                             crate::sundaev4::decode_order_constraint(
-                                &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                                &datum,
+                                &swap_order_hash,
+                                &basic_order_hash,
+                                &strategy_order_hash,
                             )
-                                .map(|c| (datum, c))
-                        })
-                    {
+                            .map(|c| (datum, c))
+                        },
+                    ) {
                         Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
@@ -397,11 +418,8 @@ impl SundaeV4Indexer {
                     // address as the global SettingsDatum but carry a
                     // different (non-empty) token name and a 2-field
                     // `OrderConfig { label, required_constraints }` datum.
-                    let token_name = output
-                        .value
-                        .0
-                        .get(&self.protocol.settings_nft.policy)
-                        .and_then(|tokens| {
+                    let token_name =
+                        output.value.0.get(&self.protocol.settings_nft.policy).and_then(|tokens| {
                             tokens.iter().find_map(|(name, qty)| {
                                 if !name.is_empty() && qty.is_positive() {
                                     Some(name.to_vec())
@@ -439,14 +457,13 @@ impl SundaeV4Indexer {
                                 .as_ref()
                                 .and_then(|t| hex::decode(t).ok())
                                 .unwrap_or_default();
-                            state.fee_settings = Some(Arc::new(
-                                crate::sundaev4::types::SundaeV4FeeSettings {
+                            state.fee_settings =
+                                Some(Arc::new(crate::sundaev4::types::SundaeV4FeeSettings {
                                     input: txo.txo_id,
                                     token,
                                     base_fee,
                                     slot: txo.created_slot,
-                                },
-                            ));
+                                }));
                         }
                     } else {
                         warn!(input = %txo.txo_id, "v4: fee_settings txo could not be reparsed on load");
@@ -469,7 +486,8 @@ impl SundaeV4Indexer {
             let parsed = MultiEraOutput::decode(era, &stxo.txo.txo)?;
             let datum = match &stxo.txo.datum {
                 Some(bytes) => {
-                    let pd = minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
+                    let pd =
+                        minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
                     Some(pd)
                 }
                 None => None,
@@ -479,25 +497,27 @@ impl SundaeV4Indexer {
             let tx_id = stxo.spent_tx_id.map(hex::encode).unwrap_or_default();
             match stxo.txo.txo_type.as_str() {
                 "order" => {
-                    if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums) {
-                        if let Ok(constraint) =
+                    if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums)
+                        && let Ok(constraint) =
                             crate::sundaev4::Constraint::from_order_datum_with_strategy(
-                                &od, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                                &od,
+                                &swap_order_hash,
+                                &basic_order_hash,
+                                &strategy_order_hash,
                             )
-                        {
-                            state.spent_orders.push(SpentOrder {
-                                order: Arc::new(SundaeV4Order {
-                                    input: stxo.txo.txo_id,
-                                    datum: od,
-                                    constraint,
-                                    value: output.value,
-                                    slot: stxo.txo.created_slot,
-                                }),
-                                reason: SpentOrderReason::Unknown,
-                                tx_id,
-                                slot: stxo.spent_slot,
-                            });
-                        }
+                    {
+                        state.spent_orders.push(SpentOrder {
+                            order: Arc::new(SundaeV4Order {
+                                input: stxo.txo.txo_id,
+                                datum: od,
+                                constraint,
+                                value: output.value,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            reason: SpentOrderReason::Unknown,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
                     }
                 }
                 "pool" => {
@@ -526,10 +546,7 @@ impl SundaeV4Indexer {
 
         // Load scoop records and build stats
         let scoop_records = self.dao.load_scoop_records().await?;
-        state.scoop_stats = build_scoop_stats(
-            &scoop_records,
-            self.scooper_keyhash.as_ref(),
-        );
+        state.scoop_stats = build_scoop_stats(&scoop_records, self.scooper_keyhash.as_ref());
 
         state.tip_slot = slot;
         self.loaded_slot = slot;
@@ -625,9 +642,9 @@ impl SundaeV4Indexer {
             .0
             .get(settings_policy)
             .map(|tokens| {
-                tokens
-                    .iter()
-                    .any(|(name, qty)| name.as_slice() == want_token.as_slice() && qty.is_positive())
+                tokens.iter().any(|(name, qty)| {
+                    name.as_slice() == want_token.as_slice() && qty.is_positive()
+                })
             })
             .unwrap_or(false);
         if !has_token {
@@ -648,19 +665,15 @@ impl SundaeV4Indexer {
         datums: &ScopedDatumLookup,
     ) -> Option<(Vec<u8>, crate::sundaev4::types::OrderConfig)> {
         let settings_policy = &self.protocol.settings_nft.policy;
-        let token_name = tx_out
-            .value
-            .0
-            .get(settings_policy)
-            .and_then(|tokens| {
-                tokens.iter().find_map(|(name, qty)| {
-                    if !name.is_empty() && qty.is_positive() {
-                        Some(name.to_vec())
-                    } else {
-                        None
-                    }
-                })
-            })?;
+        let token_name = tx_out.value.0.get(settings_policy).and_then(|tokens| {
+            tokens.iter().find_map(|(name, qty)| {
+                if !name.is_empty() && qty.is_positive() {
+                    Some(name.to_vec())
+                } else {
+                    None
+                }
+            })
+        })?;
         let order_config: crate::sundaev4::types::OrderConfig = tx_out.datum.parse(datums)?;
         Some((token_name, order_config))
     }
@@ -782,7 +795,8 @@ pub fn extract_cl_config_from_tx(
     let redeemer = redeemers
         .iter()
         .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
-    let parsed: ConcentratedLiquidityRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
+    let parsed: ConcentratedLiquidityRedeemer =
+        AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConcentratedLiquidityRedeemer::Create { initial_state } => Some(initial_state),
         _ => None,
@@ -810,10 +824,9 @@ pub fn extract_fee_split_config_for_pool_from_tx(
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config, .. } => Some(config),
-        FeeSplitRedeemer::Operate { entries } => entries
-            .into_iter()
-            .find(|e| &e.pool_oref == pool_oref)
-            .map(|e| e.config),
+        FeeSplitRedeemer::Operate { entries } => {
+            entries.into_iter().find(|e| &e.pool_oref == pool_oref).map(|e| e.config)
+        }
         FeeSplitRedeemer::Destroy { .. } => None,
     }
 }
@@ -835,9 +848,8 @@ impl ChainIndex for SundaeV4Indexer {
                 state.network_tip_slot = Some(tip);
             }
             self.tip_event_counter += 1;
-            let at_tip = state.network_tip_slot
-                .is_some_and(|net| self.loaded_slot + 10 >= net);
-            if at_tip || self.tip_event_counter % 100 == 0 {
+            let at_tip = state.network_tip_slot.is_some_and(|net| self.loaded_slot + 10 >= net);
+            if at_tip || self.tip_event_counter.is_multiple_of(100) {
                 let _ = self.event_tx.send((
                     info.slot,
                     vec![IndexEvent::TipAdvanced {
@@ -857,9 +869,8 @@ impl ChainIndex for SundaeV4Indexer {
         }
         // Throttle tip events: every 100 blocks while syncing, every block once synced.
         self.tip_event_counter += 1;
-        let at_tip = state.network_tip_slot
-            .is_some_and(|net| info.slot + 10 >= net);
-        if at_tip || self.tip_event_counter % 100 == 0 {
+        let at_tip = state.network_tip_slot.is_some_and(|net| info.slot + 10 >= net);
+        if at_tip || self.tip_event_counter.is_multiple_of(100) {
             let _ = self.event_tx.send((
                 info.slot,
                 vec![IndexEvent::TipAdvanced {
@@ -926,45 +937,51 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
             .and_then(|cl| extract_cl_config_from_tx(&tx, &cl.hash));
-        let fs_config_from_tx = self
+        let fs_config_from_tx =
+            self.protocol.execution.as_ref().and_then(|e| {
+                extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
+            });
+        let swap_order_hash: Vec<u8> = self
             .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash));
-        let swap_order_hash: Vec<u8> = self.protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.swap_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self.protocol
+        let basic_order_hash: Vec<u8> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.basic_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self.protocol
+        let strategy_order_hash: Vec<u8> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.strategy_order.as_ref())
             .map(|s| s.hash.as_ref().to_vec())
             .unwrap_or_default();
-        let cs_module_hash_bytes: Option<Vec<u8>> = self.protocol
+        let cs_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash_bytes: Option<Vec<u8>> = self.protocol
+        let cp_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.constant_product.as_ref())
             .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash_bytes: Option<Vec<u8>> = self.protocol
+        let cl_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
             .map(|cl| cl.hash.as_ref().to_vec());
-        let fs_module_hash_bytes: Option<Vec<u8>> = self.protocol
+        let fs_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
             .execution
             .as_ref()
             .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
@@ -996,15 +1013,12 @@ impl ChainIndex for SundaeV4Indexer {
                     //   2. this tx's Create redeemer
                     //   3. previously-resolved persisted config (cache)
                     //   4. defaults
-                    let resolved_cs = cs_config_from_tx
-                        .as_ref()
-                        .or_else(|| module_cache.cs.get(&pool_id));
-                    let resolved_cp = cp_config_from_tx
-                        .as_ref()
-                        .or_else(|| module_cache.cp.get(&pool_id));
-                    let resolved_cl = cl_config_from_tx
-                        .as_ref()
-                        .or_else(|| module_cache.cl.get(&pool_id));
+                    let resolved_cs =
+                        cs_config_from_tx.as_ref().or_else(|| module_cache.cs.get(&pool_id));
+                    let resolved_cp =
+                        cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
+                    let resolved_cl =
+                        cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
                     let pool_type = detect_pool_type(
                         &pd,
                         self.protocol.execution.as_ref(),
@@ -1017,65 +1031,67 @@ impl ChainIndex for SundaeV4Indexer {
                     // redeemer, persist it and remember it for future blocks.
                     if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantSum { .. }) =
                         (cs_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cs.contains_key(&pool_id)
                     {
-                        if !module_cache.cs.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConstantSumConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cs_module_hash_bytes.clone()
-                                    .expect("cs_module_hash present when CS pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cs.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CS pool config from Create redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantSumConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cs_module_hash_bytes
+                                .clone()
+                                .expect("cs_module_hash present when CS pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cs.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CS pool config from Create redeemer"
+                        );
                     }
                     // Same for CP: persist on first sighting (Create or Operate).
                     if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
                         (cp_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cp.contains_key(&pool_id)
                     {
-                        if !module_cache.cp.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConstantProductConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cp_module_hash_bytes.clone()
-                                    .expect("cp_module_hash present when CP pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cp.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CP pool config from redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantProductConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cp_module_hash_bytes
+                                .clone()
+                                .expect("cp_module_hash present when CP pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cp.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CP pool config from redeemer"
+                        );
                     }
                     // Same for CL: persist the spa/spb/fee from Create.
-                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. }) =
-                        (cl_config_from_tx.as_ref(), &pool_type)
+                    if let (
+                        Some(cfg),
+                        crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. },
+                    ) = (cl_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cl.contains_key(&pool_id)
                     {
-                        if !module_cache.cl.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConcentratedLiquidityConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cl_module_hash_bytes.clone()
-                                    .expect("cl_module_hash present when CL pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cl.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CL pool config from Create redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConcentratedLiquidityConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cl_module_hash_bytes
+                                .clone()
+                                .expect("cl_module_hash present when CL pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CL pool config from Create redeemer"
+                        );
                     }
 
                     // Same for fee_split: every pool has fee_split config in
@@ -1084,22 +1100,21 @@ impl ChainIndex for SundaeV4Indexer {
                     // persist and cache for future scoops.
                     if let (Some(cfg), Some(fs_hash)) =
                         (fs_config_from_tx.as_ref(), fs_module_hash_bytes.as_ref())
+                        && !module_cache.fee_split.contains_key(&pool_id)
                     {
-                        if !module_cache.fee_split.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode FeeSplitConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: fs_hash.clone(),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted fee_split config from redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode FeeSplitConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: fs_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted fee_split config from redeemer"
+                        );
                     }
 
                     let fs_cfg = module_cache.fee_split.get(&pool_id).cloned();
@@ -1121,13 +1136,17 @@ impl ChainIndex for SundaeV4Indexer {
             {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
                 let tx_out = cardano_types::convert_txo(output);
-                match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums)
-                    .and_then(|datum| {
+                match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
+                    |datum| {
                         crate::sundaev4::decode_order_constraint(
-                            &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                            &datum,
+                            &swap_order_hash,
+                            &basic_order_hash,
+                            &strategy_order_hash,
                         )
-                            .map(|c| (datum, c))
-                    }) {
+                        .map(|c| (datum, c))
+                    },
+                ) {
                     Ok((od, constraint)) => {
                         changes.created_txos.push(PersistedTxo {
                             txo_id: this_input.clone(),
@@ -1195,8 +1214,8 @@ impl ChainIndex for SundaeV4Indexer {
                         address: tx_out.address.to_vec(),
                         datum: tx_out.hashed_datum(&datums),
                     });
-                    new_fee_settings = Some(Arc::new(
-                        crate::sundaev4::types::SundaeV4FeeSettings {
+                    new_fee_settings =
+                        Some(Arc::new(crate::sundaev4::types::SundaeV4FeeSettings {
                             input: this_input,
                             token: self
                                 .protocol
@@ -1206,8 +1225,7 @@ impl ChainIndex for SundaeV4Indexer {
                                 .unwrap_or_default(),
                             base_fee,
                             slot,
-                        },
-                    ));
+                        }));
                 } else if let Some((token_name, oc)) = self.parse_order_config(&tx_out, &datums) {
                     changes.created_txos.push(PersistedTxo {
                         txo_id: this_input.clone(),
@@ -1236,22 +1254,22 @@ impl ChainIndex for SundaeV4Indexer {
             // configured with an enterprise address. Matching by payment
             // credential alone accepts any address form (enterprise, base,
             // pointer) whose payment key we hold.
-            if let Some(scooper_kh) = &self.scooper_keyhash {
-                if payment_hash_equals(&address, scooper_kh) {
-                    let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                    let tx_out = cardano_types::convert_txo(output);
-                    trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "wallet".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: None,
-                    });
-                    state.wallet_utxos.insert(this_input, tx_out.value);
-                }
+            if let Some(scooper_kh) = &self.scooper_keyhash
+                && payment_hash_equals(&address, scooper_kh)
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
+                changes.created_txos.push(PersistedTxo {
+                    txo_id: this_input.clone(),
+                    txo_type: "wallet".to_string(),
+                    created_slot: slot,
+                    era: output.era().into(),
+                    txo: output.encode(),
+                    address: tx_out.address.to_vec(),
+                    datum: None,
+                });
+                state.wallet_utxos.insert(this_input, tx_out.value);
             }
 
             // Track reference UTxO outputs (for ScriptContext building)
@@ -1302,9 +1320,7 @@ impl ChainIndex for SundaeV4Indexer {
         let req_signers = tx.required_signers();
         let signers: Vec<&pallas_primitives::Hash<28>> = req_signers.collect();
         let scooper_keyhash_bytes: Option<Vec<u8>> = signers.first().map(|h| h.to_vec());
-        let scooper_hex = scooper_keyhash_bytes.as_ref()
-            .map(|b| hex::encode(b))
-            .unwrap_or_default();
+        let scooper_hex = scooper_keyhash_bytes.as_ref().map(hex::encode).unwrap_or_default();
 
         let tx_id_hex = hex::encode(this_tx_hash);
 
@@ -1368,7 +1384,10 @@ impl ChainIndex for SundaeV4Indexer {
                     if !scoop_pool_ids.is_empty() {
                         state.spent_orders.push(SpentOrder {
                             order: order.clone(),
-                            reason: SpentOrderReason::Scooped { pool_ids: scoop_pool_ids.clone(), scooper: scooper_hex.clone() },
+                            reason: SpentOrderReason::Scooped {
+                                pool_ids: scoop_pool_ids.clone(),
+                                scooper: scooper_hex.clone(),
+                            },
                             tx_id: tx_id_hex.clone(),
                             slot,
                         });
@@ -1420,7 +1439,9 @@ impl ChainIndex for SundaeV4Indexer {
 
             // Update in-memory stats (once per tx, not per pool)
             let scooper_key = scooper_hex.clone();
-            if let Some(total) = state.scoop_stats.scooper_totals.iter_mut().find(|t| t.scooper == scooper_key) {
+            if let Some(total) =
+                state.scoop_stats.scooper_totals.iter_mut().find(|t| t.scooper == scooper_key)
+            {
                 total.scoop_txs += 1;
                 total.orders_processed += n_orders as u64;
             } else {
@@ -1431,22 +1452,27 @@ impl ChainIndex for SundaeV4Indexer {
                 });
             }
 
-            let pool_ids_hex: Vec<String> = scoop_pool_ids.iter()
-                .map(|id| hex::encode(id.to_bytes()))
-                .collect();
-            state.scoop_stats.recent_scoops.insert(0, ScoopRecordView {
-                tx_id: tx_id_hex.clone(),
-                slot,
-                pool_ids: pool_ids_hex,
-                n_orders,
-                scooper: scooper_hex.clone(),
-            });
+            let pool_ids_hex: Vec<String> =
+                scoop_pool_ids.iter().map(|id| hex::encode(id.to_bytes())).collect();
+            state.scoop_stats.recent_scoops.insert(
+                0,
+                ScoopRecordView {
+                    tx_id: tx_id_hex.clone(),
+                    slot,
+                    pool_ids: pool_ids_hex,
+                    n_orders,
+                    scooper: scooper_hex.clone(),
+                },
+            );
             state.scoop_stats.recent_scoops.truncate(50);
         }
 
         // Emit pool removed events
         for id in removed_pool_ids {
-            events.push(IndexEvent::V4PoolRemoved { id, tx_id: tx_id_hex.clone() });
+            events.push(IndexEvent::V4PoolRemoved {
+                id,
+                tx_id: tx_id_hex.clone(),
+            });
         }
 
         // Remove old settings if spent
@@ -1600,9 +1626,7 @@ impl ChainIndex for SundaeV4Indexer {
         if matches!(point, Point::Origin) {
             self.dao.rollback(to_slot).await?;
         }
-        let _ = self
-            .event_tx
-            .send((to_slot, vec![IndexEvent::Rollback { to_slot }]));
+        let _ = self.event_tx.send((to_slot, vec![IndexEvent::Rollback { to_slot }]));
         Ok(())
     }
 
@@ -1643,9 +1667,7 @@ fn build_scoop_stats(
 ) -> ScoopStats {
     use std::collections::BTreeMap;
 
-    let our_hex = our_keyhash
-        .map(|h| hex::encode(h.as_ref()))
-        .unwrap_or_default();
+    let our_hex = our_keyhash.map(|h| hex::encode(h.as_ref())).unwrap_or_default();
 
     let mut totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for r in records {
@@ -1746,12 +1768,15 @@ pub fn detect_pool_type(
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
     cl_config_from_tx: Option<&crate::sundaev4::types::ConcentratedLiquidityConfig>,
 ) -> crate::sundaev4::types::PoolType {
-    use crate::sundaev4::types::{PoolType, Rational};
     use crate::bigint::BigInt;
+    use crate::sundaev4::types::{PoolType, Rational};
 
     let Some(exec) = execution else {
         return PoolType::ConstantProduct {
-            fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            fee: Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
         };
     };
 
@@ -1760,33 +1785,38 @@ pub fn detect_pool_type(
     // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by tag.
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let cl_hash =
+        exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
-        if !action.enabled { continue; }
-        let Some(first) = action.modules.first() else { continue; };
-        if let Some(h) = &cp_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cp");
-                break;
-            }
+        if !action.enabled {
+            continue;
         }
-        if let Some(h) = &cs_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cs");
-                break;
-            }
+        let Some(first) = action.modules.first() else {
+            continue;
+        };
+        if let Some(h) = &cp_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cp");
+            break;
         }
-        if let Some(h) = &cl_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cl");
-                break;
-            }
+        if let Some(h) = &cs_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cs");
+            break;
+        }
+        if let Some(h) = &cl_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cl");
+            break;
         }
     }
     if matched_action.is_none() {
@@ -1810,14 +1840,14 @@ pub fn detect_pool_type(
 
     let _action = match matched_action {
         Some(a) => a,
-        None => return PoolType::ConstantProduct {
-            fee: cp_config_from_tx
-                .map(|c| c.fee.clone())
-                .unwrap_or_else(|| Rational {
+        None => {
+            return PoolType::ConstantProduct {
+                fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
                     num: BigInt::from(exec.fee.0),
                     den: BigInt::from(exec.fee.1),
                 }),
-        },
+            };
+        }
     };
 
     if matched_kind == Some("cs") {
@@ -1831,7 +1861,10 @@ pub fn detect_pool_type(
                     num: BigInt::from(fee.0),
                     den: BigInt::from(fee.1),
                 },
-                bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                bounty_k: Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
                 // Bounty off => balance_fee unread; mirror the fee for hash
                 // consistency with the CLI's create default.
                 balance_fee: Rational {
@@ -1863,7 +1896,10 @@ pub fn detect_pool_type(
                 num: BigInt::from(exec.fee.0),
                 den: BigInt::from(exec.fee.1),
             },
-            bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            bounty_k: Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
             balance_fee: Rational {
                 num: BigInt::from(exec.fee.0),
                 den: BigInt::from(exec.fee.1),
@@ -1874,8 +1910,11 @@ pub fn detect_pool_type(
     if matched_kind == Some("cl") {
         // Priority: operator override > on-chain Create redeemer > defaults
         if let Some(crate::sundaev4::types::PoolConfig::ConcentratedLiquidity {
-            sqrt_price_a, sqrt_price_b, fee,
-        }) = exec.pool_configs.get(&ident_hex) {
+            sqrt_price_a,
+            sqrt_price_b,
+            fee,
+        }) = exec.pool_configs.get(&ident_hex)
+        {
             info!(pool = %ident_hex, "CL pool config from operator override");
             return PoolType::ConcentratedLiquidity {
                 sqrt_price_a: Rational {
@@ -1908,8 +1947,14 @@ pub fn detect_pool_type(
         warn!(pool = %ident_hex, "CL pool but no Create-redeemer config recovered yet — \
             set a `concentrated-liquidity` pool-config override in scooper config to scoop this pool");
         return PoolType::ConcentratedLiquidity {
-            sqrt_price_a: Rational { num: BigInt::from(1), den: BigInt::from(1) },
-            sqrt_price_b: Rational { num: BigInt::from(1), den: BigInt::from(1) },
+            sqrt_price_a: Rational {
+                num: BigInt::from(1),
+                den: BigInt::from(1),
+            },
+            sqrt_price_b: Rational {
+                num: BigInt::from(1),
+                den: BigInt::from(1),
+            },
             fee: Rational {
                 num: BigInt::from(exec.fee.0),
                 den: BigInt::from(exec.fee.1),
@@ -1921,11 +1966,9 @@ pub fn detect_pool_type(
     // the global default — different CP pools can have different fees, and
     // `verify_module_state` hashes the config we send.
     PoolType::ConstantProduct {
-        fee: cp_config_from_tx
-            .map(|c| c.fee.clone())
-            .unwrap_or_else(|| Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
-            }),
+        fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
+            num: BigInt::from(exec.fee.0),
+            den: BigInt::from(exec.fee.1),
+        }),
     }
 }

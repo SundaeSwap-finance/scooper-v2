@@ -33,9 +33,7 @@ pub struct AppConfig {
 }
 impl AppConfig {
     pub fn acropolis_config(&self) -> Result<Arc<Config>> {
-        let config = Config::builder()
-            .add_source(LiteralSource(self.acropolis.clone()))
-            .build()?;
+        let config = Config::builder().add_source(LiteralSource(self.acropolis.clone())).build()?;
         Ok(Arc::new(config))
     }
 
@@ -71,11 +69,7 @@ pub fn load_config<S: AsRef<str>>(config_files: impl IntoIterator<Item = S>) -> 
     // `persistence.sqlite.filename`. Pinning prefix_separator keeps the prefix
     // `SCOOPER_V2_`; config-rs would otherwise take it from `separator`.
     let config = builder
-        .add_source(
-            Environment::with_prefix("SCOOPER_V2")
-                .prefix_separator("_")
-                .separator("__"),
-        )
+        .add_source(Environment::with_prefix("SCOOPER_V2").prefix_separator("_").separator("__"))
         .build()?;
     Ok(config.try_deserialize()?)
 }

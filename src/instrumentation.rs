@@ -27,20 +27,14 @@ pub struct LogConfig {
 }
 
 pub fn init(config: &LogConfig) -> Result<()> {
-    let filter = Targets::new()
-        .with_default(Level::INFO)
-        .with_target("scooper_v2", config.level);
+    let filter = Targets::new().with_default(Level::INFO).with_target("scooper_v2", config.level);
 
     match config.format {
         LogFormat::Compact => {
-            Registry::default()
-                .with(fmt::layer().compact().with_filter(filter))
-                .init();
+            Registry::default().with(fmt::layer().compact().with_filter(filter)).init();
         }
         LogFormat::Json => {
-            Registry::default()
-                .with(fmt::layer().json().with_filter(filter))
-                .init();
+            Registry::default().with(fmt::layer().json().with_filter(filter)).init();
         }
     }
 

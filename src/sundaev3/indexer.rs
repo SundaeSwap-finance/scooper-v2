@@ -101,9 +101,7 @@ impl SundaeV3Indexer {
         for datum in datums {
             let data = PlutusData::from_plutus_bytes(&datum.datum)
                 .context("could not parse persisted datum")?;
-            state
-                .datums
-                .add_metadata_datum((datum.datum.to_vec(), data));
+            state.datums.add_metadata_datum((datum.datum.to_vec(), data));
         }
 
         for txo in txos {
@@ -134,45 +132,41 @@ impl SundaeV3Indexer {
                         }),
                     );
                 }
-                "order" => {
-                    match output.datum.try_parse(&datums) {
-                        Ok(datum) => {
-                            state.orders.push(Arc::new(SundaeV3Order {
-                                input: txo.txo_id,
-                                datum,
-                                value: output.value,
-                                slot: txo.created_slot,
-                            }));
-                        }
-                        Err(reason) => {
-                            warn!(slot = txo.created_slot, input = %txo.txo_id, "v3: invalid order datum on load: {reason}");
-                            state.invalid_orders.push(InvalidOrder {
-                                input: txo.txo_id,
-                                slot: txo.created_slot,
-                                reason,
-                            });
-                        }
+                "order" => match output.datum.try_parse(&datums) {
+                    Ok(datum) => {
+                        state.orders.push(Arc::new(SundaeV3Order {
+                            input: txo.txo_id,
+                            datum,
+                            value: output.value,
+                            slot: txo.created_slot,
+                        }));
                     }
-                }
-                "invalid_order" => {
-                    match output.datum.try_parse(&datums) {
-                        Ok(datum) => {
-                            state.orders.push(Arc::new(SundaeV3Order {
-                                input: txo.txo_id,
-                                datum,
-                                value: output.value,
-                                slot: txo.created_slot,
-                            }));
-                        }
-                        Err(reason) => {
-                            state.invalid_orders.push(InvalidOrder {
-                                input: txo.txo_id,
-                                slot: txo.created_slot,
-                                reason,
-                            });
-                        }
+                    Err(reason) => {
+                        warn!(slot = txo.created_slot, input = %txo.txo_id, "v3: invalid order datum on load: {reason}");
+                        state.invalid_orders.push(InvalidOrder {
+                            input: txo.txo_id,
+                            slot: txo.created_slot,
+                            reason,
+                        });
                     }
-                }
+                },
+                "invalid_order" => match output.datum.try_parse(&datums) {
+                    Ok(datum) => {
+                        state.orders.push(Arc::new(SundaeV3Order {
+                            input: txo.txo_id,
+                            datum,
+                            value: output.value,
+                            slot: txo.created_slot,
+                        }));
+                    }
+                    Err(reason) => {
+                        state.invalid_orders.push(InvalidOrder {
+                            input: txo.txo_id,
+                            slot: txo.created_slot,
+                            reason,
+                        });
+                    }
+                },
                 "settings" => {
                     let Some(datum) = output.datum.parse(&datums) else {
                         bail!("invalid settings datum");
@@ -195,7 +189,8 @@ impl SundaeV3Indexer {
             let parsed = MultiEraOutput::decode(era, &stxo.txo.txo)?;
             let datum = match &stxo.txo.datum {
                 Some(bytes) => {
-                    let pd = minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
+                    let pd =
+                        minicbor::decode(bytes).context("could not parse spent persisted CBOR")?;
                     Some(pd)
                 }
                 None => None,
@@ -643,7 +638,10 @@ impl ChainIndex for SundaeV3Indexer {
 
         // Emit pool removed events for pools spent without scoop/manage
         for id in removed_pool_ids {
-            events.push(IndexEvent::V3PoolRemoved { id, tx_id: tx_id_hex.clone() });
+            events.push(IndexEvent::V3PoolRemoved {
+                id,
+                tx_id: tx_id_hex.clone(),
+            });
         }
 
         // remove old settings too
@@ -750,9 +748,7 @@ impl ChainIndex for SundaeV3Indexer {
             slot: to_slot,
             tip_slot: None,
         });
-        let _ = self
-            .event_tx
-            .send((to_slot, vec![IndexEvent::Rollback { to_slot }]));
+        let _ = self.event_tx.send((to_slot, vec![IndexEvent::Rollback { to_slot }]));
         Ok(())
     }
 
@@ -804,7 +800,10 @@ mod tests {
         async fn load_txos(&self) -> Result<Vec<PersistedTxo>> {
             Ok(vec![])
         }
-        async fn load_spent_txos(&self, _since_slot: u64) -> Result<Vec<crate::persistence::SpentPersistedTxo>> {
+        async fn load_spent_txos(
+            &self,
+            _since_slot: u64,
+        ) -> Result<Vec<crate::persistence::SpentPersistedTxo>> {
             Ok(vec![])
         }
         async fn load_datums(&self) -> Result<Vec<PersistedDatum>> {
@@ -817,7 +816,9 @@ mod tests {
         async fn load_scoop_records(&self) -> Result<Vec<crate::persistence::ScoopRecord>> {
             Ok(vec![])
         }
-        async fn load_module_configs(&self) -> Result<Vec<crate::persistence::PersistedModuleConfig>> {
+        async fn load_module_configs(
+            &self,
+        ) -> Result<Vec<crate::persistence::PersistedModuleConfig>> {
             Ok(vec![])
         }
     }
@@ -924,10 +925,7 @@ mod tests {
             hash: BlockHash::new([0; 32]),
         };
 
-        indexer
-            .handle_rollback(&rollback_block_point)
-            .await
-            .unwrap();
+        indexer.handle_rollback(&rollback_block_point).await.unwrap();
         {
             // After rollback, all record of this pool is gone
             let index = state.lock().await.latest().into_owned();
@@ -952,9 +950,7 @@ mod tests {
         let block_bytes = std::fs::read("testdata/metadata.block").unwrap();
         let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
         let datum_hash: DatumHash =
-            "8ecfafddfa732227ba5b494183fd3150a4c8614656e6182f92c25ee2d1480019"
-                .parse()
-                .unwrap();
+            "8ecfafddfa732227ba5b494183fd3150a4c8614656e6182f92c25ee2d1480019".parse().unwrap();
         handle_block(&mut indexer, block.clone()).await.unwrap();
         {
             let index = state.lock().await.latest().into_owned();

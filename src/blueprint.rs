@@ -4,6 +4,9 @@
 //! compiled code) and their on-chain reference UTxOs. This is protocol-agnostic
 //! and can represent V3, V4, stableswap, or future protocol versions.
 
+// pallas_primitives::Hash has "infallible" slice-to-hash conversions which panic at runtime
+#![allow(clippy::unnecessary_fallible_conversions)]
+
 use anyhow::{Context, Result};
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::Hash;
@@ -110,6 +113,7 @@ impl Blueprint {
         // reference keys ("pool.mint", "order.spend", …) matching the V1/V3
         // convention — those are listed first; the camelCase / raw-plutus.json
         // aliases keep older blueprint files loadable.
+        #[rustfmt::skip]
         let mappings: &[(&[&str], &str, &str)] = &[
             (&["constant_product.withdraw", "constant_product_module", "constant_product", "constantProduct"], "constant_product.withdraw", "constant_product"),
             (&["fee_split.withdraw", "fee_split_module", "fee_split", "feeSplit"], "fee_split.withdraw", "fee_split"),
@@ -138,12 +142,18 @@ impl Blueprint {
             None
         }
 
-        fn make_info(bp: &Blueprint, patterns: &[&str], ref_key: &str, field_name: &str) -> Result<ScriptRefInfo> {
+        fn make_info(
+            bp: &Blueprint,
+            patterns: &[&str],
+            ref_key: &str,
+            field_name: &str,
+        ) -> Result<ScriptRefInfo> {
             let validator = find_by_patterns(bp, patterns)
                 .with_context(|| format!("no validator matching patterns for '{field_name}'"))?;
 
             // Try ref_key first, then all validator title patterns
-            let reference = bp.find_reference(ref_key)
+            let reference = bp
+                .find_reference(ref_key)
                 .or_else(|| find_ref_by_patterns(bp, patterns))
                 .with_context(|| format!("no reference for '{field_name}'"))?;
 
@@ -161,7 +171,8 @@ impl Blueprint {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("'{field_name}' ref tx hash not 32 bytes"))?;
 
-            let ref_utxo = crate::cardano_types::TransactionInput::new(tx_hash, reference.tx_in.index);
+            let ref_utxo =
+                crate::cardano_types::TransactionInput::new(tx_hash, reference.tx_in.index);
 
             Ok(ScriptRefInfo {
                 hash: script_hash,
@@ -173,58 +184,109 @@ impl Blueprint {
         // Try to find constant_sum (optional — not all blueprints include it)
         let constant_sum = make_info(
             self,
-            &["constant_sum.withdraw", "constant_sum_module", "constant_sum", "constantSum"],
+            &[
+                "constant_sum.withdraw",
+                "constant_sum_module",
+                "constant_sum",
+                "constantSum",
+            ],
             "constant_sum.withdraw",
             "constant_sum",
-        ).ok();
+        )
+        .ok();
 
         // Try to find swap_order (optional — pre-redesign blueprints lack it)
         let swap_order = make_info(
             self,
-            &["swap_order.withdraw", "swap_order_module", "swap_order", "swapOrder"],
+            &[
+                "swap_order.withdraw",
+                "swap_order_module",
+                "swap_order",
+                "swapOrder",
+            ],
             "swap_order.withdraw",
             "swap_order",
-        ).ok();
+        )
+        .ok();
         // Same for basic_order (handles Deposit/Withdraw/Claim).
         let basic_order = make_info(
             self,
-            &["basic_order.withdraw", "basic_order_module", "basic_order", "basicOrder"],
+            &[
+                "basic_order.withdraw",
+                "basic_order_module",
+                "basic_order",
+                "basicOrder",
+            ],
             "basic_order.withdraw",
             "basic_order",
-        ).ok();
+        )
+        .ok();
         // Route/Fairness/Strategy constraint modules (PR #11).
         let route_order = make_info(
             self,
-            &["route_order.withdraw", "route_order_module", "route_order", "routeOrder", "route_constraint"],
+            &[
+                "route_order.withdraw",
+                "route_order_module",
+                "route_order",
+                "routeOrder",
+                "route_constraint",
+            ],
             "route_order.withdraw",
             "route_order",
-        ).ok();
+        )
+        .ok();
         let fairness_order = make_info(
             self,
-            &["fairness_order.withdraw", "fairness_order_module", "fairness_order", "fairnessOrder", "fairness_order_constraint"],
+            &[
+                "fairness_order.withdraw",
+                "fairness_order_module",
+                "fairness_order",
+                "fairnessOrder",
+                "fairness_order_constraint",
+            ],
             "fairness_order.withdraw",
             "fairness_order",
-        ).ok();
+        )
+        .ok();
         let strategy_order = make_info(
             self,
-            &["strategy_order.withdraw", "strategy_order_module", "strategy_order", "strategyOrder", "strategy_order_constraint"],
+            &[
+                "strategy_order.withdraw",
+                "strategy_order_module",
+                "strategy_order",
+                "strategyOrder",
+                "strategy_order_constraint",
+            ],
             "strategy_order.withdraw",
             "strategy_order",
-        ).ok();
+        )
+        .ok();
         // Fee constraint (optional — the once-per-scoop service-fee aggregator).
         let fee_constraint = make_info(
             self,
-            &["fee_constraint.withdraw", "fee.fee_constraint", "fee_constraint", "feeConstraint"],
+            &[
+                "fee_constraint.withdraw",
+                "fee.fee_constraint",
+                "fee_constraint",
+                "feeConstraint",
+            ],
             "fee_constraint.withdraw",
             "fee_constraint",
-        ).ok();
+        )
+        .ok();
         // Concentrated liquidity module (optional — only present when CL pools exist).
         let concentrated_liquidity = make_info(
             self,
-            &["concentrated_liquidity.withdraw", "concentrated_liquidity_module", "concentrated_liquidity", "concentratedLiquidity"],
+            &[
+                "concentrated_liquidity.withdraw",
+                "concentrated_liquidity_module",
+                "concentrated_liquidity",
+                "concentratedLiquidity",
+            ],
             "concentrated_liquidity.withdraw",
             "concentrated_liquidity",
-        ).ok();
+        )
+        .ok();
 
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
@@ -253,10 +315,7 @@ impl Validator {
     /// where script_cbor is the hex-decoded `compiled_code`.
     #[allow(dead_code)]
     pub fn compute_hash(&self) -> Result<Hash<28>> {
-        let code = self
-            .compiled_code
-            .as_ref()
-            .context("validator has no compiled_code")?;
+        let code = self.compiled_code.as_ref().context("validator has no compiled_code")?;
         let script_cbor = hex::decode(code).context("invalid hex in compiled_code")?;
         let mut preimage = Vec::with_capacity(1 + script_cbor.len());
         preimage.push(0x03);
@@ -301,7 +360,10 @@ mod tests {
     fn test_script_ref_info() {
         let bp = sample_blueprint();
         let info = bp.script_ref_info("vault", "vault").unwrap();
-        assert_eq!(hex::encode(info.hash), "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd");
+        assert_eq!(
+            hex::encode(info.hash),
+            "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd"
+        );
         assert_eq!(info.ref_utxo.0.index, 0);
     }
 
@@ -318,9 +380,9 @@ mod tests {
             eprintln!("skipping: {path} not present");
             return;
         };
-        let bp: Blueprint = serde_json::from_str(&data)
-            .expect("preview blueprint should parse");
-        let modules = bp.to_v4_module_scripts()
+        let bp: Blueprint = serde_json::from_str(&data).expect("preview blueprint should parse");
+        let modules = bp
+            .to_v4_module_scripts()
             .expect("to_v4_module_scripts should resolve every required validator");
         // Pool validator hash should be 28 bytes.
         assert_eq!(modules.pool.hash.as_slice().len(), 28);
@@ -329,11 +391,23 @@ mod tests {
         assert_eq!(modules.pool_mint.hash.as_slice().len(), 28);
         // The audit-final cs-launch deployment publishes CS + basic/strategy
         // only — CP and the swap constraint are absent by design.
-        assert!(modules.constant_sum.is_some(), "constant_sum must be present in the cs-launch blueprint");
+        assert!(
+            modules.constant_sum.is_some(),
+            "constant_sum must be present in the cs-launch blueprint"
+        );
         assert!(modules.constant_sum.as_ref().unwrap().script_cbor.is_some());
-        assert!(modules.basic_order.is_some(), "basic_order required for order dispatch");
-        assert!(modules.strategy_order.is_some(), "strategy_order required for strategy scoops");
-        assert!(modules.constant_product.is_none(), "cs-launch scope does not publish CP");
+        assert!(
+            modules.basic_order.is_some(),
+            "basic_order required for order dispatch"
+        );
+        assert!(
+            modules.strategy_order.is_some(),
+            "strategy_order required for strategy scoops"
+        );
+        assert!(
+            modules.constant_product.is_none(),
+            "cs-launch scope does not publish CP"
+        );
     }
 
     #[test]
