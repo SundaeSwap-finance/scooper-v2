@@ -1,5 +1,8 @@
 //! Builds a V4 scoop transaction using pallas 0.34 primitives.
 
+// pallas_primitives::Hash has "infallible" slice-to-hash conversions which panic at runtime
+#![allow(clippy::unnecessary_fallible_conversions)]
+
 use anyhow::{Context, Result, bail};
 use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_codec::utils::CborWrap;
@@ -237,6 +240,7 @@ pub struct MultiPoolBuildResult {
 /// - M vault spend redeemers (each with its own transcript)
 /// - M CP/FS/fairness entries (one per pool)
 /// - Fee split: TX_FEE / N total orders
+#[allow(clippy::too_many_arguments)]
 pub fn build_multi_pool_scoop_tx(
     plan: &ScoopPlan,
     settings: &SundaeV4Settings,
@@ -1011,12 +1015,12 @@ pub fn build_multi_pool_scoop_tx(
     let mut redeemer_info: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)> = Vec::new();
 
     let lookup_eu = |key: &RedeemersKey| -> ExUnits {
-        ex_units
-            .and_then(|eus| eus.iter().find(|(k, _)| k == key).map(|(_, eu)| eu.clone()))
-            .unwrap_or(ExUnits {
+        ex_units.and_then(|eus| eus.iter().find(|(k, _)| k == key).map(|(_, eu)| *eu)).unwrap_or(
+            ExUnits {
                 mem: exec.max_tx_ex_mem / 10,
                 steps: exec.max_tx_ex_steps / 10,
-            })
+            },
+        )
     };
 
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
@@ -1196,13 +1200,13 @@ pub fn build_multi_pool_scoop_tx(
     // One Spend redeemer per order input — same shape (`Scoop { own_input_index }`)
     // regardless of whether the order is a Swap or Deposit. The order validator
     // dispatches on the constraint tag inside its withdraw handler.
-    for idx in 0..n_orders {
+    for input_index in order_sorted_indices.into_iter().take(n_orders) {
         let order_key = RedeemersKey {
             tag: RedeemerTag::Spend,
-            index: order_sorted_indices[idx] as u32,
+            index: input_index as u32,
         };
         let order_redeemer = OrderRedeemer::Scoop {
-            own_input_index: order_sorted_indices[idx] as u64,
+            own_input_index: input_index as u64,
         };
         redeemer_info.push((
             order_key.clone(),
@@ -1343,20 +1347,14 @@ pub fn build_multi_pool_scoop_tx(
     if has_lp_mint_or_burn {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
-    if has_cp {
-        if let Some(cp) = &exec.module_scripts.constant_product {
-            all_ref_inputs.push(cp.ref_utxo.0.clone());
-        }
+    if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
+        all_ref_inputs.push(cp.ref_utxo.0.clone());
     }
-    if has_cs {
-        if let Some(cs) = &exec.module_scripts.constant_sum {
-            all_ref_inputs.push(cs.ref_utxo.0.clone());
-        }
+    if has_cs && let Some(cs) = &exec.module_scripts.constant_sum {
+        all_ref_inputs.push(cs.ref_utxo.0.clone());
     }
-    if has_cl {
-        if let Some(cl) = &exec.module_scripts.concentrated_liquidity {
-            all_ref_inputs.push(cl.ref_utxo.0.clone());
-        }
+    if has_cl && let Some(cl) = &exec.module_scripts.concentrated_liquidity {
+        all_ref_inputs.push(cl.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -1389,9 +1387,8 @@ pub fn build_multi_pool_scoop_tx(
     // OrderConfig requires the fee constraint. Every continuation execution
     // is charged exactly base_fee; terminal fills keep terminal settlement.
     let fee_sri = exec.module_scripts.fee_constraint.as_ref();
-    let fee_active = fee_sri
-        .map(|sri| required_constraint_hashes.contains(&sri.hash.as_ref().to_vec()))
-        .unwrap_or(false);
+    let fee_active =
+        fee_sri.map(|sri| required_constraint_hashes.contains(sri.hash.as_ref())).unwrap_or(false);
     let fee_base: Option<u64> = if fee_active {
         if m_pools == 0 {
             bail!("fee-bearing orders need a designated pool but the plan has no pool batches");
@@ -1413,10 +1410,10 @@ pub fn build_multi_pool_scoop_tx(
             &exec.module_scripts.strategy_order,
             &exec.module_scripts.fee_constraint,
         ] {
-            if let Some(sri) = slot {
-                if sri.hash.as_ref() == hash {
-                    return Some(sri);
-                }
+            if let Some(sri) = slot
+                && sri.hash.as_ref() == hash
+            {
+                return Some(sri);
             }
         }
         None
@@ -1438,10 +1435,8 @@ pub fn build_multi_pool_scoop_tx(
         all_ref_inputs.push(oc.input.0.clone());
     }
     all_ref_inputs.push(settings.input.0.clone());
-    if fee_active {
-        if let Some(fs) = fee_settings {
-            all_ref_inputs.push(fs.input.0.clone());
-        }
+    if fee_active && let Some(fs) = fee_settings {
+        all_ref_inputs.push(fs.input.0.clone());
     }
 
     // Sort the reference inputs canonically — (txId bytes, output_index) —
@@ -1549,33 +1544,27 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // Conditionally add CP withdrawal
-    if has_cp {
-        if let Some(cp_script) = &exec.module_scripts.constant_product {
-            let cp_redeemer = ConstantProductRedeemer::Operate {
-                entries: cp_entries,
-            };
-            withdrawals.push((reward_account(&cp_script.hash), cp_redeemer.to_plutus()));
-        }
+    if has_cp && let Some(cp_script) = &exec.module_scripts.constant_product {
+        let cp_redeemer = ConstantProductRedeemer::Operate {
+            entries: cp_entries,
+        };
+        withdrawals.push((reward_account(&cp_script.hash), cp_redeemer.to_plutus()));
     }
 
     // Conditionally add CS withdrawal
-    if has_cs {
-        if let Some(cs_script) = &exec.module_scripts.constant_sum {
-            let cs_redeemer = ConstantSumRedeemer::Operate {
-                entries: cs_entries,
-            };
-            withdrawals.push((reward_account(&cs_script.hash), cs_redeemer.to_plutus()));
-        }
+    if has_cs && let Some(cs_script) = &exec.module_scripts.constant_sum {
+        let cs_redeemer = ConstantSumRedeemer::Operate {
+            entries: cs_entries,
+        };
+        withdrawals.push((reward_account(&cs_script.hash), cs_redeemer.to_plutus()));
     }
 
     // Conditionally add CL withdrawal
-    if has_cl {
-        if let Some(cl_script) = &exec.module_scripts.concentrated_liquidity {
-            let cl_redeemer = ConcentratedLiquidityRedeemer::Operate {
-                entries: cl_entries,
-            };
-            withdrawals.push((reward_account(&cl_script.hash), cl_redeemer.to_plutus()));
-        }
+    if has_cl && let Some(cl_script) = &exec.module_scripts.concentrated_liquidity {
+        let cl_redeemer = ConcentratedLiquidityRedeemer::Operate {
+            entries: cl_entries,
+        };
+        withdrawals.push((reward_account(&cl_script.hash), cl_redeemer.to_plutus()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in
@@ -1598,7 +1587,7 @@ pub fn build_multi_pool_scoop_tx(
     };
     let classify_hash = |h: &[u8]| -> Option<&'static str> {
         let matches =
-            |s: &Option<ScriptRefInfo>| s.as_ref().map_or(false, |si| si.hash.as_ref() == h);
+            |s: &Option<ScriptRefInfo>| s.as_ref().is_some_and(|si| si.hash.as_ref() == h);
         if matches(&exec.module_scripts.swap_order) {
             Some("swap_order")
         } else if matches(&exec.module_scripts.basic_order) {
@@ -1632,7 +1621,8 @@ pub fn build_multi_pool_scoop_tx(
     // the op's position in its pool's `ops_order` (== the pool's transcript
     // index). `swap_op_idx` lets a direct (single-pool) swap emit its true
     // transcript index instead of a hardcoded 0.
-    let mut per_route_keyed: Vec<Vec<((usize, usize), u64, u64)>> = vec![Vec::new(); routes.len()];
+    type RouteIndices = ((usize, usize), u64, u64); // ((hop_idx, split_idx), pool_input_idx, op_idx)
+    let mut per_route_keyed: Vec<Vec<RouteIndices>> = vec![Vec::new(); routes.len()];
     let mut swap_op_idx: std::collections::HashMap<(usize, usize), u64> =
         std::collections::HashMap::new();
     for (bi, b) in batches.iter().enumerate() {
@@ -1715,12 +1705,12 @@ pub fn build_multi_pool_scoop_tx(
         let mut last_claim: BTreeMap<u64, u64> = BTreeMap::new();
         for steps in &route_steps_per_order {
             for (pin, tsi) in steps {
-                if let Some(last) = last_claim.get(pin) {
-                    if tsi <= last {
-                        anyhow::bail!(
-                            "route mandate violation: pool input {pin} transcript step {tsi} claimed after step {last} along the canonical order walk (per-pool op sequencing must follow canonical order-input order)"
-                        );
-                    }
+                if let Some(last) = last_claim.get(pin)
+                    && tsi <= last
+                {
+                    anyhow::bail!(
+                        "route mandate violation: pool input {pin} transcript step {tsi} claimed after step {last} along the canonical order walk (per-pool op sequencing must follow canonical order-input order)"
+                    );
                 }
                 last_claim.insert(*pin, *tsi);
             }
@@ -1841,8 +1831,7 @@ pub fn build_multi_pool_scoop_tx(
             }
         }
         for (hash, redeemer) in seen {
-            let h: pallas_primitives::Hash<28> =
-                hash.as_slice().try_into().expect("verified 28-byte script hash");
+            let h: pallas_primitives::Hash<28> = hash.as_slice().into();
             withdrawals.push((reward_account(&h), redeemer));
         }
     }
@@ -2496,7 +2485,7 @@ pub fn build_multi_pool_scoop_tx(
         {
             let mut agg: std::collections::BTreeMap<Vec<u8>, i64> = Default::default();
             for p in &butane_pieces {
-                butane_policy = Some(p.mint_policy.as_slice().try_into().expect("28-byte policy"));
+                butane_policy = Some(p.mint_policy.as_slice().into());
                 for (name, qty) in &p.mint_assets {
                     *agg.entry(name.clone()).or_default() += qty;
                 }
@@ -2539,32 +2528,44 @@ pub fn build_multi_pool_scoop_tx(
             };
             // Assemble the multi-policy mint map in sorted-policy order and
             // assign each policy's mint redeemer its map index.
-            let mut policies: Vec<(
-                pallas_primitives::Hash<28>,
-                Vec<(PallasBytes, NonZeroInt)>,
-                Option<pallas_primitives::PlutusData>,
-            )> = Vec::new();
+            struct PolicyMintMap {
+                policy: pallas_primitives::Hash<28>,
+                asset_pairs: Vec<(PallasBytes, NonZeroInt)>,
+                mint_redeemer_data: Option<pallas_primitives::PlutusData>,
+            }
+            let mut policies: Vec<PolicyMintMap> = Vec::new();
             if !asset_pairs.is_empty() {
-                policies.push((policy, asset_pairs, mint_redeemer_data));
+                policies.push(PolicyMintMap {
+                    policy,
+                    asset_pairs,
+                    mint_redeemer_data,
+                });
             }
             if let (Some(bp), false) = (butane_policy, butane_pairs.is_empty()) {
                 let butane_redeemer = butane_pieces
                     .first()
                     .map(|p| p.mint_redeemer.clone())
                     .expect("butane pairs imply pieces");
-                policies.push((bp, butane_pairs, Some(butane_redeemer)));
+                policies.push(PolicyMintMap {
+                    policy: bp,
+                    asset_pairs: butane_pairs,
+                    mint_redeemer_data: Some(butane_redeemer),
+                });
             }
-            policies.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+            policies.sort_by(|a, b| a.policy.as_ref().cmp(b.policy.as_ref()));
             let mut map_entries = Vec::new();
-            for (idx, (pol, pairs, redeemer)) in policies.into_iter().enumerate() {
-                if let Some(data) = redeemer {
+            for (idx, policy) in policies.into_iter().enumerate() {
+                if let Some(data) = policy.mint_redeemer_data {
                     let key = RedeemersKey {
                         tag: RedeemerTag::Mint,
                         index: idx as u32,
                     };
                     redeemer_info.push((key.clone(), data, lookup_eu(&key)));
                 }
-                map_entries.push((pol, NonEmptyKeyValuePairs::Def(pairs)));
+                map_entries.push((
+                    policy.policy,
+                    NonEmptyKeyValuePairs::Def(policy.asset_pairs),
+                ));
             }
             Some(NonEmptyKeyValuePairs::Def(map_entries))
         }
@@ -2583,7 +2584,7 @@ pub fn build_multi_pool_scoop_tx(
                 key.clone(),
                 RedeemersValue {
                     data: data.clone(),
-                    ex_units: eu.clone(),
+                    ex_units: *eu,
                 },
             )
         })
@@ -2839,57 +2840,57 @@ pub fn build_multi_pool_scoop_tx(
             );
         }
     }
-    if !butane_pieces.is_empty() {
-        if let Some(rt) = butane {
-            for (input, output) in rt.resolved_ref_outputs() {
-                if let conway::TransactionOutput::Legacy(body) = &output {
-                    resolved_ref_inputs.insert(
-                        input,
-                        ResolvedTxOut {
-                            address: body.address.to_vec(),
-                            value: legacy_value_to_internal(&body.amount),
-                            datum: match &body.datum_hash {
-                                Some(h) => DatumOption::DatumHash(*h),
-                                None => DatumOption::None,
-                            },
-                            script_ref: None,
-                        },
-                    );
-                    continue;
-                }
-                let conway::TransactionOutput::PostAlonzo(body) = &output else {
-                    continue;
-                };
+    if !butane_pieces.is_empty()
+        && let Some(rt) = butane
+    {
+        for (input, output) in rt.resolved_ref_outputs() {
+            if let conway::TransactionOutput::Legacy(body) = &output {
                 resolved_ref_inputs.insert(
                     input,
                     ResolvedTxOut {
                         address: body.address.to_vec(),
-                        value: conway_value_to_internal(&body.value),
-                        datum: match &body.datum_option {
-                            Some(conway::PseudoDatumOption::Data(d)) => {
-                                let pd: pallas_primitives::PlutusData =
-                                    minicbor::decode(&minicbor::to_vec(&d.0).unwrap())
-                                        .expect("re-decode inline datum");
-                                DatumOption::InlineDatum(pd)
-                            }
-                            Some(conway::PseudoDatumOption::Hash(h)) => DatumOption::DatumHash(*h),
+                        value: legacy_value_to_internal(&body.amount),
+                        datum: match &body.datum_hash {
+                            Some(h) => DatumOption::DatumHash(*h),
                             None => DatumOption::None,
                         },
-                        script_ref: body.script_ref.as_ref().map(|sr| {
-                            let (tag, bytes): (u8, &[u8]) = match &sr.0 {
-                                conway::PseudoScript::PlutusV1Script(s) => (1, s.0.as_ref()),
-                                conway::PseudoScript::PlutusV2Script(s) => (2, s.0.as_ref()),
-                                conway::PseudoScript::PlutusV3Script(s) => (3, s.0.as_ref()),
-                                conway::PseudoScript::NativeScript(_) => (0, &[]),
-                            };
-                            let mut pre = Vec::with_capacity(1 + bytes.len());
-                            pre.push(tag);
-                            pre.extend_from_slice(bytes);
-                            Hasher::<224>::hash(&pre)
-                        }),
+                        script_ref: None,
                     },
                 );
+                continue;
             }
+            let conway::TransactionOutput::PostAlonzo(body) = &output else {
+                continue;
+            };
+            resolved_ref_inputs.insert(
+                input,
+                ResolvedTxOut {
+                    address: body.address.to_vec(),
+                    value: conway_value_to_internal(&body.value),
+                    datum: match &body.datum_option {
+                        Some(conway::PseudoDatumOption::Data(d)) => {
+                            let pd: pallas_primitives::PlutusData =
+                                minicbor::decode(&minicbor::to_vec(&d.0).unwrap())
+                                    .expect("re-decode inline datum");
+                            DatumOption::InlineDatum(pd)
+                        }
+                        Some(conway::PseudoDatumOption::Hash(h)) => DatumOption::DatumHash(*h),
+                        None => DatumOption::None,
+                    },
+                    script_ref: body.script_ref.as_ref().map(|sr| {
+                        let (tag, bytes): (u8, &[u8]) = match &sr.0 {
+                            conway::PseudoScript::PlutusV1Script(s) => (1, s.0.as_ref()),
+                            conway::PseudoScript::PlutusV2Script(s) => (2, s.0.as_ref()),
+                            conway::PseudoScript::PlutusV3Script(s) => (3, s.0.as_ref()),
+                            conway::PseudoScript::NativeScript(_) => (0, &[]),
+                        };
+                        let mut pre = Vec::with_capacity(1 + bytes.len());
+                        pre.push(tag);
+                        pre.extend_from_slice(bytes);
+                        Hasher::<224>::hash(&pre)
+                    }),
+                },
+            );
         }
     }
     resolved_ref_inputs.insert(
@@ -2933,54 +2934,52 @@ pub fn build_multi_pool_scoop_tx(
     }
     // The FeeSettings node — the fee constraint locates it among reference
     // inputs by its entry token, then reads base_fee from its datum.
-    if fee_active {
-        if let Some(fs) = fee_settings {
-            let mut value = crate::cardano_types::Value::default();
-            value.insert(
-                &AssetClass {
-                    policy: vec![],
-                    token: vec![],
-                },
-                BigInt::from(2_000_000u64),
-            );
-            // The settings-mint policy: read it off the global settings
-            // UTxO's value (the empty-name settings NFT).
-            use num_traits::Signed;
-            let settings_policy: Vec<u8> = settings
-                .value
-                .0
-                .iter()
-                .find_map(|(policy, tokens)| {
-                    // Skip the lovelace entry (empty policy, empty name) —
-                    // the settings NFT is the empty-NAME token under the
-                    // 28-byte settings-mint policy.
-                    (!policy.is_empty()
-                        && tokens.iter().any(|(name, qty)| name.is_empty() && qty.is_positive()))
-                    .then(|| policy.clone())
-                })
-                .unwrap_or_default();
-            value.insert(
-                &AssetClass {
-                    policy: settings_policy,
-                    token: fs.token.clone(),
-                },
-                BigInt::from(1u64),
-            );
-            resolved_ref_inputs.insert(
-                fs.input.clone(),
-                ResolvedTxOut {
-                    address: settings_addr_bytes.clone(),
-                    value,
-                    datum: DatumOption::InlineDatum(
-                        crate::sundaev4::types::FeeSettingsDatum {
-                            base_fee: BigInt::from(fs.base_fee),
-                        }
-                        .to_plutus(),
-                    ),
-                    script_ref: None,
-                },
-            );
-        }
+    if fee_active && let Some(fs) = fee_settings {
+        let mut value = crate::cardano_types::Value::default();
+        value.insert(
+            &AssetClass {
+                policy: vec![],
+                token: vec![],
+            },
+            BigInt::from(2_000_000u64),
+        );
+        // The settings-mint policy: read it off the global settings
+        // UTxO's value (the empty-name settings NFT).
+        use num_traits::Signed;
+        let settings_policy: Vec<u8> = settings
+            .value
+            .0
+            .iter()
+            .find_map(|(policy, tokens)| {
+                // Skip the lovelace entry (empty policy, empty name) —
+                // the settings NFT is the empty-NAME token under the
+                // 28-byte settings-mint policy.
+                (!policy.is_empty()
+                    && tokens.iter().any(|(name, qty)| name.is_empty() && qty.is_positive()))
+                .then(|| policy.clone())
+            })
+            .unwrap_or_default();
+        value.insert(
+            &AssetClass {
+                policy: settings_policy,
+                token: fs.token.clone(),
+            },
+            BigInt::from(1u64),
+        );
+        resolved_ref_inputs.insert(
+            fs.input.clone(),
+            ResolvedTxOut {
+                address: settings_addr_bytes.clone(),
+                value,
+                datum: DatumOption::InlineDatum(
+                    crate::sundaev4::types::FeeSettingsDatum {
+                        base_fee: BigInt::from(fs.base_fee),
+                    }
+                    .to_plutus(),
+                ),
+                script_ref: None,
+            },
+        );
     }
 
     // ── Step 14: Build predicted pool UTxOs ─────────────────────────────────
@@ -3029,7 +3028,7 @@ pub fn build_multi_pool_scoop_tx(
     // tx, for the Conway-era tiered ref-script fee component.
     let butane_ref_script_bytes: u64 = butane_pieces
         .first()
-        .and_then(|_| butane)
+        .and(butane)
         .map(|rt| {
             // Every butane ref-script UTxO rides in all_ref_inputs when
             // legs are present; their bytes pay the tiered Conway
@@ -3770,10 +3769,12 @@ mod validity_tests {
     #[test]
     fn window_covers_a_full_preview_block_gap() {
         // Five minutes of TTL, and the observed gap that broke us was three.
-        assert!(
-            VALIDITY_RANGE >= 300,
-            "TTL must outlast a multi-block preview gap",
-        );
+        const {
+            assert!(
+                VALIDITY_RANGE >= 300,
+                "TTL must outlast a multi-block preview gap",
+            )
+        };
         let w = ValidityWindow::new(500, 500);
         assert_eq!(w.ttl - w.start, VALIDITY_RANGE);
     }
