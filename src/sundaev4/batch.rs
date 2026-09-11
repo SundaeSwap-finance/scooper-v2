@@ -366,7 +366,7 @@ fn find_pool_by_lp_asset(
             continue;
         }
         let ident_bytes = &asset.token[LP_LABEL.len()..];
-        for (ident, _) in pools {
+        for ident in pools.keys() {
             if ident.to_bytes() == ident_bytes {
                 return Some(ident.clone());
             }
@@ -416,7 +416,7 @@ pub fn assemble_batch(
             }
             // Canonical-append rule (see doc comment): retry passes may only
             // add orders that sort after everything already selected.
-            if selected.last().map_or(false, |s| order.input < s.order.input) {
+            if selected.last().is_some_and(|s| order.input < s.order.input) {
                 continue;
             }
 
@@ -512,7 +512,7 @@ pub fn try_execute_order(
     if !dy.is_positive() {
         return Err(format!(
             "swap result not positive: dy={dy} dx={dx} reserves=[{}, {}] total_lp={running_total_lp}",
-            &running_assets[input_idx].1, &running_assets[output_idx].1,
+            running_assets[input_idx].1, running_assets[output_idx].1,
         ));
     }
 
@@ -521,7 +521,7 @@ pub fn try_execute_order(
     if &dy < min_qty {
         return Err(format!(
             "computed dy={dy} below min_received={min_qty} (dx={dx}, reserves=[in={}, out={}])",
-            &running_assets[input_idx].1, &running_assets[output_idx].1,
+            running_assets[input_idx].1, running_assets[output_idx].1,
         ));
     }
 
@@ -834,12 +834,12 @@ pub fn resolve_proportional_deposit(
             }
             Some(q)
         });
-        if let Some(min_lp) = min_lp {
-            if &lp_minted < min_lp {
-                return Err(format!(
-                    "deposit fill mints {lp_minted} LP, below the order's minimum {min_lp}"
-                ));
-            }
+        if let Some(min_lp) = min_lp
+            && &lp_minted < min_lp
+        {
+            return Err(format!(
+                "deposit fill mints {lp_minted} LP, below the order's minimum {min_lp}"
+            ));
         }
     }
 
@@ -1159,6 +1159,7 @@ mod tests {
 
     // The on-chain CL non-swap invariant (cl_check.ak): the resolved deposit
     // fill must satisfy va1·vb1·L0² >= va0·vb0·L1².
+    #[allow(clippy::too_many_arguments)]
     fn cl_invariant_holds(
         a0: &BigInt,
         b0: &BigInt,

@@ -53,7 +53,7 @@ pub fn compute_module_state_preimages(
 
     let configs = [
         minicbor::to_vec(
-            &ConstantProductConfig {
+            ConstantProductConfig {
                 fee: Rational {
                     num: BigInt::from(fee.0),
                     den: BigInt::from(fee.1),
@@ -63,7 +63,7 @@ pub fn compute_module_state_preimages(
         )
         .unwrap(),
         minicbor::to_vec(
-            &FeeSplitConfig {
+            FeeSplitConfig {
                 protocol_share: Rational {
                     num: BigInt::from(protocol_share.0),
                     den: BigInt::from(protocol_share.1),
@@ -148,6 +148,7 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn admin_server(
     config: ServerConfig,
     network: String,
@@ -1106,7 +1107,7 @@ impl AdminServer {
         }
 
         // /v3/... routes and backward-compatible aliases (/ → /v3/)
-        let v3_path = path.strip_prefix("/v3").or_else(|| Some(path)).unwrap();
+        let v3_path = path.strip_prefix("/v3").unwrap_or(path);
 
         if let Some(pool_id) = v3_path.strip_prefix("/pool/") {
             return self.v3_query_pool(pool_id).await;

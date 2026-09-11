@@ -4,6 +4,9 @@
 //! compiled code) and their on-chain reference UTxOs. This is protocol-agnostic
 //! and can represent V3, V4, stableswap, or future protocol versions.
 
+// pallas_primitives::Hash has "infallible" slice-to-hash conversions which panic at runtime
+#![allow(clippy::unnecessary_fallible_conversions)]
+
 use anyhow::{Context, Result};
 use pallas_crypto::hash::Hasher;
 use pallas_primitives::Hash;

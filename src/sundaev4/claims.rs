@@ -214,6 +214,7 @@ fn gcd(mut a: BigInt, mut b: BigInt) -> BigInt {
 /// profit — shrinks. The smallest floor-meeting dx is therefore also the
 /// most profitable one. When no dx meets the floor, returns the plan with
 /// the highest total so callers can report how close the intent is.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_claim_meeting_floor(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
@@ -475,10 +476,10 @@ pub fn plan_rebalance_claim(
         .map(|(d, p)| &d * p)
         .fold(BigInt::from(0), |acc, x| acc + x);
     let v_increase_op = &compute_v(&after_op, prices) - &v_b;
-    if !(&(&v_increase_op * bf_den) <= &(&input_value_op * bf_num)) {
+    if !((&v_increase_op * bf_den) <= (&input_value_op * bf_num)) {
         return Err("rebalance op portion underpays the pool's balance_fee");
     }
-    if !(&(&(&v_increase_op + &BigInt::from(1)) * bf_den) > &(&input_value_op * bf_num)) {
+    if !((&(&v_increase_op + &BigInt::from(1)) * bf_den) > (&input_value_op * bf_num)) {
         return Err("rebalance op portion overpays the pool's balance_fee");
     }
 
@@ -833,10 +834,10 @@ mod tests {
             }
         }
         let v_increase_op = &v_op - &v_before;
-        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+        if !((&v_increase_op * bf.1) <= (&input_value_op * bf.0)) {
             return false;
         }
-        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+        if !((&(&v_increase_op + &BigInt::from(1)) * bf.1) > (&input_value_op * bf.0)) {
             return false;
         }
         // Actual after-state (claim extracted) must match the plan.
@@ -1009,10 +1010,10 @@ mod tests {
         }
         let v_b = compute_v(before, prices);
         let v_increase_op = &compute_v(&after_op, prices) - &v_b;
-        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+        if !((&v_increase_op * bf.1) <= (&input_value_op * bf.0)) {
             return false;
         }
-        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+        if !((&(&v_increase_op + &BigInt::from(1)) * bf.1) > (&input_value_op * bf.0)) {
             return false;
         }
         // Claim well-formedness, no-overshoot guard, cap_b.

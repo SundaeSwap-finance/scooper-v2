@@ -402,12 +402,11 @@ impl BootstrapProvider for KupoProvider {
     async fn fetch_tip(&self) -> Result<(u64, String)> {
         // Fetch the most recent checkpoint which includes the block header hash.
         let cp_url = format!("{}/checkpoints", self.url);
-        if let Ok(resp) = self.client.get(&cp_url).send().await {
-            if let Ok(checkpoints) = resp.json::<Vec<KupoCheckpoint>>().await {
-                if let Some(cp) = checkpoints.last() {
-                    return Ok((cp.slot_no, cp.header_hash.clone()));
-                }
-            }
+        if let Ok(resp) = self.client.get(&cp_url).send().await
+            && let Ok(checkpoints) = resp.json::<Vec<KupoCheckpoint>>().await
+            && let Some(cp) = checkpoints.last()
+        {
+            return Ok((cp.slot_no, cp.header_hash.clone()));
         }
         // Fallback to health endpoint (no block hash available).
         let url = format!("{}/health", self.url);
@@ -778,11 +777,11 @@ impl BootstrapProvider for BlockfrostProvider {
         for asset in &nft_assets {
             let url = format!("{}/assets/{}/addresses", self.url, asset);
             let resp = self.client.get(&url).header("project_id", &self.project_id).send().await;
-            if let Ok(resp) = resp {
-                if let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await {
-                    for h in holders {
-                        addresses.insert(h.address);
-                    }
+            if let Ok(resp) = resp
+                && let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await
+            {
+                for h in holders {
+                    addresses.insert(h.address);
                 }
             }
         }
@@ -1232,20 +1231,14 @@ async fn lookup_pool_module_configs(
     let first_tx =
         pallas_traverse::MultiEraTx::decode(&first_cbor).context("decode first tx CBOR")?;
     let first_tx_hash = hex::encode(first_tx.hash());
-    if want_cs {
-        if let Some(h) = cs_hash.as_ref() {
-            out.cs = sundaev4::extract_cs_config_from_tx(&first_tx, h);
-        }
+    if want_cs && let Some(h) = cs_hash.as_ref() {
+        out.cs = sundaev4::extract_cs_config_from_tx(&first_tx, h);
     }
-    if want_cp {
-        if let Some(h) = cp_hash.as_ref() {
-            out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, h);
-        }
+    if want_cp && let Some(h) = cp_hash.as_ref() {
+        out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, h);
     }
-    if want_cl {
-        if let Some(h) = cl_hash.as_ref() {
-            out.cl = sundaev4::extract_cl_config_from_tx(&first_tx, h);
-        }
+    if want_cl && let Some(h) = cl_hash.as_ref() {
+        out.cl = sundaev4::extract_cl_config_from_tx(&first_tx, h);
     }
     out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, &fs_hash);
 
@@ -1277,20 +1270,23 @@ async fn lookup_pool_module_configs(
             let cbor = provider.fetch_tx_cbor(&tx_hash).await?;
             let tx =
                 pallas_traverse::MultiEraTx::decode(&cbor).context("decode walk-back tx CBOR")?;
-            if want_cs && out.cs.is_none() {
-                if let Some(h) = cs_hash.as_ref() {
-                    out.cs = sundaev4::extract_cs_config_from_tx(&tx, h);
-                }
+            if want_cs
+                && out.cs.is_none()
+                && let Some(h) = cs_hash.as_ref()
+            {
+                out.cs = sundaev4::extract_cs_config_from_tx(&tx, h);
             }
-            if want_cp && out.cp.is_none() {
-                if let Some(h) = cp_hash.as_ref() {
-                    out.cp = sundaev4::extract_cp_config_from_tx(&tx, h);
-                }
+            if want_cp
+                && out.cp.is_none()
+                && let Some(h) = cp_hash.as_ref()
+            {
+                out.cp = sundaev4::extract_cp_config_from_tx(&tx, h);
             }
-            if want_cl && out.cl.is_none() {
-                if let Some(h) = cl_hash.as_ref() {
-                    out.cl = sundaev4::extract_cl_config_from_tx(&tx, h);
-                }
+            if want_cl
+                && out.cl.is_none()
+                && let Some(h) = cl_hash.as_ref()
+            {
+                out.cl = sundaev4::extract_cl_config_from_tx(&tx, h);
             }
             if out.fee_split.is_none() {
                 out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, &fs_hash);
@@ -1452,7 +1448,7 @@ async fn bootstrap_v4(
                         hex::encode(pool_datum.identifier.to_bytes())
                     )
                 })?;
-                let cbor = minicbor::to_vec(&cs_cfg.clone().to_plutus())
+                let cbor = minicbor::to_vec(cs_cfg.clone().to_plutus())
                     .context("bootstrap v4: encode ConstantSumConfig CBOR")?;
                 new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                     pool_id: pool_datum.identifier.to_bytes().to_vec(),
@@ -1468,7 +1464,7 @@ async fn bootstrap_v4(
             }
             if need_cp {
                 if let Some(cp_cfg) = recovered.cp {
-                    let cbor = minicbor::to_vec(&cp_cfg.clone().to_plutus())
+                    let cbor = minicbor::to_vec(cp_cfg.clone().to_plutus())
                         .context("bootstrap v4: encode ConstantProductConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
@@ -1492,7 +1488,7 @@ async fn bootstrap_v4(
             }
             if need_cl {
                 if let Some(cl_cfg) = recovered.cl {
-                    let cbor = minicbor::to_vec(&cl_cfg.clone().to_plutus())
+                    let cbor = minicbor::to_vec(cl_cfg.clone().to_plutus())
                         .context("bootstrap v4: encode ConcentratedLiquidityConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
@@ -1516,7 +1512,7 @@ async fn bootstrap_v4(
             }
             if need_fs {
                 if let Some(fs_cfg) = recovered.fee_split {
-                    let cbor = minicbor::to_vec(&fs_cfg.clone().to_plutus())
+                    let cbor = minicbor::to_vec(fs_cfg.clone().to_plutus())
                         .context("bootstrap v4: encode FeeSplitConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
@@ -1881,7 +1877,7 @@ async fn bootstrap_v4(
             ShelleyDelegationPart::Null,
         )
         .to_vec();
-        for (_, pool) in &pools {
+        for pool in pools.values() {
             let datum_bytes = pool.pool_datum.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
                 txo_id: pool.input.clone(),
@@ -1981,7 +1977,7 @@ async fn bootstrap_v4(
                     .0
                     .entry(protocol.settings_nft.policy.clone())
                     .or_default()
-                    .insert(want.clone().into(), crate::bigint::BigInt::from(1u64));
+                    .insert(want.clone(), crate::bigint::BigInt::from(1u64));
             }
             persisted_txos.push(PersistedTxo {
                 txo_id: fs.input.clone(),

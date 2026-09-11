@@ -39,7 +39,7 @@ impl ScriptStore {
         >,
     ) -> Result<Self> {
         let mut store = BTreeMap::new();
-        for (_input, txo) in ref_utxo_outputs {
+        for txo in ref_utxo_outputs.values() {
             if let Some(cardano_types::ScriptRef::PlutusV3(script)) = &txo.script_ref {
                 let script_cbor: &[u8] = script.as_ref();
                 // PlutusV3 script hash = blake2b_224(0x03 || script_cbor)
@@ -150,6 +150,7 @@ pub struct FailedScriptContext {
 ///
 /// For each redeemer, builds the appropriate ScriptContext, looks up the script,
 /// applies CIP-0069 convention (single argument for V3), and evaluates.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     redeemers: &[(RedeemersKey, PlutusData, ExUnits)],

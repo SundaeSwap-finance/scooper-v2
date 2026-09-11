@@ -497,28 +497,27 @@ impl SundaeV4Indexer {
             let tx_id = stxo.spent_tx_id.map(hex::encode).unwrap_or_default();
             match stxo.txo.txo_type.as_str() {
                 "order" => {
-                    if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums) {
-                        if let Ok(constraint) =
+                    if let Some(od) = output.datum.parse::<crate::sundaev4::OrderDatum>(&datums)
+                        && let Ok(constraint) =
                             crate::sundaev4::Constraint::from_order_datum_with_strategy(
                                 &od,
                                 &swap_order_hash,
                                 &basic_order_hash,
                                 &strategy_order_hash,
                             )
-                        {
-                            state.spent_orders.push(SpentOrder {
-                                order: Arc::new(SundaeV4Order {
-                                    input: stxo.txo.txo_id,
-                                    datum: od,
-                                    constraint,
-                                    value: output.value,
-                                    slot: stxo.txo.created_slot,
-                                }),
-                                reason: SpentOrderReason::Unknown,
-                                tx_id,
-                                slot: stxo.spent_slot,
-                            });
-                        }
+                    {
+                        state.spent_orders.push(SpentOrder {
+                            order: Arc::new(SundaeV4Order {
+                                input: stxo.txo.txo_id,
+                                datum: od,
+                                constraint,
+                                value: output.value,
+                                slot: stxo.txo.created_slot,
+                            }),
+                            reason: SpentOrderReason::Unknown,
+                            tx_id,
+                            slot: stxo.spent_slot,
+                        });
                     }
                 }
                 "pool" => {
@@ -850,7 +849,7 @@ impl ChainIndex for SundaeV4Indexer {
             }
             self.tip_event_counter += 1;
             let at_tip = state.network_tip_slot.is_some_and(|net| self.loaded_slot + 10 >= net);
-            if at_tip || self.tip_event_counter % 100 == 0 {
+            if at_tip || self.tip_event_counter.is_multiple_of(100) {
                 let _ = self.event_tx.send((
                     info.slot,
                     vec![IndexEvent::TipAdvanced {
@@ -871,7 +870,7 @@ impl ChainIndex for SundaeV4Indexer {
         // Throttle tip events: every 100 blocks while syncing, every block once synced.
         self.tip_event_counter += 1;
         let at_tip = state.network_tip_slot.is_some_and(|net| info.slot + 10 >= net);
-        if at_tip || self.tip_event_counter % 100 == 0 {
+        if at_tip || self.tip_event_counter.is_multiple_of(100) {
             let _ = self.event_tx.send((
                 info.slot,
                 vec![IndexEvent::TipAdvanced {
@@ -1032,70 +1031,67 @@ impl ChainIndex for SundaeV4Indexer {
                     // redeemer, persist it and remember it for future blocks.
                     if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantSum { .. }) =
                         (cs_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cs.contains_key(&pool_id)
                     {
-                        if !module_cache.cs.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConstantSumConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cs_module_hash_bytes
-                                    .clone()
-                                    .expect("cs_module_hash present when CS pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cs.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CS pool config from Create redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantSumConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cs_module_hash_bytes
+                                .clone()
+                                .expect("cs_module_hash present when CS pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cs.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CS pool config from Create redeemer"
+                        );
                     }
                     // Same for CP: persist on first sighting (Create or Operate).
                     if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
                         (cp_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cp.contains_key(&pool_id)
                     {
-                        if !module_cache.cp.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConstantProductConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cp_module_hash_bytes
-                                    .clone()
-                                    .expect("cp_module_hash present when CP pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cp.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CP pool config from redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantProductConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cp_module_hash_bytes
+                                .clone()
+                                .expect("cp_module_hash present when CP pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cp.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CP pool config from redeemer"
+                        );
                     }
                     // Same for CL: persist the spa/spb/fee from Create.
                     if let (
                         Some(cfg),
                         crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. },
                     ) = (cl_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cl.contains_key(&pool_id)
                     {
-                        if !module_cache.cl.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode ConcentratedLiquidityConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: cl_module_hash_bytes
-                                    .clone()
-                                    .expect("cl_module_hash present when CL pool detected"),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.cl.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted CL pool config from Create redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConcentratedLiquidityConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cl_module_hash_bytes
+                                .clone()
+                                .expect("cl_module_hash present when CL pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CL pool config from Create redeemer"
+                        );
                     }
 
                     // Same for fee_split: every pool has fee_split config in
@@ -1104,22 +1100,21 @@ impl ChainIndex for SundaeV4Indexer {
                     // persist and cache for future scoops.
                     if let (Some(cfg), Some(fs_hash)) =
                         (fs_config_from_tx.as_ref(), fs_module_hash_bytes.as_ref())
+                        && !module_cache.fee_split.contains_key(&pool_id)
                     {
-                        if !module_cache.fee_split.contains_key(&pool_id) {
-                            let cbor = minicbor::to_vec(&cfg.clone().to_plutus())
-                                .context("encode FeeSplitConfig CBOR")?;
-                            changes.module_configs.push(PersistedModuleConfig {
-                                pool_id: pool_id.to_bytes().to_vec(),
-                                module_hash: fs_hash.clone(),
-                                config_cbor: cbor,
-                                created_slot: slot,
-                            });
-                            module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
-                            info!(
-                                pool = %hex::encode(pool_id.to_bytes()),
-                                "v4: persisted fee_split config from redeemer"
-                            );
-                        }
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode FeeSplitConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: fs_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted fee_split config from redeemer"
+                        );
                     }
 
                     let fs_cfg = module_cache.fee_split.get(&pool_id).cloned();
@@ -1259,22 +1254,22 @@ impl ChainIndex for SundaeV4Indexer {
             // configured with an enterprise address. Matching by payment
             // credential alone accepts any address form (enterprise, base,
             // pointer) whose payment key we hold.
-            if let Some(scooper_kh) = &self.scooper_keyhash {
-                if payment_hash_equals(&address, scooper_kh) {
-                    let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                    let tx_out = cardano_types::convert_txo(output);
-                    trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "wallet".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: None,
-                    });
-                    state.wallet_utxos.insert(this_input, tx_out.value);
-                }
+            if let Some(scooper_kh) = &self.scooper_keyhash
+                && payment_hash_equals(&address, scooper_kh)
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
+                changes.created_txos.push(PersistedTxo {
+                    txo_id: this_input.clone(),
+                    txo_type: "wallet".to_string(),
+                    created_slot: slot,
+                    era: output.era().into(),
+                    txo: output.encode(),
+                    address: tx_out.address.to_vec(),
+                    datum: None,
+                });
+                state.wallet_utxos.insert(this_input, tx_out.value);
             }
 
             // Track reference UTxO outputs (for ScriptContext building)
@@ -1325,8 +1320,7 @@ impl ChainIndex for SundaeV4Indexer {
         let req_signers = tx.required_signers();
         let signers: Vec<&pallas_primitives::Hash<28>> = req_signers.collect();
         let scooper_keyhash_bytes: Option<Vec<u8>> = signers.first().map(|h| h.to_vec());
-        let scooper_hex =
-            scooper_keyhash_bytes.as_ref().map(|b| hex::encode(b)).unwrap_or_default();
+        let scooper_hex = scooper_keyhash_bytes.as_ref().map(hex::encode).unwrap_or_default();
 
         let tx_id_hex = hex::encode(this_tx_hash);
 
@@ -1803,26 +1797,26 @@ pub fn detect_pool_type(
         let Some(first) = action.modules.first() else {
             continue;
         };
-        if let Some(h) = &cp_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cp");
-                break;
-            }
+        if let Some(h) = &cp_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cp");
+            break;
         }
-        if let Some(h) = &cs_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cs");
-                break;
-            }
+        if let Some(h) = &cs_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cs");
+            break;
         }
-        if let Some(h) = &cl_hash {
-            if first.as_slice() == h.as_slice() {
-                matched_action = Some(action);
-                matched_kind = Some("cl");
-                break;
-            }
+        if let Some(h) = &cl_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("cl");
+            break;
         }
     }
     if matched_action.is_none() {

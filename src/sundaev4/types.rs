@@ -333,11 +333,11 @@ impl Constraint {
         };
         // Pallas tags: Constr 0..6 → cbor 121..127, Constr 7+ → 1280+. Strip the offset.
         let tag = if c.tag >= 121 && c.tag <= 127 {
-            (c.tag - 121) as u64
+            c.tag - 121
         } else if c.tag >= 1280 {
-            (c.tag - 1280 + 7) as u64
+            c.tag - 1280 + 7
         } else {
-            c.tag as u64
+            c.tag
         };
         let fields: Vec<PlutusData> = c.fields.clone().to_vec();
         let f = |i: usize| -> anyhow::Result<&PlutusData> {
@@ -387,11 +387,11 @@ impl Constraint {
             anyhow::bail!("constraint must be a Constr");
         };
         let tag = if c.tag >= 121 && c.tag <= 127 {
-            (c.tag - 121) as u64
+            c.tag - 121
         } else if c.tag >= 1280 {
-            (c.tag - 1280 + 7) as u64
+            c.tag - 1280 + 7
         } else {
-            c.tag as u64
+            c.tag
         };
         let fields: Vec<PlutusData> = c.fields.clone().to_vec();
         let list_pair = |i: usize| -> anyhow::Result<Vec<(AssetClass, BigInt)>> {
@@ -464,12 +464,12 @@ impl Constraint {
         basic_order_hash: &[u8],
         strategy_order_hash: &[u8],
     ) -> anyhow::Result<Self> {
-        if !strategy_order_hash.is_empty() {
-            if let Some(data) = datum.find_constraint_by_hash(strategy_order_hash) {
-                let constraints = StrategyConstraints::from_plutus(data.clone())
-                    .map_err(|e| anyhow::anyhow!("decode StrategyConstraints: {e}"))?;
-                return Ok(Constraint::Strategy { constraints });
-            }
+        if !strategy_order_hash.is_empty()
+            && let Some(data) = datum.find_constraint_by_hash(strategy_order_hash)
+        {
+            let constraints = StrategyConstraints::from_plutus(data.clone())
+                .map_err(|e| anyhow::anyhow!("decode StrategyConstraints: {e}"))?;
+            return Ok(Constraint::Strategy { constraints });
         }
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
@@ -528,7 +528,7 @@ pub fn decode_order_constraint(
         let unsupported: Vec<String> = datum
             .constraints
             .iter()
-            .filter(|(h, _)| !supported.iter().any(|s| *s == h.as_slice()))
+            .filter(|(h, _)| !supported.contains(&h.as_slice()))
             .map(|(h, _)| hex::encode(h))
             .collect();
         if unsupported.is_empty() {
@@ -1011,7 +1011,7 @@ pub struct ScooperExecution {
     pub scooper_secret_key_file: Option<String>,
     /// Optional 28-byte hex stake key hash to attach as the delegation part
     /// of the scooper's address. CIP-1852 wallets use base addresses (payment
-    /// + staking); funds sent to those addresses are unreachable from an
+    /// & staking), funds sent to those addresses are unreachable from an
     /// enterprise (payment-only) address. Leave unset to derive an enterprise
     /// address (works for fresh testnet keys with no staking).
     #[serde(default)]
@@ -1257,6 +1257,7 @@ impl SundaeV4Order {
     /// partial-fill state). `min_received` becomes a single-entry list. Uses
     /// `unit` for `extension`; `budget` is the per-order tx-fee budget.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn test_swap_order(
         input: TransactionInput,
         value: Value,
@@ -1436,7 +1437,7 @@ mod tests {
     #[test]
     fn route_whitelist_parses_idents() {
         use super::*;
-        let idents = vec![vec![0xAA; 28], vec![0xBB; 28]];
+        let idents = [vec![0xAA; 28], vec![0xBB; 28]];
         let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(
             idents.iter().map(|i| PlutusData::BoundedBytes(i.clone().into())).collect(),
         ));
@@ -1590,7 +1591,7 @@ mod tests {
                 den: BigInt::from(1000),
             },
         };
-        let cbor = minicbor::to_vec(&config.to_plutus()).unwrap();
+        let cbor = minicbor::to_vec(config.to_plutus()).unwrap();
         let hash = hex::encode(Hasher::<256>::hash(&cbor));
         eprintln!("CP CBOR: {}", hex::encode(&cbor));
         eprintln!("CP hash: {}", hash);
@@ -1752,7 +1753,7 @@ mod tests {
                 den: BigInt::from(1),
             },
         };
-        let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
+        let cbor = minicbor::to_vec(cfg.clone().to_plutus()).unwrap();
         // Persisted byte shape used by sqlite tests in persistence::sqlite.
         // If this changes, update those test fixtures.
         // Trailing `d8799f0001ff` = Rational 0/1 for balance_fee (SUN-310;

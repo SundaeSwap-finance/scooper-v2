@@ -11,7 +11,7 @@
 mod tests {
     use crate::bigint::BigInt;
     use crate::sundaev4::batch::{BatchLimits, assemble_batch};
-    use crate::sundaev4::test_harness::test_harness::*;
+    use crate::sundaev4::test_harness::*;
     use crate::sundaev4::tx_builder::TX_FEE;
     use num_traits::Signed;
 
@@ -146,7 +146,7 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             limits,
         )
         .expect("route exists");
@@ -172,7 +172,7 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             limits,
         )
         .expect("single route exists");
@@ -202,7 +202,7 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             tight,
         )
         .expect("tight single exists");
@@ -211,7 +211,7 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             tight,
         )
         .expect("tight blend exists");
@@ -358,7 +358,7 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("healthy pools can route the order");
@@ -395,10 +395,10 @@ mod tests {
             &[],
             &token_b(),
             &token_a(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         ) {
-            let collapsed = router::collapse_to_serial(&single, &order.swap_offered().1);
+            let collapsed = router::collapse_to_serial(&single, order.swap_offered().1);
             eprintln!(
                 "=== collapse_to_serial → {}",
                 collapsed
@@ -536,7 +536,7 @@ mod tests {
             &[],
             &offer,
             &ask,
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("the two healthy CP pools can fill this");
@@ -665,7 +665,7 @@ mod tests {
                 let (offer, ask) = if a_to_b { (token_a(), token_b()) } else { (token_b(), token_a()) };
                 let order = make_order(offer.clone(), amount, ask.clone(), 1, 1);
                 if let Some(blend) = router::find_blended_route(
-                    &pool_map, &[], &offer, &ask, &order.swap_offered().1,
+                    &pool_map, &[], &offer, &ask, order.swap_offered().1,
                     router::RoutingLimits::unlimited(),
                 ) {
                     let mut accum = Accumulator::new(env.exec.protocol_share);
@@ -1369,7 +1369,7 @@ mod tests {
             &[],
             &token_e(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("router should find E→A→B path");
@@ -1589,7 +1589,7 @@ mod tests {
         pool_map.insert(thin.pool_datum.identifier.clone(), thin.clone());
 
         let order = make_order(token_a(), 10_000_000, token_b(), 1, 1);
-        let order = with_route_whitelist(order, &[thin.pool_datum.identifier.clone()]);
+        let order = with_route_whitelist(order, std::slice::from_ref(&thin.pool_datum.identifier));
 
         // Sanity: unrestricted, the router prefers the deep pool — the
         // exact trap the preview orders fell into.
@@ -1598,7 +1598,7 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("unrestricted route exists");
@@ -1627,7 +1627,7 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("whitelisted route exists");
@@ -1704,7 +1704,7 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("blend must exist");
@@ -1774,7 +1774,7 @@ mod tests {
             &edges,
             &ada(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("blend exists");
@@ -1825,7 +1825,7 @@ mod tests {
             &edges,
             &ada(),
             &adab,
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("pure conversion route exists");
@@ -1972,7 +1972,7 @@ mod tests {
             &[],
             &token_a(),
             &ada(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("route exists");
@@ -2013,7 +2013,7 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("direct route");
@@ -2071,7 +2071,7 @@ mod tests {
             &[],
             &token_a(),
             &token_f(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("router should find A→E→F path");
@@ -2155,7 +2155,7 @@ mod tests {
             &[],
             &token_e(),
             &token_b(),
-            &order_eb.swap_offered().1,
+            order_eb.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("router should find E→B path");
@@ -2321,7 +2321,7 @@ mod tests {
                 &[],
                 &token_e(),
                 &token_b(),
-                &order.swap_offered().1,
+                order.swap_offered().1,
                 router::RoutingLimits::unlimited(),
             )
             .expect("router should find E→A→B path");
@@ -2437,7 +2437,7 @@ mod tests {
 mod prop_tests {
     use crate::bigint::BigInt;
     use crate::sundaev4::batch::{BatchLimits, assemble_batch};
-    use crate::sundaev4::test_harness::test_harness::*;
+    use crate::sundaev4::test_harness::*;
     use proptest::prelude::*;
     use std::sync::Arc;
 

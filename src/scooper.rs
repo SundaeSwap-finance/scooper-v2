@@ -94,6 +94,7 @@ pub struct Scooper {
 }
 
 impl Scooper {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_directory: Option<PathBuf>,
         event_rx: tokio::sync::broadcast::Receiver<(u64, Vec<IndexEvent>)>,
@@ -162,17 +163,17 @@ impl Scooper {
             }
 
             sync_log_counter += 1;
-            if sync_log_counter % SYNC_LOG_INTERVAL == 1 {
-                if let Some(s) = &self.v4_state {
-                    let state = s.lock().await;
-                    let latest = state.latest();
-                    info!(
-                        tip_slot = latest.tip_slot,
-                        network_tip = latest.network_tip_slot.unwrap_or(0),
-                        gap = latest.network_tip_slot.unwrap_or(0).saturating_sub(latest.tip_slot),
-                        "waiting for indexer to catch up"
-                    );
-                }
+            if sync_log_counter % SYNC_LOG_INTERVAL == 1
+                && let Some(s) = &self.v4_state
+            {
+                let state = s.lock().await;
+                let latest = state.latest();
+                info!(
+                    tip_slot = latest.tip_slot,
+                    network_tip = latest.network_tip_slot.unwrap_or(0),
+                    gap = latest.network_tip_slot.unwrap_or(0).saturating_sub(latest.tip_slot),
+                    "waiting for indexer to catch up"
+                );
             }
 
             // Wait for next event
@@ -569,10 +570,10 @@ impl Scooper {
             }
         }
 
-        if !updates.is_empty() {
-            if let Err(err) = self.write_updates(&updates) {
-                warn!("could not log updates: {err:#}");
-            }
+        if !updates.is_empty()
+            && let Err(err) = self.write_updates(&updates)
+        {
+            warn!("could not log updates: {err:#}");
         }
     }
 
@@ -1180,17 +1181,16 @@ impl Scooper {
         // discard our chain now and rebuild on theirs, instead of waiting
         // for the block to tell us.
         for (ident, (_, source, spent_input)) in &foreign_pools {
-            if self.v4_chain_tracker.latest_predicted_pool(ident).is_some() {
-                if let Some(base) = v4_state.pools.get(ident) {
-                    if &base.input == spent_input {
-                        warn!(
-                            pool = %ident,
-                            foreign = %hex::encode(source),
-                            "foreign mempool scoop conflicts with our in-flight chain; rebuilding on theirs",
-                        );
-                        self.v4_chain_tracker.discard_chain_and_related(ident);
-                    }
-                }
+            if self.v4_chain_tracker.latest_predicted_pool(ident).is_some()
+                && let Some(base) = v4_state.pools.get(ident)
+                && &base.input == spent_input
+            {
+                warn!(
+                    pool = %ident,
+                    foreign = %hex::encode(source),
+                    "foreign mempool scoop conflicts with our in-flight chain; rebuilding on theirs",
+                );
+                self.v4_chain_tracker.discard_chain_and_related(ident);
             }
         }
         // Effective pool per ident: our chain tip normally; the foreign
@@ -1501,36 +1501,34 @@ impl Scooper {
                         if e.contains("below min_received")
                             && is_swap_module
                             && exec.partial_fill_margin.is_some()
-                        {
-                            if let Some(dx) = self.find_partial_fill_dx(
+                            && let Some(dx) = self.find_partial_fill_dx(
                                 order,
                                 &pool_view,
                                 conversion_edges,
                                 &exec,
                                 limits,
-                            ) {
-                                if let Some(pblend) = router::find_blended_route(
-                                    &pool_view,
-                                    conversion_edges,
-                                    offer_asset,
-                                    ask_asset,
-                                    &dx,
-                                    limits,
-                                ) {
-                                    tracing::info!(
-                                        order = %order.input,
-                                        fill = %dx,
-                                        remaining = %order.swap_offered().1,
-                                        "partial fill dispatch",
-                                    );
-                                    add_result = match pblend.as_single() {
-                                        Some(single) => candidate
-                                            .try_add_routed_order(order, single, &pool_view),
-                                        None => candidate
-                                            .try_add_blended_order(order, &pblend, &pool_view),
-                                    };
+                            )
+                            && let Some(pblend) = router::find_blended_route(
+                                &pool_view,
+                                conversion_edges,
+                                offer_asset,
+                                ask_asset,
+                                &dx,
+                                limits,
+                            )
+                        {
+                            tracing::info!(
+                                order = %order.input,
+                                fill = %dx,
+                                remaining = %order.swap_offered().1,
+                                "partial fill dispatch",
+                            );
+                            add_result = match pblend.as_single() {
+                                Some(single) => {
+                                    candidate.try_add_routed_order(order, single, &pool_view)
                                 }
-                            }
+                                None => candidate.try_add_blended_order(order, &pblend, &pool_view),
+                            };
                         }
                     }
                     match add_result {
@@ -1739,15 +1737,15 @@ impl Scooper {
         }
 
         // If we found a valid prefix but had to drop a failing suffix, note it.
-        if let (Some(idx), Some(reason)) = (best, &last_bail) {
-            if idx + 1 < checkpoints.len() {
-                warn!(
-                    kept = idx + 1,
-                    dropped = checkpoints.len() - (idx + 1),
-                    reason = %reason,
-                    "isolated failing suffix from batch; scooping the valid prefix",
-                );
-            }
+        if let (Some(idx), Some(reason)) = (best, &last_bail)
+            && idx + 1 < checkpoints.len()
+        {
+            warn!(
+                kept = idx + 1,
+                dropped = checkpoints.len() - (idx + 1),
+                reason = %reason,
+                "isolated failing suffix from batch; scooping the valid prefix",
+            );
         }
 
         let had_successful_build = best.is_some();
@@ -2003,17 +2001,17 @@ impl Scooper {
 
         let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_plan,
-            &settings,
-            &exec,
+            settings,
+            exec,
             validity,
             language_views,
             &collateral_input.0,
-            &collateral_value,
+            collateral_value,
             None,
             &v4_state.ref_utxo_outputs,
             None,
             &v4_state.order_configs,
-            &strategy_executions,
+            strategy_executions,
             v4_state.fee_settings.as_deref(),
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
             self.v4_butane.as_ref(),
@@ -2068,7 +2066,7 @@ impl Scooper {
                 r.budgets
                     .iter()
                     .map(|(k, eu)| {
-                        let mut padded = eu.clone();
+                        let mut padded = *eu;
                         padded.mem = eu.mem * pad_num / pad_den;
                         padded.steps = eu.steps * pad_num / pad_den;
                         (k.clone(), padded)
@@ -2118,17 +2116,17 @@ impl Scooper {
 
         let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
             &final_plan,
-            &settings,
-            &exec,
+            settings,
+            exec,
             validity,
             language_views,
             &collateral_input.0,
-            &collateral_value,
+            collateral_value,
             Some(&padded_budgets),
             &v4_state.ref_utxo_outputs,
             Some(computed_fee),
             &v4_state.order_configs,
-            &strategy_executions,
+            strategy_executions,
             v4_state.fee_settings.as_deref(),
             funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
             self.v4_butane.as_ref(),
@@ -2420,10 +2418,10 @@ impl Scooper {
                                     .push(format!("pool {} ({})", batch.pool_ident, pin));
                             }
                         }
-                        if let Some((fi, _)) = &funding_owned {
-                            if hex_reason.contains(&hex::encode(fi.0.transaction_id.as_ref())) {
-                                implicated_kinds.push(format!("funding {fi}"));
-                            }
+                        if let Some((fi, _)) = &funding_owned
+                            && hex_reason.contains(&hex::encode(fi.0.transaction_id.as_ref()))
+                        {
+                            implicated_kinds.push(format!("funding {fi}"));
                         }
                         if hex_reason
                             .contains(&hex::encode(collateral_input.0.transaction_id.as_ref()))
@@ -2751,7 +2749,7 @@ impl Scooper {
                 dx,
                 limits,
             )
-            .map(|b| &(&b.total_output * original_offered) >= &(min_qty * dx))
+            .map(|b| (&b.total_output * original_offered) >= (min_qty * dx))
             .unwrap_or(false)
         };
 

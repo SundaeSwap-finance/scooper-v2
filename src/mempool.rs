@@ -563,6 +563,7 @@ const EVICTION_WINDOW: Duration = Duration::from_secs(300);
 /// Hard TTL on seen entries, so a wedged correlation stream can't leak.
 const SEEN_TTL: Duration = Duration::from_secs(1800);
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mempool_monitor(
     cfg: MempoolMonitorConfig,
     watch: ProtocolWatch,
@@ -1177,7 +1178,7 @@ mod tests {
         use crate::bigint::BigInt;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
-        use crate::sundaev4::test_harness::test_harness::*;
+        use crate::sundaev4::test_harness::*;
         use std::collections::BTreeMap as Map;
 
         let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
@@ -1261,7 +1262,7 @@ mod tests {
     #[test]
     fn classify_scoop_tx() {
         use crate::sundaev4::batch::{BatchLimits, assemble_batch};
-        use crate::sundaev4::test_harness::test_harness::*;
+        use crate::sundaev4::test_harness::*;
 
         let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
         let pool = make_pool(

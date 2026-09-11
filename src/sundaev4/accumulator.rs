@@ -74,13 +74,13 @@ impl PoolAccum {
         &mut self,
         order_input: &crate::cardano_types::TransactionInput,
     ) -> Result<(), String> {
-        if let Some(last) = &self.last_order_input {
-            if last > order_input {
-                return Err(format!(
-                    "canonical-order violation on pool {}: order {} sorts before order {} already in the batch (check_route_uniqueness would fail on-chain)",
-                    self.ident, order_input, last,
-                ));
-            }
+        if let Some(last) = &self.last_order_input
+            && last > order_input
+        {
+            return Err(format!(
+                "canonical-order violation on pool {}: order {} sorts before order {} already in the batch (check_route_uniqueness would fail on-chain)",
+                self.ident, order_input, last,
+            ));
         }
         self.last_order_input = Some(order_input.clone());
         Ok(())
@@ -864,12 +864,12 @@ impl Accumulator {
             })
             .collect();
 
-        return ScoopPlan {
+        ScoopPlan {
             batches,
             routes: self.routes,
             global_seq,
             conversions,
-        };
+        }
     }
 
     /// Backwards-compatible: return only the batches, dropping route/global_seq

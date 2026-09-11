@@ -142,6 +142,7 @@ pub fn cs_max_dx_for_reserve(
 /// VA = a·spb_num + L·spb_den, VB = b·spa_den + L·spa_num
 ///   A→B: dy = floor(VB · dVA_eff / ((VA + dVA_eff) · spa_den))   with dVA_eff = dx_eff·spb_num
 ///   B→A: dy = floor(VA · dVB_eff / ((VB + dVB_eff) · spb_num))   with dVB_eff = dx_eff·spa_num
+#[allow(clippy::too_many_arguments)]
 pub fn cl_swap_result(
     a: &BigInt,
     b: &BigInt,
@@ -185,6 +186,7 @@ pub fn cl_swap_result(
 ///
 /// Returns `None` if the pool can't absorb any positive dx (e.g. reserve_out
 /// already zero, or the pool is at its price boundary).
+#[allow(clippy::too_many_arguments)]
 pub fn cl_max_dx_for_reserve(
     a: &BigInt,
     b: &BigInt,
@@ -547,8 +549,8 @@ mod tests {
                 &a, &b, &lp, is_a_input,
                 &spa_num, &spa_den, &spb_num, &spb_den, &fee_num, &fee_den,
             );
-            if let Some(max_dx) = max_dx {
-                if max_dx.is_positive() {
+            if let Some(max_dx) = max_dx
+                && max_dx.is_positive() {
                     // Sample dx across [0, max_dx].
                     let dx = &max_dx * BigInt::from(dx_permille) / BigInt::from(1000u64);
                     if dx.is_positive() {
@@ -565,7 +567,6 @@ mod tests {
                         );
                     }
                 }
-            }
         }
     }
 

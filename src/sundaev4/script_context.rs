@@ -58,6 +58,7 @@ pub enum Credential {
 /// Build a complete PlutusV3 ScriptContext and return it as CBOR bytes.
 ///
 /// The ScriptContext is: `Constr(0, [tx_info, redeemer, script_info])`
+#[allow(clippy::too_many_arguments)]
 pub fn build_script_context(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     redeemers: &[(RedeemersKey, PlutusData)],

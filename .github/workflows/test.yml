@@ -24,7 +24,6 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        if: false # need to fix lints
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run Build

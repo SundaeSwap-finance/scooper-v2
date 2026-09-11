@@ -109,16 +109,10 @@ impl RoutingLimits {
     /// `cost_per_pool == 0` or `cost_per_step == 0` means that axis is
     /// unlimited.
     pub fn from_budget(budget_lovelace: u64, cost_per_pool: u64, cost_per_step: u64) -> Self {
-        let max_pools = if cost_per_pool == 0 {
-            usize::MAX
-        } else {
-            (budget_lovelace / cost_per_pool) as usize
-        };
-        let max_steps = if cost_per_step == 0 {
-            usize::MAX
-        } else {
-            (budget_lovelace / cost_per_step) as usize
-        };
+        let max_pools =
+            (budget_lovelace as usize).checked_div(cost_per_pool as usize).unwrap_or(usize::MAX);
+        let max_steps =
+            (budget_lovelace as usize).checked_div(cost_per_step as usize).unwrap_or(usize::MAX);
         Self {
             max_pools,
             max_steps,
@@ -781,6 +775,8 @@ pub fn conversion_ident(key: &str) -> Ident {
     Ident::new(format!("conv:{key}").as_bytes())
 }
 
+type ViewTypeFn = Box<dyn Fn(usize, usize) -> PoolViewType>;
+
 fn build_graph(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
     conversions: &[crate::sundaev4::conversions::ConversionEdge],
@@ -793,11 +789,7 @@ fn build_graph(
     for (ident, pool) in pools {
         let assets = &pool.pool_datum.assets;
 
-        let (fee_num, fee_den, view_type_fn): (
-            u64,
-            u64,
-            Box<dyn Fn(usize, usize) -> PoolViewType>,
-        ) = match &pool.pool_type {
+        let (fee_num, fee_den, view_type_fn): (u64, u64, ViewTypeFn) = match &pool.pool_type {
             PoolType::ConstantProduct { fee } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
@@ -1036,7 +1028,7 @@ fn evaluate_path(
             // prevent fully absorbing current_amount. Reject the path in that
             // case — the order can't fill via this routing.
             let total_in: BigInt = s.iter().fold(BigInt::from(0), |a, e| &a + &e.input_amount);
-            if &total_in < &current_amount {
+            if total_in < current_amount {
                 return Vec::new();
             }
             s
@@ -1118,13 +1110,13 @@ pub fn find_optimal_route(
     let mut plan = best_plan?;
 
     // Compute naive output: direct single-pool swap using best pool
-    if let Some(edges) = graph.get(input_token) {
-        if let Some(direct_pools) = edges.get(output_token) {
-            for pool in direct_pools {
-                let out = pool_output(pool, amount);
-                if out > plan.naive_output {
-                    plan.naive_output = out;
-                }
+    if let Some(edges) = graph.get(input_token)
+        && let Some(direct_pools) = edges.get(output_token)
+    {
+        for pool in direct_pools {
+            let out = pool_output(pool, amount);
+            if out > plan.naive_output {
+                plan.naive_output = out;
             }
         }
     }
@@ -1405,10 +1397,9 @@ pub fn find_blended_route(
                 output_token,
                 amount,
                 limits,
-            ) {
-                if pruned.total_output > single.total_output {
-                    return Some(pruned);
-                }
+            ) && pruned.total_output > single.total_output
+            {
+                return Some(pruned);
             }
         }
         return Some(single_plan(single));

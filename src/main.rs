@@ -77,10 +77,10 @@ async fn main() -> Result<()> {
     // Resolve the secret key file early so both manager_loop (bootstrap) and
     // scooper see the resolved key.
     let mut protocol = config.protocol.clone();
-    if let Some(ref mut v4) = protocol.v4 {
-        if let Some(ref mut exec) = v4.execution {
-            exec.resolve_secret_key().expect("failed to resolve scooper secret key");
-        }
+    if let Some(ref mut v4) = protocol.v4
+        && let Some(ref mut exec) = v4.execution
+    {
+        exec.resolve_secret_key().expect("failed to resolve scooper secret key");
     }
     let v4_execution = protocol.v4.as_ref().and_then(|v4| v4.execution.clone());
 
@@ -311,6 +311,7 @@ async fn shutdown_signal() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn manager_loop(
     v3_state: Option<Arc<Mutex<SundaeV3HistoricalState>>>,
     v4_state: Option<Arc<Mutex<SundaeV4HistoricalState>>>,
@@ -370,32 +371,30 @@ async fn manager_loop(
         }
 
         // Warn if DB has data but starting-point is origin (common after devnet reset)
-        if let Some((_, v4_config)) = &v4_index_and_config {
-            if matches!(v4_config.starting_point, acropolis_common::Point::Origin) {
-                if let Some(ref s) = v4_state {
-                    let slot = s.lock().await.latest().tip_slot;
-                    if slot > 0 {
-                        warn!(
-                            slot,
-                            "DB contains v4 data at slot {slot} but starting-point is 'origin' \
-                             — if the devnet was reset, delete the database file and restart"
-                        );
-                    }
-                }
+        if let Some((_, v4_config)) = &v4_index_and_config
+            && matches!(v4_config.starting_point, acropolis_common::Point::Origin)
+            && let Some(ref s) = v4_state
+        {
+            let slot = s.lock().await.latest().tip_slot;
+            if slot > 0 {
+                warn!(
+                    slot,
+                    "DB contains v4 data at slot {slot} but starting-point is 'origin' \
+                     — if the devnet was reset, delete the database file and restart"
+                );
             }
         }
-        if let Some((_, v3_config)) = &v3_index_and_config {
-            if matches!(v3_config.starting_point, acropolis_common::Point::Origin) {
-                if let Some(ref s) = v3_state {
-                    let n_pools = s.lock().await.latest().pools.len();
-                    if n_pools > 0 {
-                        warn!(
-                            n_pools,
-                            "DB contains v3 data ({n_pools} pools) but starting-point is 'origin' \
-                             — if the devnet was reset, delete the database file and restart"
-                        );
-                    }
-                }
+        if let Some((_, v3_config)) = &v3_index_and_config
+            && matches!(v3_config.starting_point, acropolis_common::Point::Origin)
+            && let Some(ref s) = v3_state
+        {
+            let n_pools = s.lock().await.latest().pools.len();
+            if n_pools > 0 {
+                warn!(
+                    n_pools,
+                    "DB contains v3 data ({n_pools} pools) but starting-point is 'origin' \
+                     — if the devnet was reset, delete the database file and restart"
+                );
             }
         }
 

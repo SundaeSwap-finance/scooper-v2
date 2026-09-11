@@ -349,28 +349,27 @@ impl IntentStore {
             .iter()
             .map(|i| Self::replacement_rank(&i.sse, i.expiry_ms, i.received_at_ms, &i.intent_id))
             .max()
+            && best > new_rank
         {
-            if best > new_rank {
-                // The incoming intent loses: tombstone it in memory so echoes
-                // die quickly, but don't disturb the winner.
-                self.tombstones.insert(
-                    intent_id.clone(),
-                    IntentTombstone {
-                        status: "replaced",
-                        tx_hash: None,
-                        cleanup_after_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
-                    },
-                );
-                return Ok((
-                    SubmitOutcome {
-                        intent_id,
-                        newly_stored: false,
-                        superseded: true,
-                        replaced: vec![],
-                    },
-                    None,
-                ));
-            }
+            // The incoming intent loses: tombstone it in memory so echoes
+            // die quickly, but don't disturb the winner.
+            self.tombstones.insert(
+                intent_id.clone(),
+                IntentTombstone {
+                    status: "replaced",
+                    tx_hash: None,
+                    cleanup_after_ms: now_ms.saturating_add(TOMBSTONE_TTL_MS),
+                },
+            );
+            return Ok((
+                SubmitOutcome {
+                    intent_id,
+                    newly_stored: false,
+                    superseded: true,
+                    replaced: vec![],
+                },
+                None,
+            ));
         }
 
         if self.total >= MAX_TOTAL_INTENTS {
@@ -935,7 +934,7 @@ mod tests {
             execution,
             signatures: vec![(sk.public_key().as_ref().to_vec(), sig.as_ref().to_vec())],
         };
-        minicbor::to_vec(&sse.to_plutus()).unwrap()
+        minicbor::to_vec(sse.to_plutus()).unwrap()
     }
 
     fn strategy_order(sk: &SecretKey) -> std::sync::Arc<SundaeV4Order> {
@@ -1076,7 +1075,7 @@ mod tests {
             execution: tampered,
             signatures: vec![(sk.public_key().as_ref().to_vec(), sig.as_ref().to_vec())],
         };
-        let cbor = minicbor::to_vec(&sse.to_plutus()).unwrap();
+        let cbor = minicbor::to_vec(sse.to_plutus()).unwrap();
         let mut store = IntentStore::default();
         assert!(store.submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).is_err());
     }
