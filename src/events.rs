@@ -115,7 +115,10 @@ impl<T> Clone for SpentOrder<T> {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum SpentOrderReason {
-    Scooped { pool_ids: Vec<Ident>, scooper: String },
+    Scooped {
+        pool_ids: Vec<Ident>,
+        scooper: String,
+    },
     Cancelled,
     Unknown,
 }

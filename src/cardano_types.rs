@@ -96,8 +96,7 @@ impl AsPlutus for AssetClass {
                 if variant != 0 {
                     return Err(plutus_parser::DecodeError::unexpected_variant(variant));
                 }
-                let [policy_data, token_data] =
-                    plutus_parser::parse_variant(variant, fields)?;
+                let [policy_data, token_data] = plutus_parser::parse_variant(variant, fields)?;
                 let policy = AsPlutus::from_plutus(policy_data)?;
                 let token = AsPlutus::from_plutus(token_data)?;
                 Ok(AssetClass { policy, token })
@@ -329,7 +328,8 @@ impl FromStr for TransactionInput {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (tx_hex, idx_str) = s.split_once('#').ok_or_else(|| anyhow::anyhow!("missing '#'"))?;
         let tx_bytes = hex::decode(tx_hex)?;
-        let tx_id: [u8; 32] = tx_bytes.try_into().map_err(|_| anyhow::anyhow!("tx hash not 32 bytes"))?;
+        let tx_id: [u8; 32] =
+            tx_bytes.try_into().map_err(|_| anyhow::anyhow!("tx hash not 32 bytes"))?;
         let index: u64 = idx_str.parse()?;
         Ok(TransactionInput::new(tx_id.into(), index))
     }

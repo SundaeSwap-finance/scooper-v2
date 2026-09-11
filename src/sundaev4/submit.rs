@@ -43,9 +43,7 @@ async fn submit_blockfrost(url: &str, cbor: &[u8]) -> Result<String> {
         .find(|(k, _)| k == "project_id")
         .map(|(_, v)| v.into_owned())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "blockfrost submit URL must include ?project_id=<token>; got `{url}`"
-            )
+            anyhow::anyhow!("blockfrost submit URL must include ?project_id=<token>; got `{url}`")
         })?;
     let mut clean = parsed.clone();
     clean.set_query(None);
@@ -107,18 +105,10 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
         },
         "id": 1
     });
-    let resp = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .context("ogmios submit request failed")?;
+    let resp = client.post(url).json(&body).send().await.context("ogmios submit request failed")?;
 
     let status = resp.status();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .context("ogmios response not valid JSON")?;
+    let json: serde_json::Value = resp.json().await.context("ogmios response not valid JSON")?;
 
     if let Some(result) = json.get("result") {
         let hash = result
@@ -128,10 +118,7 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
             .unwrap_or("unknown");
         Ok(hash.to_string())
     } else {
-        let error = json
-            .get("error")
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let error = json.get("error").map(|e| e.to_string()).unwrap_or_default();
         bail!("ogmios submit failed ({}): {}", status, error);
     }
 }

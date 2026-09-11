@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use pallas_codec::utils::{KeyValuePairs, MaybeIndefArray};
-use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutput};
+use pallas_primitives::conway::{self, RedeemerTag, RedeemersKey, TransactionOutput};
 use pallas_primitives::{Hash, PlutusData};
 
 use crate::cardano_types;
@@ -58,6 +58,7 @@ pub enum Credential {
 /// Build a complete PlutusV3 ScriptContext and return it as CBOR bytes.
 ///
 /// The ScriptContext is: `Constr(0, [tx_info, redeemer, script_info])`
+#[allow(clippy::too_many_arguments)]
 pub fn build_script_context(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     redeemers: &[(RedeemersKey, PlutusData)],
@@ -68,7 +69,14 @@ pub fn build_script_context(
     redeemer_data: &PlutusData,
     slot_config: &SlotConfig,
 ) -> Vec<u8> {
-    let tx_info = build_tx_info(tx_body, redeemers, resolved_inputs, resolved_ref_inputs, tx_hash, slot_config);
+    let tx_info = build_tx_info(
+        tx_body,
+        redeemers,
+        resolved_inputs,
+        resolved_ref_inputs,
+        tx_hash,
+        slot_config,
+    );
     let script_info = build_script_info(script_purpose);
 
     let context = constr(0, vec![tx_info, redeemer_data.clone(), script_info]);
@@ -99,7 +107,12 @@ pub fn build_script_context_v2(
     slot_config: &SlotConfig,
 ) -> Vec<u8> {
     let tx_info = build_tx_info_v2(
-        tx_body, redeemers, resolved_inputs, resolved_ref_inputs, tx_hash, slot_config,
+        tx_body,
+        redeemers,
+        resolved_inputs,
+        resolved_ref_inputs,
+        tx_hash,
+        slot_config,
     );
     let purpose = encode_purpose_v2(script_purpose);
     let context = constr(0, vec![tx_info, purpose]);
@@ -107,12 +120,16 @@ pub fn build_script_context_v2(
 }
 
 fn encode_output_reference_v2(oref: &OutputReference) -> PlutusData {
-    constr(0, vec![
-        constr(0, vec![PlutusData::BoundedBytes(
-            oref.tx_hash.to_vec().into(),
-        )]),
-        pd_int(oref.index as i64),
-    ])
+    constr(
+        0,
+        vec![
+            constr(
+                0,
+                vec![PlutusData::BoundedBytes(oref.tx_hash.to_vec().into())],
+            ),
+            pd_int(oref.index as i64),
+        ],
+    )
 }
 
 fn encode_tx_in_info_list_v2(
@@ -120,32 +137,33 @@ fn encode_tx_in_info_list_v2(
     resolved: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
 ) -> PlutusData {
     let mut sorted: Vec<_> = inputs.to_vec();
-    sorted.sort_by(|a, b| {
-        a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
-    });
+    sorted.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index)));
     pd_array(
         sorted
             .iter()
             .map(|input| {
                 let key = cardano_types::TransactionInput(input.clone());
-                let out = resolved
-                    .get(&key)
-                    .map(encode_resolved_tx_out)
-                    .unwrap_or_else(|| {
-                        constr(0, vec![
+                let out = resolved.get(&key).map(encode_resolved_tx_out).unwrap_or_else(|| {
+                    constr(
+                        0,
+                        vec![
                             encode_address_bytes(&[]),
                             encode_empty_value(),
                             constr(0, vec![]),
                             constr(1, vec![]),
-                        ])
-                    });
-                constr(0, vec![
-                    encode_output_reference_v2(&OutputReference {
-                        tx_hash: input.transaction_id,
-                        index: input.index,
-                    }),
-                    out,
-                ])
+                        ],
+                    )
+                });
+                constr(
+                    0,
+                    vec![
+                        encode_output_reference_v2(&OutputReference {
+                            tx_hash: input.transaction_id,
+                            index: input.index,
+                        }),
+                        out,
+                    ],
+                )
             })
             .collect(),
     )
@@ -158,15 +176,14 @@ fn encode_staking_credential_v2(cred: PlutusData) -> PlutusData {
 
 fn encode_purpose_v2(purpose: &ScriptPurpose) -> PlutusData {
     match purpose {
-        ScriptPurpose::Minting(policy) => constr(0, vec![PlutusData::BoundedBytes(
-            policy.to_vec().into(),
-        )]),
-        ScriptPurpose::Spending(oref, _) => {
-            constr(1, vec![encode_output_reference_v2(oref)])
+        ScriptPurpose::Minting(policy) => {
+            constr(0, vec![PlutusData::BoundedBytes(policy.to_vec().into())])
         }
-        ScriptPurpose::Rewarding(cred) => constr(2, vec![encode_staking_credential_v2(
-            encode_credential(cred),
-        )]),
+        ScriptPurpose::Spending(oref, _) => constr(1, vec![encode_output_reference_v2(oref)]),
+        ScriptPurpose::Rewarding(cred) => constr(
+            2,
+            vec![encode_staking_credential_v2(encode_credential(cred))],
+        ),
     }
 }
 
@@ -206,7 +223,9 @@ fn build_tx_info_v2(
     // mint: Value INCLUDING the zero-ada stub entry (V2 quirk).
     let mint = {
         let inner = encode_mint(tx_body.mint.as_ref());
-        let PlutusData::Map(pairs) = inner else { unreachable!("encode_mint returns a map") };
+        let PlutusData::Map(pairs) = inner else {
+            unreachable!("encode_mint returns a map")
+        };
         let mut all: Vec<(PlutusData, PlutusData)> = vec![(
             PlutusData::BoundedBytes(vec![].into()),
             pd_map(vec![(PlutusData::BoundedBytes(vec![].into()), pd_int(0))]),
@@ -222,9 +241,7 @@ fn build_tx_info_v2(
             kvps.iter()
                 .map(|(account, coin)| {
                     (
-                        encode_staking_credential_v2(
-                            encode_reward_account_credential(account),
-                        ),
+                        encode_staking_credential_v2(encode_reward_account_credential(account)),
                         pd_int(*coin as i64),
                     )
                 })
@@ -233,18 +250,12 @@ fn build_tx_info_v2(
         None => pd_map(vec![]),
     };
 
-    let valid_range = encode_validity_range(
-        tx_body.validity_interval_start,
-        tx_body.ttl,
-        slot_config,
-    );
+    let valid_range =
+        encode_validity_range(tx_body.validity_interval_start, tx_body.ttl, slot_config);
 
     let signatories = match &tx_body.required_signers {
         Some(signers) => pd_array(
-            signers
-                .iter()
-                .map(|hash| PlutusData::BoundedBytes(hash.to_vec().into()))
-                .collect(),
+            signers.iter().map(|hash| PlutusData::BoundedBytes(hash.to_vec().into())).collect(),
         ),
         None => pd_array(vec![]),
     };
@@ -253,11 +264,11 @@ fn build_tx_info_v2(
     let redeemers_pd = {
         let mut pairs = Vec::new();
         for (key, data) in redeemers {
-            if let Ok((_, purpose)) =
-                crate::sundaev4::evaluator::resolve_script_and_purpose(
-                    key, tx_body, resolved_inputs,
-                )
-            {
+            if let Ok((_, purpose)) = crate::sundaev4::evaluator::resolve_script_and_purpose(
+                key,
+                tx_body,
+                resolved_inputs,
+            ) {
                 pairs.push((encode_purpose_v2(&purpose), data.clone()));
             }
         }
@@ -269,10 +280,23 @@ fn build_tx_info_v2(
     // id: TxId = Constr 0 [bytes] (newtyped in V2).
     let id = constr(0, vec![PlutusData::BoundedBytes(tx_hash.to_vec().into())]);
 
-    constr(0, vec![
-        inputs, ref_inputs, outputs, fee, mint, tx_certs, wdrl,
-        valid_range, signatories, redeemers_pd, data, id,
-    ])
+    constr(
+        0,
+        vec![
+            inputs,
+            ref_inputs,
+            outputs,
+            fee,
+            mint,
+            tx_certs,
+            wdrl,
+            valid_range,
+            signatories,
+            redeemers_pd,
+            data,
+            id,
+        ],
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -303,9 +327,7 @@ fn build_tx_info(
             // differently here than on the node.
             let mut ref_vec: Vec<_> = ref_set.iter().cloned().collect();
             ref_vec.sort_by(|a, b| {
-                a.transaction_id
-                    .cmp(&b.transaction_id)
-                    .then(a.index.cmp(&b.index))
+                a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
             });
             encode_tx_in_info_list(&ref_vec, resolved_ref_inputs)
         }
@@ -313,13 +335,7 @@ fn build_tx_info(
     };
 
     // outputs: list of TxOut
-    let outputs = pd_array(
-        tx_body
-            .outputs
-            .iter()
-            .map(encode_tx_out)
-            .collect(),
-    );
+    let outputs = pd_array(tx_body.outputs.iter().map(encode_tx_out).collect());
 
     // fee: integer
     let fee = pd_int(tx_body.fee as i64);
@@ -348,19 +364,13 @@ fn build_tx_info(
     };
 
     // valid_range: Interval (slots converted to POSIX milliseconds)
-    let valid_range = encode_validity_range(
-        tx_body.validity_interval_start,
-        tx_body.ttl,
-        slot_config,
-    );
+    let valid_range =
+        encode_validity_range(tx_body.validity_interval_start, tx_body.ttl, slot_config);
 
     // signatories: list of PubKeyHash
     let signatories = match &tx_body.required_signers {
         Some(signers) => pd_array(
-            signers
-                .iter()
-                .map(|hash| PlutusData::BoundedBytes(hash.to_vec().into()))
-                .collect(),
+            signers.iter().map(|hash| PlutusData::BoundedBytes(hash.to_vec().into())).collect(),
         ),
         None => pd_array(vec![]),
     };
@@ -422,7 +432,7 @@ fn build_script_info(purpose: &ScriptPurpose) -> PlutusData {
             let oref_pd = encode_output_reference(oref);
             let datum_option = match datum {
                 Some(d) => constr(0, vec![d.clone()]), // Some(datum)
-                None => constr(1, vec![]),              // None
+                None => constr(1, vec![]),             // None
             };
             constr(1, vec![oref_pd, datum_option])
         }
@@ -485,12 +495,8 @@ fn encode_output_reference(oref: &OutputReference) -> PlutusData {
 
 fn encode_credential(cred: &Credential) -> PlutusData {
     match cred {
-        Credential::PubKey(hash) => {
-            constr(0, vec![PlutusData::BoundedBytes(hash.to_vec().into())])
-        }
-        Credential::Script(hash) => {
-            constr(1, vec![PlutusData::BoundedBytes(hash.to_vec().into())])
-        }
+        Credential::PubKey(hash) => constr(0, vec![PlutusData::BoundedBytes(hash.to_vec().into())]),
+        Credential::Script(hash) => constr(1, vec![PlutusData::BoundedBytes(hash.to_vec().into())]),
     }
 }
 
@@ -500,11 +506,7 @@ fn encode_tx_in_info_list(
     resolved: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
 ) -> PlutusData {
     let mut sorted = inputs.to_vec();
-    sorted.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    sorted.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index)));
     pd_array(
         sorted
             .iter()
@@ -530,12 +532,15 @@ fn encode_tx_in_info(
         Some(r) => encode_resolved_tx_out(r),
         None => {
             // Fallback: empty TxOut (shouldn't happen in practice)
-            constr(0, vec![
-                encode_address_bytes(&[]),
-                encode_empty_value(),
-                constr(1, vec![]), // NoOutputDatum
-                constr(1, vec![]), // None script_ref
-            ])
+            constr(
+                0,
+                vec![
+                    encode_address_bytes(&[]),
+                    encode_empty_value(),
+                    constr(1, vec![]), // NoOutputDatum
+                    constr(1, vec![]), // None script_ref
+                ],
+            )
         }
     };
     constr(0, vec![oref, txout])
@@ -547,12 +552,12 @@ fn encode_resolved_tx_out(txo: &ResolvedTxOut) -> PlutusData {
     let address = encode_address_bytes(&txo.address);
     let value = encode_value(&txo.value);
     let datum_option = match &txo.datum {
-        DatumOption::None => constr(0, vec![]),      // NoOutputDatum
+        DatumOption::None => constr(0, vec![]), // NoOutputDatum
         DatumOption::DatumHash(h) => {
-            constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])  // OutputDatumHash
+            constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())]) // OutputDatumHash
         }
         DatumOption::InlineDatum(d) => {
-            constr(2, vec![d.clone()])  // OutputDatum (inline)
+            constr(2, vec![d.clone()]) // OutputDatum (inline)
         }
     };
     let script_ref = match &txo.script_ref {
@@ -575,23 +580,24 @@ fn encode_tx_out(output: &TransactionOutput) -> PlutusData {
                 };
                 let ada_policy = PlutusData::BoundedBytes(vec![].into());
                 let ada_token = PlutusData::BoundedBytes(vec![].into());
-                pd_map(vec![(ada_policy, pd_map(vec![(ada_token, pd_int(lovelace as i64))]))])
+                pd_map(vec![(
+                    ada_policy,
+                    pd_map(vec![(ada_token, pd_int(lovelace as i64))]),
+                )])
             };
             let datum_option = constr(0, vec![]); // NoOutputDatum
-            let script_ref = constr(1, vec![]);   // None
+            let script_ref = constr(1, vec![]); // None
             constr(0, vec![address, value, datum_option, script_ref])
         }
         TransactionOutput::PostAlonzo(o) => {
             let address = encode_address_bytes(&o.address);
             let value = encode_conway_value(&o.value);
             let datum_option = match &o.datum_option {
-                None => constr(0, vec![]),  // NoOutputDatum
+                None => constr(0, vec![]), // NoOutputDatum
                 Some(conway::PseudoDatumOption::Hash(h)) => {
                     constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])
                 }
-                Some(conway::PseudoDatumOption::Data(d)) => {
-                    constr(2, vec![d.0.clone()])
-                }
+                Some(conway::PseudoDatumOption::Data(d)) => constr(2, vec![d.0.clone()]),
             };
             let script_ref = constr(1, vec![]); // None (we don't encode script_ref in outputs)
             constr(0, vec![address, value, datum_option, script_ref])
@@ -606,10 +612,13 @@ fn encode_address_bytes(raw: &[u8]) -> PlutusData {
 
     let Ok(addr) = Address::from_bytes(raw) else {
         // Fallback: encode as raw bytes
-        return constr(0, vec![
-            constr(0, vec![PlutusData::BoundedBytes(raw.to_vec().into())]),
-            constr(1, vec![]),
-        ]);
+        return constr(
+            0,
+            vec![
+                constr(0, vec![PlutusData::BoundedBytes(raw.to_vec().into())]),
+                constr(1, vec![]),
+            ],
+        );
     };
 
     match addr {
@@ -625,15 +634,23 @@ fn encode_address_bytes(raw: &[u8]) -> PlutusData {
             let staking = match shelley.delegation() {
                 pallas_addresses::ShelleyDelegationPart::Key(h) => {
                     // Some(Inline(PubKeyCredential))
-                    constr(0, vec![constr(0, vec![
-                        constr(0, vec![PlutusData::BoundedBytes(h.to_vec().into())])
-                    ])])
+                    constr(
+                        0,
+                        vec![constr(
+                            0,
+                            vec![constr(0, vec![PlutusData::BoundedBytes(h.to_vec().into())])],
+                        )],
+                    )
                 }
                 pallas_addresses::ShelleyDelegationPart::Script(h) => {
                     // Some(Inline(ScriptCredential))
-                    constr(0, vec![constr(0, vec![
-                        constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])
-                    ])])
+                    constr(
+                        0,
+                        vec![constr(
+                            0,
+                            vec![constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])],
+                        )],
+                    )
                 }
                 pallas_addresses::ShelleyDelegationPart::Null
                 | pallas_addresses::ShelleyDelegationPart::Pointer(_) => {
@@ -644,10 +661,13 @@ fn encode_address_bytes(raw: &[u8]) -> PlutusData {
         }
         _ => {
             // Non-Shelley address: encode payment as raw bytes
-            constr(0, vec![
-                constr(0, vec![PlutusData::BoundedBytes(raw.to_vec().into())]),
-                constr(1, vec![]),
-            ])
+            constr(
+                0,
+                vec![
+                    constr(0, vec![PlutusData::BoundedBytes(raw.to_vec().into())]),
+                    constr(1, vec![]),
+                ],
+            )
         }
     }
 }
@@ -743,7 +763,11 @@ fn encode_mint(
 /// Bound::PosInf = Constr(2, [])
 /// Closure (True) = Constr(1, [])
 /// Closure (False) = Constr(0, [])
-fn encode_validity_range(start: Option<u64>, ttl: Option<u64>, slot_config: &SlotConfig) -> PlutusData {
+fn encode_validity_range(
+    start: Option<u64>,
+    ttl: Option<u64>,
+    slot_config: &SlotConfig,
+) -> PlutusData {
     let lower = match start {
         Some(s) => {
             let posix_ms = slot_config.slot_to_posix_ms(s);
@@ -790,9 +814,7 @@ fn encode_redeemers_map(
                 RedeemerTag::Propose => 5,
             }
         }
-        tag_order(&a.tag)
-            .cmp(&tag_order(&b.tag))
-            .then(a.index.cmp(&b.index))
+        tag_order(&a.tag).cmp(&tag_order(&b.tag)).then(a.index.cmp(&b.index))
     });
 
     let mut pairs: Vec<(PlutusData, PlutusData)> = Vec::new();
@@ -814,9 +836,7 @@ fn encode_redeemer_purpose(
             // Look up the input at this index
             let mut sorted_inputs: Vec<_> = tx_body.inputs.iter().cloned().collect();
             sorted_inputs.sort_by(|a, b| {
-                a.transaction_id
-                    .cmp(&b.transaction_id)
-                    .then(a.index.cmp(&b.index))
+                a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
             });
             if let Some(input) = sorted_inputs.get(key.index as usize) {
                 let oref = encode_output_reference(&OutputReference {
@@ -825,10 +845,13 @@ fn encode_redeemer_purpose(
                 });
                 constr(1, vec![oref]) // Spending
             } else {
-                constr(1, vec![encode_output_reference(&OutputReference {
-                    tx_hash: [0u8; 32].into(),
-                    index: 0,
-                })])
+                constr(
+                    1,
+                    vec![encode_output_reference(&OutputReference {
+                        tx_hash: [0u8; 32].into(),
+                        index: 0,
+                    })],
+                )
             }
         }
         RedeemerTag::Reward => {
@@ -839,10 +862,16 @@ fn encode_redeemer_purpose(
                     let cred = encode_reward_account_credential(account);
                     constr(2, vec![cred]) // Rewarding
                 } else {
-                    constr(2, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
+                    constr(
+                        2,
+                        vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])],
+                    )
                 }
             } else {
-                constr(2, vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])])
+                constr(
+                    2,
+                    vec![constr(0, vec![PlutusData::BoundedBytes(vec![].into())])],
+                )
             }
         }
         RedeemerTag::Mint => {
@@ -860,9 +889,7 @@ fn encode_redeemer_purpose(
                 constr(0, vec![PlutusData::BoundedBytes(vec![].into())])
             }
         }
-        _ => {
-            constr(0, vec![PlutusData::BoundedBytes(vec![].into())])
-        }
+        _ => constr(0, vec![PlutusData::BoundedBytes(vec![].into())]),
     }
 }
 

@@ -61,19 +61,19 @@ impl ScoopBuilder {
                 let order_give_0 = order_give_num.clone();
                 let order_give_minus_1 = order_give_num - BigInt::from(1);
 
-                let order_give;
-                if is_efficient(&pool_takes, &pool_gives, &order_give_plus_1, &diff)
-                    && order_give_plus_1 <= given.amount
-                {
-                    order_give = order_give_plus_1;
-                } else if is_efficient(&pool_takes, &pool_gives, &order_give_0, &diff) {
-                    order_give = order_give_0;
-                } else if is_efficient(&pool_takes, &pool_gives, &order_give_minus_1, &diff) {
-                    order_give = order_give_minus_1;
-                } else {
-                    // couldn't find an efficient orderGive, do not apply
-                    return Err(ApplyOrderError::NoEfficientOrderGive);
-                }
+                let order_give =
+                    if is_efficient(&pool_takes, &pool_gives, &order_give_plus_1, &diff)
+                        && order_give_plus_1 <= given.amount
+                    {
+                        order_give_plus_1
+                    } else if is_efficient(&pool_takes, &pool_gives, &order_give_0, &diff) {
+                        order_give_0
+                    } else if is_efficient(&pool_takes, &pool_gives, &order_give_minus_1, &diff) {
+                        order_give_minus_1
+                    } else {
+                        // couldn't find an efficient orderGive, do not apply
+                        return Err(ApplyOrderError::NoEfficientOrderGive);
+                    };
 
                 self.value.add(&given.asset_class(), &order_give);
                 self.value.subtract(&taken.asset_class(), &takes);

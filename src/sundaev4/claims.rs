@@ -65,22 +65,16 @@ pub struct ClaimPlan {
 
 /// `V = Σ p_i · r_i`.
 pub fn compute_v(reserves: &[(AssetClass, BigInt)], prices: &[BigInt]) -> BigInt {
-    reserves
-        .iter()
-        .zip(prices)
-        .fold(BigInt::from(0), |acc, ((_, r), p)| acc + r * p)
+    reserves.iter().zip(prices).fold(BigInt::from(0), |acc, ((_, r), p)| acc + r * p)
 }
 
 /// `Q = Σ (N·p_i·r_i − V)²` — zero when perfectly balanced.
 pub fn compute_q(reserves: &[(AssetClass, BigInt)], prices: &[BigInt], v: &BigInt) -> BigInt {
     let n = BigInt::from(reserves.len() as u64);
-    reserves
-        .iter()
-        .zip(prices)
-        .fold(BigInt::from(0), |acc, ((_, r), p)| {
-            let d = &(&n * &(r * p)) - v;
-            acc + &d * &d
-        })
+    reserves.iter().zip(prices).fold(BigInt::from(0), |acc, ((_, r), p)| {
+        let d = &(&n * &(r * p)) - v;
+        acc + &d * &d
+    })
 }
 
 /// Plan a claim entry against a CS pool at the pool's `balance_fee` rate.
@@ -178,7 +172,12 @@ pub fn plan_claim(
     let mut final_assets = after_op;
     final_assets[out_idx].1 = &final_assets[out_idx].1 - &claim;
 
-    Some(ClaimPlan { dx: dx.clone(), dy, claim, final_assets })
+    Some(ClaimPlan {
+        dx: dx.clone(),
+        dy,
+        claim,
+        final_assets,
+    })
 }
 
 /// Result of searching for a claim that satisfies an intent's floor.
@@ -215,6 +214,7 @@ fn gcd(mut a: BigInt, mut b: BigInt) -> BigInt {
 /// profit — shrinks. The smallest floor-meeting dx is therefore also the
 /// most profitable one. When no dx meets the floor, returns the plan with
 /// the highest total so callers can report how close the intent is.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_claim_meeting_floor(
     reserves: &[(AssetClass, BigInt)],
     prices: &[BigInt],
@@ -239,7 +239,11 @@ pub fn plan_claim_meeting_floor(
 
     // Upper bound: spendable, and dy ≤ reserve_out.
     let dx_reserve_cap = &(&reserves[out_idx].1 * p_out) / p_in;
-    let hi_raw = if spendable < &dx_reserve_cap { spendable.clone() } else { dx_reserve_cap };
+    let hi_raw = if spendable < &dx_reserve_cap {
+        spendable.clone()
+    } else {
+        dx_reserve_cap
+    };
     let mut hi = in_steps(&hi_raw);
     if !hi.is_positive() {
         return None;
@@ -280,7 +284,10 @@ pub fn plan_claim_meeting_floor(
     }
     let best = plan_at(&hi)?;
     if &total(&best) < needed_out {
-        return Some(ClaimSearch { plan: best, meets_floor: false });
+        return Some(ClaimSearch {
+            plan: best,
+            meets_floor: false,
+        });
     }
 
     // Floor is reachable: bisect the smallest dx whose total meets it.
@@ -356,9 +363,7 @@ pub fn plan_rebalance_claim(
         return Err("rebalance shape arity mismatch");
     }
 
-    let after: Vec<BigInt> = (0..n)
-        .map(|i| &(&reserves[i].1 + &held[i]) - &targets[i])
-        .collect();
+    let after: Vec<BigInt> = (0..n).map(|i| &(&reserves[i].1 + &held[i]) - &targets[i]).collect();
     if after.iter().any(|a| a.is_negative()) {
         return Err("pool reserve would go negative (insufficient liquidity)");
     }
@@ -394,11 +399,19 @@ pub fn plan_rebalance_claim(
 
     // Op-portion shape: with the claim restored, ≥1 reserve up and ≥1 down.
     let has_inc = (0..n).any(|i| {
-        let restored = if i == claim_idx { &after[i] + &claim } else { after[i].clone() };
+        let restored = if i == claim_idx {
+            &after[i] + &claim
+        } else {
+            after[i].clone()
+        };
         restored > reserves[i].1
     });
     let has_dec = (0..n).any(|i| {
-        let restored = if i == claim_idx { &after[i] + &claim } else { after[i].clone() };
+        let restored = if i == claim_idx {
+            &after[i] + &claim
+        } else {
+            after[i].clone()
+        };
         restored < reserves[i].1
     });
     if !has_inc || !has_dec {
@@ -410,11 +423,8 @@ pub fn plan_rebalance_claim(
     // pool is being asked to underwrite.
     let v_b = compute_v(reserves, prices);
     let q_b = compute_q(reserves, prices, &v_b);
-    let after_assets: Vec<(AssetClass, BigInt)> = reserves
-        .iter()
-        .zip(after.iter())
-        .map(|((a, _), amt)| (a.clone(), amt.clone()))
-        .collect();
+    let after_assets: Vec<(AssetClass, BigInt)> =
+        reserves.iter().zip(after.iter()).map(|((a, _), amt)| (a.clone(), amt.clone())).collect();
     let v_a = compute_v(&after_assets, prices);
     if !v_a.is_positive() {
         return Err("pool value after the rebalance would be non-positive");
@@ -449,7 +459,14 @@ pub fn plan_rebalance_claim(
         .iter()
         .enumerate()
         .map(|(i, (a, amt))| {
-            (a.clone(), if i == claim_idx { amt + &claim } else { amt.clone() })
+            (
+                a.clone(),
+                if i == claim_idx {
+                    amt + &claim
+                } else {
+                    amt.clone()
+                },
+            )
         })
         .collect();
     let input_value_op: BigInt = (0..n)
@@ -459,15 +476,20 @@ pub fn plan_rebalance_claim(
         .map(|(d, p)| &d * p)
         .fold(BigInt::from(0), |acc, x| acc + x);
     let v_increase_op = &compute_v(&after_op, prices) - &v_b;
-    if !(&(&v_increase_op * bf_den) <= &(&input_value_op * bf_num)) {
+    if !((&v_increase_op * bf_den) <= (&input_value_op * bf_num)) {
         return Err("rebalance op portion underpays the pool's balance_fee");
     }
-    if !(&(&(&v_increase_op + &BigInt::from(1)) * bf_den) > &(&input_value_op * bf_num)) {
+    if !((&(&v_increase_op + &BigInt::from(1)) * bf_den) > (&input_value_op * bf_num)) {
         return Err("rebalance op portion overpays the pool's balance_fee");
     }
 
     let deltas: Vec<BigInt> = (0..n).map(|i| &held[i] - &targets[i]).collect();
-    Ok(RebalancePlan { deltas, claim_idx, claim, final_assets: after_assets })
+    Ok(RebalancePlan {
+        deltas,
+        claim_idx,
+        claim,
+        final_assets: after_assets,
+    })
 }
 
 /// Size the declared claim for one receive leg of a rebalance, returning
@@ -500,8 +522,8 @@ fn solve_claim_value(
         } else {
             BigInt::from(0)
         };
-        let next = net_gain
-            + &op_portion_fee(reserves, prices, after, claim_idx, &claim, balance_fee);
+        let next =
+            net_gain + &op_portion_fee(reserves, prices, after, claim_idx, &claim, balance_fee);
         if next == claim_value {
             break;
         }
@@ -545,7 +567,11 @@ fn op_portion_fee(
     let (bf_num, bf_den) = balance_fee;
     let input_value_op: BigInt = (0..reserves.len())
         .map(|i| {
-            let after_op = if i == claim_idx { &after[i] + claim } else { after[i].clone() };
+            let after_op = if i == claim_idx {
+                &after[i] + claim
+            } else {
+                after[i].clone()
+            };
             &after_op - &reserves[i].1
         })
         .zip(prices.iter())
@@ -675,10 +701,8 @@ pub fn resolve_claim_shape(
             if holding(asset) >= *floor {
                 continue; // carried through untouched — floor already met
             }
-            return Err(
-                "min_deltas demands inflow of an asset this pool can't \
-                 produce",
-            );
+            return Err("min_deltas demands inflow of an asset this pool can't \
+                 produce");
         };
         // A floor above current holdings is a receive target; at-or-below
         // is an outflow cap handled via pin().
@@ -688,9 +712,7 @@ pub fn resolve_claim_shape(
         }
     }
     if receives.is_empty() {
-        return Err(
-            "no receive target: no min_deltas entry demands a positive delta",
-        );
+        return Err("no receive target: no min_deltas entry demands a positive delta");
     }
 
     // Single-op rebalance when the trade can't be expressed as one pair:
@@ -702,14 +724,16 @@ pub fn resolve_claim_shape(
     let offer_capable = reserves
         .iter()
         .enumerate()
-        .filter(|(i, (a, _))| {
-            !receive_idxs.contains(i) && (&holding(a) - &pin(a)).is_positive()
-        })
+        .filter(|(i, (a, _))| !receive_idxs.contains(i) && (&holding(a) - &pin(a)).is_positive())
         .count();
     if receives.len() > 1 || offer_capable > 1 {
         let held: Vec<BigInt> = reserves.iter().map(|(a, _)| holding(a)).collect();
         let targets: Vec<BigInt> = reserves.iter().map(|(a, _)| pin(a)).collect();
-        return Ok(ResolvedShape::Rebalance(RebalanceShape { held, targets, min_ada }));
+        return Ok(ResolvedShape::Rebalance(RebalanceShape {
+            held,
+            targets,
+            min_ada,
+        }));
     }
     let (out_idx, min_recv) = receives.into_iter().next().expect("len == 1");
 
@@ -763,14 +787,14 @@ mod tests {
     use super::*;
 
     fn ac(tag: u8) -> AssetClass {
-        AssetClass { policy: vec![tag; 28], token: vec![tag] }
+        AssetClass {
+            policy: vec![tag; 28],
+            token: vec![tag],
+        }
     }
 
     fn pool(r: &[i64]) -> Vec<(AssetClass, BigInt)> {
-        r.iter()
-            .enumerate()
-            .map(|(i, amt)| (ac(i as u8 + 1), BigInt::from(*amt)))
-            .collect()
+        r.iter().enumerate().map(|(i, amt)| (ac(i as u8 + 1), BigInt::from(*amt))).collect()
     }
 
     fn ones(n: usize) -> Vec<BigInt> {
@@ -810,10 +834,10 @@ mod tests {
             }
         }
         let v_increase_op = &v_op - &v_before;
-        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+        if !((&v_increase_op * bf.1) <= (&input_value_op * bf.0)) {
             return false;
         }
-        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+        if !((&(&v_increase_op + &BigInt::from(1)) * bf.1) > (&input_value_op * bf.0)) {
             return false;
         }
         // Actual after-state (claim extracted) must match the plan.
@@ -846,7 +870,15 @@ mod tests {
         let before = pool(&[1_000_000, 1_000_000, 1_000_000]);
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
-        let plan = plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &BigInt::from(10_000));
+        let plan = plan_claim(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
+            &BigInt::from(10_000),
+        );
         assert!(plan.is_none());
     }
 
@@ -858,17 +890,41 @@ mod tests {
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
         let dx = BigInt::from(50_000_000);
-        let plan = plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &dx)
-            .expect("imbalanced pool should admit a claim");
+        let plan = plan_claim(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
+            &dx,
+        )
+        .expect("imbalanced pool should admit a claim");
         assert!(plan.claim > BigInt::from(0));
         assert_eq!(plan.dy, dx); // 1:1 prices, fee waived
-        assert!(contract_accepts(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &plan, 0, 1));
+        assert!(contract_accepts(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            &plan,
+            0,
+            1
+        ));
 
         // Maximality: one more unit must fail the contract inequality.
         let mut greedy = plan.clone();
         greedy.claim = &plan.claim + &BigInt::from(1);
         greedy.final_assets[1].1 = &plan.final_assets[1].1 - &BigInt::from(1);
-        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &greedy, 0, 1));
+        assert!(!contract_accepts(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            &greedy,
+            0,
+            1
+        ));
     }
 
     #[test]
@@ -877,8 +933,15 @@ mod tests {
         let before = pool(&[400_000_000, 800_000_000, 600_000_000]);
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
-        let plan =
-            plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 1, 0, &BigInt::from(50_000_000));
+        let plan = plan_claim(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            1,
+            0,
+            &BigInt::from(50_000_000),
+        );
         assert!(plan.is_none());
     }
 
@@ -887,8 +950,15 @@ mod tests {
         let before = pool(&[400_000_000, 800_000_000, 600_000_000]);
         let prices = ones(3);
         let k = (BigInt::from(0), BigInt::from(1));
-        let plan =
-            plan_claim(&before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &BigInt::from(50_000_000));
+        let plan = plan_claim(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
+            &BigInt::from(50_000_000),
+        );
         assert!(plan.is_none());
     }
 
@@ -905,9 +975,8 @@ mod tests {
     ) -> bool {
         use num_traits::Signed;
         let n = before.len();
-        let after: Vec<(AssetClass, BigInt)> = (0..n)
-            .map(|i| (before[i].0.clone(), &before[i].1 + &plan.deltas[i]))
-            .collect();
+        let after: Vec<(AssetClass, BigInt)> =
+            (0..n).map(|i| (before[i].0.clone(), &before[i].1 + &plan.deltas[i])).collect();
         if after != plan.final_assets || after.iter().any(|(_, a)| a.is_negative()) {
             return false;
         }
@@ -916,7 +985,14 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (a, amt))| {
-                (a.clone(), if i == plan.claim_idx { amt + &plan.claim } else { amt.clone() })
+                (
+                    a.clone(),
+                    if i == plan.claim_idx {
+                        amt + &plan.claim
+                    } else {
+                        amt.clone()
+                    },
+                )
             })
             .collect();
         let has_inc = (0..n).any(|i| after_op[i].1 > before[i].1);
@@ -934,10 +1010,10 @@ mod tests {
         }
         let v_b = compute_v(before, prices);
         let v_increase_op = &compute_v(&after_op, prices) - &v_b;
-        if !(&(&v_increase_op * bf.1) <= &(&input_value_op * bf.0)) {
+        if !((&v_increase_op * bf.1) <= (&input_value_op * bf.0)) {
             return false;
         }
-        if !(&(&(&v_increase_op + &BigInt::from(1)) * bf.1) > &(&input_value_op * bf.0)) {
+        if !((&(&v_increase_op + &BigInt::from(1)) * bf.1) > (&input_value_op * bf.0)) {
             return false;
         }
         // Claim well-formedness, no-overshoot guard, cap_b.
@@ -979,29 +1055,50 @@ mod tests {
         let held = vec![big(10_000_000_000), big(0), big(0)];
         let targets = vec![big(0), big(4_995_500_000), big(4_995_500_000)];
         let plan = plan_rebalance_claim(
-            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &targets,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &held,
+            &targets,
         )
         .expect("1-in/2-out rebalance is valid on a fee pool when the payout absorbs the fee");
         // The order nets −9.00: it pays 10.00 of fee and earns a 1.00 bounty.
         assert_eq!(plan.claim, big(1_000_000));
         assert_eq!(plan.claim_idx, 1, "deepest receive leg carries the claim");
-        let net_gain: BigInt = (0..3)
-            .map(|i| &(&targets[i] - &held[i]) * &prices[i])
-            .fold(big(0), |acc, d| acc + d);
+        let net_gain: BigInt =
+            (0..3).map(|i| &(&targets[i] - &held[i]) * &prices[i]).fold(big(0), |acc, d| acc + d);
         assert_eq!(&net_gain + &fee, &plan.claim * &prices[plan.claim_idx]);
-        assert!(contract_accepts_rebalance(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan));
+        assert!(contract_accepts_rebalance(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &plan
+        ));
 
         // Two scarce assets in, the abundant one out.
         let before = pool(&[800_000_000_000, 900_000_000_000, 1_400_000_000_000]);
         let held = vec![big(6_000_000_000), big(4_000_000_000), big(0)];
         let targets = vec![big(0), big(0), big(9_992_000_000)];
         let plan = plan_rebalance_claim(
-            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &targets,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &held,
+            &targets,
         )
         .expect("2-in/1-out rebalance is valid on a fee pool too");
         assert_eq!(plan.claim, big(2_000_000));
         assert_eq!(plan.claim_idx, 2);
-        assert!(contract_accepts_rebalance(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan));
+        assert!(contract_accepts_rebalance(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &plan
+        ));
     }
 
     /// The fee pool's neutral zone: near equilibrium cap_b admits less bounty
@@ -1019,7 +1116,12 @@ mod tests {
         // claim — far past what this pool's imbalance underwrites.
         let greedy = vec![big(0), big(5_000_500_000), big(5_000_500_000)];
         let err = plan_rebalance_claim(
-            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &greedy,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &held,
+            &greedy,
         )
         .expect_err("profit on a fee pool must be refused near equilibrium");
         assert!(err.contains("cap_b"), "got: {err}");
@@ -1028,7 +1130,12 @@ mod tests {
         // which the validator's `amount > 0` clause forbids.
         let underpaid = vec![big(0), big(4_990_000_000), big(4_990_000_000)];
         let err = plan_rebalance_claim(
-            &before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &held, &underpaid,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &held,
+            &underpaid,
         )
         .expect_err("a payout below fee-neutral has no claim to declare");
         assert!(err.contains("no bounty to claim"), "got: {err}");
@@ -1045,12 +1152,25 @@ mod tests {
         let held = vec![big(10_000_000_000), big(0), big(0)];
         let targets = vec![big(0), big(5_000_500_000), big(5_000_500_000)];
         let plan = plan_rebalance_claim(
-            &before, &prices, (&k.0, &k.1), (&waived.0, &waived.1), &held, &targets,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&waived.0, &waived.1),
+            &held,
+            &targets,
         )
         .expect("waived pools admit the value-neutral rebalance as before");
-        assert_eq!(plan.claim, big(1_000_000), "claim == net gain when the fee is waived");
+        assert_eq!(
+            plan.claim,
+            big(1_000_000),
+            "claim == net gain when the fee is waived"
+        );
         assert!(contract_accepts_rebalance(
-            &before, &prices, (&k.0, &k.1), (&waived.0, &waived.1), &plan
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&waived.0, &waived.1),
+            &plan
         ));
     }
 
@@ -1143,7 +1263,12 @@ mod tests {
         // Under the current (SUN-310) contract this shape overshoots USDr's
         // balance point (surplus → deficit) and must be rejected.
         let err = plan_rebalance_claim(
-            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &held, &targets,
+            &reserves,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            &held,
+            &targets,
         )
         .expect_err("no-overshoot guard must reject the pre-SUN-310 shape");
         assert!(err.contains("overshoot"), "got: {err}");
@@ -1189,23 +1314,59 @@ mod tests {
         // the best plan the planner reports still satisfies the contract.
         let overshoot_floor = BigInt::from(629_252_486u64);
         let search = plan_claim_meeting_floor(
-            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &spendable, &overshoot_floor,
+            &reserves,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
+            &spendable,
+            &overshoot_floor,
         )
         .expect("a best-effort plan is still feasible");
-        assert!(!search.meets_floor, "no_flip caps the total below the overshoot floor");
+        assert!(
+            !search.meets_floor,
+            "no_flip caps the total below the overshoot floor"
+        );
         let total = &search.plan.dy + &search.plan.claim;
-        assert!(total <= BigInt::from(628_314_683u64), "capped at the balance point: {total}");
-        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &search.plan, 0, 1));
+        assert!(
+            total <= BigInt::from(628_314_683u64),
+            "capped at the balance point: {total}"
+        );
+        assert!(contract_accepts(
+            &reserves,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            &search.plan,
+            0,
+            1
+        ));
 
         // A floor at or under the cap is met, and the plan respects no_flip.
         let reachable_floor = BigInt::from(600_000_000u64);
         let search = plan_claim_meeting_floor(
-            &reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1, &spendable, &reachable_floor,
+            &reserves,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
+            &spendable,
+            &reachable_floor,
         )
         .expect("claim must be feasible");
         assert!(search.meets_floor, "a sub-cap floor is reachable");
         assert!(&search.plan.dy + &search.plan.claim >= reachable_floor);
-        assert!(contract_accepts(&reserves, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), &search.plan, 0, 1));
+        assert!(contract_accepts(
+            &reserves,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            &search.plan,
+            0,
+            1
+        ));
     }
 
     #[test]
@@ -1226,12 +1387,28 @@ mod tests {
         // = 50_000, so dy = 50_000_000 − 50_000 = 49_950_000.
         assert_eq!(plan.dy, BigInt::from(49_950_000));
         // The exact contract clauses (incl. the balance_fee fee-pin) accept it.
-        assert!(contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &plan, 0, 1));
+        assert!(contract_accepts(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &plan,
+            0,
+            1
+        ));
         // Maximality: one more claim unit fails the contract check.
         let mut greedy = plan.clone();
         greedy.claim = &plan.claim + &BigInt::from(1);
         greedy.final_assets[1].1 = &plan.final_assets[1].1 - &BigInt::from(1);
-        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &greedy, 0, 1));
+        assert!(!contract_accepts(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &greedy,
+            0,
+            1
+        ));
     }
 
     #[test]
@@ -1242,13 +1419,26 @@ mod tests {
         let prices = ones(3);
         let k = (BigInt::from(9), BigInt::from(4000));
         let waived = plan_claim(
-            &before, &prices, (&k.0, &k.1), (&BigInt::from(0), &BigInt::from(1)), 0, 1,
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&BigInt::from(0), &BigInt::from(1)),
+            0,
+            1,
             &BigInt::from(50_000_000),
         )
         .expect("waived plan exists");
         // Same plan, judged against a fee-charging pool → rejected by the pin.
         let bf = (BigInt::from(10), BigInt::from(10000));
-        assert!(!contract_accepts(&before, &prices, (&k.0, &k.1), (&bf.0, &bf.1), &waived, 0, 1));
+        assert!(!contract_accepts(
+            &before,
+            &prices,
+            (&k.0, &k.1),
+            (&bf.0, &bf.1),
+            &waived,
+            0,
+            1
+        ));
     }
 
     /// min_deltas re-basing (SUN-310): entries are deltas over the order's
@@ -1258,7 +1448,11 @@ mod tests {
     /// the absolute reading resolved to "no receive target".
     #[test]
     fn resolve_claim_shape_rebases_deltas_over_holdings() {
-        let reserves = pool(&[3_250_000_000_000u64 as i64, 4_900_000_000_000, 6_850_000_000_000]);
+        let reserves = pool(&[
+            3_250_000_000_000u64 as i64,
+            4_900_000_000_000,
+            6_850_000_000_000,
+        ]);
         let prices = ones(3);
         let mut value = crate::cardano_types::Value::default();
         // Order already holds 10G of asset 1 (the receive target) and 10G of
@@ -1266,8 +1460,8 @@ mod tests {
         value.insert(&reserves[0].0, BigInt::from(10_000_000_000u64));
         value.insert(&reserves[1].0, BigInt::from(10_000_000_000u64));
         let min_deltas = vec![
-            (reserves[0].0.clone(), BigInt::from(1_500_000_000)),  // receive ≥ +1.5G
-            (reserves[1].0.clone(), BigInt::from(-600_000_000)),   // spend ≤ 0.6G
+            (reserves[0].0.clone(), BigInt::from(1_500_000_000)), // receive ≥ +1.5G
+            (reserves[1].0.clone(), BigInt::from(-600_000_000)),  // spend ≤ 0.6G
         ];
         let shape = resolve_claim_shape(&value, &min_deltas, &reserves, &prices)
             .expect("delta mins must resolve");
@@ -1298,11 +1492,15 @@ mod tests {
     /// which made signers write explicit 0-deltas for every untouched asset.
     #[test]
     fn resolve_claim_shape_freezes_unnamed_assets() {
-        let reserves = pool(&[3_250_000_000_000u64 as i64, 4_900_000_000_000, 6_850_000_000_000]);
+        let reserves = pool(&[
+            3_250_000_000_000u64 as i64,
+            4_900_000_000_000,
+            6_850_000_000_000,
+        ]);
         let prices = ones(3);
         let mut value = crate::cardano_types::Value::default();
         value.insert(&reserves[0].0, BigInt::from(10_000_000_000u64)); // receive target
-        value.insert(&reserves[1].0, BigInt::from(1_000_000_000u64));  // named spend
+        value.insert(&reserves[1].0, BigInt::from(1_000_000_000u64)); // named spend
         value.insert(&reserves[2].0, BigInt::from(10_000_000_000u64)); // UNNAMED — frozen
         let min_deltas = vec![
             (reserves[0].0.clone(), BigInt::from(1_000_324_661)),

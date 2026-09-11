@@ -10,8 +10,8 @@
 #[cfg(test)]
 mod tests {
     use crate::bigint::BigInt;
-    use crate::sundaev4::batch::{assemble_batch, BatchLimits};
-    use crate::sundaev4::test_harness::test_harness::*;
+    use crate::sundaev4::batch::{BatchLimits, assemble_batch};
+    use crate::sundaev4::test_harness::*;
     use crate::sundaev4::tx_builder::TX_FEE;
     use num_traits::Signed;
 
@@ -24,28 +24,115 @@ mod tests {
     /// MNGO, token_e=tOKENA. Exact live reserves.
     #[test]
     fn repro_router_parity_84e3e4c8() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let mut pool_map = BTreeMap::new();
         for p in [
             // Direct MNGO/MINT pools (token_a=MINT, token_b=MNGO).
-            make_cl_pool(&env, 0x46, token_a(), 349_594_488_343, token_b(), 53_852_218_245,
-                6_765_584_440_427, 97, 100, 103, 100, 5, 10000), // f46671fb
-            make_cl_pool(&env, 0x80, token_a(), 125_000_000_000, token_b(), 125_000_000_000,
-                1_309_382_102_236, 90, 100, 110, 100, 5, 10000), // 80c8d105
-            make_cl_pool(&env, 0xb5, token_a(), 75_100_000_000, token_b(), 74_899_865_896,
-                495_795_726_371, 85, 100, 118, 100, 10, 10000),  // b56479f5
-            make_pool(&env, 0xc2, token_a(), 125_000_000_000, token_b(), 125_000_000_000), // c21bd0b9 CP
-            make_cl_pool(&env, 0x65, token_a(), 144_196_000_000, token_b(), 0,
-                4_000_000_000_000, 1095, 1000, 1140, 1000, 30, 10000), // 65fe0a9e (value-losing)
+            make_cl_pool(
+                &env,
+                0x46,
+                token_a(),
+                349_594_488_343,
+                token_b(),
+                53_852_218_245,
+                6_765_584_440_427,
+                97,
+                100,
+                103,
+                100,
+                5,
+                10000,
+            ), // f46671fb
+            make_cl_pool(
+                &env,
+                0x80,
+                token_a(),
+                125_000_000_000,
+                token_b(),
+                125_000_000_000,
+                1_309_382_102_236,
+                90,
+                100,
+                110,
+                100,
+                5,
+                10000,
+            ), // 80c8d105
+            make_cl_pool(
+                &env,
+                0xb5,
+                token_a(),
+                75_100_000_000,
+                token_b(),
+                74_899_865_896,
+                495_795_726_371,
+                85,
+                100,
+                118,
+                100,
+                10,
+                10000,
+            ), // b56479f5
+            make_pool(
+                &env,
+                0xc2,
+                token_a(),
+                125_000_000_000,
+                token_b(),
+                125_000_000_000,
+            ), // c21bd0b9 CP
+            make_cl_pool(
+                &env,
+                0x65,
+                token_a(),
+                144_196_000_000,
+                token_b(),
+                0,
+                4_000_000_000_000,
+                1095,
+                1000,
+                1140,
+                1000,
+                30,
+                10000,
+            ), // 65fe0a9e (value-losing)
             // Multi-hop legs: MNGO→tOKENA (3f94fbd6), tOKENA→MINT (ea58fe73).
-            make_pool(&env, 0x3f, token_e(), 300_000_000_000, token_b(), 150_000_000_000), // tOKENA/MNGO
-            make_pool(&env, 0xea, token_e(), 200_000_000_000, token_a(), 100_000_000_000), // tOKENA/MINT
+            make_pool(
+                &env,
+                0x3f,
+                token_e(),
+                300_000_000_000,
+                token_b(),
+                150_000_000_000,
+            ), // tOKENA/MNGO
+            make_pool(
+                &env,
+                0xea,
+                token_e(),
+                200_000_000_000,
+                token_a(),
+                100_000_000_000,
+            ), // tOKENA/MINT
             // ADA legs: MNGO→ADA (a22550f2), ADA→MINT (31bba660).
-            make_pool(&env, 0xa2, token_f(), 62_500_000_000, token_b(), 25_000_000_000),   // ADA/MNGO
-            make_pool(&env, 0x31, token_f(), 625_000_000_000, token_a(), 250_000_000_000), // ADA/MINT
+            make_pool(
+                &env,
+                0xa2,
+                token_f(),
+                62_500_000_000,
+                token_b(),
+                25_000_000_000,
+            ), // ADA/MNGO
+            make_pool(
+                &env,
+                0x31,
+                token_f(),
+                625_000_000_000,
+                token_a(),
+                250_000_000_000,
+            ), // ADA/MINT
         ] {
             pool_map.insert(p.pool_datum.identifier.clone(), p);
         }
@@ -55,45 +142,101 @@ mod tests {
         let limits = router::RoutingLimits::from_budget(5_000_000, 1_000_000, 500_000);
 
         let blend = router::find_blended_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, limits,
-        ).expect("route exists");
-        eprintln!("=== blend: branches={} total_out={}", blend.branches.len(), blend.total_output);
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("route exists");
+        eprintln!(
+            "=== blend: branches={} total_out={}",
+            blend.branches.len(),
+            blend.total_output
+        );
         for (bi, br) in blend.branches.iter().enumerate() {
             for (hi, hop) in br.hops.iter().enumerate() {
                 for sp in &hop.splits {
-                    eprintln!("  b{bi} h{hi} pool={} in={} out={}",
-                        hex::encode(&sp.pool.ident.to_bytes()[..1]), sp.input_amount, sp.output_amount);
+                    eprintln!(
+                        "  b{bi} h{hi} pool={} in={} out={}",
+                        hex::encode(&sp.pool.ident.to_bytes()[..1]),
+                        sp.input_amount,
+                        sp.output_amount
+                    );
                 }
             }
         }
         let single = router::find_optimal_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, limits,
-        ).expect("single route exists");
-        eprintln!("=== find_optimal_route: hops={} total_out={}", single.hops.len(), single.total_output);
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("single route exists");
+        eprintln!(
+            "=== find_optimal_route: hops={} total_out={}",
+            single.hops.len(),
+            single.total_output
+        );
 
         // The full blend fits max_pools=5 (direct 1 + tOKENA 2 + ADA 2), so it
         // isn't pruned; it must beat the single-hop answer.
-        assert!(blend.branches.len() >= 2, "expected a multi-branch blend at 5-pool budget");
-        assert!(blend.total_output > single.total_output, "blend must beat single-hop");
+        assert!(
+            blend.branches.len() >= 2,
+            "expected a multi-branch blend at 5-pool budget"
+        );
+        assert!(
+            blend.total_output > single.total_output,
+            "blend must beat single-hop"
+        );
 
         // TIGHT budget (3 pools): the full 5-pool blend now exceeds the budget.
         // Budget-aware pruning must find the best route that FITS 3 pools (direct
         // + ONE multi-hop leg) rather than collapsing to the single-hop fallback.
         let tight = router::RoutingLimits::from_budget(3_000_000, 1_000_000, 500_000);
         let tight_single = router::find_optimal_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, tight,
-        ).expect("tight single exists");
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            tight,
+        )
+        .expect("tight single exists");
         let tight_blend = router::find_blended_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1, tight,
-        ).expect("tight blend exists");
-        let tpools: std::collections::BTreeSet<_> = tight_blend.branches.iter()
-            .flat_map(|b| b.hops.iter()).flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone()))
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            tight,
+        )
+        .expect("tight blend exists");
+        let tpools: std::collections::BTreeSet<_> = tight_blend
+            .branches
+            .iter()
+            .flat_map(|b| b.hops.iter())
+            .flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone()))
             .collect();
-        eprintln!("=== TIGHT(3): branches={} pools={} total_out={} (single={})",
-            tight_blend.branches.len(), tpools.len(), tight_blend.total_output, tight_single.total_output);
-        assert!(tpools.len() <= 3, "pruned blend must fit the 3-pool budget, used {}", tpools.len());
-        assert!(tight_blend.total_output > tight_single.total_output,
-            "budget-aware pruning must beat single-hop, not fall back to it");
+        eprintln!(
+            "=== TIGHT(3): branches={} pools={} total_out={} (single={})",
+            tight_blend.branches.len(),
+            tpools.len(),
+            tight_blend.total_output,
+            tight_single.total_output
+        );
+        assert!(
+            tpools.len() <= 3,
+            "pruned blend must fit the 3-pool budget, used {}",
+            tpools.len()
+        );
+        assert!(
+            tight_blend.total_output > tight_single.total_output,
+            "budget-aware pruning must beat single-hop, not fall back to it"
+        );
     }
 
     /// Exact reproduction of the live quarantine (order 565ec5d3), a
@@ -110,9 +253,9 @@ mod tests {
     /// both the blended path (fillable) and the collapse path (rejected) are safe.
     #[test]
     fn repro_565ec5d3_f46671fb_over_drain() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         // token_a = tOKENB (asset A / idx0), token_b = tOKENE (asset B / idx1).
@@ -122,19 +265,78 @@ mod tests {
         let mut pool_map = BTreeMap::new();
         for p in [
             // f46671fb — the tight pool that over-drained (350G B / 53.45G E).
-            make_cl_pool(&env, 0x46, token_a(), 350_000_000_000, token_b(), 53_452_218_245,
-                6_765_375_373_647, 97, 100, 103, 100, 5, 10000),
+            make_cl_pool(
+                &env,
+                0x46,
+                token_a(),
+                350_000_000_000,
+                token_b(),
+                53_452_218_245,
+                6_765_375_373_647,
+                97,
+                100,
+                103,
+                100,
+                5,
+                10000,
+            ),
             // 80c8d105 — mid CL, wider range [0.9,1.1].
-            make_cl_pool(&env, 0x80, token_a(), 125_000_000_000, token_b(), 125_000_000_000,
-                1_309_382_102_236, 90, 100, 110, 100, 5, 10000),
+            make_cl_pool(
+                &env,
+                0x80,
+                token_a(),
+                125_000_000_000,
+                token_b(),
+                125_000_000_000,
+                1_309_382_102_236,
+                90,
+                100,
+                110,
+                100,
+                5,
+                10000,
+            ),
             // b56479f5 — CL, range [0.85,1.18].
-            make_cl_pool(&env, 0xb5, token_a(), 75_100_000_000, token_b(), 74_899_865_896,
-                495_795_726_371, 85, 100, 118, 100, 10, 10000),
+            make_cl_pool(
+                &env,
+                0xb5,
+                token_a(),
+                75_100_000_000,
+                token_b(),
+                74_899_865_896,
+                495_795_726_371,
+                85,
+                100,
+                118,
+                100,
+                10,
+                10000,
+            ),
             // c21bd0b9 — constant-product 125G/125G.
-            make_pool(&env, 0xc2, token_a(), 125_000_000_000, token_b(), 125_000_000_000),
+            make_pool(
+                &env,
+                0xc2,
+                token_a(),
+                125_000_000_000,
+                token_b(),
+                125_000_000_000,
+            ),
             // 65fe0a9e — dormant one-sided CL (all B, 0 E, parked out of range).
-            make_cl_pool(&env, 0x65, token_a(), 144_196_000_000, token_b(), 0,
-                4_000_000_000_000, 1095, 1000, 1140, 1000, 30, 10000),
+            make_cl_pool(
+                &env,
+                0x65,
+                token_a(),
+                144_196_000_000,
+                token_b(),
+                0,
+                4_000_000_000_000,
+                1095,
+                1000,
+                1140,
+                1000,
+                30,
+                10000,
+            ),
         ] {
             pool_map.insert(p.pool_datum.identifier.clone(), p);
         }
@@ -152,7 +354,11 @@ mod tests {
         // rejects). So the order must route cleanly through the healthy pools and
         // ACCUMULATE OK — no over-drain, no fee_budget<0 leg, no quarantine.
         let blend = router::find_blended_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1,
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("healthy pools can route the order");
@@ -185,13 +391,21 @@ mod tests {
         // ~363.6G, so the collapse must be REJECTED (None) — never a route that
         // sends 400G through it and over-drains. This is the exact live path.
         if let Some(single) = router::find_optimal_route(
-            &pool_map, &[], &token_b(), &token_a(), &order.swap_offered().1,
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         ) {
-            let collapsed = router::collapse_to_serial(&single, &order.swap_offered().1);
-            eprintln!("=== collapse_to_serial → {}",
-                collapsed.as_ref().map(|c| format!("Some(in={}, out={})", c.total_input, c.total_output))
-                    .unwrap_or_else(|| "None (skipped)".into()));
+            let collapsed = router::collapse_to_serial(&single, order.swap_offered().1);
+            eprintln!(
+                "=== collapse_to_serial → {}",
+                collapsed
+                    .as_ref()
+                    .map(|c| format!("Some(in={}, out={})", c.total_input, c.total_output))
+                    .unwrap_or_else(|| "None (skipped)".into())
+            );
             if let Some(serial) = collapsed {
                 let mut accum = Accumulator::new(env.exec.protocol_share);
                 if let Err(e) = accum.try_add_routed_order(&order, &serial, &pool_map) {
@@ -231,31 +445,86 @@ mod tests {
         // `cl_fee_budget` against lp_after = 0 is the liquidity the reserves
         // support: this fixture is ~81.3e9 (2.2%) short of its own books.
         let supported = swap_math::cl_fee_budget(
-            &big(a), &big(b), &big(0), &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d));
-        assert!(supported < big(lp), "fixture must be underfunded: {supported} vs {lp}");
+            &big(a),
+            &big(b),
+            &big(0),
+            &big(spa_n),
+            &big(spa_d),
+            &big(spb_n),
+            &big(spb_d),
+        );
+        assert!(
+            supported < big(lp),
+            "fixture must be underfunded: {supported} vs {lp}"
+        );
 
         // Neither direction may report spare capacity.
         for is_a_input in [false, true] {
             if let Some(reserve_cap) = swap_math::cl_max_dx_for_reserve(
-                &big(a), &big(b), &big(lp), is_a_input,
-                &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d), &fee_n, &fee_d,
+                &big(a),
+                &big(b),
+                &big(lp),
+                is_a_input,
+                &big(spa_n),
+                &big(spa_d),
+                &big(spb_n),
+                &big(spb_d),
+                &fee_n,
+                &fee_d,
             ) {
                 let vp = swap_math::cl_max_dx_value_preserving(
-                    &big(a), &big(b), &big(lp), &reserve_cap, is_a_input,
-                    &big(spa_n), &big(spa_d), &big(spb_n), &big(spb_d), &fee_n, &fee_d,
+                    &big(a),
+                    &big(b),
+                    &big(lp),
+                    &reserve_cap,
+                    is_a_input,
+                    &big(spa_n),
+                    &big(spa_d),
+                    &big(spb_n),
+                    &big(spb_d),
+                    &fee_n,
+                    &fee_d,
                 );
                 assert_eq!(
-                    vp, big(0),
+                    vp,
+                    big(0),
                     "underfunded pool must be excluded, got cap {vp} (is_a_input={is_a_input})"
                 );
             }
         }
 
         // End to end: the router routes around it and the route accumulates.
-        let cl = make_cl_pool(&env, 0x10, token_a(), a, token_b(), b, lp,
-                              spa_n, spa_d, spb_n, spb_d, 30, 10000);
-        let cp1 = make_pool(&env, 0x11, token_a(), 1_620_199_307_449, token_b(), 1_624_906_635_884);
-        let cp2 = make_pool(&env, 0x12, token_a(), 898_826_200_404, token_b(), 450_988_088_115);
+        let cl = make_cl_pool(
+            &env,
+            0x10,
+            token_a(),
+            a,
+            token_b(),
+            b,
+            lp,
+            spa_n,
+            spa_d,
+            spb_n,
+            spb_d,
+            30,
+            10000,
+        );
+        let cp1 = make_pool(
+            &env,
+            0x11,
+            token_a(),
+            1_620_199_307_449,
+            token_b(),
+            1_624_906_635_884,
+        );
+        let cp2 = make_pool(
+            &env,
+            0x12,
+            token_a(),
+            898_826_200_404,
+            token_b(),
+            450_988_088_115,
+        );
         let mut pool_map = BTreeMap::new();
         for p in [cl, cp1, cp2] {
             pool_map.insert(p.pool_datum.identifier.clone(), p);
@@ -263,7 +532,11 @@ mod tests {
         let (offer, ask) = (token_b(), token_a());
         let order = make_order(offer.clone(), 1_158_376_366_982, ask.clone(), 1, 1);
         let blend = router::find_blended_route(
-            &pool_map, &[], &offer, &ask, &order.swap_offered().1,
+            &pool_map,
+            &[],
+            &offer,
+            &ask,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("the two healthy CP pools can fill this");
@@ -272,7 +545,11 @@ mod tests {
             Some(single) => accum.try_add_routed_order(&order, single, &pool_map),
             None => accum.try_add_blended_order(&order, &blend, &pool_map),
         };
-        assert!(result.is_ok(), "route must be fillable, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "route must be fillable, got {:?}",
+            result.err()
+        );
     }
 
     use proptest::prelude::*;
@@ -388,7 +665,7 @@ mod tests {
                 let (offer, ask) = if a_to_b { (token_a(), token_b()) } else { (token_b(), token_a()) };
                 let order = make_order(offer.clone(), amount, ask.clone(), 1, 1);
                 if let Some(blend) = router::find_blended_route(
-                    &pool_map, &[], &offer, &ask, &order.swap_offered().1,
+                    &pool_map, &[], &offer, &ask, order.swap_offered().1,
                     router::RoutingLimits::unlimited(),
                 ) {
                     let mut accum = Accumulator::new(env.exec.protocol_share);
@@ -427,36 +704,65 @@ mod tests {
     #[test]
     fn single_pool_single_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 1);
         assert!(batch.swaps[0].dy.is_positive());
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (result, eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
-        assert!(!eval.budgets.is_empty(), "should have evaluated at least one script");
+        assert!(
+            !eval.budgets.is_empty(),
+            "should have evaluated at least one script"
+        );
         assert_eq!(result.predicted_pools.len(), 1);
     }
 
     #[test]
     fn single_pool_reverse_direction() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         // Sell B for A (opposite direction)
         let orders = vec![make_order(token_b(), 5_000_000, token_a(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 1);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (_result, eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
     }
@@ -464,20 +770,33 @@ mod tests {
     #[test]
     fn single_pool_multiple_same_direction() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let orders = vec![
             make_order(token_a(), 10_000_000, token_b(), 1, 1),
             make_order(token_a(), 20_000_000, token_b(), 1, 2),
             make_order(token_a(), 5_000_000, token_b(), 1, 3),
         ];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 3);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (result, eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
 
@@ -491,34 +810,56 @@ mod tests {
     #[test]
     fn single_pool_opposing_orders() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let orders = vec![
             make_order(token_a(), 10_000_000, token_b(), 1, 1),
             make_order(token_b(), 5_000_000, token_a(), 1, 2),
         ];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 2);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (result, eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
 
         // k-value should be non-decreasing
         let pool_datum = &result.predicted_pools[0].2.pool_datum;
         assert_k_nondecreasing(
-            &BigInt::from(1_000_000_000i64), &BigInt::from(1_000_000_000i64),
-            &pool_datum.assets[0].1, &pool_datum.assets[1].1,
+            &BigInt::from(1_000_000_000i64),
+            &BigInt::from(1_000_000_000i64),
+            &pool_datum.assets[0].1,
+            &pool_datum.assets[1].1,
         );
     }
 
     #[test]
     fn single_pool_many_orders() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let orders: Vec<_> = (1..=8u64)
             .map(|i| {
                 if i % 2 == 0 {
@@ -529,14 +870,20 @@ mod tests {
             })
             .collect();
 
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
 
         assert!(batch.swaps.len() >= 2, "should execute multiple orders");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (_result, eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
     }
@@ -549,21 +896,54 @@ mod tests {
         // Two pools with different token pairs
         let tok_c = token(0x05, 0x06);
         let tok_d = token(0x07, 0x08);
-        let pool_1 = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
-        let pool_2 = make_pool(&env, 0xBB, tok_c.clone(), 1_000_000_000, tok_d.clone(), 1_000_000_000);
+        let pool_1 = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let pool_2 = make_pool(
+            &env,
+            0xBB,
+            tok_c.clone(),
+            1_000_000_000,
+            tok_d.clone(),
+            1_000_000_000,
+        );
 
         let orders_1 = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
         let orders_2 = vec![make_order(tok_c.clone(), 10_000_000, tok_d.clone(), 1, 2)];
 
-        let batch_1 = assemble_batch(&pool_1, &orders_1, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
-        let batch_2 = assemble_batch(&pool_2, &orders_2, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let batch_1 = assemble_batch(
+            &pool_1,
+            &orders_1,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let batch_2 = assemble_batch(
+            &pool_2,
+            &orders_2,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch_1, batch_2], &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval(&[batch_1, batch_2], &settings, 1000)
             .expect("multi-pool build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
-        assert_eq!(result.predicted_pools.len(), 2, "should predict 2 pool outputs");
+        assert_eq!(
+            result.predicted_pools.len(),
+            2,
+            "should predict 2 pool outputs"
+        );
     }
 
     #[test]
@@ -571,22 +951,49 @@ mod tests {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let tok_c = token(0x05, 0x06);
         let tok_d = token(0x07, 0x08);
-        let pool_1 = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
-        let pool_2 = make_pool(&env, 0xBB, tok_c.clone(), 1_000_000_000, tok_d.clone(), 1_000_000_000);
+        let pool_1 = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let pool_2 = make_pool(
+            &env,
+            0xBB,
+            tok_c.clone(),
+            1_000_000_000,
+            tok_d.clone(),
+            1_000_000_000,
+        );
 
         let orders_1 = vec![
             make_order(token_a(), 10_000_000, token_b(), 1, 1),
             make_order(token_b(), 5_000_000, token_a(), 1, 2),
         ];
-        let orders_2 = vec![
-            make_order(tok_c.clone(), 15_000_000, tok_d.clone(), 1, 3),
-        ];
+        let orders_2 = vec![make_order(tok_c.clone(), 15_000_000, tok_d.clone(), 1, 3)];
 
-        let batch_1 = assemble_batch(&pool_1, &orders_1, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
-        let batch_2 = assemble_batch(&pool_2, &orders_2, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let batch_1 = assemble_batch(
+            &pool_1,
+            &orders_1,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let batch_2 = assemble_batch(
+            &pool_2,
+            &orders_2,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch_1, batch_2], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch_1, batch_2], &settings, 1000)
             .expect("multi-pool mixed build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -601,7 +1008,10 @@ mod tests {
             let per_order_fee = TX_FEE / n_orders as u64;
             let last_order_fee = TX_FEE - per_order_fee * (n_orders as u64 - 1);
             let fee_sum = per_order_fee * (n_orders as u64 - 1) + last_order_fee;
-            assert_eq!(fee_sum, TX_FEE, "fee deductions must sum to TX_FEE for {n_orders} orders");
+            assert_eq!(
+                fee_sum, TX_FEE,
+                "fee deductions must sum to TX_FEE for {n_orders} orders"
+            );
         }
     }
 
@@ -610,11 +1020,27 @@ mod tests {
     #[test]
     fn min_received_filters_impossible_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         // Order wants way more tokens than the swap could produce
         let orders = vec![make_order(token_a(), 10_000_000, token_b(), 999_999_999, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default());
-        assert!(batch.is_none(), "impossible min_received should prevent batch assembly");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        );
+        assert!(
+            batch.is_none(),
+            "impossible min_received should prevent batch assembly"
+        );
     }
 
     // ─── Constant-sum pool tests ────────────────────────────────────────────
@@ -627,14 +1053,21 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xCC,
+            &env,
+            0xCC,
             vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], // 1:1 price
             fee.clone(),
         );
         let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("CS batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 1);
         // CS swap: dy = dx * price_in * (1 - fee) / price_out
@@ -642,10 +1075,14 @@ mod tests {
         assert_eq!(batch.swaps[0].dy, BigInt::from(9_970_000));
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("CS build_and_eval should succeed");
 
-        assert!(!eval.budgets.is_empty(), "should have evaluated at least one script");
+        assert!(
+            !eval.budgets.is_empty(),
+            "should have evaluated at least one script"
+        );
     }
 
     #[test]
@@ -656,23 +1093,33 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xCC,
+            &env,
+            0xCC,
             vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             fee,
         );
         let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("CS batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, _eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (result, _eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("CS build_and_eval should succeed");
 
-        let ref_inputs = result.tx_body.reference_inputs
-            .as_ref()
-            .expect("scoop has reference inputs");
+        let ref_inputs =
+            result.tx_body.reference_inputs.as_ref().expect("scoop has reference inputs");
         let ms = &env.exec.module_scripts;
-        assert!(!ref_inputs.contains(&ms.settings.ref_utxo.0), "settings validator ref script attached but never executed");
+        assert!(
+            !ref_inputs.contains(&ms.settings.ref_utxo.0),
+            "settings validator ref script attached but never executed"
+        );
         let executed = [
             ("pool", &ms.pool),
             ("order", &ms.order),
@@ -681,9 +1128,15 @@ mod tests {
             ("constant_sum", ms.constant_sum.as_ref().unwrap()),
         ];
         for (name, info) in executed {
-            assert!(ref_inputs.contains(&info.ref_utxo.0), "{name} ref script missing");
+            assert!(
+                ref_inputs.contains(&info.ref_utxo.0),
+                "{name} ref script missing"
+            );
         }
-        assert!(ref_inputs.contains(&settings.input.0), "settings UTxO must still be read as a reference input");
+        assert!(
+            ref_inputs.contains(&settings.input.0),
+            "settings UTxO must still be read as a reference input"
+        );
     }
 
     #[test]
@@ -700,22 +1153,33 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xCD,
+            &env,
+            0xCD,
             vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
             vec![BigInt::from(4), BigInt::from(5)],
             fee.clone(),
         );
         let orders = vec![make_order(token_a(), 100_300_903, token_b(), 80_000_000, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("unaligned CS batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("unaligned CS batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 1, "the unaligned order must be admitted");
         assert_eq!(batch.swaps[0].dy, BigInt::from(80_000_000));
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("floor fill with a crumb should evaluate on-chain");
-        assert!(!eval.budgets.is_empty(), "should have evaluated at least one script");
+        assert!(
+            !eval.budgets.is_empty(),
+            "should have evaluated at least one script"
+        );
     }
 
     #[test]
@@ -726,7 +1190,8 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xCC,
+            &env,
+            0xCC,
             vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             fee.clone(),
@@ -736,13 +1201,20 @@ mod tests {
             make_order(token_a(), 20_000_000, token_b(), 1, 2),
             make_order(token_a(), 5_000_000, token_b(), 1, 3),
         ];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("CS batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 3);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("CS build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -756,7 +1228,8 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xCC,
+            &env,
+            0xCC,
             vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             fee.clone(),
@@ -765,13 +1238,20 @@ mod tests {
             make_order(token_a(), 10_000_000, token_b(), 1, 1),
             make_order(token_b(), 5_000_000, token_a(), 1, 2),
         ];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("CS batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
 
         assert_eq!(batch.swaps.len(), 2);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("CS build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -788,11 +1268,22 @@ mod tests {
         };
 
         // CP pool
-        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         // CS pool
         let cs_pool = make_cs_pool(
-            &env, 0xCC,
-            vec![(tok_c.clone(), 1_000_000_000), (tok_d.clone(), 1_000_000_000)],
+            &env,
+            0xCC,
+            vec![
+                (tok_c.clone(), 1_000_000_000),
+                (tok_d.clone(), 1_000_000_000),
+            ],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
         );
@@ -800,24 +1291,43 @@ mod tests {
         let cp_orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
         let cs_orders = vec![make_order(tok_c.clone(), 10_000_000, tok_d.clone(), 1, 2)];
 
-        let cp_batch = assemble_batch(&cp_pool, &cp_orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
-        let cs_batch = assemble_batch(&cs_pool, &cs_orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let cp_batch = assemble_batch(
+            &cp_pool,
+            &cp_orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let cs_batch = assemble_batch(
+            &cs_pool,
+            &cs_orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[cp_batch, cs_batch], &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval(&[cp_batch, cs_batch], &settings, 1000)
             .expect("mixed CP+CS build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
-        assert_eq!(result.predicted_pools.len(), 2, "should predict 2 pool outputs");
+        assert_eq!(
+            result.predicted_pools.len(),
+            2,
+            "should predict 2 pool outputs"
+        );
     }
 
     // ─── Routed-through-CS tests ─────────────────────────────────────────────
 
     #[test]
     fn routed_through_cs_pool() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cs_fee = crate::sundaev4::types::Rational {
@@ -826,10 +1336,18 @@ mod tests {
         };
 
         // CP pool 0xAA: A/B
-        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         // CS pool 0xDD: A/E at 1:1
         let cs_pool = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -848,21 +1366,25 @@ mod tests {
 
         let route = router::find_optimal_route(
             &pool_map,
-            &[], &token_e(), &token_b(), &order.swap_offered().1,
+            &[],
+            &token_e(),
+            &token_b(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
-        ).expect("router should find E→A→B path");
+        )
+        .expect("router should find E→A→B path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
         assert!(router::is_routed(&route));
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
-        accum.try_add_routed_order(&order, &route, &pool_map)
-            .expect("routed order should execute");
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("routed order should execute");
 
         let plan = accum.into_plan();
         assert_eq!(plan.batches.len(), 2, "routed order touches 2 pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("routed E→A→B build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -886,7 +1408,8 @@ mod tests {
         };
         // Coprime reserves (both prime): gcd = 1.
         let pool = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -938,7 +1461,8 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -972,12 +1496,8 @@ mod tests {
                 t
             },
         };
-        let order = make_basic_withdraw_order(
-            lp_asset,
-            5_000_017,
-            vec![(token_a(), 1), (token_e(), 1)],
-            1,
-        );
+        let order =
+            make_basic_withdraw_order(lp_asset, 5_000_017, vec![(token_a(), 1), (token_e(), 1)], 1);
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1011,7 +1531,8 @@ mod tests {
             den: BigInt::from(1000),
         };
         let pool = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -1024,12 +1545,7 @@ mod tests {
                 t
             },
         };
-        let order = make_basic_deposit_order(
-            vec![(token_a(), 10_000_000)],
-            lp_asset,
-            1,
-            1,
-        );
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_000)], lp_asset, 1, 1);
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         let err = accum
@@ -1050,43 +1566,55 @@ mod tests {
     /// router ignored the whitelist and picked the deeper pool.
     #[test]
     fn route_whitelist_restricts_routing() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
-        use crate::sundaev4::router;
         use crate::sundaev4::parse_route_whitelist;
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
 
         // Two CP pools on the same pair: 0xAA is deep (better price for the
         // taker), 0xBB is thin.
-        let deep = make_pool(&env, 0xAA, token_a(), 2_000_000_000, token_b(), 2_000_000_000);
+        let deep = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            2_000_000_000,
+            token_b(),
+            2_000_000_000,
+        );
         let thin = make_pool(&env, 0xBB, token_a(), 500_000_000, token_b(), 500_000_000);
         let mut pool_map = BTreeMap::new();
         pool_map.insert(deep.pool_datum.identifier.clone(), deep.clone());
         pool_map.insert(thin.pool_datum.identifier.clone(), thin.clone());
 
         let order = make_order(token_a(), 10_000_000, token_b(), 1, 1);
-        let order = with_route_whitelist(order, &[thin.pool_datum.identifier.clone()]);
+        let order = with_route_whitelist(order, std::slice::from_ref(&thin.pool_datum.identifier));
 
         // Sanity: unrestricted, the router prefers the deep pool — the
         // exact trap the preview orders fell into.
         let free = router::find_optimal_route(
             &pool_map,
-            &[], &token_a(), &token_b(), &order.swap_offered().1,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
-        ).expect("unrestricted route exists");
+        )
+        .expect("unrestricted route exists");
         assert_eq!(
-            free.hops[0].splits[0].pool.ident,
-            deep.pool_datum.identifier,
+            free.hops[0].splits[0].pool.ident, deep.pool_datum.identifier,
             "unrestricted router should pick the deep pool",
         );
 
         // Dispatch-equivalent: parse the whitelist off the order and filter
         // the pool view before routing.
-        let route_hash = env.exec.module_scripts.route_order.as_ref().unwrap().hash.as_ref().to_vec();
+        let route_hash =
+            env.exec.module_scripts.route_order.as_ref().unwrap().hash.as_ref().to_vec();
         let wl = parse_route_whitelist(
             order.datum.find_constraint_by_hash(&route_hash).expect("order carries route module"),
-        ).expect("whitelist parses");
+        )
+        .expect("whitelist parses");
         assert_eq!(wl, vec![thin.pool_datum.identifier.clone()]);
         let filtered: BTreeMap<_, _> = pool_map
             .iter()
@@ -1096,23 +1624,28 @@ mod tests {
 
         let route = router::find_optimal_route(
             &filtered,
-            &[], &token_a(), &token_b(), &order.swap_offered().1,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
-        ).expect("whitelisted route exists");
+        )
+        .expect("whitelisted route exists");
         assert_eq!(route.hops.len(), 1);
         assert_eq!(
-            route.hops[0].splits[0].pool.ident,
-            thin.pool_datum.identifier,
+            route.hops[0].splits[0].pool.ident, thin.pool_datum.identifier,
             "whitelist should force the thin pool",
         );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
-        accum.try_add_routed_order(&order, &route, &filtered)
+        accum
+            .try_add_routed_order(&order, &route, &filtered)
             .expect("whitelisted order should execute");
         let plan = accum.into_plan();
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("whitelisted route must satisfy route.ak's check_pool_whitelisted");
         assert!(!eval.budgets.is_empty());
     }
@@ -1125,14 +1658,35 @@ mod tests {
     /// execution must evaluate cleanly with no route module involved.
     #[test]
     fn basic_swap_blends_across_paths() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let direct = make_pool(&env, 0xA1, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
-        let leg1 = make_pool(&env, 0xA2, token_a(), 1_000_000_000, token_e(), 1_000_000_000);
-        let leg2 = make_pool(&env, 0xA3, token_e(), 1_000_000_000, token_b(), 1_000_000_000);
+        let direct = make_pool(
+            &env,
+            0xA1,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let leg1 = make_pool(
+            &env,
+            0xA2,
+            token_a(),
+            1_000_000_000,
+            token_e(),
+            1_000_000_000,
+        );
+        let leg2 = make_pool(
+            &env,
+            0xA3,
+            token_e(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
 
         let mut pool_map = BTreeMap::new();
         for p in [&direct, &leg1, &leg2] {
@@ -1150,11 +1704,15 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("blend must exist");
-        assert_eq!(blend.branches.len(), 2, "direct + 2-hop path should both carry flow");
+        assert_eq!(
+            blend.branches.len(),
+            2,
+            "direct + 2-hop path should both carry flow"
+        );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1181,9 +1739,9 @@ mod tests {
     /// the deployment artifact isn't available.
     #[test]
     fn basic_swap_blends_through_butane_mint() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         if !env.enable_butane() {
@@ -1197,7 +1755,14 @@ mod tests {
         // Shallow direct pool, deep ADAb pool: the blend sends real flow
         // through the mint.
         let direct = make_pool(&env, 0xB1, ada(), 500_000_000, token_b(), 500_000_000);
-        let via = make_pool(&env, 0xB2, adab.clone(), 4_000_000_000, token_b(), 4_000_000_000);
+        let via = make_pool(
+            &env,
+            0xB2,
+            adab.clone(),
+            4_000_000_000,
+            token_b(),
+            4_000_000_000,
+        );
         let mut pool_map = BTreeMap::new();
         for p in [&direct, &via] {
             pool_map.insert(p.pool_datum.identifier.clone(), (*p).clone());
@@ -1209,7 +1774,7 @@ mod tests {
             &edges,
             &ada(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("blend exists");
@@ -1239,9 +1804,9 @@ mod tests {
     /// no pool modules. Users minting ADAb through Sundae order flow.
     #[test]
     fn basic_order_pure_adab_mint() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         if !env.enable_butane() {
@@ -1260,7 +1825,7 @@ mod tests {
             &edges,
             &ada(),
             &adab,
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("pure conversion route exists");
@@ -1292,9 +1857,9 @@ mod tests {
     /// contract's exact cross-multiplication.
     #[test]
     fn swap_partial_fill_continuation() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let pool = make_pool(&env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
@@ -1305,11 +1870,16 @@ mod tests {
         // fill averages ~0.33 — impossible; a 100M fill averages ~0.66 ✓.
         // Budget 8 ADA: a 25% fill's pro-rata fee cap (2 ADA) covers the
         // fee share — the user literally buys partial-fill granularity.
-        let order = make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
+        let order =
+            make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
         let fill = BigInt::from(100_000_000u64);
 
         let route = router::find_optimal_route(
-            &pool_map, &[], &token_a(), &token_b(), &fill,
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            &fill,
             router::RoutingLimits::unlimited(),
         )
         .expect("partial route exists");
@@ -1330,7 +1900,9 @@ mod tests {
         // leftover offer + the received tokens, and its datum decrements
         // remaining_offered by the fill.
         let order_addr = {
-            use pallas_addresses::{ShelleyAddress, ShelleyPaymentPart, ShelleyDelegationPart, Network};
+            use pallas_addresses::{
+                Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+            };
             ShelleyAddress::new(
                 Network::Testnet,
                 ShelleyPaymentPart::Script(env.exec.module_scripts.order.hash),
@@ -1367,7 +1939,11 @@ mod tests {
         )
         .unwrap();
         match c {
-            crate::sundaev4::Constraint::Swap { original_offered, remaining_offered, .. } => {
+            crate::sundaev4::Constraint::Swap {
+                original_offered,
+                remaining_offered,
+                ..
+            } => {
                 assert_eq!(original_offered, BigInt::from(400_000_000u64));
                 assert_eq!(remaining_offered, BigInt::from(300_000_000u64));
             }
@@ -1380,9 +1956,9 @@ mod tests {
     /// receives dy ADA drives it negative, and the module expects ≥ 0.
     #[test]
     fn swap_order_receiving_ada_full_fill() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let pool = make_pool(&env, 0xC9, ada(), 1_000_000_000, token_a(), 1_000_000_000);
@@ -1392,7 +1968,11 @@ mod tests {
         // Sell 10M tOKENA for ADA, easily satisfiable min.
         let order = make_order(token_a(), 10_000_000, ada(), 1_000_000, 1);
         let route = router::find_optimal_route(
-            &pool_map, &[], &token_a(), &ada(), &order.swap_offered().1,
+            &pool_map,
+            &[],
+            &token_a(),
+            &ada(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("route exists");
@@ -1411,12 +1991,19 @@ mod tests {
     /// Single-pool basic swap: the degenerate case must also evaluate.
     #[test]
     fn basic_swap_direct() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xA4, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xA4,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let mut pool_map = BTreeMap::new();
         pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
 
@@ -1426,7 +2013,7 @@ mod tests {
             &[],
             &token_a(),
             &token_b(),
-            &order.swap_offered().1,
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
         )
         .expect("direct route");
@@ -1445,9 +2032,9 @@ mod tests {
 
     #[test]
     fn routed_through_two_cs_pools() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cs_fee = crate::sundaev4::types::Rational {
@@ -1457,14 +2044,16 @@ mod tests {
 
         // CS pool 0xDD: A/E at 1:1
         let cs_pool_ae = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee.clone(),
         );
         // CS pool 0xEE: E/F at 2:1 (E worth 2× F)
         let cs_pool_ef = make_cs_pool(
-            &env, 0xEE,
+            &env,
+            0xEE,
             vec![(token_e(), 1_000_000_000), (token_f(), 2_000_000_000)],
             vec![BigInt::from(2_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -1479,20 +2068,24 @@ mod tests {
 
         let route = router::find_optimal_route(
             &pool_map,
-            &[], &token_a(), &token_f(), &order.swap_offered().1,
+            &[],
+            &token_a(),
+            &token_f(),
+            order.swap_offered().1,
             router::RoutingLimits::unlimited(),
-        ).expect("router should find A→E→F path");
+        )
+        .expect("router should find A→E→F path");
         assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
-        accum.try_add_routed_order(&order, &route, &pool_map)
-            .expect("routed order should execute");
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("routed order should execute");
 
         let plan = accum.into_plan();
         assert_eq!(plan.batches.len(), 2, "routed order touches 2 CS pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("routed A→E→F build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -1501,9 +2094,9 @@ mod tests {
 
     #[test]
     fn mixed_direct_and_routed_cs() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cs_fee = crate::sundaev4::types::Rational {
@@ -1512,15 +2105,24 @@ mod tests {
         };
 
         // 3 pools: CP A/B, CS A/E, CS E/F
-        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let cs_pool_ae = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee.clone(),
         );
         let cs_pool_ef = make_cs_pool(
-            &env, 0xEE,
+            &env,
+            0xEE,
             vec![(token_e(), 1_000_000_000), (token_f(), 2_000_000_000)],
             vec![BigInt::from(2_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -1535,12 +2137,14 @@ mod tests {
 
         // Direct order: A→B on CP pool
         let order_ab = make_order(token_a(), 10_000_000, token_b(), 1, 1);
-        accum.try_add_order(&order_ab, &cp_pool.pool_datum.identifier, &cp_pool)
+        accum
+            .try_add_order(&order_ab, &cp_pool.pool_datum.identifier, &cp_pool)
             .expect("direct A→B order should execute");
 
         // Direct order: A→E on CS pool
         let order_ae = make_order(token_a(), 10_000_000, token_e(), 1, 2);
-        accum.try_add_order(&order_ae, &cs_pool_ae.pool_datum.identifier, &cs_pool_ae)
+        accum
+            .try_add_order(&order_ae, &cs_pool_ae.pool_datum.identifier, &cs_pool_ae)
             .expect("direct A→E order should execute");
 
         // Routed order: E→B (route: E→A via CS, then A→B via CP)
@@ -1548,21 +2152,31 @@ mod tests {
         let order_eb = make_order(token_e(), 5_000_000, token_b(), 1, 3);
         let route = router::find_optimal_route(
             &pool_map,
-            &[], &token_e(), &token_b(), &order_eb.swap_offered().1,
+            &[],
+            &token_e(),
+            &token_b(),
+            order_eb.swap_offered().1,
             router::RoutingLimits::unlimited(),
-        ).expect("router should find E→B path");
+        )
+        .expect("router should find E→B path");
         assert_eq!(route.hops.len(), 2);
 
-        accum.try_add_routed_order(&order_eb, &route, &pool_map)
+        accum
+            .try_add_routed_order(&order_eb, &route, &pool_map)
             .expect("routed E→B order should execute");
 
         let plan = accum.into_plan();
         // CS A/E pool has direct + routed leg, CP pool has direct + routed leg
         // CS E/F pool is not involved (route goes E→A→B, not through E/F)
-        assert_eq!(plan.batches.len(), 2, "direct + routed orders touch 2 pools");
+        assert_eq!(
+            plan.batches.len(),
+            2,
+            "direct + routed orders touch 2 pools"
+        );
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("mixed direct+routed build_and_eval should succeed");
 
         assert!(!eval.budgets.is_empty());
@@ -1582,19 +2196,33 @@ mod tests {
     #[test]
     fn batch_route_claims_follow_canonical_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         // Deliberately shuffled admission order vs canonical input order.
         let orders = vec![
             make_order(token_a(), 10_000_000, token_b(), 1, 3),
             make_order(token_a(), 20_000_000, token_b(), 1, 1),
             make_order(token_a(), 5_000_000, token_b(), 1, 2),
         ];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 3);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("shuffled-admission batch must satisfy check_route_uniqueness");
         assert!(!eval.budgets.is_empty());
     }
@@ -1609,7 +2237,14 @@ mod tests {
         use crate::sundaev4::accumulator::Accumulator;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let ident = pool.pool_datum.identifier.clone();
 
         let early = make_order(token_a(), 20_000_000, token_b(), 1, 1);
@@ -1617,16 +2252,21 @@ mod tests {
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum.try_add_order(&late, &ident, &pool).expect("first admission succeeds");
-        let err = accum.try_add_order(&early, &ident, &pool)
+        let err = accum
+            .try_add_order(&early, &ident, &pool)
             .expect_err("out-of-canonical-order same-pool admission must be rejected");
-        assert!(err.contains("canonical-order violation"), "unexpected error: {err}");
+        assert!(
+            err.contains("canonical-order violation"),
+            "unexpected error: {err}"
+        );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum.try_add_order(&early, &ident, &pool).expect("canonical first");
         accum.try_add_order(&late, &ident, &pool).expect("canonical second");
         let plan = accum.into_plan();
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (_result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (_result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("canonical admission builds a valid tx");
         assert!(!eval.budgets.is_empty());
     }
@@ -1637,18 +2277,26 @@ mod tests {
     /// a batch has two orders on one pool.
     #[test]
     fn batch_two_routed_orders_share_pools() {
-        use std::collections::BTreeMap;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
+        use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cs_fee = crate::sundaev4::types::Rational {
             num: BigInt::from(3),
             den: BigInt::from(1000),
         };
-        let cp_pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let cs_pool = make_cs_pool(
-            &env, 0xDD,
+            &env,
+            0xDD,
             vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
             vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
             cs_fee,
@@ -1670,19 +2318,23 @@ mod tests {
             let view = accum.current_pool_view(&pool_map);
             let route = router::find_optimal_route(
                 &view,
-                &[], &token_e(), &token_b(), &order.swap_offered().1,
+                &[],
+                &token_e(),
+                &token_b(),
+                order.swap_offered().1,
                 router::RoutingLimits::unlimited(),
-            ).expect("router should find E→A→B path");
+            )
+            .expect("router should find E→A→B path");
             assert_eq!(route.hops.len(), 2, "should be a 2-hop route");
-            accum.try_add_routed_order(order, &route, &view)
-                .expect("routed order should execute");
+            accum.try_add_routed_order(order, &route, &view).expect("routed order should execute");
         }
 
         let plan = accum.into_plan();
         assert_eq!(plan.batches.len(), 2, "both orders share the same 2 pools");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval_plan(&plan, &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
             .expect("two routed orders on shared pools must claim distinct, increasing steps");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 2);
@@ -1697,24 +2349,39 @@ mod tests {
     /// and asserts both bounds offline, on top of the on-chain evaluation.
     #[test]
     fn batch_protocol_capture_per_step() {
-        use plutus_parser::AsPlutus;
         use crate::sundaev4::types::PoolRedeemer;
+        use plutus_parser::AsPlutus;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
-        let orders: Vec<_> = (1..=5u64)
-            .map(|i| make_order(token_a(), 10_000_000, token_b(), 1, i))
-            .collect();
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let orders: Vec<_> =
+            (1..=5u64).map(|i| make_order(token_a(), 10_000_000, token_b(), 1, i)).collect();
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 5);
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch], &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
             .expect("5-similar-swap batch must satisfy fee_split's per-entry budget bound");
         assert!(!eval.budgets.is_empty());
 
-        let transcript = result.redeemers.iter()
+        let transcript = result
+            .redeemers
+            .iter()
             .find_map(|(_, pd, _)| match PoolRedeemer::from_plutus(pd.clone()) {
                 Ok(PoolRedeemer::Action { transcript, .. }) => Some(transcript),
                 _ => None,
@@ -1741,7 +2408,10 @@ mod tests {
             total_growth = &total_growth + &growth;
             prev_lp = entry.state_after.total_lp.clone();
         }
-        assert!(total_gross > BigInt::from(0), "similar swaps should accrue fees");
+        assert!(
+            total_gross > BigInt::from(0),
+            "similar swaps should accrue fees"
+        );
         assert_eq!(
             total_growth,
             &total_gross * &ps_num / &ps_den,
@@ -1766,8 +2436,8 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     use crate::bigint::BigInt;
-    use crate::sundaev4::batch::{assemble_batch, BatchLimits};
-    use crate::sundaev4::test_harness::test_harness::*;
+    use crate::sundaev4::batch::{BatchLimits, assemble_batch};
+    use crate::sundaev4::test_harness::*;
     use proptest::prelude::*;
     use std::sync::Arc;
 
@@ -1789,8 +2459,8 @@ mod prop_tests {
         seed: u64,
         slot_offset: u64,
     ) -> Vec<Arc<crate::sundaev4::types::SundaeV4Order>> {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut orders = Vec::with_capacity(n);
         for i in 0..n {
@@ -1809,7 +2479,13 @@ mod prop_tests {
                 (tok_b.clone(), tok_a.clone(), reserve_b)
             };
             let amount = (reserve * fraction / 10_000).max(1_000_000);
-            orders.push(make_order(offer_tok, amount, want_tok, 1, slot_offset + (i + 1) as u64));
+            orders.push(make_order(
+                offer_tok,
+                amount,
+                want_tok,
+                1,
+                slot_offset + (i + 1) as u64,
+            ));
         }
         orders
     }
@@ -1839,54 +2515,94 @@ mod prop_tests {
         eprintln!();
         eprintln!("=== Proptest Example: multi-pool scoop (2 pools, 5 orders) ===");
         eprintln!();
-        eprintln!("Pool 1 (A/B): reserves A={r_a1}  B={r_b1}  k={}", r_a1 as i128 * r_b1 as i128);
-        eprintln!("Pool 2 (C/D): reserves C={r_a2}  D={r_b2}  k={}", r_a2 as i128 * r_b2 as i128);
-        eprintln!("Fee: {}/{}  Protocol share: {}/{}", env.exec.fee.0, env.exec.fee.1, env.exec.protocol_share.0, env.exec.protocol_share.1);
+        eprintln!(
+            "Pool 1 (A/B): reserves A={r_a1}  B={r_b1}  k={}",
+            r_a1 as i128 * r_b1 as i128
+        );
+        eprintln!(
+            "Pool 2 (C/D): reserves C={r_a2}  D={r_b2}  k={}",
+            r_a2 as i128 * r_b2 as i128
+        );
+        eprintln!(
+            "Fee: {}/{}  Protocol share: {}/{}",
+            env.exec.fee.0, env.exec.fee.1, env.exec.protocol_share.0, env.exec.protocol_share.1
+        );
         eprintln!();
 
         let batch_1 = assemble_batch(
-            &pool_1, &orders_1, env.exec.fee, env.exec.protocol_share, &BatchLimits::default(),
-        ).expect("batch 1 should assemble");
+            &pool_1,
+            &orders_1,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch 1 should assemble");
         let batch_2 = assemble_batch(
-            &pool_2, &orders_2, env.exec.fee, env.exec.protocol_share, &BatchLimits::default(),
-        ).expect("batch 2 should assemble");
+            &pool_2,
+            &orders_2,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch 2 should assemble");
 
         eprintln!("Pool 1 batch: {} swaps", batch_1.swaps.len());
         for (i, swap) in batch_1.swaps.iter().enumerate() {
             let dir = if swap.output_idx == 1 { "A->B" } else { "B->A" };
             eprintln!("  swap[{i}]: {dir}  dx={:<12} dy={:<12}", swap.dx, swap.dy);
         }
-        eprintln!("  final: A={}  B={}", batch_1.final_assets[0].1, batch_1.final_assets[1].1);
+        eprintln!(
+            "  final: A={}  B={}",
+            batch_1.final_assets[0].1, batch_1.final_assets[1].1
+        );
         eprintln!();
         eprintln!("Pool 2 batch: {} swaps", batch_2.swaps.len());
         for (i, swap) in batch_2.swaps.iter().enumerate() {
             let dir = if swap.output_idx == 1 { "C->D" } else { "D->C" };
             eprintln!("  swap[{i}]: {dir}  dx={:<12} dy={:<12}", swap.dx, swap.dy);
         }
-        eprintln!("  final: C={}  D={}", batch_2.final_assets[0].1, batch_2.final_assets[1].1);
+        eprintln!(
+            "  final: C={}  D={}",
+            batch_2.final_assets[0].1, batch_2.final_assets[1].1
+        );
         eprintln!();
 
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, eval) = env.build_and_eval(&[batch_1, batch_2], &settings, 1000)
+        let (result, eval) = env
+            .build_and_eval(&[batch_1, batch_2], &settings, 1000)
             .expect("multi-pool build_and_eval should succeed");
 
-        eprintln!("Transaction inputs: {} pools + {} orders = {} total", 2, 5,
-            result.resolved_inputs.len());
-        eprintln!("Script evaluations ({} validators executed):", eval.budgets.len());
+        eprintln!(
+            "Transaction inputs: {} pools + {} orders = {} total",
+            2,
+            5,
+            result.resolved_inputs.len()
+        );
+        eprintln!(
+            "Script evaluations ({} validators executed):",
+            eval.budgets.len()
+        );
         for (key, eu) in &eval.budgets {
             let tag_str = match key.tag {
                 pallas_primitives::conway::RedeemerTag::Spend => "Spend ",
                 pallas_primitives::conway::RedeemerTag::Reward => "Reward",
                 _ => "Other ",
             };
-            eprintln!("  {tag_str}[{}]: cpu={:>12}  mem={:>8}", key.index, eu.steps, eu.mem);
+            eprintln!(
+                "  {tag_str}[{}]: cpu={:>12}  mem={:>8}",
+                key.index, eu.steps, eu.mem
+            );
         }
         eprintln!();
 
         for (pi, (ident, _input, pool)) in result.predicted_pools.iter().enumerate() {
             let pd = &pool.pool_datum;
-            eprintln!("Predicted pool {pi} (ident={}..): A={}  B={}",
-                &hex::encode(ident.to_bytes())[..8], pd.assets[0].1, pd.assets[1].1);
+            eprintln!(
+                "Predicted pool {pi} (ident={}..): A={}  B={}",
+                &hex::encode(ident.to_bytes())[..8],
+                pd.assets[0].1,
+                pd.assets[1].1
+            );
         }
 
         // k-value checks
@@ -1897,8 +2613,14 @@ mod prop_tests {
         let k0_2 = BigInt::from(r_a2) * BigInt::from(r_b2);
         let k1_2 = &pd2.assets[0].1 * &pd2.assets[1].1;
         eprintln!();
-        eprintln!("Pool 1 k-value: {k0_1} -> {k1_1}  (delta=+{})", &k1_1 - &k0_1);
-        eprintln!("Pool 2 k-value: {k0_2} -> {k1_2}  (delta=+{})", &k1_2 - &k0_2);
+        eprintln!(
+            "Pool 1 k-value: {k0_1} -> {k1_1}  (delta=+{})",
+            &k1_1 - &k0_1
+        );
+        eprintln!(
+            "Pool 2 k-value: {k0_2} -> {k1_2}  (delta=+{})",
+            &k1_2 - &k0_2
+        );
         assert!(k1_1 >= k0_1, "pool 1 k decreased");
         assert!(k1_2 >= k0_2, "pool 2 k decreased");
 
@@ -1922,8 +2644,8 @@ mod prop_tests {
         seed: u64,
         slot_offset: u64,
     ) -> Vec<Arc<crate::sundaev4::types::SundaeV4Order>> {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut orders = Vec::with_capacity(n);
         for i in 0..n {
@@ -1944,7 +2666,13 @@ mod prop_tests {
             // v_increase = floor(dx * fee_num / fee_den) requires dx * fee_num % fee_den == 0
             // for an exact integer dy. With fee 3/1000, dx must be a multiple of 1000.
             let amount = ((reserve * fraction / 10_000) / 1000 * 1000).max(1_000_000);
-            orders.push(make_order(offer_tok, amount, want_tok, 1, slot_offset + (i + 1) as u64));
+            orders.push(make_order(
+                offer_tok,
+                amount,
+                want_tok,
+                1,
+                slot_offset + (i + 1) as u64,
+            ));
         }
         orders
     }
@@ -2103,5 +2831,3 @@ mod prop_tests {
         }
     }
 }
-
-

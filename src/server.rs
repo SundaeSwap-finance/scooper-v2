@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc, sync::atomic::{AtomicBool, Ordering}, task::{Context, Poll}};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
 
 use http_body_util::{Either, Full};
 use hyper::{
@@ -40,22 +46,32 @@ pub fn compute_module_state_preimages(
     fee: (u64, u64),
     protocol_share: (u64, u64),
 ) -> ModuleStatePreimages {
+    use crate::bigint::BigInt;
+    use crate::sundaev4::{ConstantProductConfig, FeeSplitConfig, Rational};
     use pallas_crypto::hash::Hasher;
     use plutus_parser::AsPlutus;
-    use crate::sundaev4::{ConstantProductConfig, FeeSplitConfig, Rational};
-    use crate::bigint::BigInt;
 
     let configs = [
         minicbor::to_vec(
-            &ConstantProductConfig {
-                fee: Rational { num: BigInt::from(fee.0), den: BigInt::from(fee.1) },
-            }.to_plutus(),
-        ).unwrap(),
+            ConstantProductConfig {
+                fee: Rational {
+                    num: BigInt::from(fee.0),
+                    den: BigInt::from(fee.1),
+                },
+            }
+            .to_plutus(),
+        )
+        .unwrap(),
         minicbor::to_vec(
-            &FeeSplitConfig {
-                protocol_share: Rational { num: BigInt::from(protocol_share.0), den: BigInt::from(protocol_share.1) },
-            }.to_plutus(),
-        ).unwrap(),
+            FeeSplitConfig {
+                protocol_share: Rational {
+                    num: BigInt::from(protocol_share.0),
+                    den: BigInt::from(protocol_share.1),
+                },
+            }
+            .to_plutus(),
+        )
+        .unwrap(),
     ];
 
     let mut map = BTreeMap::new();
@@ -126,13 +142,13 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
         .map_err(|e| anyhow::anyhow!("failed to parse TLS key: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let config =
+        rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn admin_server(
     config: ServerConfig,
     network: String,
@@ -335,7 +351,10 @@ impl AdminServer {
             .unwrap()
     }
 
-    fn error_response(status: hyper::StatusCode, message: impl Into<String>) -> Response<ResponseBody> {
+    fn error_response(
+        status: hyper::StatusCode,
+        message: impl Into<String>,
+    ) -> Response<ResponseBody> {
         let body = serde_json::json!({ "error": message.into() }).to_string();
         Response::builder()
             .status(status)
@@ -510,9 +529,7 @@ impl AdminServer {
                     // order's OrderConfig as a reference input; when that
                     // token isn't on chain, no execution can succeed no
                     // matter what the swap/claim math says.
-                    (Some(order), _)
-                        if !order_configs.contains_key(&order.datum.config_token) =>
-                    {
+                    (Some(order), _) if !order_configs.contains_key(&order.datum.config_token) => {
                         serde_json::json!({
                             "state": "config-missing",
                             "config_token": hex::encode(&order.datum.config_token),
@@ -522,9 +539,10 @@ impl AdminServer {
                                        against an existing config)",
                         })
                     }
-                    (Some(order), Some(crate::sundaev4::intents::ExecutionHint::Claim {
-                        pool,
-                    })) => Self::probe_claim(order, i, pool, &pools),
+                    (
+                        Some(order),
+                        Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }),
+                    ) => Self::probe_claim(order, i, pool, &pools),
                     (Some(order), None) => Self::probe_swap(order, i, &pools),
                 };
                 serde_json::json!({
@@ -629,13 +647,11 @@ impl AdminServer {
         pools: &BTreeMap<crate::sundaev3::Ident, Arc<crate::sundaev4::SundaeV4Pool>>,
     ) -> serde_json::Value {
         use crate::bigint::BigInt;
-        use crate::sundaev4::claims;
         use crate::sundaev4::PoolType;
+        use crate::sundaev4::claims;
 
-        let Some(pool) = pools
-            .iter()
-            .find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)
-            .map(|(_, p)| p)
+        let Some(pool) =
+            pools.iter().find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex).map(|(_, p)| p)
         else {
             return serde_json::json!({
                 "state": "pool-not-found",
@@ -645,7 +661,12 @@ impl AdminServer {
         };
         // SUN-310: claims work at any balance_fee (0 = full waiver); the op
         // portion pays balance_fee and the fee flows through the transcript.
-        let PoolType::ConstantSum { prices, bounty_k, balance_fee, .. } = &pool.pool_type
+        let PoolType::ConstantSum {
+            prices,
+            bounty_k,
+            balance_fee,
+            ..
+        } = &pool.pool_type
         else {
             return serde_json::json!({
                 "state": "pool-not-claimable",
@@ -788,10 +809,7 @@ impl AdminServer {
                     obj.insert("state".into(), "claimable".into());
                 } else {
                     obj.insert("state".into(), "below-floor".into());
-                    obj.insert(
-                        "shortfall".into(),
-                        (&needed - &total).to_string().into(),
-                    );
+                    obj.insert("shortfall".into(), (&needed - &total).to_string().into());
                     obj.insert(
                         "detail".into(),
                         "even spending the order's full input budget, the \
@@ -827,10 +845,7 @@ impl AdminServer {
             return match *req.method() {
                 hyper::Method::POST => self.post_strategy_intent(req).await,
                 hyper::Method::GET => self.list_strategy_intents().await,
-                _ => Self::error_response(
-                    hyper::StatusCode::METHOD_NOT_ALLOWED,
-                    "use GET or POST",
-                ),
+                _ => Self::error_response(hyper::StatusCode::METHOD_NOT_ALLOWED, "use GET or POST"),
             };
         }
         if let Some(id_hex) = path.strip_prefix("/v4/strategy-intents/") {
@@ -859,10 +874,8 @@ impl AdminServer {
                 hyper::Method::POST => {
                     let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
                     let now_paused = !was_paused;
-                    let remote = self
-                        .remote_addr
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "unknown".into());
+                    let remote =
+                        self.remote_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".into());
                     let forwarded_for = req
                         .headers()
                         .get("x-forwarded-for")
@@ -974,7 +987,8 @@ impl AdminServer {
         let Some(v4) = &self.v4_state else {
             return serde_json::to_string(&serde_json::json!({
                 "error": "v4 indexer not configured"
-            })).unwrap();
+            }))
+            .unwrap();
         };
         let state = v4.lock().await.latest().into_owned();
 
@@ -983,9 +997,14 @@ impl AdminServer {
             _ => 0.0,
         };
 
-        let ada_balance: f64 = state.wallet_utxos.values()
+        let ada_balance: f64 = state
+            .wallet_utxos
+            .values()
             .map(|v| {
-                let lovelace = v.get(&crate::cardano_types::AssetClass { policy: vec![], token: vec![] });
+                let lovelace = v.get(&crate::cardano_types::AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                });
                 lovelace.to_f64().unwrap_or(0.0) / 1_000_000.0
             })
             .sum();
@@ -1010,7 +1029,8 @@ impl AdminServer {
             "our_keyhash": stats.our_keyhash,
             "scooper_totals": stats.scooper_totals,
             "recent_scoops": stats.recent_scoops,
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn serve_metrics(&self) -> Response<ResponseBody> {
@@ -1019,7 +1039,8 @@ impl AdminServer {
             &self.v4_state,
             &self.paused,
             &self.metrics,
-        ).await;
+        )
+        .await;
         Response::builder()
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             .header("Access-Control-Allow-Origin", "*")
@@ -1060,9 +1081,7 @@ impl AdminServer {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let msg = format!(
-                            "event: error\ndata: {{\"lagged\":{n}}}\n\n"
-                        );
+                        let msg = format!("event: error\ndata: {{\"lagged\":{n}}}\n\n");
                         if tx.send(Bytes::from(msg)).await.is_err() {
                             return;
                         }
@@ -1088,10 +1107,7 @@ impl AdminServer {
         }
 
         // /v3/... routes and backward-compatible aliases (/ → /v3/)
-        let v3_path = path
-            .strip_prefix("/v3")
-            .or_else(|| Some(path))
-            .unwrap();
+        let v3_path = path.strip_prefix("/v3").unwrap_or(path);
 
         if let Some(pool_id) = v3_path.strip_prefix("/pool/") {
             return self.v3_query_pool(pool_id).await;
@@ -1202,11 +1218,7 @@ impl AdminServer {
                     json_map.insert(hex, val);
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to serialize order {:?}: {}",
-                        order.datum.ident,
-                        e
-                    );
+                    tracing::error!("Failed to serialize order {:?}: {}", order.datum.ident, e);
                     continue;
                 }
             }
@@ -1314,8 +1326,11 @@ impl AdminServer {
             if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
                 use num_traits::ToPrimitive;
                 let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
-                let limits =
-                    crate::sundaev4::router::RoutingLimits::from_budget(per_exec, cost_per_pool, cost_per_step);
+                let limits = crate::sundaev4::router::RoutingLimits::from_budget(
+                    per_exec,
+                    cost_per_pool,
+                    cost_per_step,
+                );
                 if limits.max_pools < 1 || limits.max_steps < 1 {
                     non_executable.push(serde_json::json!({
                         "order": order.input.to_string(),
@@ -1384,18 +1399,14 @@ impl AdminServer {
         let mut json_map = serde_json::Map::new();
 
         for (ident, orders) in &groups {
-            let order_vals: Vec<serde_json::Value> = orders
-                .iter()
-                .filter_map(|o| serde_json::to_value(o.as_ref()).ok())
-                .collect();
+            let order_vals: Vec<serde_json::Value> =
+                orders.iter().filter_map(|o| serde_json::to_value(o.as_ref()).ok()).collect();
             json_map.insert(hex::encode(ident.to_bytes()), order_vals.into());
         }
 
         // Collect unmatched orders (those not in any group)
-        let matched: std::collections::BTreeSet<&TransactionInput> = groups
-            .values()
-            .flat_map(|orders| orders.iter().map(|o| &o.input))
-            .collect();
+        let matched: std::collections::BTreeSet<&TransactionInput> =
+            groups.values().flat_map(|orders| orders.iter().map(|o| &o.input)).collect();
         let unmatched: Vec<serde_json::Value> = state
             .orders
             .iter()
@@ -1460,7 +1471,12 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v3_order_created",
             serde_json::json!({ "order": order.input.to_string() }).to_string(),
         ),
-        IndexEvent::V3OrderScooped { order, pool_id, tx_id, scooper } => (
+        IndexEvent::V3OrderScooped {
+            order,
+            pool_id,
+            tx_id,
+            scooper,
+        } => (
             "v3_order_scooped",
             serde_json::json!({
                 "order": order.input.to_string(),
@@ -1474,10 +1490,7 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v3_order_cancelled",
             serde_json::json!({ "order": order.input.to_string(), "tx_id": tx_id }).to_string(),
         ),
-        IndexEvent::V3SettingsUpdated { .. } => (
-            "v3_settings_updated",
-            "{}".to_string(),
-        ),
+        IndexEvent::V3SettingsUpdated { .. } => ("v3_settings_updated", "{}".to_string()),
         IndexEvent::V4PoolCreated { id, .. } => (
             "v4_pool_created",
             serde_json::json!({ "id": id.to_string() }).to_string(),
@@ -1494,7 +1507,12 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_order_created",
             serde_json::json!({ "order": order.input.to_string() }).to_string(),
         ),
-        IndexEvent::V4OrderScooped { order, pool_ids, tx_id, scooper } => (
+        IndexEvent::V4OrderScooped {
+            order,
+            pool_ids,
+            tx_id,
+            scooper,
+        } => (
             "v4_order_scooped",
             serde_json::json!({
                 "order": order.input.to_string(),
@@ -1508,10 +1526,7 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_order_cancelled",
             serde_json::json!({ "order": order.input.to_string(), "tx_id": tx_id }).to_string(),
         ),
-        IndexEvent::V4SettingsUpdated { .. } => (
-            "v4_settings_updated",
-            "{}".to_string(),
-        ),
+        IndexEvent::V4SettingsUpdated { .. } => ("v4_settings_updated", "{}".to_string()),
         IndexEvent::TipAdvanced {
             slot,
             network_tip_slot,
