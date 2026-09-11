@@ -21,7 +21,6 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Run Format
-        if: false # need to fix formatting
         run: cargo fmt --all -- --check
 
       - name: Run Clippy

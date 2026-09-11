@@ -27,28 +27,25 @@ pub(crate) mod test_harness {
 
     /// The cost model from our devnet config.
     pub const PLUTUS_V3_COST_MODEL: &[i64] = &[
-        100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32,
-        201305, 8356, 4, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000,
-        100, 100, 100, 16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0,
-        1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900, 1716, 549, 57,
-        85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1, 898148, 27279,
-        1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
-        76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552,
-        1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32,
-        11546, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 90434, 519,
-        0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1,
-        1, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 955506, 213312, 0,
-        2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788,
-        420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933,
-        32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000,
-        100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868,
-        18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
-        158221314, 26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4,
-        207616, 8310, 4, 1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181,
-        726, 719, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1,
-        107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1,
-        158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
-        1964219, 24520, 3,
+        100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
+        100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100,
+        94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848,
+        123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1,
+        898148, 27279, 1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
+        76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1,
+        33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900,
+        1716, 549, 57, 85848, 0, 1, 90434, 519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716,
+        549, 57, 85848, 0, 1, 1, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 955506,
+        213312, 0, 2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788, 420,
+        1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933, 32, 43053543, 10,
+        53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000, 100, 962335, 18, 2780678, 6,
+        442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18, 1995836, 36,
+        3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36, 74698472,
+        36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4, 1293828,
+        28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1,
+        100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1,
+        1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1, 1964219, 24520,
+        3,
     ];
 
     /// Deterministic test secret key (same as devnet config).
@@ -82,7 +79,10 @@ pub(crate) mod test_harness {
         pub scripts: ScriptStore,
         /// Loaded Butane runtime for conversion-leg tests (repo config).
         pub butane: Option<crate::sundaev4::butane::ButaneRuntime>,
-        pub ref_utxo_outputs: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
+        pub ref_utxo_outputs: BTreeMap<
+            crate::cardano_types::TransactionInput,
+            crate::cardano_types::TransactionOutput,
+        >,
         pub language_views: Vec<u8>,
         pub collateral_utxo: TransactionInput,
         pub collateral_value: Value,
@@ -110,9 +110,8 @@ pub(crate) mod test_harness {
             let scripts = ScriptStore::from_blueprint(&blueprint)
                 .expect("ScriptStore::from_blueprint failed");
 
-            let module_scripts = blueprint
-                .to_v4_module_scripts()
-                .expect("blueprint.to_v4_module_scripts failed");
+            let module_scripts =
+                blueprint.to_v4_module_scripts().expect("blueprint.to_v4_module_scripts failed");
 
             let language_views = encode_language_views(PLUTUS_V3_COST_MODEL);
 
@@ -186,34 +185,41 @@ pub(crate) mod test_harness {
                 }
                 _ => None,
             };
-            let mut order_configs: BTreeMap<
-                Vec<u8>,
-                Arc<crate::sundaev4::SundaeV4OrderConfig>,
-            > = BTreeMap::new();
+            let mut order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>> =
+                BTreeMap::new();
             if let Some(ctx) = &ctx {
                 // Mirrors the CLI's mint-order-config presets.
                 let entries: [(&[u8], Vec<Vec<u8>>); 3] = [
-                    (CFG_SWAP, vec![
-                        ctx.swap_order.clone(),
-                        ctx.route_order.clone(),
-                        ctx.fairness_order.clone(),
-                    ]),
-                    (CFG_BASIC, vec![
-                        ctx.basic_order.clone(),
-                        ctx.fairness_order.clone(),
-                    ]),
-                    (CFG_STRATEGY, vec![
-                        ctx.strategy_order.clone(),
-                        ctx.route_order.clone(),
-                        ctx.fairness_order.clone(),
-                    ]),
+                    (
+                        CFG_SWAP,
+                        vec![
+                            ctx.swap_order.clone(),
+                            ctx.route_order.clone(),
+                            ctx.fairness_order.clone(),
+                        ],
+                    ),
+                    (
+                        CFG_BASIC,
+                        vec![ctx.basic_order.clone(), ctx.fairness_order.clone()],
+                    ),
+                    (
+                        CFG_STRATEGY,
+                        vec![
+                            ctx.strategy_order.clone(),
+                            ctx.route_order.clone(),
+                            ctx.fairness_order.clone(),
+                        ],
+                    ),
                 ];
                 for (i, (token, required)) in entries.into_iter().enumerate() {
                     let token = token.to_vec();
                     let mut value = Value::default();
                     value.insert(&ada(), BigInt::from(2_000_000i64));
                     value.insert(
-                        &AssetClass { policy: ctx.settings_mint.clone(), token: token.clone() },
+                        &AssetClass {
+                            policy: ctx.settings_mint.clone(),
+                            token: token.clone(),
+                        },
                         BigInt::from(1i64),
                     );
                     order_configs.insert(
@@ -335,7 +341,9 @@ pub(crate) mod test_harness {
                     _ => None,
                 }
             }
-            let Some(section) = find_butane(&cfg) else { return false };
+            let Some(section) = find_butane(&cfg) else {
+                return false;
+            };
             let Ok(mut parsed) =
                 serde_json::from_value::<crate::sundaev4::butane::ButaneConfig>(section.clone())
             else {
@@ -353,9 +361,9 @@ pub(crate) mod test_harness {
             // Preview's live V2 cost model, from the same config.
             fn find_v2(v: &serde_json::Value) -> Option<&serde_json::Value> {
                 match v {
-                    serde_json::Value::Object(m) => m
-                        .get("plutus-v2-cost-model")
-                        .or_else(|| m.values().find_map(find_v2)),
+                    serde_json::Value::Object(m) => {
+                        m.get("plutus-v2-cost-model").or_else(|| m.values().find_map(find_v2))
+                    }
                     _ => None,
                 }
             }
@@ -373,7 +381,6 @@ pub(crate) mod test_harness {
             settings: &SundaeV4Settings,
             slot: u64,
         ) -> anyhow::Result<(MultiPoolBuildResult, EvalResult)> {
-
             let build = build_multi_pool_scoop_tx(
                 plan,
                 settings,
@@ -389,7 +396,7 @@ pub(crate) mod test_harness {
                 None, // fee_override
                 &self.order_configs,
                 &std::collections::BTreeMap::new(), // strategy_executions
-                None, // fee_settings (harness configs are fee-less)
+                None,                               // fee_settings (harness configs are fee-less)
                 Some((self.funding_utxo.clone(), &self.funding_value)),
                 self.butane.as_ref(),
             )?;
@@ -419,10 +426,8 @@ pub(crate) mod test_harness {
                     .inputs
                     .iter()
                     .map(|i| {
-                        let key = crate::cardano_types::TransactionInput::new(
-                            i.transaction_id,
-                            i.index,
-                        );
+                        let key =
+                            crate::cardano_types::TransactionInput::new(i.transaction_id, i.index);
                         build
                             .resolved_inputs
                             .get(&key)
@@ -497,16 +502,34 @@ pub(crate) mod test_harness {
             let fairness_hash = vec![0x80];
 
             vec![
-                (self.exec.module_scripts.constant_product.as_ref().expect("harness blueprint includes constantProduct").hash.to_vec(), cp_hash),
+                (
+                    self.exec
+                        .module_scripts
+                        .constant_product
+                        .as_ref()
+                        .expect("harness blueprint includes constantProduct")
+                        .hash
+                        .to_vec(),
+                    cp_hash,
+                ),
                 (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
-                (self.exec.module_scripts.fairness.hash.to_vec(), fairness_hash),
+                (
+                    self.exec.module_scripts.fairness.hash.to_vec(),
+                    fairness_hash,
+                ),
             ]
         }
 
         /// The action entry modules list: [cp_hash, fs_hash, fairness_hash].
         pub fn action_modules(&self) -> Vec<Vec<u8>> {
             vec![
-                self.exec.module_scripts.constant_product.as_ref().expect("harness blueprint includes constantProduct").hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .constant_product
+                    .as_ref()
+                    .expect("harness blueprint includes constantProduct")
+                    .hash
+                    .to_vec(),
                 self.exec.module_scripts.fee_split.hash.to_vec(),
                 self.exec.module_scripts.fairness.hash.to_vec(),
             ]
@@ -515,15 +538,29 @@ pub(crate) mod test_harness {
         /// Compute `module_state` entries for a CS pool.
         ///
         /// Same structure as CP module_state but uses CS module hash and config.
-        pub fn cs_module_state(&self, prices: &[BigInt], fee: &Rational) -> Vec<(Vec<u8>, Vec<u8>)> {
-            let cs_script = self.exec.module_scripts.constant_sum.as_ref()
+        pub fn cs_module_state(
+            &self,
+            prices: &[BigInt],
+            fee: &Rational,
+        ) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let cs_script = self
+                .exec
+                .module_scripts
+                .constant_sum
+                .as_ref()
                 .expect("blueprint must include constantSum validator for CS tests");
 
             let cs_config = ConstantSumConfig {
                 prices: prices.to_vec(),
                 fee: fee.clone(),
-                bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-                balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                bounty_k: Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
+                balance_fee: Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
             };
             let cs_cbor = minicbor::to_vec(&cs_config.to_plutus()).unwrap();
             let cs_hash = Hasher::<256>::hash(&cs_cbor).to_vec();
@@ -542,13 +579,20 @@ pub(crate) mod test_harness {
             vec![
                 (cs_script.hash.to_vec(), cs_hash),
                 (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
-                (self.exec.module_scripts.fairness.hash.to_vec(), fairness_hash),
+                (
+                    self.exec.module_scripts.fairness.hash.to_vec(),
+                    fairness_hash,
+                ),
             ]
         }
 
         /// The action entry modules list for CS pools: [cs_hash, fs_hash, fairness_hash].
         pub fn cs_action_modules(&self) -> Vec<Vec<u8>> {
-            let cs_script = self.exec.module_scripts.constant_sum.as_ref()
+            let cs_script = self
+                .exec
+                .module_scripts
+                .constant_sum
+                .as_ref()
                 .expect("blueprint must include constantSum validator for CS tests");
             vec![
                 cs_script.hash.to_vec(),
@@ -561,7 +605,10 @@ pub(crate) mod test_harness {
     // ─── Shared test helpers ──────────────────────────────────────────────────
 
     pub fn ada() -> AssetClass {
-        AssetClass { policy: vec![], token: vec![] }
+        AssetClass {
+            policy: vec![],
+            token: vec![],
+        }
     }
 
     /// Create a token with a 28-byte policy hash (required for pallas Value building).
@@ -652,13 +699,11 @@ pub(crate) mod test_harness {
                 circulating_lp: BigInt::from(circulating_lp),
                 preminted_lp: BigInt::from(preminted_lp),
                 identifier: Ident::new(&ident_bytes),
-                actions: vec![
-                    ActionEntry {
-                        tag: BigInt::from(100),
-                        enabled: true,
-                        modules: env.action_modules(),
-                    },
-                ],
+                actions: vec![ActionEntry {
+                    tag: BigInt::from(100),
+                    enabled: true,
+                    modules: env.action_modules(),
+                }],
                 module_state: env.module_state(),
                 min_surplus: BigInt::from(0),
                 extension: crate::sundaev4::types::plutus_void(),
@@ -699,8 +744,14 @@ pub(crate) mod test_harness {
         let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
         lp_name.extend_from_slice(&ident_bytes);
         let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
-        let nft_asset = AssetClass { policy: pool_mint_policy.clone(), token: nft_name };
-        let lp_asset = AssetClass { policy: pool_mint_policy, token: lp_name };
+        let nft_asset = AssetClass {
+            policy: pool_mint_policy.clone(),
+            token: nft_name,
+        };
+        let lp_asset = AssetClass {
+            policy: pool_mint_policy,
+            token: lp_name,
+        };
 
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(50_000_000i64));
@@ -738,9 +789,18 @@ pub(crate) mod test_harness {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConcentratedLiquidity {
-                sqrt_price_a: Rational { num: BigInt::from(spa_num), den: BigInt::from(spa_den) },
-                sqrt_price_b: Rational { num: BigInt::from(spb_num), den: BigInt::from(spb_den) },
-                fee: Rational { num: BigInt::from(fee_num), den: BigInt::from(fee_den) },
+                sqrt_price_a: Rational {
+                    num: BigInt::from(spa_num),
+                    den: BigInt::from(spa_den),
+                },
+                sqrt_price_b: Rational {
+                    num: BigInt::from(spb_num),
+                    den: BigInt::from(spb_den),
+                },
+                fee: Rational {
+                    num: BigInt::from(fee_num),
+                    den: BigInt::from(fee_den),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -790,10 +850,8 @@ pub(crate) mod test_harness {
         let mut tx_hash = [0u8; 32];
         tx_hash[0] = ident_byte;
 
-        let datum_assets: Vec<(AssetClass, BigInt)> = assets
-            .iter()
-            .map(|(a, r)| (a.clone(), BigInt::from(*r)))
-            .collect();
+        let datum_assets: Vec<(AssetClass, BigInt)> =
+            assets.iter().map(|(a, r)| (a.clone(), BigInt::from(*r))).collect();
 
         Arc::new(SundaeV4Pool {
             input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
@@ -804,13 +862,11 @@ pub(crate) mod test_harness {
                 circulating_lp: BigInt::from(circulating_lp),
                 preminted_lp: BigInt::from(preminted_lp),
                 identifier: Ident::new(&ident_bytes),
-                actions: vec![
-                    ActionEntry {
-                        tag: BigInt::from(100),
-                        enabled: true,
-                        modules: env.cs_action_modules(),
-                    },
-                ],
+                actions: vec![ActionEntry {
+                    tag: BigInt::from(100),
+                    enabled: true,
+                    modules: env.cs_action_modules(),
+                }],
                 module_state: env.cs_module_state(&prices, &fee),
                 min_surplus: BigInt::from(0),
                 extension: crate::sundaev4::types::plutus_void(),
@@ -818,8 +874,14 @@ pub(crate) mod test_harness {
             pool_type: PoolType::ConstantSum {
                 prices,
                 fee,
-                bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-                balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+                bounty_k: Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
+                balance_fee: Rational {
+                    num: BigInt::from(0),
+                    den: BigInt::from(1),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -935,10 +997,8 @@ pub(crate) mod test_harness {
         );
         // Re-encode the constraint payload in the basic module's layout:
         // ctor 2 with (offered list, min_received list).
-        let offered: Vec<(AssetClass, BigInt)> =
-            vec![(offer_tok, BigInt::from(offer_amount))];
-        let min_received: Vec<(AssetClass, BigInt)> =
-            vec![(want_tok, BigInt::from(min_want))];
+        let offered: Vec<(AssetClass, BigInt)> = vec![(offer_tok, BigInt::from(offer_amount))];
+        let min_received: Vec<(AssetClass, BigInt)> = vec![(want_tok, BigInt::from(min_want))];
         let payload = PlutusData::Constr(pallas_primitives::Constr {
             tag: 123, // ctor 2 (121 + 2): scooper-side "swap" dispatch tag
             any_constructor: None,
@@ -1088,12 +1148,9 @@ pub(crate) mod test_harness {
             slot,
         );
 
-        let offered_bi: Vec<(AssetClass, BigInt)> = offered
-            .into_iter()
-            .map(|(a, q)| (a, BigInt::from(q)))
-            .collect();
-        let min_received: Vec<(AssetClass, BigInt)> =
-            vec![(lp_asset, BigInt::from(min_lp))];
+        let offered_bi: Vec<(AssetClass, BigInt)> =
+            offered.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
+        let min_received: Vec<(AssetClass, BigInt)> = vec![(lp_asset, BigInt::from(min_lp))];
         let payload = PlutusData::Constr(pallas_primitives::Constr {
             tag: 121, // ctor 0: Deposit
             any_constructor: None,
@@ -1149,12 +1206,9 @@ pub(crate) mod test_harness {
             slot,
         );
 
-        let offered_bi: Vec<(AssetClass, BigInt)> =
-            vec![(lp_asset, BigInt::from(lp_amount))];
-        let min_bi: Vec<(AssetClass, BigInt)> = min_received
-            .into_iter()
-            .map(|(a, q)| (a, BigInt::from(q)))
-            .collect();
+        let offered_bi: Vec<(AssetClass, BigInt)> = vec![(lp_asset, BigInt::from(lp_amount))];
+        let min_bi: Vec<(AssetClass, BigInt)> =
+            min_received.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
         let payload = PlutusData::Constr(pallas_primitives::Constr {
             tag: 122, // ctor 1: Withdraw
             any_constructor: None,
@@ -1178,7 +1232,9 @@ pub(crate) mod test_harness {
     ) -> SundaeV4Order {
         let mut order = with_real_constraints(order, cfg_token);
         if let Some(payload) = payload_override {
-            let Some(Some(ctx)) = TEST_CTX.get() else { return order };
+            let Some(Some(ctx)) = TEST_CTX.get() else {
+                return order;
+            };
             for (h, data) in order.datum.constraints.iter_mut() {
                 if *h == ctx.basic_order || *h == ctx.swap_order {
                     *data = payload.clone();

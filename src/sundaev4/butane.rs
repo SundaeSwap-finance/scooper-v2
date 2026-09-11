@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway;
 use serde::Deserialize;
@@ -116,9 +116,8 @@ pub struct ButaneRuntime {
 }
 
 fn parse_outref(s: &str) -> Result<TransactionInput> {
-    let (txid, idx) = s
-        .split_once('#')
-        .with_context(|| format!("outref {s:?} must be txid#index"))?;
+    let (txid, idx) =
+        s.split_once('#').with_context(|| format!("outref {s:?} must be txid#index"))?;
     let txid = hex::decode(txid).with_context(|| format!("outref txid {txid:?}"))?;
     anyhow::ensure!(txid.len() == 32, "outref txid must be 32 bytes");
     let idx: u64 = idx.parse().with_context(|| format!("outref index {idx:?}"))?;
@@ -168,8 +167,7 @@ impl ButaneRuntime {
                 conway::TransactionOutput,
             ) = minicbor::decode(&entry)
                 .map_err(|e| anyhow::anyhow!("decode deployment entry {role}: {e}"))?;
-            let ref_input =
-                TransactionInput::new(raw_input.transaction_id, raw_input.index);
+            let ref_input = TransactionInput::new(raw_input.transaction_id, raw_input.index);
 
             let conway::TransactionOutput::PostAlonzo(ref body) = ref_output else {
                 bail!("deployment {role}: expected post-alonzo output");
@@ -214,10 +212,9 @@ impl ButaneRuntime {
         let registry_utxo = parse_outref(&config.registry_utxo)?;
         let mut extra_resolved = Vec::new();
         let decode_output = |label: &str, hex_cbor: &str| -> Result<conway::TransactionOutput> {
-            let bytes = hex::decode(hex_cbor)
-                .with_context(|| format!("{label} output cbor not hex"))?;
-            minicbor::decode(&bytes)
-                .map_err(|e| anyhow::anyhow!("decode {label} output: {e}"))
+            let bytes =
+                hex::decode(hex_cbor).with_context(|| format!("{label} output cbor not hex"))?;
+            minicbor::decode(&bytes).map_err(|e| anyhow::anyhow!("decode {label} output: {e}"))
         };
         if let Some(cbor) = &config.registry_utxo_cbor {
             extra_resolved.push((registry_utxo.clone(), decode_output("registry", cbor)?));
@@ -259,7 +256,10 @@ impl ButaneRuntime {
             .filter(|s| s.enabled)
             .map(|s| ConversionEdge {
                 key: format!("butane:{}:mint", s.name),
-                from: AssetClass { policy: vec![], token: vec![] },
+                from: AssetClass {
+                    policy: vec![],
+                    token: vec![],
+                },
                 to: self.synthetic_asset(&s.name),
                 rate_num: BigInt::from(s.rate.0),
                 rate_den: BigInt::from(s.rate.1),
@@ -279,14 +279,9 @@ impl ButaneRuntime {
     /// config CBOR). Synthetics without params CBOR are skipped — their
     /// deposits fail eval with a missing-resolution error rather than a
     /// wrong context.
-    pub fn resolved_ref_outputs(
-        &self,
-    ) -> Vec<(TransactionInput, conway::TransactionOutput)> {
-        let mut out: Vec<(TransactionInput, conway::TransactionOutput)> = self
-            .scripts
-            .values()
-            .map(|ds| (ds.ref_input.clone(), ds.ref_output.clone()))
-            .collect();
+    pub fn resolved_ref_outputs(&self) -> Vec<(TransactionInput, conway::TransactionOutput)> {
+        let mut out: Vec<(TransactionInput, conway::TransactionOutput)> =
+            self.scripts.values().map(|ds| (ds.ref_input.clone(), ds.ref_output.clone())).collect();
         out.extend(self.extra_resolved.iter().cloned());
         out
     }
@@ -312,8 +307,15 @@ pub struct DepositPieces {
     pub ref_inputs: Vec<TransactionInput>,
 }
 
-fn constr(tag_idx: u64, fields: Vec<pallas_primitives::PlutusData>) -> pallas_primitives::PlutusData {
-    let tag = if tag_idx < 7 { 121 + tag_idx } else { 1280 + (tag_idx - 7) };
+fn constr(
+    tag_idx: u64,
+    fields: Vec<pallas_primitives::PlutusData>,
+) -> pallas_primitives::PlutusData {
+    let tag = if tag_idx < 7 {
+        121 + tag_idx
+    } else {
+        1280 + (tag_idx - 7)
+    };
     pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
         tag,
         any_constructor: None,
@@ -362,17 +364,18 @@ impl ButaneRuntime {
             )]),
         );
         // Pot datum: Constr 6 [synthetic name, credit].
-        let datum = constr(6, vec![
-            PlutusData::BoundedBytes(synthetic.as_bytes().to_vec().into()),
-            PlutusData::BigInt(pallas_primitives::BigInt::Int((minted as i64).into())),
-        ]);
+        let datum = constr(
+            6,
+            vec![
+                PlutusData::BoundedBytes(synthetic.as_bytes().to_vec().into()),
+                PlutusData::BigInt(pallas_primitives::BigInt::Int((minted as i64).into())),
+            ],
+        );
         let pot_output = conway::TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: pallas_primitives::Bytes::from(addr),
                 value: pot_value,
-                datum_option: Some(conway::PseudoDatumOption::Data(
-                    CborWrap(datum),
-                )),
+                datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(datum))),
                 script_ref: None,
             },
         );
@@ -383,12 +386,19 @@ impl ButaneRuntime {
         //   underlying     → bytes(syntheticsAux hash)
         //   upgradable     → Constr 0 [Constr 0 [registry txid], registry idx]
         let withdrawals = vec![
-            (synthetics.hash.clone(), constr(1, vec![]), synthetics.plutus_version),
+            (
+                synthetics.hash.clone(),
+                constr(1, vec![]),
+                synthetics.plutus_version,
+            ),
             (
                 synthetics_aux.hash.clone(),
-                constr(16, vec![PlutusData::BoundedBytes(
-                    synthetic.as_bytes().to_vec().into(),
-                )]),
+                constr(
+                    16,
+                    vec![PlutusData::BoundedBytes(
+                        synthetic.as_bytes().to_vec().into(),
+                    )],
+                ),
                 synthetics_aux.plutus_version,
             ),
             (
@@ -398,14 +408,20 @@ impl ButaneRuntime {
             ),
             (
                 upgradable.hash.clone(),
-                constr(0, vec![
-                    constr(0, vec![PlutusData::BoundedBytes(
-                        self.registry_utxo.0.transaction_id.as_ref().to_vec().into(),
-                    )]),
-                    PlutusData::BigInt(pallas_primitives::BigInt::Int(
-                        (self.registry_utxo.0.index as i64).into(),
-                    )),
-                ]),
+                constr(
+                    0,
+                    vec![
+                        constr(
+                            0,
+                            vec![PlutusData::BoundedBytes(
+                                self.registry_utxo.0.transaction_id.as_ref().to_vec().into(),
+                            )],
+                        ),
+                        PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                            (self.registry_utxo.0.index as i64).into(),
+                        )),
+                    ],
+                ),
                 upgradable.plutus_version,
             ),
         ];
@@ -447,9 +463,7 @@ pub fn load_runtime(config: &Option<ButaneConfig>) -> Option<ButaneRuntime> {
             Some(rt)
         }
         Err(e) => {
-            tracing::warn!(
-                "butane config present but unusable — integration disabled: {e:#}"
-            );
+            tracing::warn!("butane config present but unusable — integration disabled: {e:#}");
             None
         }
     }
@@ -459,24 +473,38 @@ pub fn load_runtime(config: &Option<ButaneConfig>) -> Option<ButaneRuntime> {
 mod tests {
     use super::*;
 
-    const PREVIEW_ARTIFACT: &str =
-        "/home/pi/Downloads/butane-v2.deployment.preview.json";
+    const PREVIEW_ARTIFACT: &str = "/home/pi/Downloads/butane-v2.deployment.preview.json";
 
     fn preview_config() -> ButaneConfig {
         let hashes: &[(&str, &str)] = &[
-            ("spend", "b132270a7949dc354385295c99e90483d95f393dc604e9383111ce79"),
-            ("mint", "84de43f8ae128d33d1c0e04ace1b275f76e45e375d884d8fda36a5e2"),
-            ("synthetics", "04156db9a24fefa2091ba48ab0cd64e3bf90f9c83028b9906e3d670b"),
-            ("synthetics-aux", "c0fde399e58e6d422fab65aa7e66d2174026ee616cc511b17355d387"),
-            ("external-underlying", "75a2e23edd8f7d1c55d62a72f7e326216e420100753da83231daf255"),
-            ("upgradable", "8137010c1908095a4e484ed91b4f8ff222cb5968afc802258a24acde"),
+            (
+                "spend",
+                "b132270a7949dc354385295c99e90483d95f393dc604e9383111ce79",
+            ),
+            (
+                "mint",
+                "84de43f8ae128d33d1c0e04ace1b275f76e45e375d884d8fda36a5e2",
+            ),
+            (
+                "synthetics",
+                "04156db9a24fefa2091ba48ab0cd64e3bf90f9c83028b9906e3d670b",
+            ),
+            (
+                "synthetics-aux",
+                "c0fde399e58e6d422fab65aa7e66d2174026ee616cc511b17355d387",
+            ),
+            (
+                "external-underlying",
+                "75a2e23edd8f7d1c55d62a72f7e326216e420100753da83231daf255",
+            ),
+            (
+                "upgradable",
+                "8137010c1908095a4e484ed91b4f8ff222cb5968afc802258a24acde",
+            ),
         ];
         ButaneConfig {
             deployment_file: PREVIEW_ARTIFACT.into(),
-            script_hashes: hashes
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            script_hashes: hashes.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             registry_utxo: format!("{}#0", "00".repeat(32)),
             registry_utxo_cbor: None,
             synthetics: vec![ButaneSyntheticConfig {
@@ -499,12 +527,14 @@ mod tests {
             eprintln!("skipping: {PREVIEW_ARTIFACT} not present");
             return;
         }
-        let rt = ButaneRuntime::load(&preview_config())
-            .expect("artifact should load and verify");
+        let rt = ButaneRuntime::load(&preview_config()).expect("artifact should load and verify");
         assert_eq!(rt.scripts.len(), REQUIRED_ROLES.len());
         // The mint policy drives the synthetic asset id.
         let adab = rt.synthetic_asset("ADAb");
-        assert_eq!(hex::encode(&adab.policy), preview_config().script_hashes["mint"]);
+        assert_eq!(
+            hex::encode(&adab.policy),
+            preview_config().script_hashes["mint"]
+        );
         assert_eq!(adab.token, b"ADAb".to_vec());
         // Edges resolve for the enabled synthetic.
         let edges = rt.edges();
@@ -522,8 +552,7 @@ mod tests {
             return;
         }
         let mut cfg = preview_config();
-        cfg.script_hashes
-            .insert("mint".into(), "ab".repeat(28));
+        cfg.script_hashes.insert("mint".into(), "ab".repeat(28));
         assert!(ButaneRuntime::load(&cfg).is_err());
     }
 
@@ -548,12 +577,19 @@ mod tests {
 
         // Mint: synthetic + treas under the mint policy, redeemer int 0.
         assert_eq!(p.mint_policy, rt.script("mint").hash);
-        assert_eq!(p.mint_assets, vec![(b"ADAb".to_vec(), 40_000_000i64), (b"treas".to_vec(), 1)]);
+        assert_eq!(
+            p.mint_assets,
+            vec![(b"ADAb".to_vec(), 40_000_000i64), (b"treas".to_vec(), 1)]
+        );
 
         // Four withdrawals with the on-chain language mix (V3/V3/V3/V2).
         assert_eq!(p.withdrawals.len(), 4);
         let versions: Vec<u8> = p.withdrawals.iter().map(|(_, _, v)| *v).collect();
-        assert_eq!(versions, vec![3, 3, 3, 2], "synthetics/aux/underlying V3, upgradable V2");
+        assert_eq!(
+            versions,
+            vec![3, 3, 3, 2],
+            "synthetics/aux/underlying V3, upgradable V2"
+        );
 
         // Ref inputs: params, registry, and 5 distinct ref-script UTxOs.
         assert_eq!(p.ref_inputs.len(), 7);
@@ -564,14 +600,13 @@ mod tests {
     /// drift before a deploy does.
     #[test]
     fn preview_repo_config_loads() {
-        let raw = std::fs::read_to_string("config/preview-v4.json")
-            .expect("repo preview config");
+        let raw = std::fs::read_to_string("config/preview-v4.json").expect("repo preview config");
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         fn find_butane(v: &serde_json::Value) -> Option<&serde_json::Value> {
             match v {
-                serde_json::Value::Object(m) => m
-                    .get("butane")
-                    .or_else(|| m.values().find_map(find_butane)),
+                serde_json::Value::Object(m) => {
+                    m.get("butane").or_else(|| m.values().find_map(find_butane))
+                }
                 _ => None,
             }
         }

@@ -87,7 +87,10 @@ pub struct ConversionEdge {
 
 fn parse_asset(s: &str) -> Result<AssetClass, String> {
     if s.is_empty() || s == "lovelace" {
-        return Ok(AssetClass { policy: vec![], token: vec![] });
+        return Ok(AssetClass {
+            policy: vec![],
+            token: vec![],
+        });
     }
     let (policy, token) = s
         .split_once('.')

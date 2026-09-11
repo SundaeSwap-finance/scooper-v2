@@ -237,9 +237,7 @@ impl IntentStore {
             bail!("signed_execution must be a Constr");
         };
         let fields: Vec<PlutusData> = c.fields.clone().to_vec();
-        let execution_pd = fields
-            .first()
-            .context("signed_execution missing execution field")?;
+        let execution_pd = fields.first().context("signed_execution missing execution field")?;
         let payload = minicbor::to_vec(execution_pd)
             .map_err(|e| anyhow::anyhow!("re-encode execution: {e}"))?;
 
@@ -305,7 +303,12 @@ impl IntentStore {
         if let Some(t) = self.tombstones.get(&intent_id) {
             let superseded = t.status == "replaced";
             return Ok((
-                SubmitOutcome { intent_id, newly_stored: false, superseded, replaced: vec![] },
+                SubmitOutcome {
+                    intent_id,
+                    newly_stored: false,
+                    superseded,
+                    replaced: vec![],
+                },
                 None,
             ));
         }
@@ -400,7 +403,12 @@ impl IntentStore {
         entry.push(stored.clone());
         self.total += 1;
         Ok((
-            SubmitOutcome { intent_id, newly_stored: true, superseded: false, replaced },
+            SubmitOutcome {
+                intent_id,
+                newly_stored: true,
+                superseded: false,
+                replaced,
+            },
             Some(stored),
         ))
     }
@@ -413,8 +421,7 @@ impl IntentStore {
             .map(|v| {
                 v.iter()
                     .filter(|i| {
-                        i.expiry_ms > now_ms
-                            && window_open_at(&i.sse, now_ms).unwrap_or(false)
+                        i.expiry_ms > now_ms && window_open_at(&i.sse, now_ms).unwrap_or(false)
                     })
                     .collect()
             })
@@ -477,8 +484,11 @@ impl IntentStore {
         match self.by_order.remove(key) {
             Some(intents) => {
                 self.total -= intents.len();
-                let status: &'static str =
-                    if tx_hash.is_some() { "executed" } else { "order-gone" };
+                let status: &'static str = if tx_hash.is_some() {
+                    "executed"
+                } else {
+                    "order-gone"
+                };
                 intents
                     .into_iter()
                     .map(|i| {
@@ -605,7 +615,10 @@ pub fn synthesize_swap_constraint(
                 return None; // multi-asset offer: not yet supported
             }
             offered = Some((
-                crate::cardano_types::AssetClass { policy: policy.clone(), token: name.clone() },
+                crate::cardano_types::AssetClass {
+                    policy: policy.clone(),
+                    token: name.clone(),
+                },
                 qty.clone(),
             ));
         }
@@ -688,12 +701,12 @@ fn multisig_satisfied(
             let signature = pallas_crypto::key::ed25519::Signature::from(sig_arr);
             public.verify(payload, &signature)
         }),
-        Multisig::AllOf(scripts) => scripts
-            .iter()
-            .all(|s| multisig_satisfied(s, payload, signatures, now_ms)),
-        Multisig::AnyOf(scripts) => scripts
-            .iter()
-            .any(|s| multisig_satisfied(s, payload, signatures, now_ms)),
+        Multisig::AllOf(scripts) => {
+            scripts.iter().all(|s| multisig_satisfied(s, payload, signatures, now_ms))
+        }
+        Multisig::AnyOf(scripts) => {
+            scripts.iter().any(|s| multisig_satisfied(s, payload, signatures, now_ms))
+        }
         Multisig::AtLeast(required, scripts) => {
             let n = scripts
                 .iter()
@@ -731,9 +744,16 @@ impl IntentService {
     pub async fn load(dao: Box<dyn StrategyIntentDao>, peers: Vec<String>) -> Result<Self> {
         let store = IntentStore::load(dao.as_ref(), now_ms()).await?;
         if !store.is_empty() {
-            tracing::info!(count = store.len(), "rehydrated strategy intents from persistence");
+            tracing::info!(
+                count = store.len(),
+                "rehydrated strategy intents from persistence"
+            );
         }
-        Ok(Self { store: tokio::sync::Mutex::new(store), dao, peers })
+        Ok(Self {
+            store: tokio::sync::Mutex::new(store),
+            dao,
+            peers,
+        })
     }
 
     /// Validate, store, persist, and (if new) gossip an intent.
@@ -778,7 +798,9 @@ impl IntentService {
                     .await;
                 match result {
                     Ok(resp) if resp.status().is_success() => {}
-                    Ok(resp) => tracing::debug!(url, status = %resp.status(), "intent gossip rejected"),
+                    Ok(resp) => {
+                        tracing::debug!(url, status = %resp.status(), "intent gossip rejected")
+                    }
                     Err(e) => tracing::debug!(url, "intent gossip failed: {e}"),
                 }
             });
@@ -826,7 +848,10 @@ impl IntentService {
             self.dao.delete_intents(&cleaned).await?;
         }
         if n > 0 {
-            tracing::info!(transitioned = n, "strategy intents moved to terminal status");
+            tracing::info!(
+                transitioned = n,
+                "strategy intents moved to terminal status"
+            );
         }
         Ok(n)
     }
@@ -847,10 +872,7 @@ pub fn to_persisted(intent: &StoredIntent) -> PersistedStrategyIntent {
         order_tx_id: key.0,
         order_index: key.1,
         sse_cbor: intent.sse_cbor.clone(),
-        hint: intent
-            .hint
-            .as_ref()
-            .and_then(|h| serde_json::to_string(h).ok()),
+        hint: intent.hint.as_ref().and_then(|h| serde_json::to_string(h).ok()),
         expiry_ms: intent.expiry_ms,
         received_at_ms: intent.received_at_ms,
         status: None,
@@ -865,8 +887,8 @@ mod tests {
     use crate::cardano_types::{AssetClass, Value};
     use crate::multisig::Multisig;
     use crate::sundaev4::types::{
-        Destination, IntervalBound, OrderDatum, OutputRef, StrategyConstraints,
-        StrategyExecution, StrategyValidityRange, SundaeV4Order,
+        Destination, IntervalBound, OrderDatum, OutputRef, StrategyConstraints, StrategyExecution,
+        StrategyValidityRange, SundaeV4Order,
     };
     use pallas_crypto::key::ed25519::SecretKey;
 
@@ -890,7 +912,10 @@ mod tests {
                 upper_bound: finite(expiry),
             },
             min_received: vec![(
-                AssetClass { policy: vec![0xCC; 28], token: b"TOK".to_vec() },
+                AssetClass {
+                    policy: vec![0xCC; 28],
+                    token: b"TOK".to_vec(),
+                },
                 BigInt::from(1_000_000),
             )],
             final_destination: None,
@@ -908,10 +933,7 @@ mod tests {
         let sig = sk.sign(&payload);
         let sse = SignedStrategyExecution {
             execution,
-            signatures: vec![(
-                sk.public_key().as_ref().to_vec(),
-                sig.as_ref().to_vec(),
-            )],
+            signatures: vec![(sk.public_key().as_ref().to_vec(), sig.as_ref().to_vec())],
         };
         minicbor::to_vec(&sse.to_plutus()).unwrap()
     }
@@ -955,9 +977,17 @@ mod tests {
         let cbor = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
         let mut store = IntentStore::default();
 
-        let hint = Some(ExecutionHint::Claim { pool: "cafe01".into() });
+        let hint = Some(ExecutionHint::Claim {
+            pool: "cafe01".into(),
+        });
         let (outcome, stored) = store
-            .submit(cbor.clone(), hint.clone(), |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                cbor.clone(),
+                hint.clone(),
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .expect("valid intent should be accepted");
         assert!(outcome.newly_stored);
         let stored = stored.expect("stored intent returned");
@@ -972,7 +1002,13 @@ mod tests {
 
         // Same bytes again: dedup, no error, not re-stored.
         let (echo, stored2) = store
-            .submit(cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                cbor.clone(),
+                None,
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .expect("duplicate intent should be a no-op");
         assert!(!echo.newly_stored);
         assert!(stored2.is_none());
@@ -980,15 +1016,29 @@ mod tests {
         assert_eq!(echo.intent_id, outcome.intent_id);
 
         // A duplicate can attach/replace a hint (latest Some wins) …
-        let new_hint = Some(ExecutionHint::Claim { pool: "beef02".into() });
+        let new_hint = Some(ExecutionHint::Claim {
+            pool: "beef02".into(),
+        });
         let (echo2, updated) = store
-            .submit(cbor.clone(), new_hint.clone(), |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                cbor.clone(),
+                new_hint.clone(),
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .expect("hint update should succeed");
         assert!(!echo2.newly_stored);
         assert_eq!(updated.expect("updated intent returned").hint, new_hint);
         // … but a hint-less duplicate leaves the stored hint untouched.
         let (_, none_update) = store
-            .submit(cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                cbor.clone(),
+                None,
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .expect("no-hint duplicate is a no-op");
         assert!(none_update.is_none());
         let key0 = (vec![0xAB; 32], 1u64);
@@ -1007,9 +1057,7 @@ mod tests {
         let order = strategy_order(&sk);
         let cbor = signed_sse_cbor(&interloper, test_execution(NOW_MS + 60_000));
         let mut store = IntentStore::default();
-        let err = store
-            .submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
-            .unwrap_err();
+        let err = store.submit(cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap_err();
         assert!(err.to_string().contains("do not satisfy"), "got: {err}");
     }
 
@@ -1074,7 +1122,10 @@ mod tests {
     fn synthesizes_swap_from_execution() {
         let sk = key();
         let mut order = strategy_order(&sk);
-        let offer_asset = AssetClass { policy: vec![0xDD; 28], token: b"TOKENA".to_vec() };
+        let offer_asset = AssetClass {
+            policy: vec![0xDD; 28],
+            token: b"TOKENA".to_vec(),
+        };
         {
             let o = std::sync::Arc::get_mut(&mut order).unwrap();
             o.value.insert(&offer_asset, BigInt::from(5_000_000));
@@ -1083,10 +1134,18 @@ mod tests {
         // Offered-asset delta bound −3M: at most 3M may leave, consumable = 3M.
         let mut exec = test_execution(NOW_MS + 60_000);
         exec.min_received.push((offer_asset.clone(), BigInt::from(-3_000_000)));
-        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let sse = SignedStrategyExecution {
+            execution: exec,
+            signatures: vec![],
+        };
         let c = synthesize_swap_constraint(&order, &sse).expect("synthesizable");
         match c {
-            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+            Constraint::Swap {
+                offered,
+                original_offered,
+                remaining_offered,
+                min_received,
+            } => {
                 assert_eq!(offered, offer_asset);
                 assert_eq!(original_offered, BigInt::from(3_000_000));
                 assert_eq!(remaining_offered, BigInt::from(3_000_000));
@@ -1100,13 +1159,19 @@ mod tests {
         // synthesizable as a swap.
         let mut exec = test_execution(NOW_MS + 60_000);
         exec.min_received.push((offer_asset.clone(), BigInt::from(0)));
-        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let sse = SignedStrategyExecution {
+            execution: exec,
+            signatures: vec![],
+        };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
 
         // Only an offered-asset bound (nothing to receive) → None.
         let mut exec = test_execution(NOW_MS + 60_000);
         exec.min_received = vec![(offer_asset.clone(), BigInt::from(-1_000_000))];
-        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let sse = SignedStrategyExecution {
+            execution: exec,
+            signatures: vec![],
+        };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
 
         // No offered-asset entry at all → the offer is FROZEN on-chain
@@ -1114,14 +1179,20 @@ mod tests {
         // unconstrained default built full-balance fills the validator
         // rejected.
         let exec = test_execution(NOW_MS + 60_000); // receive entry only
-        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let sse = SignedStrategyExecution {
+            execution: exec,
+            signatures: vec![],
+        };
         assert!(synthesize_swap_constraint(&order, &sse).is_none());
     }
 
     #[test]
     fn window_covers_requires_full_containment() {
         let exec = test_execution(NOW_MS + 60_000); // lower = NOW-1000 (finite)
-        let sse = SignedStrategyExecution { execution: exec, signatures: vec![] };
+        let sse = SignedStrategyExecution {
+            execution: exec,
+            signatures: vec![],
+        };
         // Fully inside.
         assert!(window_covers(&sse, NOW_MS, NOW_MS + 30_000));
         // End pokes past the upper bound.
@@ -1152,23 +1223,36 @@ mod tests {
         let new_cbor = signed_sse_cbor(&sk, unbounded(NOW_MS));
 
         let (o1, _) = store
-            .submit(old_cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                old_cbor.clone(),
+                None,
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .unwrap();
         let (o2, _) = store
-            .submit(new_cbor.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS)
+            .submit(
+                new_cbor.clone(),
+                None,
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
             .unwrap();
-        assert!(o2.newly_stored, "later valid-from replaces the standing intent");
+        assert!(
+            o2.newly_stored,
+            "later valid-from replaces the standing intent"
+        );
         assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
         assert_eq!(store.len(), 1);
 
         // Reversed arrival order converges on the same winner.
         let mut store2 = IntentStore::default();
-        let (r2, _) = store2
-            .submit(new_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
-            .unwrap();
-        let (r1, _) = store2
-            .submit(old_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS)
-            .unwrap();
+        let (r2, _) =
+            store2.submit(new_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+        let (r1, _) =
+            store2.submit(old_cbor, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(r2.newly_stored);
         assert!(r1.superseded);
         assert_eq!(store2.len(), 1);
@@ -1193,7 +1277,10 @@ mod tests {
                 is_inclusive: true,
             };
             e.min_received = vec![(
-                AssetClass { policy: vec![0xCC; 28], token: b"TOK".to_vec() },
+                AssetClass {
+                    policy: vec![0xCC; 28],
+                    token: b"TOK".to_vec(),
+                },
                 BigInt::from(min),
             )];
             e
@@ -1205,13 +1292,14 @@ mod tests {
         // (fixed by the bytes) can't decide the outcome.
         for (first, second) in [(a.clone(), b.clone()), (b, a)] {
             let mut store = IntentStore::default();
-            let (o1, _) = store
-                .submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS)
-                .unwrap();
-            let (o2, _) = store
-                .submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS + 1)
-                .unwrap();
-            assert!(o2.newly_stored, "the intent posted second replaces the standing one");
+            let (o1, _) =
+                store.submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+            let (o2, _) =
+                store.submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS + 1).unwrap();
+            assert!(
+                o2.newly_stored,
+                "the intent posted second replaces the standing one"
+            );
             assert!(!o2.superseded);
             assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
             assert_eq!(store.len(), 1);
@@ -1230,10 +1318,19 @@ mod tests {
 
         // A newer intent (later expiry) replaces the standing one.
         let first = signed_sse_cbor(&sk, test_execution(NOW_MS + 60_000));
-        let (o1, _) = store.submit(first.clone(), None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+        let (o1, _) = store
+            .submit(
+                first.clone(),
+                None,
+                |_| Some(order.clone()),
+                |_| None,
+                NOW_MS,
+            )
+            .unwrap();
         assert!(o1.newly_stored);
         let second = signed_sse_cbor(&sk, test_execution(NOW_MS + 90_000));
-        let (o2, _) = store.submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+        let (o2, _) =
+            store.submit(second, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(o2.newly_stored);
         assert_eq!(o2.replaced, vec![o1.intent_id.clone()]);
         assert_eq!(store.len(), 1);
@@ -1244,7 +1341,8 @@ mod tests {
 
         // A gossip echo of the replaced intent loses deterministically:
         // not stored, flagged superseded, winner untouched.
-        let (echo, stored) = store.submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+        let (echo, stored) =
+            store.submit(first, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(!echo.newly_stored);
         assert!(echo.superseded);
         assert!(stored.is_none());
@@ -1253,7 +1351,8 @@ mod tests {
         // An older intent arriving *after* the winner also loses, even
         // without a tombstone (deterministic (expiry, id) ranking).
         let stale = signed_sse_cbor(&sk, test_execution(NOW_MS + 70_000));
-        let (o3, stored) = store.submit(stale, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
+        let (o3, stored) =
+            store.submit(stale, None, |_| Some(order.clone()), |_| None, NOW_MS).unwrap();
         assert!(!o3.newly_stored);
         assert!(o3.superseded);
         assert!(stored.is_none());

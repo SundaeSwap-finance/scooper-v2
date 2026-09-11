@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use pallas_crypto::hash::Hasher;
-use pallas_primitives::conway::{self, RedeemersKey, RedeemerTag, TransactionOutput};
+use pallas_primitives::conway::{self, RedeemerTag, RedeemersKey, TransactionOutput};
 use pallas_primitives::{ExUnits, Hash, PlutusData};
 use tracing::warn;
 
@@ -33,7 +33,10 @@ impl ScriptStore {
     /// the inner CBOR bytestring (used for hashing), and we unwrap once more to
     /// get the raw FLAT bytes for the evaluator.
     pub fn from_ref_utxos(
-        ref_utxo_outputs: &BTreeMap<cardano_types::TransactionInput, cardano_types::TransactionOutput>,
+        ref_utxo_outputs: &BTreeMap<
+            cardano_types::TransactionInput,
+            cardano_types::TransactionOutput,
+        >,
     ) -> Result<Self> {
         let mut store = BTreeMap::new();
         for (_input, txo) in ref_utxo_outputs {
@@ -45,8 +48,9 @@ impl ScriptStore {
                 preimage.extend_from_slice(script_cbor);
                 let hash: Hash<28> = Hasher::<224>::hash(&preimage);
                 // CBOR unwrap: handles both definite and indefinite-length bytestrings
-                let flat_bytes = cbor_unwrap_bytes(script_cbor)
-                    .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
+                let flat_bytes = cbor_unwrap_bytes(script_cbor).with_context(|| {
+                    format!("CBOR unwrap failed for script {}", hex::encode(hash))
+                })?;
                 store.insert(hash, (flat_bytes, 3));
             }
         }
@@ -56,11 +60,7 @@ impl ScriptStore {
     /// Insert a script with an explicit language version (Butane's deployed
     /// validators are a V2/V3 mix; their bytes come from the verified
     /// deployment artifact, not chain-indexed ref UTxOs).
-    pub fn insert_with_version(
-        &mut self,
-        script_cbor: &[u8],
-        version: u8,
-    ) -> Result<Hash<28>> {
+    pub fn insert_with_version(&mut self, script_cbor: &[u8], version: u8) -> Result<Hash<28>> {
         let mut preimage = Vec::with_capacity(1 + script_cbor.len());
         preimage.push(version);
         preimage.extend_from_slice(script_cbor);
@@ -82,16 +82,22 @@ impl ScriptStore {
         let mut store = BTreeMap::new();
         for validator in &blueprint.validators {
             if let Some(code_hex) = &validator.compiled_code {
-                let script_cbor = hex::decode(code_hex)
-                    .with_context(|| format!("invalid hex in compiled_code for '{}'", validator.title))?;
+                let script_cbor = hex::decode(code_hex).with_context(|| {
+                    format!("invalid hex in compiled_code for '{}'", validator.title)
+                })?;
                 // PlutusV3 script hash = blake2b_224(0x03 || script_cbor)
                 let mut preimage = Vec::with_capacity(1 + script_cbor.len());
                 preimage.push(0x03);
                 preimage.extend_from_slice(&script_cbor);
                 let hash: Hash<28> = Hasher::<224>::hash(&preimage);
                 // CBOR unwrap to get FLAT bytes
-                let flat_bytes = cbor_unwrap_bytes(&script_cbor)
-                    .with_context(|| format!("CBOR unwrap failed for '{}' ({})", validator.title, hex::encode(hash)))?;
+                let flat_bytes = cbor_unwrap_bytes(&script_cbor).with_context(|| {
+                    format!(
+                        "CBOR unwrap failed for '{}' ({})",
+                        validator.title,
+                        hex::encode(hash)
+                    )
+                })?;
                 store.insert(hash, (flat_bytes, 3));
             }
         }
@@ -164,17 +170,14 @@ pub fn evaluate_scoop_tx(
     use uplc_turbo::machine::{ExBudget, PlutusVersion};
     use uplc_turbo::term::Term;
 
-    let redeemer_pairs: Vec<(RedeemersKey, PlutusData)> = redeemers
-        .iter()
-        .map(|(k, d, _)| (k.clone(), d.clone()))
-        .collect();
+    let redeemer_pairs: Vec<(RedeemersKey, PlutusData)> =
+        redeemers.iter().map(|(k, d, _)| (k.clone(), d.clone())).collect();
 
     let mut budgets = Vec::new();
 
     for (key, redeemer_data, _ex_units) in redeemers {
         // Determine which script to run and build the ScriptPurpose
-        let (script_hash, purpose) =
-            resolve_script_and_purpose(key, tx_body, resolved_inputs)?;
+        let (script_hash, purpose) = resolve_script_and_purpose(key, tx_body, resolved_inputs)?;
 
         // Look up FLAT script bytes + language
         let (flat_bytes, version) = scripts
@@ -185,8 +188,9 @@ pub fn evaluate_scoop_tx(
         let arena = Arena::new();
 
         // Decode FLAT script
-        let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, flat_bytes)
-            .map_err(|e| anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash)))?;
+        let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, flat_bytes).map_err(|e| {
+            anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash))
+        })?;
 
         // Build the version-appropriate context and argument list. V3 takes
         // one argument (the full ScriptContext, redeemer embedded); V2 takes
@@ -210,8 +214,7 @@ pub fn evaluate_scoop_tx(
                 .map_err(|e| anyhow::anyhow!("context CBOR decode failed: {e}"))?;
             // CIP-0069: V3 validators receive a single argument
             let applied = program.apply(&arena, Term::data(&arena, context_pd));
-            let result =
-                applied.eval_with_params(&arena, PlutusVersion::V3, cost_model, budget);
+            let result = applied.eval_with_params(&arena, PlutusVersion::V3, cost_model, budget);
             (context_cbor, result)
         } else if version == 2 {
             let cm2 = cost_model_v2.with_context(|| {
@@ -232,8 +235,7 @@ pub fn evaluate_scoop_tx(
             );
             let context_pd = UplcPlutusData::from_cbor(&arena, &context_cbor)
                 .map_err(|e| anyhow::anyhow!("V2 context CBOR decode failed: {e}"))?;
-            let redeemer_cbor = minicbor::to_vec(redeemer_data)
-                .expect("CBOR encode redeemer");
+            let redeemer_cbor = minicbor::to_vec(redeemer_data).expect("CBOR encode redeemer");
             let redeemer_pd = UplcPlutusData::from_cbor(&arena, &redeemer_cbor)
                 .map_err(|e| anyhow::anyhow!("redeemer CBOR decode failed: {e}"))?;
             // V2 argument order: [datum (spending only),] redeemer, context.
@@ -303,19 +305,15 @@ pub(crate) fn resolve_script_and_purpose(
             // Find the input at this sorted index
             let mut sorted_inputs: Vec<_> = tx_body.inputs.iter().cloned().collect();
             sorted_inputs.sort_by(|a, b| {
-                a.transaction_id
-                    .cmp(&b.transaction_id)
-                    .then(a.index.cmp(&b.index))
+                a.transaction_id.cmp(&b.transaction_id).then(a.index.cmp(&b.index))
             });
             let input = sorted_inputs
                 .get(key.index as usize)
                 .context("spend redeemer index out of bounds")?;
 
-            let input_key =
-                cardano_types::TransactionInput::new(input.transaction_id, input.index);
-            let resolved = resolved_inputs
-                .get(&input_key)
-                .context("resolved input not found for spend")?;
+            let input_key = cardano_types::TransactionInput::new(input.transaction_id, input.index);
+            let resolved =
+                resolved_inputs.get(&input_key).context("resolved input not found for spend")?;
 
             // Extract script hash from the address
             let script_hash = extract_payment_script_hash(&resolved.address)
@@ -335,10 +333,7 @@ pub(crate) fn resolve_script_and_purpose(
             Ok((script_hash, ScriptPurpose::Spending(oref, datum)))
         }
         RedeemerTag::Mint => {
-            let mint = tx_body
-                .mint
-                .as_ref()
-                .context("mint redeemer but no mint in tx body")?;
+            let mint = tx_body.mint.as_ref().context("mint redeemer but no mint in tx body")?;
             let mut policies: Vec<Hash<28>> = mint.iter().map(|(p, _)| *p).collect();
             policies.sort();
             let policy = policies
@@ -349,10 +344,8 @@ pub(crate) fn resolve_script_and_purpose(
         }
         RedeemerTag::Reward => {
             // Find the withdrawal at this sorted index
-            let withdrawals = tx_body
-                .withdrawals
-                .as_ref()
-                .context("reward redeemer but no withdrawals")?;
+            let withdrawals =
+                tx_body.withdrawals.as_ref().context("reward redeemer but no withdrawals")?;
             let sorted_accounts: Vec<_> = withdrawals.iter().map(|(a, _)| a.clone()).collect();
             let account = sorted_accounts
                 .get(key.index as usize)
@@ -407,7 +400,8 @@ mod debug_eval {
         use uplc_turbo::machine::{ExBudget, PlutusVersion};
         use uplc_turbo::term::Term;
 
-        let script_hex = std::fs::read_to_string(std::env::var("SCRIPT_HEX_FILE").unwrap()).unwrap();
+        let script_hex =
+            std::fs::read_to_string(std::env::var("SCRIPT_HEX_FILE").unwrap()).unwrap();
         let wrapped = hex::decode(script_hex.trim()).unwrap();
         let flat = super::cbor_unwrap_bytes(&wrapped)
             .and_then(|inner| super::cbor_unwrap_bytes(&inner).or(Ok(inner)))
@@ -418,10 +412,14 @@ mod debug_eval {
         let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat).unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
-        let budget = ExBudget { cpu: 10_000_000_000, mem: 14_000_000 };
+        let budget = ExBudget {
+            cpu: 10_000_000_000,
+            mem: 14_000_000,
+        };
         let cost_model: Vec<i64> = serde_json::from_str(
             &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let result = applied.eval_with_params(&arena, PlutusVersion::V3, &cost_model, budget);
         println!("logs ({}):", result.info.logs.len());
         for log in &result.info.logs {

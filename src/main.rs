@@ -68,16 +68,10 @@ async fn main() -> Result<()> {
 
     let persistence = persistence::connect(&config.persistence).await?;
 
-    let v3_state = config
-        .protocol
-        .v3
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(SundaeV3HistoricalState::new())));
-    let v4_state = config
-        .protocol
-        .v4
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(SundaeV4HistoricalState::new())));
+    let v3_state =
+        config.protocol.v3.as_ref().map(|_| Arc::new(Mutex::new(SundaeV3HistoricalState::new())));
+    let v4_state =
+        config.protocol.v4.as_ref().map(|_| Arc::new(Mutex::new(SundaeV4HistoricalState::new())));
     let broadcaster = tokio::sync::watch::Sender::default();
 
     // Resolve the secret key file early so both manager_loop (bootstrap) and
@@ -85,14 +79,10 @@ async fn main() -> Result<()> {
     let mut protocol = config.protocol.clone();
     if let Some(ref mut v4) = protocol.v4 {
         if let Some(ref mut exec) = v4.execution {
-            exec.resolve_secret_key()
-                .expect("failed to resolve scooper secret key");
+            exec.resolve_secret_key().expect("failed to resolve scooper secret key");
         }
     }
-    let v4_execution = protocol
-        .v4
-        .as_ref()
-        .and_then(|v4| v4.execution.clone());
+    let v4_execution = protocol.v4.as_ref().and_then(|v4| v4.execution.clone());
 
     // Strategy intent service: ingest via the admin server, execution by the
     // scooper, hygiene via the prune loop below. Only meaningful with a v4
@@ -210,9 +200,7 @@ async fn main() -> Result<()> {
             (cfg, watch, provisional)
         })
     });
-    let scooper_provisional = mempool_spawn
-        .as_ref()
-        .and_then(|(_, _, p)| p.clone());
+    let scooper_provisional = mempool_spawn.as_ref().and_then(|(_, _, p)| p.clone());
     let scooper_node_submit = mempool_spawn
         .as_ref()
         .filter(|(_, _, p)| p.is_some())
@@ -229,9 +217,8 @@ async fn main() -> Result<()> {
         shutdown.child_token(),
     ));
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
-    let v4_routing_costs = v4_execution
-        .as_ref()
-        .map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
+    let v4_routing_costs =
+        v4_execution.as_ref().map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
     let v4_module_preimages = v4_execution
         .as_ref()
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
@@ -429,8 +416,16 @@ async fn manager_loop(
             if v3_needs_bootstrap || v4_needs_bootstrap {
                 match bootstrap::run_bootstrap(
                     bootstrap_config,
-                    if v3_needs_bootstrap { protocol.v3.as_ref() } else { None },
-                    if v4_needs_bootstrap { protocol.v4.as_ref() } else { None },
+                    if v3_needs_bootstrap {
+                        protocol.v3.as_ref()
+                    } else {
+                        None
+                    },
+                    if v4_needs_bootstrap {
+                        protocol.v4.as_ref()
+                    } else {
+                        None
+                    },
                     &v3_state,
                     &v4_state,
                     &persistence,
@@ -439,8 +434,7 @@ async fn manager_loop(
                 {
                     Ok(result) => {
                         if !result.tip_hash.is_empty() {
-                            let point_str =
-                                format!("{}.{}", result.tip_slot, result.tip_hash);
+                            let point_str = format!("{}.{}", result.tip_slot, result.tip_hash);
                             match point_str.parse() {
                                 Ok(point) => bootstrap_point = Some(point),
                                 Err(e) => {
@@ -468,7 +462,9 @@ async fn manager_loop(
                         if bootstrap_point.is_some() {
                             info!("Bootstrap succeeded, starting chain sync from tip");
                         } else {
-                            info!("Bootstrap succeeded but no block hash available; using configured starting point");
+                            info!(
+                                "Bootstrap succeeded but no block hash available; using configured starting point"
+                            );
                         }
                     }
                     Err(e) => {
@@ -479,23 +475,13 @@ async fn manager_loop(
         }
 
         if let Some((v3_index, v3_config)) = v3_index_and_config {
-            let start = bootstrap_point
-                .clone()
-                .unwrap_or_else(|| v3_config.starting_point.clone());
-            indexer
-                .add_index(v3_index, start, force_restart)
-                .await
-                .unwrap();
+            let start = bootstrap_point.clone().unwrap_or_else(|| v3_config.starting_point.clone());
+            indexer.add_index(v3_index, start, force_restart).await.unwrap();
         }
 
         if let Some((v4_index, v4_config)) = v4_index_and_config {
-            let start = bootstrap_point
-                .clone()
-                .unwrap_or_else(|| v4_config.starting_point.clone());
-            indexer
-                .add_index(v4_index, start, force_restart)
-                .await
-                .unwrap();
+            let start = bootstrap_point.clone().unwrap_or_else(|| v4_config.starting_point.clone());
+            indexer.add_index(v4_index, start, force_restart).await.unwrap();
         }
 
         match process.start().await {

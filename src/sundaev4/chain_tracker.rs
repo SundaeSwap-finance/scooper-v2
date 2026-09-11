@@ -17,8 +17,8 @@ use tracing::info;
 
 use crate::cardano_types::TransactionInput;
 use crate::sundaev3::Ident;
-use crate::sundaev4::types::SundaeV4Order;
 use crate::sundaev4::SundaeV4Pool;
+use crate::sundaev4::types::SundaeV4Order;
 
 /// A predicted pool UTxO resulting from a submitted tx.
 #[derive(Clone, Debug)]
@@ -59,10 +59,7 @@ pub struct InFlightTx {
 impl InFlightTx {
     /// Get the predicted pool for a specific ident within this multi-pool tx.
     pub fn predicted_pool_for(&self, ident: &Ident) -> Option<&PredictedPoolUtxo> {
-        self.predicted_pools
-            .iter()
-            .find(|(id, _)| id == ident)
-            .map(|(_, p)| p)
+        self.predicted_pools.iter().find(|(id, _)| id == ident).map(|(_, p)| p)
     }
 }
 
@@ -102,10 +99,7 @@ impl ChainTracker {
     /// Next chain index for a pool (0 if no chain exists). Used in tests.
     #[cfg(test)]
     pub fn next_chain_index(&self, pool_ident: &Ident) -> usize {
-        self.chains
-            .get(pool_ident)
-            .map(|chain| chain.len())
-            .unwrap_or(0)
+        self.chains.get(pool_ident).map(|chain| chain.len()).unwrap_or(0)
     }
 
     /// Collect all order inputs consumed by in-flight transactions.
@@ -255,9 +249,9 @@ impl ChainTracker {
             .chains
             .iter()
             .filter(|(_, chain)| {
-                chain.iter().any(|tx| {
-                    tx.provisional_parents.iter().any(|p| p.as_slice() == parent_tx)
-                })
+                chain
+                    .iter()
+                    .any(|tx| tx.provisional_parents.iter().any(|p| p.as_slice() == parent_tx))
             })
             .map(|(ident, _)| ident.clone())
             .collect();
@@ -348,14 +342,16 @@ impl ChainTracker {
 
     /// Find an in-flight tx whose predicted pool output matches the given
     /// on-chain pool input. Returns the tx_hash for use with `confirm_settlement`.
-    pub fn find_settled_tx(&self, pool_ident: &Ident, pool_input: &TransactionInput) -> Option<Hash<32>> {
+    pub fn find_settled_tx(
+        &self,
+        pool_ident: &Ident,
+        pool_input: &TransactionInput,
+    ) -> Option<Hash<32>> {
         self.chains
             .get(pool_ident)?
             .iter()
             .find(|tx| {
-                tx.predicted_pool_for(pool_ident)
-                    .map(|p| p.input == *pool_input)
-                    .unwrap_or(false)
+                tx.predicted_pool_for(pool_ident).map(|p| p.input == *pool_input).unwrap_or(false)
             })
             .map(|tx| tx.tx_hash)
     }
@@ -396,7 +392,10 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
@@ -411,10 +410,13 @@ mod tests {
             tx_hash,
             pool_idents: vec![ident.clone()],
             consumed_orders: vec![],
-            predicted_pools: vec![(ident, PredictedPoolUtxo {
-                input: TransactionInput::new(tx_hash, 0),
-                pool,
-            })],
+            predicted_pools: vec![(
+                ident,
+                PredictedPoolUtxo {
+                    input: TransactionInput::new(tx_hash, 0),
+                    pool,
+                },
+            )],
             ttl,
             provisional_parents: BTreeSet::new(),
             consumed_wallet_inputs: vec![],
@@ -430,13 +432,20 @@ mod tests {
     ) -> InFlightTx {
         let tx_hash: Hash<32> = [hash_byte; 32].into();
         let pool_idents: Vec<Ident> = ident_bytes.iter().map(|&b| Ident::new(&[b])).collect();
-        let predicted_pools: Vec<_> = ident_bytes.iter().enumerate().map(|(i, &b)| {
-            let pool = make_pool(b);
-            (Ident::new(&[b]), PredictedPoolUtxo {
-                input: TransactionInput::new(tx_hash, i as u64),
-                pool,
+        let predicted_pools: Vec<_> = ident_bytes
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let pool = make_pool(b);
+                (
+                    Ident::new(&[b]),
+                    PredictedPoolUtxo {
+                        input: TransactionInput::new(tx_hash, i as u64),
+                        pool,
+                    },
+                )
             })
-        }).collect();
+            .collect();
         InFlightTx {
             tx_hash,
             pool_idents,
@@ -536,7 +545,10 @@ mod tests {
         let mut tracker = ChainTracker::new();
 
         let order_input = TransactionInput::new([0xff; 32].into(), 7);
-        let zero_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let zero_asset = crate::cardano_types::AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
         let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
             order_input.clone(),
             Value::default(),
@@ -597,7 +609,10 @@ mod tests {
         let mut tracker = ChainTracker::new();
 
         let order_input = TransactionInput::new([0xff; 32].into(), 7);
-        let zero_asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let zero_asset = crate::cardano_types::AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
         let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
             order_input.clone(),
             Value::default(),

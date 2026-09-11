@@ -130,10 +130,12 @@ impl Accumulator {
             .fee_split_config
             .as_ref()
             .map(|c| (c.protocol_share.num.clone(), c.protocol_share.den.clone()))
-            .unwrap_or_else(|| (
-                BigInt::from(self.protocol_share.0),
-                BigInt::from(self.protocol_share.1),
-            ));
+            .unwrap_or_else(|| {
+                (
+                    BigInt::from(self.protocol_share.0),
+                    BigInt::from(self.protocol_share.1),
+                )
+            });
         PoolAccum {
             pool: effective_pool.clone(),
             ident: pool_ident.clone(),
@@ -204,8 +206,7 @@ impl Accumulator {
         let prev_assets = accum.running_assets.clone();
 
         // Update running reserves
-        accum.running_assets[swap.input_idx].1 =
-            &accum.running_assets[swap.input_idx].1 + &swap.dx;
+        accum.running_assets[swap.input_idx].1 = &accum.running_assets[swap.input_idx].1 + &swap.dx;
         accum.running_assets[swap.output_idx].1 =
             &accum.running_assets[swap.output_idx].1 - &swap.dy;
 
@@ -389,15 +390,16 @@ impl Accumulator {
             let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
             if final_asset.as_ref() == Some(ask_asset) {
                 let (_, remaining) = order.swap_offered();
-                let total_in = blend
-                    .branches
-                    .iter()
-                    .fold(crate::bigint::BigInt::from(0), |acc, b| &acc + &b.total_input);
+                let total_in =
+                    blend.branches.iter().fold(crate::bigint::BigInt::from(0), |acc, b| {
+                        &acc + &b.total_input
+                    });
                 // Partial fills: the contract's exact pro-rata check,
                 // received·original ≥ min·fill.
                 let ok = if &total_in < remaining {
-                    if let crate::sundaev4::Constraint::Swap { original_offered, .. } =
-                        &order.constraint
+                    if let crate::sundaev4::Constraint::Swap {
+                        original_offered, ..
+                    } = &order.constraint
                     {
                         &total_out * original_offered >= min_qty * &total_in
                     } else {
@@ -487,7 +489,9 @@ impl Accumulator {
             // For multi-split non-entry hops, track allocated dx so the last
             // split absorbs the integer-division remainder.
             let mut allocated_dx = BigInt::from(0);
-            let hop_total: BigInt = hop.splits.iter()
+            let hop_total: BigInt = hop
+                .splits
+                .iter()
                 .map(|s| s.input_amount.clone())
                 .fold(BigInt::from(0), |a, b| &a + &b);
 
@@ -502,7 +506,9 @@ impl Accumulator {
                 // tx builder later composes the mechanism's pieces (pot
                 // output, mint, withdrawals) from plan.conversions.
                 if let crate::sundaev4::router::PoolViewType::Conversion {
-                    rate_num, rate_den, key,
+                    rate_num,
+                    rate_den,
+                    key,
                 } = &split.pool.view_type
                 {
                     let dx = if is_entry_hop {
@@ -563,7 +569,8 @@ impl Accumulator {
                     &accum.running_assets,
                     &hop.input_token,
                     &hop.output_token,
-                ).ok_or_else(|| format!("can't determine direction for pool {}", pool_ident))?;
+                )
+                .ok_or_else(|| format!("can't determine direction for pool {}", pool_ident))?;
 
                 // For hop 0, use the router's split amount. For subsequent hops,
                 // use the actual output from the previous hop (single-split) or
@@ -617,10 +624,8 @@ impl Accumulator {
                 let prev_assets = accum.running_assets.clone();
 
                 // Update running reserves
-                accum.running_assets[input_idx].1 =
-                    &accum.running_assets[input_idx].1 + &dx;
-                accum.running_assets[output_idx].1 =
-                    &accum.running_assets[output_idx].1 - &dy;
+                accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
+                accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
 
                 // Per-entry protocol_lp bump (mirrors tx_builder) so CL dy
                 // computed for subsequent ops in this pool matches tx-time.
@@ -658,7 +663,11 @@ impl Accumulator {
                     final_output_amount = &final_output_amount + &dy;
                 }
 
-                let route_ref = RouteRef { route_idx, hop_idx, split_idx };
+                let route_ref = RouteRef {
+                    route_idx,
+                    hop_idx,
+                    split_idx,
+                };
 
                 // Entry-hop first split is the primary (owns order). All
                 // others are continuations with route metadata for tx-time
@@ -706,8 +715,7 @@ impl Accumulator {
                         original_offered, ..
                     } = &order.constraint
                     {
-                        &final_output_amount * original_offered
-                            >= min_qty * &route.total_input
+                        &final_output_amount * original_offered >= min_qty * &route.total_input
                     } else {
                         false // partial fills only exist for swap constraints
                     }
@@ -727,16 +735,11 @@ impl Accumulator {
             // Pure-conversion route: the order's first conversion leg is its
             // primary op — the tx builder spends the order, emits its
             // redeemers, and builds its fulfillment off that leg.
-            let mine = self
-                .conversions
-                .iter_mut()
-                .find(|c| c.route_idx == route_idx);
+            let mine = self.conversions.iter_mut().find(|c| c.route_idx == route_idx);
             match mine {
                 Some(c) => c.primary = true,
                 None => {
-                    return Err(
-                        "route has neither pool splits nor conversion legs".into(),
-                    );
+                    return Err("route has neither pool splits nor conversion legs".into());
                 }
             }
         }
@@ -788,7 +791,9 @@ impl Accumulator {
         self.pools
             .values()
             .flat_map(|p| {
-                p.swaps.iter().map(|s| &s.order.input)
+                p.swaps
+                    .iter()
+                    .map(|s| &s.order.input)
                     .chain(p.deposits.iter().map(|d| &d.order.input))
                     .chain(p.withdraws.iter().map(|w| &w.order.input))
             })
@@ -848,7 +853,8 @@ impl Accumulator {
         // Resolve raw (Ident, op_idx) entries to (batch_idx, op_idx). Skip
         // entries pointing at filtered-out empty pools — none should exist
         // since global_seq is only populated when an op was actually pushed.
-        let global_seq: Vec<GlobalOp> = self.global_seq_raw
+        let global_seq: Vec<GlobalOp> = self
+            .global_seq_raw
             .iter()
             .filter_map(|(ident, op_idx)| {
                 ident_to_batch_idx.get(ident).map(|&batch_idx| GlobalOp {
@@ -882,18 +888,32 @@ mod tests {
     use crate::sundaev4::types::{Destination, PoolDatum, PoolType, Rational, SundaeV4Order};
 
     fn ada() -> AssetClass {
-        AssetClass { policy: vec![], token: vec![] }
+        AssetClass {
+            policy: vec![],
+            token: vec![],
+        }
     }
 
     fn token_a() -> AssetClass {
-        AssetClass { policy: vec![0x01], token: vec![0x02] }
+        AssetClass {
+            policy: vec![0x01],
+            token: vec![0x02],
+        }
     }
 
     fn token_b() -> AssetClass {
-        AssetClass { policy: vec![0x03], token: vec![0x04] }
+        AssetClass {
+            policy: vec![0x03],
+            token: vec![0x04],
+        }
     }
 
-    fn make_pool(ident_byte: u8, ada_reserve: i64, token: AssetClass, token_reserve: i64) -> Arc<SundaeV4Pool> {
+    fn make_pool(
+        ident_byte: u8,
+        ada_reserve: i64,
+        token: AssetClass,
+        token_reserve: i64,
+    ) -> Arc<SundaeV4Pool> {
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(ada_reserve));
         value.insert(&token, BigInt::from(token_reserve));
@@ -916,14 +936,22 @@ mod tests {
                 extension: crate::sundaev4::types::plutus_void(),
             },
             pool_type: PoolType::ConstantProduct {
-                fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                fee: Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
             },
             slot: 100,
             fee_split_config: None,
         })
     }
 
-    fn make_buy_order(ada_amount: i64, min_token: AssetClass, min_qty: i64, slot: u64) -> Arc<SundaeV4Order> {
+    fn make_buy_order(
+        ada_amount: i64,
+        min_token: AssetClass,
+        min_qty: i64,
+        slot: u64,
+    ) -> Arc<SundaeV4Order> {
         let offer_amount = ada_amount - 2_000_000; // subtract min UTxO
         let mut value = Value::default();
         value.insert(&ada(), BigInt::from(ada_amount));
@@ -1015,21 +1043,25 @@ mod tests {
     fn test_accumulator_matches_assemble_batch() {
         // Verify that the accumulator produces the same batch as assemble_batch
         // for a single pool with multiple orders
-        use crate::sundaev4::batch::{assemble_batch, BatchLimits};
+        use crate::sundaev4::batch::{BatchLimits, assemble_batch};
 
         let pool = make_pool(0xAA, 1_000_000_000, token_a(), 1_000_000_000);
         let ident = pool.pool_datum.identifier.clone();
         let fee = (3u64, 1000u64);
         let protocol_share = (1u64, 2u64);
 
-        let orders: Vec<_> = (1..=3u64)
-            .map(|slot| make_buy_order(10_000_000, token_a(), 1, slot))
-            .collect();
+        let orders: Vec<_> =
+            (1..=3u64).map(|slot| make_buy_order(10_000_000, token_a(), 1, slot)).collect();
 
         // Build via assemble_batch
         let batch_classic = assemble_batch(
-            &pool, &orders, fee, protocol_share, &BatchLimits { max_orders: 30 },
-        ).unwrap();
+            &pool,
+            &orders,
+            fee,
+            protocol_share,
+            &BatchLimits { max_orders: 30 },
+        )
+        .unwrap();
 
         // Build via accumulator (same order)
         let mut accum = Accumulator::new(protocol_share);

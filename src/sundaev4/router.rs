@@ -99,17 +99,16 @@ pub struct RoutingLimits {
 impl RoutingLimits {
     /// Unlimited — preserves pre-fan-out-gating behaviour.
     pub fn unlimited() -> Self {
-        Self { max_pools: usize::MAX, max_steps: usize::MAX }
+        Self {
+            max_pools: usize::MAX,
+            max_steps: usize::MAX,
+        }
     }
 
     /// Compute limits from an order's lovelace budget and per-unit costs.
     /// `cost_per_pool == 0` or `cost_per_step == 0` means that axis is
     /// unlimited.
-    pub fn from_budget(
-        budget_lovelace: u64,
-        cost_per_pool: u64,
-        cost_per_step: u64,
-    ) -> Self {
+    pub fn from_budget(budget_lovelace: u64, cost_per_pool: u64, cost_per_step: u64) -> Self {
         let max_pools = if cost_per_pool == 0 {
             usize::MAX
         } else {
@@ -120,7 +119,10 @@ impl RoutingLimits {
         } else {
             (budget_lovelace / cost_per_step) as usize
         };
-        Self { max_pools, max_steps }
+        Self {
+            max_pools,
+            max_steps,
+        }
     }
 }
 
@@ -163,7 +165,9 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
-        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+        PoolViewType::Conversion {
+            rate_num, rate_den, ..
+        } => {
             // Depth-limited by the view's reserve_out (output units): solve the
             // largest dx whose post-fee, rate-converted output fits reserve_out.
             //   dx_eff · rate_num/rate_den ≤ reserve_out
@@ -178,19 +182,32 @@ fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
             let dx_eff_max = &pool.reserve_out * rate_den / rate_num;
             Some(&dx_eff_max * &fee_den / &fee_mult)
         }
-        PoolViewType::ConstantSum { price_in, price_out } => {
+        PoolViewType::ConstantSum {
+            price_in,
+            price_out,
+        } => {
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
             let prices = [price_in.clone(), price_out.clone()];
             Some(
                 swap_math::cs_max_dx_for_reserve(
-                    &pool.reserve_out, &prices, 0, 1, &fee_num, &fee_den,
+                    &pool.reserve_out,
+                    &prices,
+                    0,
+                    1,
+                    &fee_num,
+                    &fee_den,
                 )
                 .unwrap_or_else(|| BigInt::from(0)),
             )
         }
         PoolViewType::ConcentratedLiquidity {
-            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+            is_a_input,
+            spa_num,
+            spa_den,
+            spb_num,
+            spb_den,
+            lp,
         } => {
             let (a, b) = if *is_a_input {
                 (&pool.reserve_in, &pool.reserve_out)
@@ -201,8 +218,16 @@ fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
             let fee_den = BigInt::from(pool.fee_den);
             // Cap 1: don't drain the output reserve below zero.
             let reserve_cap = match swap_math::cl_max_dx_for_reserve(
-                a, b, lp, *is_a_input, spa_num, spa_den, spb_num, spb_den,
-                &fee_num, &fee_den,
+                a,
+                b,
+                lp,
+                *is_a_input,
+                spa_num,
+                spa_den,
+                spb_num,
+                spb_den,
+                &fee_num,
+                &fee_den,
             ) {
                 Some(cap) => cap,
                 None => return Some(BigInt::from(0)),
@@ -212,8 +237,17 @@ fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
             // returns reserve_cap unchanged; for a pool swapped in its
             // value-losing direction it returns ~0, excluding it from routing.
             Some(swap_math::cl_max_dx_value_preserving(
-                a, b, lp, &reserve_cap, *is_a_input,
-                spa_num, spa_den, spb_num, spb_den, &fee_num, &fee_den,
+                a,
+                b,
+                lp,
+                &reserve_cap,
+                *is_a_input,
+                spa_num,
+                spa_den,
+                spb_num,
+                spb_den,
+                &fee_num,
+                &fee_den,
             ))
         }
     }
@@ -231,22 +265,43 @@ fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
 /// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
     let raw = match &pool.view_type {
-        PoolViewType::ConstantProduct => {
-            swap_math::cp_swap_result(&pool.reserve_in, &pool.reserve_out, dx, pool.fee_num, pool.fee_den)
-        }
-        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+        PoolViewType::ConstantProduct => swap_math::cp_swap_result(
+            &pool.reserve_in,
+            &pool.reserve_out,
+            dx,
+            pool.fee_num,
+            pool.fee_den,
+        ),
+        PoolViewType::Conversion {
+            rate_num, rate_den, ..
+        } => {
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
             let dx_eff = dx - &(dx * &fee_num / &fee_den);
             &dx_eff * rate_num / rate_den
         }
-        PoolViewType::ConstantSum { price_in, price_out } => {
+        PoolViewType::ConstantSum {
+            price_in,
+            price_out,
+        } => {
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
-            swap_math::cs_swap_result(dx, &[price_in.clone(), price_out.clone()], 0, 1, &fee_num, &fee_den)
+            swap_math::cs_swap_result(
+                dx,
+                &[price_in.clone(), price_out.clone()],
+                0,
+                1,
+                &fee_num,
+                &fee_den,
+            )
         }
         PoolViewType::ConcentratedLiquidity {
-            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+            is_a_input,
+            spa_num,
+            spa_den,
+            spb_num,
+            spb_den,
+            lp,
         } => {
             let fee_num = BigInt::from(pool.fee_num);
             let fee_den = BigInt::from(pool.fee_den);
@@ -258,8 +313,17 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
                 (&pool.reserve_out, &pool.reserve_in)
             };
             swap_math::cl_swap_result(
-                a, b, lp, dx, *is_a_input,
-                spa_num, spa_den, spb_num, spb_den, &fee_num, &fee_den,
+                a,
+                b,
+                lp,
+                dx,
+                *is_a_input,
+                spa_num,
+                spa_den,
+                spb_num,
+                spb_den,
+                &fee_num,
+                &fee_den,
             )
         }
     };
@@ -302,19 +366,29 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
                 / &(&fee_den * &denom * &denom)
         }
-        PoolViewType::ConstantSum { price_in, price_out } => {
+        PoolViewType::ConstantSum {
+            price_in,
+            price_out,
+        } => {
             // CS marginal is constant: dy/dx = price_in * fee_mult / (price_out * fee_den)
             let _ = raw_allocated;
             &fee_mult * price_in * &scale() / &(price_out * &fee_den)
         }
-        PoolViewType::Conversion { rate_num, rate_den, .. } => {
+        PoolViewType::Conversion {
+            rate_num, rate_den, ..
+        } => {
             // Linear edge: constant marginal, same shape as CS with the rate
             // in place of the price ratio.
             let _ = raw_allocated;
             &fee_mult * rate_num * &scale() / &(rate_den * &fee_den)
         }
         PoolViewType::ConcentratedLiquidity {
-            is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+            is_a_input,
+            spa_num,
+            spa_den,
+            spb_num,
+            spb_den,
+            lp,
         } => {
             // Marginal dy/dx in CL = derivative of the validator formula:
             //   A→B:  dy = vb0·dva_eff / (spa_den·(va0+dva_eff))
@@ -382,7 +456,10 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     // Convert effective back to raw: raw = x_eff * fee_den / fee_mult
                     &x_eff * &fee_den / &fee_mult
                 }
-                PoolViewType::ConstantSum { price_in, price_out } => {
+                PoolViewType::ConstantSum {
+                    price_in,
+                    price_out,
+                } => {
                     // CS marginal is constant. If lambda <= marginal, absorb
                     // everything up to what the reserve allows. Otherwise 0.
                     let cs_marginal = &fee_mult * price_in * &sc / &(price_out * &fee_den);
@@ -394,7 +471,9 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         BigInt::from(0)
                     }
                 }
-                PoolViewType::Conversion { rate_num, rate_den, .. } => {
+                PoolViewType::Conversion {
+                    rate_num, rate_den, ..
+                } => {
                     // Same all-or-nothing shape as CS: constant marginal,
                     // absorb up to the depth limit when the edge's rate beats
                     // lambda.
@@ -406,7 +485,12 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     }
                 }
                 PoolViewType::ConcentratedLiquidity {
-                    is_a_input, spa_num, spa_den, spb_num, spb_den, lp,
+                    is_a_input,
+                    spa_num,
+                    spa_den,
+                    spb_num,
+                    spb_den,
+                    lp,
                 } => {
                     // Invert marginal = λ:
                     //   A→B: va² = (fm·vb0·va0·spb_num·SCALE) / (λ·fd·spa_den)
@@ -454,8 +538,16 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     // than the pool can pay out, and the tx_builder produces
                     // a negative pool output → ValueNotConservedUTxO at submit.
                     let max_dx = swap_math::cl_max_dx_for_reserve(
-                        a, b, lp, *is_a_input, spa_num, spa_den, spb_num, spb_den,
-                        &fee_num, &fee_den,
+                        a,
+                        b,
+                        lp,
+                        *is_a_input,
+                        spa_num,
+                        spa_den,
+                        spb_num,
+                        spb_den,
+                        &fee_num,
+                        &fee_den,
                     );
                     match max_dx {
                         Some(cap) if raw > cap => cap,
@@ -488,7 +580,10 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
 /// (so the abundant-side pool is de-preferred).
 fn tiebreak_score(pool: &PoolView, dx: &BigInt) -> BigInt {
     match &pool.view_type {
-        PoolViewType::ConstantSum { price_in, price_out } => {
+        PoolViewType::ConstantSum {
+            price_in,
+            price_out,
+        } => {
             let dy = pool_output(pool, dx);
             let v_in_before = price_in * &pool.reserve_in;
             let v_out_before = price_out * &pool.reserve_out;
@@ -511,11 +606,8 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     // let the λ-search allocate to it, then `clamp_to_absorb` would zero that
     // allocation, dropping the routed sum below `total_input` and failing the
     // whole path. Excluding it up front lets the split fill via the real pools.
-    let kept: Vec<PoolView> = pools
-        .iter()
-        .filter(|p| pool_absorb_cap(p) != Some(BigInt::from(0)))
-        .cloned()
-        .collect();
+    let kept: Vec<PoolView> =
+        pools.iter().filter(|p| pool_absorb_cap(p) != Some(BigInt::from(0))).cloned().collect();
     let pools = kept.as_slice();
     if pools.is_empty() {
         return vec![];
@@ -569,9 +661,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         }
         let out = pool_output(pool, total_input);
         let tie = tiebreak_score(pool, total_input);
-        if out > best_output
-            || (out == best_output && out.is_positive() && tie > best_tiebreak)
-        {
+        if out > best_output || (out == best_output && out.is_positive() && tie > best_tiebreak) {
             best_output = out.clone();
             best_allocs = vec![BigInt::from(0); pools.len()];
             best_allocs[i] = total_input.clone();
@@ -703,13 +793,25 @@ fn build_graph(
     for (ident, pool) in pools {
         let assets = &pool.pool_datum.assets;
 
-        let (fee_num, fee_den, view_type_fn): (u64, u64, Box<dyn Fn(usize, usize) -> PoolViewType>) = match &pool.pool_type {
+        let (fee_num, fee_den, view_type_fn): (
+            u64,
+            u64,
+            Box<dyn Fn(usize, usize) -> PoolViewType>,
+        ) = match &pool.pool_type {
             PoolType::ConstantProduct { fee } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
-                (fn_num, fn_den, Box::new(|_, _| PoolViewType::ConstantProduct))
+                (
+                    fn_num,
+                    fn_den,
+                    Box::new(|_, _| PoolViewType::ConstantProduct),
+                )
             }
-            PoolType::ConcentratedLiquidity { sqrt_price_a, sqrt_price_b, fee } => {
+            PoolType::ConcentratedLiquidity {
+                sqrt_price_a,
+                sqrt_price_b,
+                fee,
+            } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
                 let spa_num = sqrt_price_a.num.clone();
@@ -717,30 +819,40 @@ fn build_graph(
                 let spb_num = sqrt_price_b.num.clone();
                 let spb_den = sqrt_price_b.den.clone();
                 let lp = pool.pool_datum.total_lp.clone();
-                (fn_num, fn_den, Box::new(move |i, _| PoolViewType::ConcentratedLiquidity {
-                    is_a_input: i == 0,
-                    spa_num: spa_num.clone(),
-                    spa_den: spa_den.clone(),
-                    spb_num: spb_num.clone(),
-                    spb_den: spb_den.clone(),
-                    lp: lp.clone(),
-                }))
+                (
+                    fn_num,
+                    fn_den,
+                    Box::new(move |i, _| PoolViewType::ConcentratedLiquidity {
+                        is_a_input: i == 0,
+                        spa_num: spa_num.clone(),
+                        spa_den: spa_den.clone(),
+                        spb_num: spb_num.clone(),
+                        spb_den: spb_den.clone(),
+                        lp: lp.clone(),
+                    }),
+                )
             }
             PoolType::ConstantSum { prices, fee, .. } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
                 let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
                 let prices = prices.clone();
-                (fn_num, fn_den, Box::new(move |i, j| PoolViewType::ConstantSum {
-                    price_in: prices[i].clone(),
-                    price_out: prices[j].clone(),
-                }))
+                (
+                    fn_num,
+                    fn_den,
+                    Box::new(move |i, j| PoolViewType::ConstantSum {
+                        price_in: prices[i].clone(),
+                        price_out: prices[j].clone(),
+                    }),
+                )
             }
         };
 
         // Create edges for all (i, j) pairs
         for i in 0..assets.len() {
             for j in 0..assets.len() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let (ref token_in, ref reserve_in) = assets[i];
                 let (ref token_out, ref reserve_out) = assets[j];
 
@@ -774,12 +886,8 @@ fn build_graph(
                 &eff * &edge.rate_num / &edge.rate_den
             })
             .unwrap_or_else(|| BigInt::from(u64::MAX));
-        graph
-            .entry(edge.from.clone())
-            .or_default()
-            .entry(edge.to.clone())
-            .or_default()
-            .push(PoolView {
+        graph.entry(edge.from.clone()).or_default().entry(edge.to.clone()).or_default().push(
+            PoolView {
                 ident: conversion_ident(&edge.key),
                 reserve_in: BigInt::from(0),
                 reserve_out: depth,
@@ -790,7 +898,8 @@ fn build_graph(
                     rate_den: edge.rate_den.clone(),
                     key: edge.key.clone(),
                 },
-            });
+            },
+        );
     }
 
     graph
@@ -896,13 +1005,13 @@ fn evaluate_path(
             // best single pool for current_amount and route everything
             // through it. For CL, this guards against virtual-reserve
             // overrun; CP/CS pass unconditionally.
-            let candidates: Vec<&PoolView> = hop.pools.iter()
-                .filter(|p| pool_can_absorb(p, &current_amount))
-                .collect();
+            let candidates: Vec<&PoolView> =
+                hop.pools.iter().filter(|p| pool_can_absorb(p, &current_amount)).collect();
             if candidates.is_empty() {
                 return Vec::new();
             }
-            let best = candidates.iter()
+            let best = candidates
+                .iter()
                 .max_by_key(|p| pool_output(p, &current_amount))
                 .copied()
                 .expect("candidates non-empty");
@@ -919,10 +1028,8 @@ fn evaluate_path(
             // allocations and re-optimize over those.
             if s.len() > max_splits_here {
                 s.sort_by(|a, b| b.input_amount.cmp(&a.input_amount));
-                let kept_pools: Vec<PoolView> = s.iter()
-                    .take(max_splits_here)
-                    .map(|e| e.pool.clone())
-                    .collect();
+                let kept_pools: Vec<PoolView> =
+                    s.iter().take(max_splits_here).map(|e| e.pool.clone()).collect();
                 s = optimize_split(&kept_pools, &current_amount);
             }
             // optimize_split may return undersized allocations when CL caps
@@ -973,9 +1080,7 @@ pub fn find_optimal_route(
     // Each hop adds at least 1 pool and at least 1 step to the route, so
     // capping search depth at `min(max_pools, max_steps, 4)` discards paths
     // we'd reject anyway and saves the optimization work.
-    let max_depth = 4
-        .min(limits.max_pools.max(1))
-        .min(limits.max_steps.max(1));
+    let max_depth = 4.min(limits.max_pools.max(1)).min(limits.max_steps.max(1));
     let paths = find_paths(&graph, input_token, output_token, max_depth);
 
     if paths.is_empty() {
@@ -987,20 +1092,15 @@ pub fn find_optimal_route(
 
     for path in &paths {
         let hops = evaluate_path(path, amount, &limits);
-        let total_out = hops
-            .last()
-            .map(|h| h.total_output.clone())
-            .unwrap_or_else(|| BigInt::from(0));
+        let total_out =
+            hops.last().map(|h| h.total_output.clone()).unwrap_or_else(|| BigInt::from(0));
 
         // Final safety check (evaluate_path enforces budgets but pool count
         // can over-count if the same pool ident appears in two hops).
-        let distinct_pools: std::collections::BTreeSet<_> = hops.iter()
-            .flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone()))
-            .collect();
+        let distinct_pools: std::collections::BTreeSet<_> =
+            hops.iter().flat_map(|h| h.splits.iter().map(|s| s.pool.ident.clone())).collect();
         let total_steps: usize = hops.iter().map(|h| h.splits.len()).sum();
-        if distinct_pools.len() > limits.max_pools
-            || total_steps > limits.max_steps
-        {
+        if distinct_pools.len() > limits.max_pools || total_steps > limits.max_steps {
             continue;
         }
 
@@ -1070,16 +1170,17 @@ impl BlendedRoute {
 pub fn collapse_to_serial(plan: &RoutingPlan, input: &BigInt) -> Option<RoutingPlan> {
     let mut hops = Vec::with_capacity(plan.hops.len());
     for (hop_idx, hop) in plan.hops.iter().enumerate() {
-        let best = hop
-            .splits
-            .iter()
-            .max_by(|a, b| a.input_amount.cmp(&b.input_amount))?;
+        let best = hop.splits.iter().max_by(|a, b| a.input_amount.cmp(&b.input_amount))?;
         if matches!(best.pool.view_type, PoolViewType::Conversion { .. }) {
             return None;
         }
         // Only the entry hop's input_amount is read downstream (later
         // single-split hops cascade the previous hop's actual output).
-        let hop_input = if hop_idx == 0 { input.clone() } else { best.input_amount.clone() };
+        let hop_input = if hop_idx == 0 {
+            input.clone()
+        } else {
+            best.input_amount.clone()
+        };
         // Collapsing routes the WHOLE hop flow through this one pool, which can
         // be far more than the split it was allocated (the optimizer split the
         // hop precisely because no single pool could absorb it all). If the
@@ -1117,9 +1218,7 @@ pub fn collapse_to_serial(plan: &RoutingPlan, input: &BigInt) -> Option<RoutingP
 /// The distinct pool/edge idents a path's hops could touch (candidate set —
 /// conservative: `optimize_split` may end up allocating 0 to some of them).
 fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {
-    path.iter()
-        .flat_map(|h| h.pools.iter().map(|p| p.ident.clone()))
-        .collect()
+    path.iter().flat_map(|h| h.pools.iter().map(|p| p.ident.clone())).collect()
 }
 
 /// Find the optimal allocation of `amount` across parallel routes over the
@@ -1151,7 +1250,12 @@ pub fn find_blended_route(
 
     // The winner-take-all answer is both our fallback and our baseline.
     let single = find_optimal_route(
-        pools, conversions, input_token, output_token, amount, limits,
+        pools,
+        conversions,
+        input_token,
+        output_token,
+        amount,
+        limits,
     )?;
     let single_plan = |plan: RoutingPlan| -> BlendedRoute {
         BlendedRoute {
@@ -1162,9 +1266,7 @@ pub fn find_blended_route(
     };
 
     let graph = build_graph(pools, conversions);
-    let max_depth = 4
-        .min(limits.max_pools.max(1))
-        .min(limits.max_steps.max(1));
+    let max_depth = 4.min(limits.max_pools.max(1)).min(limits.max_steps.max(1));
     let paths = find_paths(&graph, input_token, output_token, max_depth);
     if paths.len() < 2 {
         return Some(single_plan(single));
@@ -1220,7 +1322,11 @@ pub fn find_blended_route(
     let mut remaining = amount.clone();
     for step in 0..CHUNKS {
         // Last chunk absorbs the division remainder so value is conserved.
-        let this_chunk = if step == CHUNKS - 1 { remaining.clone() } else { chunk.clone() };
+        let this_chunk = if step == CHUNKS - 1 {
+            remaining.clone()
+        } else {
+            chunk.clone()
+        };
         let mut best: Option<(usize, BigInt, BigInt)> = None; // (idx, new_out, gain)
         for (ci, path_idx) in chosen.iter().enumerate() {
             let trial = &alloc[ci] + &this_chunk;
@@ -1267,11 +1373,8 @@ pub fn find_blended_route(
         .flat_map(|b| b.hops.iter())
         .flat_map(|h| h.splits.iter().map(|sp| sp.pool.ident.clone()))
         .collect();
-    let total_steps: usize = branches
-        .iter()
-        .flat_map(|b| b.hops.iter())
-        .map(|h| h.splits.len())
-        .sum();
+    let total_steps: usize =
+        branches.iter().flat_map(|b| b.hops.iter()).map(|h| h.splits.len()).sum();
     if distinct_pools.len() > limits.max_pools || total_steps > limits.max_steps {
         // The blend beats `single` but spends more pools/steps than the order's
         // fee budget affords. Rather than throw it away and collapse to a single
@@ -1285,9 +1388,8 @@ pub fn find_blended_route(
             for h in &b.hops {
                 for sp in &h.splits {
                     if pools.contains_key(&sp.pool.ident) {
-                        let e = contrib
-                            .entry(sp.pool.ident.clone())
-                            .or_insert_with(|| BigInt::from(0));
+                        let e =
+                            contrib.entry(sp.pool.ident.clone()).or_insert_with(|| BigInt::from(0));
                         *e = &*e + &sp.output_amount;
                     }
                 }
@@ -1297,7 +1399,12 @@ pub fn find_blended_route(
             let mut reduced = pools.clone();
             reduced.remove(&weakest);
             if let Some(pruned) = find_blended_route(
-                &reduced, conversions, input_token, output_token, amount, limits,
+                &reduced,
+                conversions,
+                input_token,
+                output_token,
+                amount,
+                limits,
             ) {
                 if pruned.total_output > single.total_output {
                     return Some(pruned);
@@ -1307,9 +1414,7 @@ pub fn find_blended_route(
         return Some(single_plan(single));
     }
 
-    let total_output: BigInt = branches
-        .iter()
-        .fold(BigInt::from(0), |a, b| &a + &b.total_output);
+    let total_output: BigInt = branches.iter().fold(BigInt::from(0), |a, b| &a + &b.total_output);
     // Paranoia: integer flooring at chunk boundaries could in principle land
     // a hair under the all-in answer; never return a worse blend.
     if branches.len() < 2 || total_output <= single.total_output {
@@ -1343,11 +1448,17 @@ mod tests {
     use crate::sundaev4::types::PoolDatum;
 
     fn ada() -> AssetClass {
-        AssetClass { policy: vec![], token: vec![] }
+        AssetClass {
+            policy: vec![],
+            token: vec![],
+        }
     }
 
     fn token(id: u8) -> AssetClass {
-        AssetClass { policy: vec![id], token: vec![id] }
+        AssetClass {
+            policy: vec![id],
+            token: vec![id],
+        }
     }
 
     fn make_pool(
@@ -1680,10 +1791,18 @@ mod tests {
         assert_eq!(plan.hops.len(), 1);
         // The split should outperform CP-only.
         let cp_only = swap_math::cp_swap_result(
-            &BigInt::from(10_000_000), &BigInt::from(10_000_000),
-            &BigInt::from(100_000), 3, 1000,
+            &BigInt::from(10_000_000),
+            &BigInt::from(10_000_000),
+            &BigInt::from(100_000),
+            3,
+            1000,
         );
-        assert!(plan.total_output > cp_only, "split should beat CP-only: {} vs {}", plan.total_output, cp_only);
+        assert!(
+            plan.total_output > cp_only,
+            "split should beat CP-only: {} vs {}",
+            plan.total_output,
+            cp_only
+        );
         // Should actually split (use both pools)
         assert!(is_routed(&plan), "should split across CS and CP");
     }
@@ -1695,7 +1814,11 @@ mod tests {
         // 3-asset CS pool: A, B, C with prices [1, 2, 3]
         let (id, pool) = make_cs_pool(
             0x01,
-            vec![(token(0xAA), 1_000_000), (token(0xBB), 1_000_000), (token(0xCC), 1_000_000)],
+            vec![
+                (token(0xAA), 1_000_000),
+                (token(0xBB), 1_000_000),
+                (token(0xCC), 1_000_000),
+            ],
             vec![1, 2, 3],
         );
         pools.insert(id, pool);
@@ -1815,7 +1938,10 @@ mod tests {
     }
 
     fn adab() -> AssetClass {
-        AssetClass { policy: vec![0xBB; 28], token: b"ADAb".to_vec() }
+        AssetClass {
+            policy: vec![0xBB; 28],
+            token: b"ADAb".to_vec(),
+        }
     }
 
     fn mint_edge(max_input: Option<i64>) -> crate::sundaev4::conversions::ConversionEdge {
@@ -1847,12 +1973,16 @@ mod tests {
         // Direct pool is shallow; ADAb pool is 10x deeper.
         let (i1, p1) = make_pool(1, ada(), 400_000_000, night.clone(), 400_000_000);
         let (i2, p2) = make_pool(2, adab(), 4_000_000_000, night.clone(), 4_000_000_000);
-        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
-            [(i1, p1), (i2, p2)].into_iter().collect();
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> = [(i1, p1), (i2, p2)].into_iter().collect();
 
         let amount = BigInt::from(100_000_000);
         let direct_only = find_optimal_route(
-            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &[],
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .expect("direct route exists");
 
@@ -1874,15 +2004,16 @@ mod tests {
         );
         // The winning plan actually routes through the conversion edge.
         let conv_ident = conversion_ident("butane:ADAb:mint");
-        let uses_edge = with_edge
-            .hops
-            .iter()
-            .any(|h| h.splits.iter().any(|sp| sp.pool.ident == conv_ident));
+        let uses_edge =
+            with_edge.hops.iter().any(|h| h.splits.iter().any(|sp| sp.pool.ident == conv_ident));
         assert!(uses_edge, "plan should route through the conversion edge");
         // Value conservation through the free 1:1 edge: hop 1 output equals
         // hop 2 input allocation.
         assert_eq!(with_edge.hops.len(), 2);
-        assert_eq!(with_edge.hops[0].total_output, with_edge.hops[1].splits[0].input_amount);
+        assert_eq!(
+            with_edge.hops[0].total_output,
+            with_edge.hops[1].splits[0].input_amount
+        );
     }
 
     /// A 1:1 zero-fee edge into a deeper pool: value is conserved through
@@ -1902,10 +2033,19 @@ mod tests {
                 key: "x".into(),
             },
         };
-        assert_eq!(pool_output(&view, &BigInt::from(123_456_789)), BigInt::from(123_456_789));
+        assert_eq!(
+            pool_output(&view, &BigInt::from(123_456_789)),
+            BigInt::from(123_456_789)
+        );
         // 1% input fee
-        let feed = PoolView { fee_num: 100, ..view.clone() };
-        assert_eq!(pool_output(&feed, &BigInt::from(1_000_000)), BigInt::from(990_000));
+        let feed = PoolView {
+            fee_num: 100,
+            ..view.clone()
+        };
+        assert_eq!(
+            pool_output(&feed, &BigInt::from(1_000_000)),
+            BigInt::from(990_000)
+        );
         // 2:1 rate
         let two = PoolView {
             view_type: PoolViewType::Conversion {
@@ -1925,8 +2065,7 @@ mod tests {
         let night = token(9);
         let (i1, p1) = make_pool(1, ada(), 1_000_000_000, night.clone(), 1_000_000_000);
         let (i2, p2) = make_pool(2, adab(), 1_000_000_000, night.clone(), 1_000_000_000);
-        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
-            [(i1, p1), (i2, p2)].into_iter().collect();
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> = [(i1, p1), (i2, p2)].into_iter().collect();
 
         let cap = 10_000_000i64;
         let plan = find_optimal_route(
@@ -1961,17 +2100,26 @@ mod tests {
         let night = token(9);
         let (i1, p1) = make_pool(1, ada(), 1_000_000_000, night.clone(), 1_000_000_000);
         let (i2, p2) = make_pool(2, adab(), 1_000_000_000, night.clone(), 1_000_000_000);
-        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
-            [(i1, p1), (i2, p2)].into_iter().collect();
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> = [(i1, p1), (i2, p2)].into_iter().collect();
         let edges = [mint_edge(None)];
         let amount = BigInt::from(100_000_000);
 
         let single = find_optimal_route(
-            &pools, &edges, &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &edges,
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .unwrap();
         let blended = find_blended_route(
-            &pools, &edges, &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &edges,
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .unwrap();
 
@@ -2008,11 +2156,21 @@ mod tests {
         let amount = BigInt::from(50_000_000);
 
         let single = find_optimal_route(
-            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &[],
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .unwrap();
         let blended = find_blended_route(
-            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &[],
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .unwrap();
         assert_eq!(blended.branches.len(), 1);
@@ -2039,12 +2197,16 @@ mod tests {
             vec![1, 1, 1],
         );
         let (i2, p2) = make_pool(2, ada(), 500_000_000, mid.clone(), 500_000_000);
-        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> =
-            [(i1, p1), (i2, p2)].into_iter().collect();
+        let pools: BTreeMap<Ident, Arc<SundaeV4Pool>> = [(i1, p1), (i2, p2)].into_iter().collect();
         let amount = BigInt::from(50_000_000);
 
         let blended = find_blended_route(
-            &pools, &[], &ada(), &night, &amount, RoutingLimits::unlimited(),
+            &pools,
+            &[],
+            &ada(),
+            &night,
+            &amount,
+            RoutingLimits::unlimited(),
         )
         .unwrap();
         assert_eq!(

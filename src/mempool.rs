@@ -32,8 +32,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::events::IndexEvent;
-use crate::sundaev4::SundaeV4HistoricalState;
 use crate::metrics::Metrics;
+use crate::sundaev4::SundaeV4HistoricalState;
 
 /// Config lives at `protocol.v4.mempool`; absent = monitor disabled
 /// (graceful degrade, matching the butane section's convention).
@@ -188,7 +188,10 @@ impl ProvisionalState {
     pub fn note_tx(
         &mut self,
         tx_hash: Vec<u8>,
-        created: Vec<(crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Order>)>,
+        created: Vec<(
+            crate::cardano_types::TransactionInput,
+            Arc<crate::sundaev4::SundaeV4Order>,
+        )>,
         spent: Vec<crate::cardano_types::TransactionInput>,
         pool_predictions: Vec<(
             crate::sundaev3::Ident,
@@ -204,7 +207,11 @@ impl ProvisionalState {
             effects.created_orders.push(input.clone());
             self.orders.insert(
                 input,
-                ProvisionalOrder { order, source_tx: tx_hash.clone(), gone: false },
+                ProvisionalOrder {
+                    order,
+                    source_tx: tx_hash.clone(),
+                    gone: false,
+                },
             );
         }
         for input in spent {
@@ -232,7 +239,12 @@ impl ProvisionalState {
     /// (If it reappears — a re-add after a brief eviction — un-suspend.)
     pub fn set_gone(&mut self, tx_hash: &[u8], gone: bool) {
         // Split the borrow: `by_tx` is read while `orders`/`pools` are written.
-        let Self { orders, pools, by_tx, .. } = self;
+        let Self {
+            orders,
+            pools,
+            by_tx,
+            ..
+        } = self;
         let Some(effects) = by_tx.get_mut(tx_hash) else {
             return;
         };
@@ -275,9 +287,7 @@ impl ProvisionalState {
     }
 
     /// Orders currently eligible for chained dispatch, with their parent tx.
-    pub fn dispatchable_orders(
-        &self,
-    ) -> Vec<(Arc<crate::sundaev4::SundaeV4Order>, Vec<u8>)> {
+    pub fn dispatchable_orders(&self) -> Vec<(Arc<crate::sundaev4::SundaeV4Order>, Vec<u8>)> {
         self.orders
             .values()
             .filter(|p| {
@@ -319,16 +329,11 @@ impl ProvisionalState {
 
     /// Inputs of currently-tracked provisional orders (for classification).
     pub fn order_inputs(&self) -> BTreeSet<(Vec<u8>, u64)> {
-        self.orders
-            .keys()
-            .map(|i| (i.0.transaction_id.as_ref().to_vec(), i.0.index))
-            .collect()
+        self.orders.keys().map(|i| (i.0.transaction_id.as_ref().to_vec(), i.0.index)).collect()
     }
 
     /// Live (not-gone) foreign pool predictions.
-    pub fn foreign_pools(
-        &self,
-    ) -> Vec<(crate::sundaev3::Ident, ForeignPoolPrediction)> {
+    pub fn foreign_pools(&self) -> Vec<(crate::sundaev3::Ident, ForeignPoolPrediction)> {
         self.pools
             .iter()
             .filter(|(_, fp)| !fp.gone)
@@ -351,7 +356,10 @@ pub fn provisional_orders_from_tx(
     tx: &MultiEraTx,
     watch: &ProtocolWatch,
     slot: u64,
-) -> Vec<(crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Order>)> {
+) -> Vec<(
+    crate::cardano_types::TransactionInput,
+    Arc<crate::sundaev4::SundaeV4Order>,
+)> {
     use plutus_parser::AsPlutus;
     let tx_hash = tx.hash();
     let witness_datums: BTreeMap<pallas_primitives::DatumHash, pallas_primitives::PlutusData> = tx
@@ -366,7 +374,9 @@ pub fn provisional_orders_from_tx(
         .collect();
     let mut out = Vec::new();
     for (idx, output) in tx.outputs().iter().enumerate() {
-        let Ok(address) = output.address() else { continue };
+        let Ok(address) = output.address() else {
+            continue;
+        };
         let pallas_addresses::Address::Shelley(shelley) = address else {
             continue;
         };
@@ -430,7 +440,10 @@ pub fn pool_predictions_from_tx(
     watch: &ProtocolWatch,
     pool_context: &BTreeMap<
         crate::sundaev3::Ident,
-        (crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Pool>),
+        (
+            crate::cardano_types::TransactionInput,
+            Arc<crate::sundaev4::SundaeV4Pool>,
+        ),
     >,
     slot: u64,
 ) -> Vec<(
@@ -440,14 +453,13 @@ pub fn pool_predictions_from_tx(
 )> {
     use plutus_parser::AsPlutus;
     let tx_hash = tx.hash();
-    let spent: BTreeSet<(Vec<u8>, u64)> = tx
-        .inputs()
-        .iter()
-        .map(|i| (i.hash().to_vec(), i.index()))
-        .collect();
+    let spent: BTreeSet<(Vec<u8>, u64)> =
+        tx.inputs().iter().map(|i| (i.hash().to_vec(), i.index())).collect();
     let mut out = Vec::new();
     for (idx, output) in tx.outputs().iter().enumerate() {
-        let Ok(address) = output.address() else { continue };
+        let Ok(address) = output.address() else {
+            continue;
+        };
         let pallas_addresses::Address::Shelley(shelley) = address else {
             continue;
         };
@@ -473,7 +485,10 @@ pub fn pool_predictions_from_tx(
         };
         // Sanity: the tx must actually spend the pool UTxO we know about —
         // otherwise this is a chain we can't see the base of.
-        if !spent.contains(&(old_input.0.transaction_id.as_ref().to_vec(), old_input.0.index)) {
+        if !spent.contains(&(
+            old_input.0.transaction_id.as_ref().to_vec(),
+            old_input.0.index,
+        )) {
             debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output doesn't spend the known pool input; skipping");
             continue;
         }
@@ -521,16 +536,11 @@ pub async fn submit_via_node(
     let mut client = pallas_network::facades::NodeClient::connect(socket_path, network_magic)
         .await
         .map_err(|e| NodeSubmitError::Transport(e.to_string()))?;
-    let result = client
-        .submission()
-        .submit_tx(EraTx(CONWAY_ERA, cbor.to_vec()))
-        .await;
+    let result = client.submission().submit_tx(EraTx(CONWAY_ERA, cbor.to_vec())).await;
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
-        Ok(Response::Rejected(reason)) => {
-            Err(NodeSubmitError::Rejected(hex::encode(&reason.0)))
-        }
+        Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(hex::encode(&reason.0))),
         Err(e) => Err(NodeSubmitError::Transport(e.to_string())),
     }
 }
@@ -677,7 +687,11 @@ async fn watch_mempool(
                     ));
                 }
             }
-            (orders, pools, latest.network_tip_slot.unwrap_or(latest.tip_slot))
+            (
+                orders,
+                pools,
+                latest.network_tip_slot.unwrap_or(latest.tip_slot),
+            )
         };
 
         let mut current: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -704,15 +718,18 @@ async fn watch_mempool(
             if !class.relevant() {
                 continue;
             }
-            metrics
-                .mempool_order_creates
-                .fetch_add(class.order_creates as u64, std::sync::atomic::Ordering::Relaxed);
-            metrics
-                .mempool_order_spends
-                .fetch_add(class.order_spends as u64, std::sync::atomic::Ordering::Relaxed);
-            metrics
-                .mempool_pool_spends
-                .fetch_add(class.pool_spends as u64, std::sync::atomic::Ordering::Relaxed);
+            metrics.mempool_order_creates.fetch_add(
+                class.order_creates as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics.mempool_order_spends.fetch_add(
+                class.order_spends as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics.mempool_pool_spends.fetch_add(
+                class.pool_spends as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             info!(
                 tx = %hex::encode(&hash),
                 order_creates = class.order_creates,
@@ -732,9 +749,7 @@ async fn watch_mempool(
                 let spent: Vec<crate::cardano_types::TransactionInput> = if class.order_spends > 0 {
                     tx.inputs()
                         .iter()
-                        .filter(|i| {
-                            known_order_inputs.contains(&(i.hash().to_vec(), i.index()))
-                        })
+                        .filter(|i| known_order_inputs.contains(&(i.hash().to_vec(), i.index())))
                         .map(|i| crate::cardano_types::TransactionInput::new(*i.hash(), i.index()))
                         .collect()
                 } else {
@@ -746,7 +761,10 @@ async fn watch_mempool(
                     // resolve link by link.
                     let mut context: BTreeMap<
                         crate::sundaev3::Ident,
-                        (crate::cardano_types::TransactionInput, Arc<crate::sundaev4::SundaeV4Pool>),
+                        (
+                            crate::cardano_types::TransactionInput,
+                            Arc<crate::sundaev4::SundaeV4Pool>,
+                        ),
                     > = {
                         let state = v4_state.lock().await;
                         let latest = state.latest();
@@ -769,7 +787,9 @@ async fn watch_mempool(
                         source_tx = %hex::encode(&hash),
                         "mempool: provisional order candidate",
                     );
-                    new_events.push(IndexEvent::V4MempoolOrderSeen { order: order.clone() });
+                    new_events.push(IndexEvent::V4MempoolOrderSeen {
+                        order: order.clone(),
+                    });
                 }
                 for (ident, _, spent_input) in &pool_predictions {
                     info!(
@@ -779,13 +799,15 @@ async fn watch_mempool(
                         "mempool: pool spend predicted",
                     );
                 }
-                p.lock()
-                    .unwrap()
-                    .note_tx(hash.clone(), created, spent, pool_predictions);
+                p.lock().unwrap().note_tx(hash.clone(), created, spent, pool_predictions);
             }
             seen.lock().unwrap().insert(
                 hash,
-                SeenTx { seen_at: Instant::now(), class, gone_at: None },
+                SeenTx {
+                    seen_at: Instant::now(),
+                    class,
+                    gone_at: None,
+                },
             );
         }
 
@@ -935,9 +957,15 @@ mod tests {
     #[test]
     fn provisional_store_lifecycle() {
         use crate::cardano_types::TransactionInput;
-        fn dummy_order(tx_byte: u8, idx: u64) -> (TransactionInput, Arc<crate::sundaev4::SundaeV4Order>) {
+        fn dummy_order(
+            tx_byte: u8,
+            idx: u64,
+        ) -> (TransactionInput, Arc<crate::sundaev4::SundaeV4Order>) {
             let input = TransactionInput::new([tx_byte; 32].into(), idx);
-            let asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+            let asset = crate::cardano_types::AssetClass {
+                policy: vec![],
+                token: vec![],
+            };
             let order = crate::sundaev4::SundaeV4Order::test_swap_order(
                 input.clone(),
                 Default::default(),
@@ -956,7 +984,12 @@ mod tests {
         let (in_a, ord_a) = dummy_order(0xA1, 0);
         let (spent_target, _) = dummy_order(0x33, 0);
 
-        state.note_tx(parent_a.clone(), vec![(in_a.clone(), ord_a)], vec![spent_target.clone()], vec![]);
+        state.note_tx(
+            parent_a.clone(),
+            vec![(in_a.clone(), ord_a)],
+            vec![spent_target.clone()],
+            vec![],
+        );
         state.note_tx(parent_b.clone(), vec![], vec![in_a.clone()], vec![]);
 
         // Order from A is tracked but B spends it → not dispatchable.
@@ -1023,7 +1056,10 @@ mod tests {
     fn a_provisional_order_spent_by_a_vanished_tx_is_dispatchable_again() {
         use crate::cardano_types::TransactionInput;
         let input = TransactionInput::new([0xA1; 32].into(), 0);
-        let asset = crate::cardano_types::AssetClass { policy: vec![], token: vec![] };
+        let asset = crate::cardano_types::AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
         let order = Arc::new(crate::sundaev4::SundaeV4Order::test_swap_order(
             input.clone(),
             Default::default(),
@@ -1038,7 +1074,12 @@ mod tests {
         let mut state = ProvisionalState::default();
         let creator = vec![0xA1; 32];
         let spender = vec![0xB2; 32];
-        state.note_tx(creator.clone(), vec![(input.clone(), order)], vec![], vec![]);
+        state.note_tx(
+            creator.clone(),
+            vec![(input.clone(), order)],
+            vec![],
+            vec![],
+        );
         state.note_tx(spender.clone(), vec![], vec![input.clone()], vec![]);
         assert_eq!(state.dispatchable_orders().len(), 0);
 
@@ -1054,9 +1095,9 @@ mod tests {
 
     #[test]
     fn foreign_pool_prediction_lifecycle() {
+        use crate::bigint::BigInt;
         use crate::cardano_types::TransactionInput;
         use crate::sundaev3::Ident;
-        use crate::bigint::BigInt;
         use crate::sundaev4::{PoolDatum, PoolType, Rational};
 
         fn dummy_pool(ident: &Ident, tx_byte: u8) -> Arc<crate::sundaev4::SundaeV4Pool> {
@@ -1075,7 +1116,10 @@ mod tests {
                     extension: crate::sundaev4::plutus_void(),
                 },
                 pool_type: PoolType::ConstantProduct {
-                    fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+                    fee: Rational {
+                        num: BigInt::from(3),
+                        den: BigInt::from(1000),
+                    },
                 },
                 slot: 1,
                 fee_split_config: None,
@@ -1130,44 +1174,80 @@ mod tests {
     /// dispatchable order with the decremented remaining_offered.
     #[test]
     fn parse_provisional_order_from_tx() {
-        use std::collections::BTreeMap as Map;
+        use crate::bigint::BigInt;
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::router;
         use crate::sundaev4::test_harness::test_harness::*;
-        use crate::bigint::BigInt;
+        use std::collections::BTreeMap as Map;
 
         let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
         let pool = make_pool(&env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
         let mut pool_map = Map::new();
         pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
-        let order = make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
+        let order =
+            make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
         let fill = BigInt::from(100_000_000u64);
         let route = router::find_optimal_route(
-            &pool_map, &[], &token_a(), &token_b(), &fill,
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            &fill,
             router::RoutingLimits::unlimited(),
-        ).expect("partial route exists");
+        )
+        .expect("partial route exists");
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum.try_add_routed_order(&order, &route, &pool_map).expect("partial fill adds");
         let plan = accum.into_plan();
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (build, _eval) = env.build_and_eval_plan(&plan, &settings, 1000)
-            .expect("partial fill builds");
+        let (build, _eval) =
+            env.build_and_eval_plan(&plan, &settings, 1000).expect("partial fill builds");
 
         let tx = MultiEraTx::decode(&build.cbor).expect("tx decodes");
         let watch = ProtocolWatch {
             pool_script_hash: env.exec.module_scripts.pool.hash,
             order_script_hashes: vec![env.exec.module_scripts.order.hash],
-            swap_order_hash: env.exec.module_scripts.swap_order.as_ref().unwrap().hash.as_ref().to_vec(),
-            basic_order_hash: env.exec.module_scripts.basic_order.as_ref().unwrap().hash.as_ref().to_vec(),
-            strategy_order_hash: env.exec.module_scripts.strategy_order.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default(),
+            swap_order_hash: env
+                .exec
+                .module_scripts
+                .swap_order
+                .as_ref()
+                .unwrap()
+                .hash
+                .as_ref()
+                .to_vec(),
+            basic_order_hash: env
+                .exec
+                .module_scripts
+                .basic_order
+                .as_ref()
+                .unwrap()
+                .hash
+                .as_ref()
+                .to_vec(),
+            strategy_order_hash: env
+                .exec
+                .module_scripts
+                .strategy_order
+                .as_ref()
+                .map(|m| m.hash.as_ref().to_vec())
+                .unwrap_or_default(),
         };
         let parsed = provisional_orders_from_tx(&tx, &watch, 42);
-        assert_eq!(parsed.len(), 1, "continuation parses as one provisional order");
+        assert_eq!(
+            parsed.len(),
+            1,
+            "continuation parses as one provisional order"
+        );
         let (input, cont) = &parsed[0];
         assert_eq!(input.0.transaction_id.as_ref(), tx.hash().as_ref());
         assert_eq!(cont.slot, 42);
         match &cont.constraint {
-            crate::sundaev4::Constraint::Swap { remaining_offered, original_offered, .. } => {
+            crate::sundaev4::Constraint::Swap {
+                remaining_offered,
+                original_offered,
+                ..
+            } => {
                 assert_eq!(*original_offered, BigInt::from(400_000_000u64));
                 assert_eq!(*remaining_offered, BigInt::from(300_000_000u64));
             }
@@ -1180,17 +1260,30 @@ mod tests {
     /// as an order-address output.
     #[test]
     fn classify_scoop_tx() {
-        use crate::sundaev4::batch::{assemble_batch, BatchLimits};
+        use crate::sundaev4::batch::{BatchLimits, assemble_batch};
         use crate::sundaev4::test_harness::test_harness::*;
 
         let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
-        let pool = make_pool(&env, 0xAA, token_a(), 1_000_000_000, token_b(), 1_000_000_000);
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
         let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("batch assembly should succeed");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
         let settings = make_settings(&env, &env.scooper_keyhash());
-        let (result, _eval) = env.build_and_eval(&[batch], &settings, 1000)
-            .expect("build_and_eval should succeed");
+        let (result, _eval) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
 
         let tx = MultiEraTx::decode(&result.cbor).expect("scoop tx decodes");
         let watch = ProtocolWatch {

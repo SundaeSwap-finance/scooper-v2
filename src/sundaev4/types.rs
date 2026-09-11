@@ -1,10 +1,10 @@
-use anyhow::Context as _;
 use acropolis_common::Point;
+use anyhow::Context as _;
 use pallas_addresses::ScriptHash;
 use pallas_primitives::PlutusData;
 use plutus_parser::AsPlutus;
-use serde::ser::SerializeStruct;
 use serde::Serializer;
+use serde::ser::SerializeStruct;
 
 use crate::bigint::BigInt;
 use crate::cardano_types::{AssetClass, TransactionInput, Value};
@@ -22,19 +22,24 @@ mod hex_ser {
     pub fn vec_bytes<S: Serializer>(v: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = s.serialize_seq(Some(v.len()))?;
-        for b in v { seq.serialize_element(&hex::encode(b))?; }
+        for b in v {
+            seq.serialize_element(&hex::encode(b))?;
+        }
         seq.end()
     }
 
-    pub fn vec_bytes_pair_as_map<S: Serializer>(v: &Vec<(Vec<u8>, Vec<u8>)>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn vec_bytes_pair_as_map<S: Serializer>(
+        v: &Vec<(Vec<u8>, Vec<u8>)>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = s.serialize_map(Some(v.len()))?;
-        for (k, v) in v { map.serialize_entry(&hex::encode(k), &hex::encode(v))?; }
+        for (k, v) in v {
+            map.serialize_entry(&hex::encode(k), &hex::encode(v))?;
+        }
         map.end()
     }
-
 }
-
 
 /// Void / unit as PlutusData — `Constr 0 []`. The audit-final PoolDatum's
 /// `extension` field is Void on every pool the CLI creates. Used in tests
@@ -343,8 +348,14 @@ impl Constraint {
                 .map_err(|e| anyhow::anyhow!("decode list pair: {e}"))
         };
         Ok(match tag {
-            0 => Constraint::Deposit { offered: list_pair(0)?, min_received: list_pair(1)? },
-            1 => Constraint::Withdraw { offered: list_pair(0)?, min_received: list_pair(1)? },
+            0 => Constraint::Deposit {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
+            1 => Constraint::Withdraw {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
             2 => Constraint::Swap {
                 offered: AssetClass::from_plutus(f(0)?.clone())
                     .map_err(|e| anyhow::anyhow!("decode swap.offered: {e}"))?,
@@ -354,7 +365,10 @@ impl Constraint {
                     .map_err(|e| anyhow::anyhow!("decode swap.remaining_offered: {e}"))?,
                 min_received: list_pair(3)?,
             },
-            3 => Constraint::Claim { offered: list_pair(0)?, min_received: list_pair(1)? },
+            3 => Constraint::Claim {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
             t => anyhow::bail!("unknown constraint tag {t}"),
         })
     }
@@ -388,8 +402,14 @@ impl Constraint {
                 .map_err(|e| anyhow::anyhow!("decode list pair: {e}"))
         };
         Ok(match tag {
-            0 => Constraint::Deposit { offered: list_pair(0)?, min_received: list_pair(1)? },
-            1 => Constraint::Withdraw { offered: list_pair(0)?, min_received: list_pair(1)? },
+            0 => Constraint::Deposit {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
+            1 => Constraint::Withdraw {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
             2 => {
                 let offered = list_pair(0)?;
                 let min_received = list_pair(1)?;
@@ -407,7 +427,10 @@ impl Constraint {
                     ),
                 }
             }
-            3 => Constraint::Claim { offered: list_pair(0)?, min_received: list_pair(1)? },
+            3 => Constraint::Claim {
+                offered: list_pair(0)?,
+                min_received: list_pair(1)?,
+            },
             t => anyhow::bail!("unknown basic constraint tag {t}"),
         })
     }
@@ -451,13 +474,16 @@ impl Constraint {
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
 
-
     /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
     /// the constraint. Returns `None` for non-Swap orders — the scooper's
     /// batching path only handles swaps.
     pub fn swap_offered(&self) -> Option<(&AssetClass, &BigInt)> {
         match self {
-            Constraint::Swap { offered, remaining_offered, .. } => Some((offered, remaining_offered)),
+            Constraint::Swap {
+                offered,
+                remaining_offered,
+                ..
+            } => Some((offered, remaining_offered)),
             _ => None,
         }
     }
@@ -586,8 +612,15 @@ pub struct OutputRef {
 /// new variants and avoids boxing/dynamic dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PoolType {
-    ConstantProduct { fee: Rational },
-    ConstantSum { prices: Vec<BigInt>, fee: Rational, bounty_k: Rational, balance_fee: Rational },
+    ConstantProduct {
+        fee: Rational,
+    },
+    ConstantSum {
+        prices: Vec<BigInt>,
+        fee: Rational,
+        bounty_k: Rational,
+        balance_fee: Rational,
+    },
     /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
     /// bound the pool's price range (`a < b`). The validator works on
     /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
@@ -771,10 +804,16 @@ pub const TAG_DEPOSIT: u64 = 6;
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantProductRedeemer {
-    Create { initial_state: ConstantProductConfig },
-    Operate { entries: Vec<CPOperateEntry> },
+    Create {
+        initial_state: ConstantProductConfig,
+    },
+    Operate {
+        entries: Vec<CPOperateEntry>,
+    },
     /// SUN-103/ADR-0006 teardown; parsed only (indexer tolerance).
-    Destroy { entries: Vec<PlutusData> },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
 }
 
 /// Redeemer for the pool_mint policy. The scooper only uses `MintLP` (to mint
@@ -782,10 +821,17 @@ pub enum ConstantProductRedeemer {
 /// for full withdrawals — both run by the CLI, not the scooper.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum PoolMintRedeemer {
-    CreatePool { seed_utxo: OutputRef, settings_ref_index: u64 },
+    CreatePool {
+        seed_utxo: OutputRef,
+        settings_ref_index: u64,
+    },
     /// SUN-102: one MintLP redeemer may mint/burn LP for several pools.
-    MintLP { pool_idents: Vec<Ident> },
-    BurnPool { pool_ident: Ident },
+    MintLP {
+        pool_idents: Vec<Ident>,
+    },
+    BurnPool {
+        pool_ident: Ident,
+    },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -798,18 +844,31 @@ pub struct CPOperateEntry {
 pub enum ConstantSumRedeemer {
     /// SUN-005: Create pins the created pool's output index (initial_state
     /// stays field 0 — pool_mint hashes it for module_state).
-    Create { initial_state: PlutusData, pool_output_index: u64 },
-    Operate { entries: Vec<CSOperateEntry> },
+    Create {
+        initial_state: PlutusData,
+        pool_output_index: u64,
+    },
+    Operate {
+        entries: Vec<CSOperateEntry>,
+    },
     /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy { entries: Vec<PlutusData> },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConcentratedLiquidityRedeemer {
-    Create { initial_state: ConcentratedLiquidityConfig },
-    Operate { entries: Vec<CLOperateEntry> },
+    Create {
+        initial_state: ConcentratedLiquidityConfig,
+    },
+    Operate {
+        entries: Vec<CLOperateEntry>,
+    },
     /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy { entries: Vec<PlutusData> },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -840,9 +899,13 @@ pub enum FeeSplitRedeemer {
         settings_ref_index: u64,
         stake_list_ref_index: u64,
     },
-    Operate { entries: Vec<FSOperateEntry> },
+    Operate {
+        entries: Vec<FSOperateEntry>,
+    },
     /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy { entries: Vec<PlutusData> },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
@@ -854,9 +917,13 @@ pub struct FSOperateEntry {
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum FairnessRedeemer {
     Create,
-    Operate { entries: Vec<FairnessOperateEntry> },
+    Operate {
+        entries: Vec<FairnessOperateEntry>,
+    },
     /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy { entries: Vec<PlutusData> },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
 }
 
 // Audit-final shape: names the signing scooper by index into the settings'
@@ -1027,10 +1094,18 @@ fn default_partial_fill_fee_estimate() -> u64 {
     2_500_000
 }
 
-fn default_max_tx_ex_mem() -> u64 { 14_000_000 }
-fn default_max_tx_ex_steps() -> u64 { 10_000_000_000 }
-fn default_max_tx_size() -> usize { 16_384 }
-pub(crate) fn default_budget_padding() -> (u64, u64) { (21, 20) }
+fn default_max_tx_ex_mem() -> u64 {
+    14_000_000
+}
+fn default_max_tx_ex_steps() -> u64 {
+    10_000_000_000
+}
+fn default_max_tx_size() -> usize {
+    16_384
+}
+pub(crate) fn default_budget_padding() -> (u64, u64) {
+    (21, 20)
+}
 
 impl ScooperExecution {
     /// If `scooper_secret_key_file` is set, read the file and populate
@@ -1048,10 +1123,8 @@ impl ScooperExecution {
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("skey file missing cborHex field: {path}"))?;
                 // Strip CBOR wrapping (5820 = 32-byte bytestring prefix)
-                self.scooper_secret_key = cbor_hex
-                    .strip_prefix("5820")
-                    .unwrap_or(cbor_hex)
-                    .to_string();
+                self.scooper_secret_key =
+                    cbor_hex.strip_prefix("5820").unwrap_or(cbor_hex).to_string();
             } else {
                 self.scooper_secret_key = trimmed.to_string();
             }
@@ -1166,14 +1239,16 @@ impl SundaeV4Order {
     /// Panics on non-Swap; only call from paths that have already filtered to
     /// swap-shaped orders.
     pub fn swap_offered(&self) -> (&AssetClass, &BigInt) {
-        self.constraint.swap_offered()
+        self.constraint
+            .swap_offered()
             .expect("SundaeV4Order::swap_offered called on non-Swap constraint")
     }
 
     /// First entry of the Swap's min_received list. See
     /// [`Constraint::swap_min_received`].
     pub fn swap_min_received(&self) -> (&AssetClass, &BigInt) {
-        self.constraint.swap_min_received()
+        self.constraint
+            .swap_min_received()
             .expect("SundaeV4Order::swap_min_received called on non-Swap constraint")
     }
 
@@ -1199,8 +1274,8 @@ impl SundaeV4Order {
             any_constructor: None,
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
                 offer_asset.to_plutus(),
-                offer_qty.clone().to_plutus(),       // original_offered
-                offer_qty.to_plutus(),               // remaining_offered
+                offer_qty.clone().to_plutus(), // original_offered
+                offer_qty.to_plutus(),         // remaining_offered
                 min_recv_list.to_plutus(),
             ]),
         });
@@ -1229,7 +1304,13 @@ impl SundaeV4Order {
         };
         let constraint = Constraint::from_plutus_constraint(&swap_data)
             .expect("test_swap_order: constraint should decode");
-        SundaeV4Order { input, value, datum, constraint, slot }
+        SundaeV4Order {
+            input,
+            value,
+            datum,
+            constraint,
+            slot,
+        }
     }
 }
 
@@ -1298,7 +1379,11 @@ pub struct SundaeV4Protocol {
 mod tests {
     /// Preview's real anchor: slot 0 at 2022-10-25T00:00:00Z, 1s slots.
     fn preview_slots() -> super::SlotConfig {
-        super::SlotConfig { zero_slot: 0, zero_time: 1_666_656_000_000, slot_length: 1000 }
+        super::SlotConfig {
+            zero_slot: 0,
+            zero_time: 1_666_656_000_000,
+            slot_length: 1000,
+        }
     }
 
     #[test]
@@ -1322,7 +1407,11 @@ mod tests {
         // A zero slot_length would divide by zero; times before the anchor
         // would underflow. Neither can arise from a sane genesis file, but
         // both come from operator config.
-        let sc = SlotConfig { zero_slot: 42, zero_time: 1_000_000, slot_length: 0 };
+        let sc = SlotConfig {
+            zero_slot: 42,
+            zero_time: 1_000_000,
+            slot_length: 0,
+        };
         assert_eq!(sc.posix_ms_to_slot(2_000_000), 42 + 1_000_000);
         let sc = preview_slots();
         assert_eq!(sc.posix_ms_to_slot(0), 0);
@@ -1331,15 +1420,17 @@ mod tests {
     #[test]
     fn wall_clock_slot_tracks_real_time() {
         let sc = preview_slots();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as u64;
         let slot = sc.wall_clock_slot();
         // Within a second of the slot derived from the same clock, and well
         // past the preview slots that were live when this was written.
         assert!(slot.abs_diff(sc.posix_ms_to_slot(now_ms)) <= 1);
-        assert!(slot > 118_726_081, "wall clock slot {slot} is before 2026-07-30");
+        assert!(
+            slot > 118_726_081,
+            "wall clock slot {slot} is before 2026-07-30"
+        );
     }
 
     #[test]
@@ -1347,10 +1438,7 @@ mod tests {
         use super::*;
         let idents = vec![vec![0xAA; 28], vec![0xBB; 28]];
         let pd = PlutusData::Array(pallas_primitives::MaybeIndefArray::Def(
-            idents
-                .iter()
-                .map(|i| PlutusData::BoundedBytes(i.clone().into()))
-                .collect(),
+            idents.iter().map(|i| PlutusData::BoundedBytes(i.clone().into())).collect(),
         ));
         let wl = parse_route_whitelist(&pd).unwrap();
         assert_eq!(wl, vec![Ident::new(&[0xAA; 28]), Ident::new(&[0xBB; 28])]);
@@ -1383,8 +1471,14 @@ mod tests {
     fn basic_tag2_decodes_as_swap() {
         use super::*;
         use plutus_parser::AsPlutus;
-        let asset = AssetClass { policy: vec![0xAA; 28], token: b"IN".to_vec() };
-        let want = AssetClass { policy: vec![0xBB; 28], token: b"OUT".to_vec() };
+        let asset = AssetClass {
+            policy: vec![0xAA; 28],
+            token: b"IN".to_vec(),
+        };
+        let want = AssetClass {
+            policy: vec![0xBB; 28],
+            token: b"OUT".to_vec(),
+        };
         let offered: Vec<(AssetClass, BigInt)> = vec![(asset.clone(), BigInt::from(100))];
         let mins: Vec<(AssetClass, BigInt)> = vec![(want.clone(), BigInt::from(95))];
         let pd = PlutusData::Constr(pallas_primitives::Constr {
@@ -1397,7 +1491,12 @@ mod tests {
         });
         let c = Constraint::from_basic_plutus_constraint(&pd).unwrap();
         match c {
-            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+            Constraint::Swap {
+                offered,
+                original_offered,
+                remaining_offered,
+                min_received,
+            } => {
                 assert_eq!(offered, asset);
                 assert_eq!(original_offered, BigInt::from(100));
                 assert_eq!(remaining_offered, BigInt::from(100));
@@ -1428,24 +1527,24 @@ mod tests {
         // identifier=0xdeadbeef, 1 action (tag=100, enabled=true, modules=[0xaa]),
         // module_state=[(0xaa, 0xbb)]
         let bytes = hex::decode(concat!(
-            "d8799f",                           // Constr 0 (PoolDatum)
-            "9f",                               // List: assets
-            "9f9f4040ff00ff",                   // (("",""), 0) - ADA with 0 reserves
-            "9f9f44010203044405060708ff01ff",    // ((0x01020304,0x05060708),1) - token
+            "d8799f",                         // Constr 0 (PoolDatum)
+            "9f",                             // List: assets
+            "9f9f4040ff00ff",                 // (("",""), 0) - ADA with 0 reserves
+            "9f9f44010203044405060708ff01ff", // ((0x01020304,0x05060708),1) - token
             "ff",
-            "1a000f4240",                       // total_lp = 1_000_000
-            "1901f4",                           // circulating_lp = 500
-            "1a000f3e4c",                       // preminted_lp = 999_500
-            "44deadbeef",                       // identifier
-            "9f",                               // List: actions
-            "d8799f1864d87a80",                 // ActionEntry { tag: 100, enabled: true,
-            "9f41aaffff",                       // modules: [0xaa] }
+            "1a000f4240",       // total_lp = 1_000_000
+            "1901f4",           // circulating_lp = 500
+            "1a000f3e4c",       // preminted_lp = 999_500
+            "44deadbeef",       // identifier
+            "9f",               // List: actions
+            "d8799f1864d87a80", // ActionEntry { tag: 100, enabled: true,
+            "9f41aaffff",       // modules: [0xaa] }
             "ff",
-            "9f",                               // List: module_state
-            "9f41aa41bbff",                     // (0xaa, 0xbb)
+            "9f",           // List: module_state
+            "9f41aa41bbff", // (0xaa, 0xbb)
             "ff",
-            "00",                               // min_surplus = 0 (audit-final)
-            "d87980",                           // extension = Void (audit-final)
+            "00",     // min_surplus = 0 (audit-final)
+            "d87980", // extension = Void (audit-final)
             "ff"
         ))
         .unwrap();
@@ -1468,9 +1567,9 @@ mod tests {
         let bytes = hex::decode(concat!(
             "d8799f",
             "9f9f9f4040ff1a00989680ff9f9f44010203044405060708ff1a004c4b40ffff",
-            "1903e8",       // total_lp = 1000
-            "1901f4",       // circulating_lp = 500
-            "1901f4",       // preminted_lp = 500
+            "1903e8", // total_lp = 1000
+            "1901f4", // circulating_lp = 500
+            "1901f4", // preminted_lp = 500
             "ff"
         ))
         .unwrap();
@@ -1486,7 +1585,10 @@ mod tests {
     fn test_cp_config_hash_matches_ts() {
         use pallas_crypto::hash::Hasher;
         let config = ConstantProductConfig {
-            fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
+            fee: Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
         };
         let cbor = minicbor::to_vec(&config.to_plutus()).unwrap();
         let hash = hex::encode(Hasher::<256>::hash(&cbor));
@@ -1494,7 +1596,10 @@ mod tests {
         eprintln!("CP hash: {}", hash);
         // TS produces: d8799fd8799f031903e8ffff → hash 191f6d4b...
         assert_eq!(hex::encode(&cbor), "d8799fd8799f031903e8ffff");
-        assert_eq!(hash, "191f6d4b97693d5268090e9d918bfad9e171e5699b155bdc9bd944e005891a5a");
+        assert_eq!(
+            hash,
+            "191f6d4b97693d5268090e9d918bfad9e171e5699b155bdc9bd944e005891a5a"
+        );
     }
 
     #[test]
@@ -1503,7 +1608,10 @@ mod tests {
         //   offered = ADA (asset only)
         //   original_offered = remaining_offered = 5_000_000
         //   min_received = [(token, 1_000_000)]
-        let ada = AssetClass { policy: vec![], token: vec![] };
+        let ada = AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
         let token = AssetClass {
             policy: vec![0x01, 0x02, 0x03, 0x04],
             token: vec![0x05, 0x06, 0x07, 0x08],
@@ -1513,16 +1621,15 @@ mod tests {
             any_constructor: None,
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
         });
-        let min_recv: Vec<(AssetClass, BigInt)> =
-            vec![(token.clone(), BigInt::from(1_000_000))];
+        let min_recv: Vec<(AssetClass, BigInt)> = vec![(token.clone(), BigInt::from(1_000_000))];
         let constraints = PlutusData::Constr(pallas_primitives::Constr {
             tag: 121 + 2, // Swap
             any_constructor: None,
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
-                ada.clone().to_plutus(),               // offered: AssetClass
-                BigInt::from(5_000_000).to_plutus(),   // original_offered: Int
-                BigInt::from(5_000_000).to_plutus(),   // remaining_offered: Int
-                min_recv.to_plutus(),                  // min_received: List<(AssetClass, Int)>
+                ada.clone().to_plutus(),             // offered: AssetClass
+                BigInt::from(5_000_000).to_plutus(), // original_offered: Int
+                BigInt::from(5_000_000).to_plutus(), // remaining_offered: Int
+                min_recv.to_plutus(),                // min_received: List<(AssetClass, Int)>
             ]),
         });
         const SWAP_HASH: [u8; 28] = [0xAA; 28];
@@ -1548,7 +1655,12 @@ mod tests {
             .expect("decoded order should carry the test swap constraint");
         let parsed = Constraint::from_plutus_constraint(inner).unwrap();
         match parsed {
-            Constraint::Swap { offered, original_offered, remaining_offered, min_received } => {
+            Constraint::Swap {
+                offered,
+                original_offered,
+                remaining_offered,
+                min_received,
+            } => {
                 assert_eq!(offered, ada);
                 assert_eq!(original_offered, BigInt::from(5_000_000));
                 assert_eq!(remaining_offered, BigInt::from(5_000_000));
@@ -1627,16 +1739,28 @@ mod tests {
         // ConstantSumConfig { prices: [1, 2], fee: 3/1000, bounty_k: 0/1 }
         let cfg = ConstantSumConfig {
             prices: vec![BigInt::from(1), BigInt::from(2)],
-            fee: Rational { num: BigInt::from(3), den: BigInt::from(1000) },
-            bounty_k: Rational { num: BigInt::from(0), den: BigInt::from(1) },
-            balance_fee: Rational { num: BigInt::from(0), den: BigInt::from(1) },
+            fee: Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+            bounty_k: Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
+            balance_fee: Rational {
+                num: BigInt::from(0),
+                den: BigInt::from(1),
+            },
         };
         let cbor = minicbor::to_vec(&cfg.clone().to_plutus()).unwrap();
         // Persisted byte shape used by sqlite tests in persistence::sqlite.
         // If this changes, update those test fixtures.
         // Trailing `d8799f0001ff` = Rational 0/1 for balance_fee (SUN-310;
         // replaces the old waive_fee_on_claim Bool).
-        assert_eq!(hex::encode(&cbor), "d8799f9f0102ffd8799f031903e8ffd8799f0001ffd8799f0001ffff");
+        assert_eq!(
+            hex::encode(&cbor),
+            "d8799f9f0102ffd8799f031903e8ffd8799f0001ffd8799f0001ffff"
+        );
 
         let pd: PlutusData = minicbor::decode(&cbor).unwrap();
         let decoded: ConstantSumConfig = AsPlutus::from_plutus(pd).unwrap();
@@ -1664,8 +1788,20 @@ mod tests {
     fn test_pool_state_from_pool() {
         let pool = PoolDatum {
             assets: vec![
-                (AssetClass { policy: vec![], token: vec![] }, BigInt::from(100)),
-                (AssetClass { policy: vec![1], token: vec![2] }, BigInt::from(200)),
+                (
+                    AssetClass {
+                        policy: vec![],
+                        token: vec![],
+                    },
+                    BigInt::from(100),
+                ),
+                (
+                    AssetClass {
+                        policy: vec![1],
+                        token: vec![2],
+                    },
+                    BigInt::from(200),
+                ),
             ],
             total_lp: BigInt::from(1000),
             circulating_lp: BigInt::from(500),
@@ -1689,9 +1825,13 @@ mod tests {
 
         // Build a minimal PoolRedeemer::Action and check its CBOR hex
         let state = PoolState {
-            assets: vec![
-                (AssetClass { policy: vec![0xaa], token: vec![0xbb] }, BigInt::from(100)),
-            ],
+            assets: vec![(
+                AssetClass {
+                    policy: vec![0xaa],
+                    token: vec![0xbb],
+                },
+                BigInt::from(100),
+            )],
             total_lp: BigInt::from(1000),
             circulating_lp: BigInt::from(500),
             preminted_lp: BigInt::from(500),
@@ -1705,7 +1845,8 @@ mod tests {
                 total_lp: BigInt::from(0),
                 circulating_lp: BigInt::from(0),
                 preminted_lp: BigInt::from(0),
-            }.to_plutus(),
+            }
+            .to_plutus(),
         };
         let redeemer = PoolRedeemer::Action {
             tag: BigInt::from(100),

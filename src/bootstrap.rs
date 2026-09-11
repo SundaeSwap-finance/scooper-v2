@@ -3,10 +3,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use num_traits::Signed;
-use pallas_addresses::{Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+use pallas_addresses::{
+    Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+};
 use pallas_codec::utils::CborWrap;
-use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
 use pallas_primitives::conway;
+use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
 use plutus_parser::{AsPlutus, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -30,7 +32,9 @@ use crate::cardano_types::CIP_67_ASSET_LABEL_222;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
 pub enum BootstrapConfig {
-    Kupo { url: String },
+    Kupo {
+        url: String,
+    },
     Blockfrost {
         url: String,
         #[serde(rename = "project-id")]
@@ -62,17 +66,27 @@ pub struct BootstrapResult {
 /// Convert internal `Value` to pallas Conway-era value for encoding bootstrap UTxOs.
 fn value_to_conway(value: &Value) -> conway::Value {
     use num_traits::ToPrimitive;
-    let ada_asset = AssetClass { policy: vec![], token: vec![] };
+    let ada_asset = AssetClass {
+        policy: vec![],
+        token: vec![],
+    };
     let lovelace = value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
 
-    let mut policy_map: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, u64>> =
-        std::collections::BTreeMap::new();
+    let mut policy_map: std::collections::BTreeMap<
+        Vec<u8>,
+        std::collections::BTreeMap<Vec<u8>, u64>,
+    > = std::collections::BTreeMap::new();
     for (policy_bytes, tokens) in &value.0 {
-        if policy_bytes.is_empty() { continue; }
+        if policy_bytes.is_empty() {
+            continue;
+        }
         for (token_bytes, qty) in tokens {
             let amt = qty.clone().unwrap().to_u64().unwrap_or(0);
             if amt > 0 {
-                policy_map.entry(policy_bytes.clone()).or_default().insert(token_bytes.clone(), amt);
+                policy_map
+                    .entry(policy_bytes.clone())
+                    .or_default()
+                    .insert(token_bytes.clone(), amt);
             }
         }
     }
@@ -81,14 +95,23 @@ fn value_to_conway(value: &Value) -> conway::Value {
         return conway::Value::Coin(lovelace);
     }
 
-    let multiasset_pairs: Vec<_> = policy_map.into_iter().filter_map(|(policy, tokens)| {
-        let policy_hash: Hash<28> = Hash::from(policy.as_slice());
-        let token_pairs: Vec<_> = tokens.into_iter()
-            .filter_map(|(name, qty)| PositiveCoin::try_from(qty).ok().map(|pc| (PallasBytes::from(name), pc)))
-            .collect();
-        if token_pairs.is_empty() { None }
-        else { Some((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))) }
-    }).collect();
+    let multiasset_pairs: Vec<_> = policy_map
+        .into_iter()
+        .filter_map(|(policy, tokens)| {
+            let policy_hash: Hash<28> = Hash::from(policy.as_slice());
+            let token_pairs: Vec<_> = tokens
+                .into_iter()
+                .filter_map(|(name, qty)| {
+                    PositiveCoin::try_from(qty).ok().map(|pc| (PallasBytes::from(name), pc))
+                })
+                .collect();
+            if token_pairs.is_empty() {
+                None
+            } else {
+                Some((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)))
+            }
+        })
+        .collect();
 
     if multiasset_pairs.is_empty() {
         conway::Value::Coin(lovelace)
@@ -105,7 +128,8 @@ fn encode_bootstrap_utxo(
 ) -> Vec<u8> {
     let pallas_value = value_to_conway(value);
     let datum_option = datum_cbor.map(|cbor| {
-        let pd: conway::PlutusData = minicbor::decode(cbor).expect("invalid datum CBOR in bootstrap");
+        let pd: conway::PlutusData =
+            minicbor::decode(cbor).expect("invalid datum CBOR in bootstrap");
         conway::PseudoDatumOption::Data(CborWrap(pd))
     });
     let txo = conway::TransactionOutput::PostAlonzo(
@@ -293,20 +317,17 @@ impl BootstrapProvider for KupoProvider {
 
         let mut result = Vec::with_capacity(resp.len());
         for utxo in resp {
-            let tx_bytes = hex::decode(&utxo.transaction_id)
-                .context("kupo: invalid tx hash hex")?;
-            let tx_hash: [u8; 32] = tx_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
+            let tx_bytes =
+                hex::decode(&utxo.transaction_id).context("kupo: invalid tx hash hex")?;
+            let tx_hash: [u8; 32] =
+                tx_bytes.try_into().map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
 
             let value = parse_kupo_value(&utxo.value);
 
             // Resolve datum: inline datums have datum_type="inline" and datum is the CBOR hex.
             // Hash datums have datum_type="hash" and datum_hash is set.
             let datum_cbor = if utxo.datum_type.as_deref() == Some("inline") {
-                utxo.datum
-                    .as_deref()
-                    .and_then(|d| hex::decode(d).ok())
+                utxo.datum.as_deref().and_then(|d| hex::decode(d).ok())
             } else if let Some(ref dh) = utxo.datum_hash {
                 match self.fetch_datum(dh).await {
                     Ok(bytes) => Some(bytes),
@@ -346,11 +367,10 @@ impl BootstrapProvider for KupoProvider {
 
         let mut result = Vec::with_capacity(resp.len());
         for utxo in resp {
-            let tx_bytes = hex::decode(&utxo.transaction_id)
-                .context("kupo: invalid tx hash hex")?;
-            let tx_hash: [u8; 32] = tx_bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
+            let tx_bytes =
+                hex::decode(&utxo.transaction_id).context("kupo: invalid tx hash hex")?;
+            let tx_hash: [u8; 32] =
+                tx_bytes.try_into().map_err(|_| anyhow::anyhow!("kupo: tx hash not 32 bytes"))?;
 
             result.push(FetchedUtxo {
                 tx_hash,
@@ -590,7 +610,10 @@ impl BootstrapProvider for BlockfrostProvider {
                 .context("blockfrost: parse UTxOs")?;
 
             let batch_len = utxos.len();
-            debug!("blockfrost: fetched page {page} ({batch_len} UTxOs, {} total so far)", all_utxos.len() + batch_len);
+            debug!(
+                "blockfrost: fetched page {page} ({batch_len} UTxOs, {} total so far)",
+                all_utxos.len() + batch_len
+            );
             for utxo in utxos {
                 let tx_bytes =
                     hex::decode(&utxo.tx_hash).context("blockfrost: invalid tx hash hex")?;
@@ -754,12 +777,7 @@ impl BootstrapProvider for BlockfrostProvider {
         let mut addresses = std::collections::BTreeSet::new();
         for asset in &nft_assets {
             let url = format!("{}/assets/{}/addresses", self.url, asset);
-            let resp = self
-                .client
-                .get(&url)
-                .header("project_id", &self.project_id)
-                .send()
-                .await;
+            let resp = self.client.get(&url).header("project_id", &self.project_id).send().await;
             if let Ok(resp) = resp {
                 if let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await {
                     for h in holders {
@@ -822,9 +840,10 @@ impl BootstrapProvider for BlockfrostProvider {
             .json()
             .await
             .context("blockfrost: parse asset history")?;
-        let first = history.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("blockfrost: no history for asset {asset_unit}")
-        })?;
+        let first = history
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("blockfrost: no history for asset {asset_unit}"))?;
         if first.action != "minted" {
             anyhow::bail!(
                 "blockfrost: first history entry for {asset_unit} is {}, not 'minted'",
@@ -978,20 +997,28 @@ async fn bootstrap_v3(
         for (i, utxo) in order_utxos.iter().enumerate() {
             if (i + 1) % 100 == 0 || i + 1 == n_utxos {
                 if i + 1 == n_utxos {
-                    info!("bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                    info!(
+                        "bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)",
+                        i + 1,
+                        orders.len(),
+                        invalid_orders.len()
+                    );
                 } else {
-                    debug!("bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                    debug!(
+                        "bootstrap: parsed {}/{n_utxos} V3 orders ({} valid, {} invalid)",
+                        i + 1,
+                        orders.len(),
+                        invalid_orders.len()
+                    );
                 }
             }
             let Some(ref cbor) = utxo.datum_cbor else {
                 continue;
             };
             let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-            match PlutusData::from_plutus_bytes(cbor)
-                .map_err(|e| format!("{e}"))
-                .and_then(|data| {
-                    sundaev3::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
-                }) {
+            match PlutusData::from_plutus_bytes(cbor).map_err(|e| format!("{e}")).and_then(|data| {
+                sundaev3::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
+            }) {
                 Ok(datum) => {
                     orders.push(Arc::new(sundaev3::SundaeV3Order {
                         input,
@@ -1076,10 +1103,7 @@ fn needs_cs_lookup(
     // module hash across every enabled action instead — the tag isn't a
     // reliable discriminator between CS and CP.
     let is_cs = pool_datum.actions.iter().any(|a| {
-        a.enabled
-            && a.modules
-                .first()
-                .is_some_and(|h| h.as_slice() == cs_script.hash.as_ref())
+        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cs_script.hash.as_ref())
     });
     if !is_cs {
         return false;
@@ -1103,17 +1127,23 @@ fn needs_cp_lookup(
     execution: Option<&sundaev4::ScooperExecution>,
     cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
 ) -> bool {
-    let Some(exec) = execution else { return false; };
-    let Some(cp) = exec.module_scripts.constant_product.as_ref() else { return false; };
+    let Some(exec) = execution else {
+        return false;
+    };
+    let Some(cp) = exec.module_scripts.constant_product.as_ref() else {
+        return false;
+    };
     let cp_hash = cp.hash;
-    let is_cp = pool_datum.actions.iter().any(|a| {
-        a.enabled
-            && a.modules
-                .first()
-                .is_some_and(|h| h.as_slice() == cp_hash.as_ref())
-    });
-    if !is_cp { return false; }
-    if cp_configs.contains_key(&pool_datum.identifier) { return false; }
+    let is_cp = pool_datum
+        .actions
+        .iter()
+        .any(|a| a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cp_hash.as_ref()));
+    if !is_cp {
+        return false;
+    }
+    if cp_configs.contains_key(&pool_datum.identifier) {
+        return false;
+    }
     true
 }
 
@@ -1124,18 +1154,21 @@ fn needs_cl_lookup(
     execution: Option<&sundaev4::ScooperExecution>,
     cl_configs: &std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig>,
 ) -> bool {
-    let Some(exec) = execution else { return false; };
+    let Some(exec) = execution else {
+        return false;
+    };
     let Some(cl_script) = exec.module_scripts.concentrated_liquidity.as_ref() else {
         return false;
     };
     let is_cl = pool_datum.actions.iter().any(|a| {
-        a.enabled
-            && a.modules
-                .first()
-                .is_some_and(|h| h.as_slice() == cl_script.hash.as_ref())
+        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cl_script.hash.as_ref())
     });
-    if !is_cl { return false; }
-    if cl_configs.contains_key(&pool_datum.identifier) { return false; }
+    if !is_cl {
+        return false;
+    }
+    if cl_configs.contains_key(&pool_datum.identifier) {
+        return false;
+    }
     true
 }
 
@@ -1196,8 +1229,8 @@ async fn lookup_pool_module_configs(
     // here, so for static configs this single call is enough.
     debug!(asset = %asset_unit, "bootstrap v4: fetching first (mint) tx for module configs");
     let first_cbor = provider.fetch_first_mint_tx_cbor(&asset_unit).await?;
-    let first_tx = pallas_traverse::MultiEraTx::decode(&first_cbor)
-        .context("decode first tx CBOR")?;
+    let first_tx =
+        pallas_traverse::MultiEraTx::decode(&first_cbor).context("decode first tx CBOR")?;
     let first_tx_hash = hex::encode(first_tx.hash());
     if want_cs {
         if let Some(h) = cs_hash.as_ref() {
@@ -1230,9 +1263,7 @@ async fn lookup_pool_module_configs(
     // the first occurrence we find here is the most recent config in time.
     let page_size: u32 = 100;
     'pages: for page in 1u32.. {
-        let tx_hashes = provider
-            .fetch_asset_tx_hashes_desc(&asset_unit, page, page_size)
-            .await?;
+        let tx_hashes = provider.fetch_asset_tx_hashes_desc(&asset_unit, page, page_size).await?;
         if tx_hashes.is_empty() {
             break;
         }
@@ -1244,8 +1275,8 @@ async fn lookup_pool_module_configs(
                 break 'pages;
             }
             let cbor = provider.fetch_tx_cbor(&tx_hash).await?;
-            let tx = pallas_traverse::MultiEraTx::decode(&cbor)
-                .context("decode walk-back tx CBOR")?;
+            let tx =
+                pallas_traverse::MultiEraTx::decode(&cbor).context("decode walk-back tx CBOR")?;
             if want_cs && out.cs.is_none() {
                 if let Some(h) = cs_hash.as_ref() {
                     out.cs = sundaev4::extract_cs_config_from_tx(&tx, h);
@@ -1308,31 +1339,19 @@ async fn bootstrap_v4(
         .as_ref()
         .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
         .map(|cl| cl.hash.as_ref().to_vec());
-    let fs_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+    let fs_module_hash: Option<Vec<u8>> =
+        protocol.execution.as_ref().map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
 
-    let persisted_configs = dao
-        .load_module_configs()
-        .await
-        .context("bootstrap v4: load persisted module configs")?;
-    let mut cs_configs: std::collections::BTreeMap<
-        Ident,
-        sundaev4::ConstantSumConfig,
-    > = std::collections::BTreeMap::new();
-    let mut cp_configs: std::collections::BTreeMap<
-        Ident,
-        sundaev4::ConstantProductConfig,
-    > = std::collections::BTreeMap::new();
-    let mut cl_configs: std::collections::BTreeMap<
-        Ident,
-        sundaev4::ConcentratedLiquidityConfig,
-    > = std::collections::BTreeMap::new();
-    let mut fs_configs: std::collections::BTreeMap<
-        Ident,
-        sundaev4::FeeSplitConfig,
-    > = std::collections::BTreeMap::new();
+    let persisted_configs =
+        dao.load_module_configs().await.context("bootstrap v4: load persisted module configs")?;
+    let mut cs_configs: std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig> =
+        std::collections::BTreeMap::new();
+    let mut cp_configs: std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig> =
+        std::collections::BTreeMap::new();
+    let mut cl_configs: std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig> =
+        std::collections::BTreeMap::new();
+    let mut fs_configs: std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig> =
+        std::collections::BTreeMap::new();
     for cfg in persisted_configs {
         let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
             .context("bootstrap v4: persisted module config CBOR malformed")?;
@@ -1453,7 +1472,9 @@ async fn bootstrap_v4(
                         .context("bootstrap v4: encode ConstantProductConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
-                        module_hash: cp_module_hash.clone().expect("cp_module_hash known when need_cp"),
+                        module_hash: cp_module_hash
+                            .clone()
+                            .expect("cp_module_hash known when need_cp"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -1475,7 +1496,9 @@ async fn bootstrap_v4(
                         .context("bootstrap v4: encode ConcentratedLiquidityConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
-                        module_hash: cl_module_hash.clone().expect("cl_module_hash known when need_cl"),
+                        module_hash: cl_module_hash
+                            .clone()
+                            .expect("cl_module_hash known when need_cl"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -1497,7 +1520,9 @@ async fn bootstrap_v4(
                         .context("bootstrap v4: encode FeeSplitConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
-                        module_hash: fs_module_hash.clone().expect("fs_module_hash known when execution present"),
+                        module_hash: fs_module_hash
+                            .clone()
+                            .expect("fs_module_hash known when execution present"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -1552,9 +1577,19 @@ async fn bootstrap_v4(
         for (i, utxo) in order_utxos.iter().enumerate() {
             if (i + 1) % 100 == 0 || i + 1 == n_utxos {
                 if i + 1 == n_utxos {
-                    info!("bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                    info!(
+                        "bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)",
+                        i + 1,
+                        orders.len(),
+                        invalid_orders.len()
+                    );
                 } else {
-                    debug!("bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)", i + 1, orders.len(), invalid_orders.len());
+                    debug!(
+                        "bootstrap: parsed {}/{n_utxos} V4 orders ({} valid, {} invalid)",
+                        i + 1,
+                        orders.len(),
+                        invalid_orders.len()
+                    );
                 }
             }
             let Some(ref cbor) = utxo.datum_cbor else {
@@ -1586,9 +1621,12 @@ async fn bootstrap_v4(
                 })
                 .and_then(|datum| {
                     sundaev4::decode_order_constraint(
-                        &datum, &swap_order_hash, &basic_order_hash, &strategy_order_hash,
+                        &datum,
+                        &swap_order_hash,
+                        &basic_order_hash,
+                        &strategy_order_hash,
                     )
-                        .map(|constraint| (datum, constraint))
+                    .map(|constraint| (datum, constraint))
                 }) {
                 Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
@@ -1618,15 +1656,17 @@ async fn bootstrap_v4(
         .context("bootstrap v4: fetch settings UTxOs")?;
     let mut settings = None;
     let mut fee_settings: Option<Arc<sundaev4::SundaeV4FeeSettings>> = None;
-    let fee_token: Option<Vec<u8>> = protocol
-        .fee_settings_token
-        .as_ref()
-        .and_then(|t| hex::decode(t).ok());
+    let fee_token: Option<Vec<u8>> =
+        protocol.fee_settings_token.as_ref().and_then(|t| hex::decode(t).ok());
     let mut order_configs: std::collections::BTreeMap<Vec<u8>, Arc<sundaev4::SundaeV4OrderConfig>> =
         std::collections::BTreeMap::new();
     for utxo in &settings_utxos {
-        let Some(ref cbor) = utxo.datum_cbor else { continue };
-        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else { continue };
+        let Some(ref cbor) = utxo.datum_cbor else {
+            continue;
+        };
+        let Ok(data) = PlutusData::from_plutus_bytes(cbor) else {
+            continue;
+        };
         if utxo.value.get(&protocol.settings_nft).is_positive() {
             // Global settings entry — empty-name token under settings_mint.
             if let Ok(datum) = sundaev4::SettingsDatum::from_plutus(data) {
@@ -1673,19 +1713,15 @@ async fn bootstrap_v4(
         // Non-global settings entry: try OrderConfig (PR #11). Other shapes
         // (e.g. PoolConfig minted by mint-pool-config) are ignored — the
         // scooper doesn't consume them directly.
-        let token_name = utxo
-            .value
-            .0
-            .get(&protocol.settings_nft.policy)
-            .and_then(|tokens| {
-                tokens.iter().find_map(|(name, qty)| {
-                    if !name.is_empty() && qty.is_positive() {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                })
-            });
+        let token_name = utxo.value.0.get(&protocol.settings_nft.policy).and_then(|tokens| {
+            tokens.iter().find_map(|(name, qty)| {
+                if !name.is_empty() && qty.is_positive() {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+        });
         let parsed = sundaev4::OrderConfig::from_plutus(data).ok();
         if let (Some(token_name), Some(oc)) = (token_name, parsed) {
             let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
@@ -1701,7 +1737,10 @@ async fn bootstrap_v4(
             );
         }
     }
-    info!(count = order_configs.len(), "bootstrap v4: hydrated OrderConfig settings entries");
+    info!(
+        count = order_configs.len(),
+        "bootstrap v4: hydrated OrderConfig settings entries"
+    );
 
     // Fetch wallet UTxOs if execution is configured. Probe both the
     // enterprise address (payment-only) and, if a stake keyhash is configured,
@@ -1711,10 +1750,7 @@ async fn bootstrap_v4(
     let mut scooper_addr_bytes: Vec<u8> = Vec::new();
     if let Some(ref exec) = protocol.execution {
         let mut candidates: Vec<pallas_addresses::Address> = Vec::new();
-        match sundaev4::derive_scooper_pallas_address_with_stake(
-            &exec.scooper_secret_key,
-            None,
-        ) {
+        match sundaev4::derive_scooper_pallas_address_with_stake(&exec.scooper_secret_key, None) {
             Err(e) => warn!("bootstrap v4: could not derive enterprise address: {e:#}"),
             Ok(addr) => {
                 scooper_addr_bytes = addr.to_vec();
@@ -1741,8 +1777,7 @@ async fn bootstrap_v4(
             match provider.fetch_address_utxos(&addr_bech32).await {
                 Ok(utxos) => {
                     for utxo in &utxos {
-                        let input =
-                            TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
                         wallet_utxos.insert(input, utxo.value.clone());
                     }
                 }
@@ -1804,15 +1839,14 @@ async fn bootstrap_v4(
                     // pallas stores in PlutusV3Script.
                     let script = pallas_primitives::PlutusScript::<3>(script_cbor.into());
                     // Dummy address — only the script_ref field matters.
-                    let dummy_addr = pallas_addresses::Address::Shelley(
-                        pallas_addresses::ShelleyAddress::new(
+                    let dummy_addr =
+                        pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
                             pallas_addresses::Network::Testnet,
                             pallas_addresses::ShelleyPaymentPart::Key(
                                 pallas_primitives::Hash::new([0u8; 28]),
                             ),
                             pallas_addresses::ShelleyDelegationPart::Null,
-                        ),
-                    );
+                        ));
                     let txo = crate::cardano_types::TransactionOutput {
                         address: dummy_addr,
                         value: crate::cardano_types::Value::default(),
@@ -1826,7 +1860,10 @@ async fn bootstrap_v4(
                 }
             }
         }
-        info!(count = ref_utxo_outputs.len(), "bootstrap: fetched reference scripts");
+        info!(
+            count = ref_utxo_outputs.len(),
+            "bootstrap: fetched reference scripts"
+        );
     }
 
     let n_pools = pools.len();
@@ -1842,7 +1879,8 @@ async fn bootstrap_v4(
             Network::Testnet,
             ShelleyPaymentPart::Script(protocol.pool_script_hash),
             ShelleyDelegationPart::Null,
-        ).to_vec();
+        )
+        .to_vec();
         for (_, pool) in &pools {
             let datum_bytes = pool.pool_datum.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
@@ -1856,13 +1894,18 @@ async fn bootstrap_v4(
             });
         }
 
-        let order_addr = protocol.order_script_hashes.first().map(|h| {
-            ShelleyAddress::new(
-                Network::Testnet,
-                ShelleyPaymentPart::Script(*h),
-                ShelleyDelegationPart::Null,
-            ).to_vec()
-        }).unwrap_or_default();
+        let order_addr = protocol
+            .order_script_hashes
+            .first()
+            .map(|h| {
+                ShelleyAddress::new(
+                    Network::Testnet,
+                    ShelleyPaymentPart::Script(*h),
+                    ShelleyDelegationPart::Null,
+                )
+                .to_vec()
+            })
+            .unwrap_or_default();
         for order in &orders {
             let datum_bytes = order.datum.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
@@ -1881,7 +1924,8 @@ async fn bootstrap_v4(
                 Network::Testnet,
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
-            ).to_vec();
+            )
+            .to_vec();
             let datum_bytes = s.datum.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
                 txo_id: s.input.clone(),
@@ -1904,7 +1948,8 @@ async fn bootstrap_v4(
                 Network::Testnet,
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
-            ).to_vec();
+            )
+            .to_vec();
             let datum_bytes = oc.config.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
                 txo_id: oc.input.clone(),
@@ -1924,13 +1969,17 @@ async fn bootstrap_v4(
                 Network::Testnet,
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
-            ).to_vec();
+            )
+            .to_vec();
             let datum_bytes = sundaev4::FeeSettingsDatum {
                 base_fee: crate::bigint::BigInt::from(fs.base_fee),
-            }.to_plutus_bytes();
+            }
+            .to_plutus_bytes();
             let mut value = crate::cardano_types::Value::default();
             if let Some(want) = &fee_token {
-                value.0.entry(protocol.settings_nft.policy.clone())
+                value
+                    .0
+                    .entry(protocol.settings_nft.policy.clone())
                     .or_default()
                     .insert(want.clone().into(), crate::bigint::BigInt::from(1u64));
             }
@@ -1961,7 +2010,8 @@ async fn bootstrap_v4(
             Network::Testnet,
             ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
             ShelleyDelegationPart::Null,
-        ).to_vec();
+        )
+        .to_vec();
         for (input, output) in &ref_utxo_outputs {
             let txo_bytes = match &output.script_ref {
                 Some(crate::cardano_types::ScriptRef::PlutusV3(script)) => {
@@ -1970,7 +2020,9 @@ async fn bootstrap_v4(
                             address: PallasBytes::from(dummy_addr.clone()),
                             value: conway::Value::Coin(2_000_000),
                             datum_option: None,
-                            script_ref: Some(CborWrap(conway::PseudoScript::PlutusV3Script(script.clone()))),
+                            script_ref: Some(CborWrap(conway::PseudoScript::PlutusV3Script(
+                                script.clone(),
+                            ))),
                         },
                     );
                     minicbor::to_vec(&txo).expect("infallible encoding")
@@ -1998,7 +2050,8 @@ async fn bootstrap_v4(
                 metadata_datums: vec![],
                 scoop_records: vec![],
                 module_configs: new_persisted_configs.clone(),
-            }).await?;
+            })
+            .await?;
             info!(
                 txos = n,
                 module_configs = new_persisted_configs.len(),
@@ -2070,16 +2123,14 @@ mod live_smoke_tests {
         // Pick any pool NFT under the preview policy and verify we can walk
         // the asset-history -> tx-cbor pipeline without serde failures.
         let policy_hash: ScriptHash = PREVIEW_POOL_NFT_POLICY_HEX.parse()?;
-        let pool_utxos = provider
-            .fetch_pool_utxos_by_nft(&policy_hash, &policy_hash)
-            .await?;
+        let pool_utxos = provider.fetch_pool_utxos_by_nft(&policy_hash, &policy_hash).await?;
         let utxo = pool_utxos
             .iter()
             .find(|u| u.datum_cbor.is_some())
             .expect("preview must have at least one pool with a datum");
-        let pool_datum = sundaev4::PoolDatum::from_plutus(
-            PlutusData::from_plutus_bytes(utxo.datum_cbor.as_ref().unwrap())?,
-        )?;
+        let pool_datum = sundaev4::PoolDatum::from_plutus(PlutusData::from_plutus_bytes(
+            utxo.datum_cbor.as_ref().unwrap(),
+        )?)?;
         let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
         asset_name.extend_from_slice(pool_datum.identifier.to_bytes());
         let asset_unit = format!(
@@ -2104,14 +2155,18 @@ mod live_smoke_tests {
         let provider = BlockfrostProvider::new(PREVIEW_BLOCKFROST, PREVIEW_PROJECT_ID);
         let policy_hash: ScriptHash = PREVIEW_POOL_NFT_POLICY_HEX.parse()?;
         let cs_hash: ScriptHash = PREVIEW_CS_MODULE_HASH_HEX.parse()?;
-        let pool_utxos = provider
-            .fetch_pool_utxos_by_nft(&policy_hash, &policy_hash)
-            .await?;
+        let pool_utxos = provider.fetch_pool_utxos_by_nft(&policy_hash, &policy_hash).await?;
         let mut found_cs = false;
         for utxo in &pool_utxos {
-            let Some(ref cbor) = utxo.datum_cbor else { continue; };
-            let Ok(pd) = PlutusData::from_plutus_bytes(cbor) else { continue; };
-            let Ok(pool_datum) = sundaev4::PoolDatum::from_plutus(pd) else { continue; };
+            let Some(ref cbor) = utxo.datum_cbor else {
+                continue;
+            };
+            let Ok(pd) = PlutusData::from_plutus_bytes(cbor) else {
+                continue;
+            };
+            let Ok(pool_datum) = sundaev4::PoolDatum::from_plutus(pd) else {
+                continue;
+            };
             // Detect "is this a CS pool" via the swap action's first module hash.
             let is_cs = pool_datum
                 .actions
