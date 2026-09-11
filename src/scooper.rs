@@ -1226,10 +1226,51 @@ impl Scooper {
                     };
                     match candidate.try_add_deposit(order, &pool_ident, &effective_pool) {
                         Ok(_) => true,
-                        Err(e) => {
-                            skip_add_failed += 1;
-                            tracing::info!(error = %e, order = %order.input, "try_add failed");
-                            false
+                        Err(deposit_err) => {
+                            // A basket out of proportion with the pool still
+                            // fills as a zap: a rebalancing swap, then the
+                            // deposit that swap makes possible.
+                            let mut zap_candidate = accum.clone();
+                            let zap = if !matches!(
+                                effective_pool.pool_type,
+                                crate::sundaev4::PoolType::ConstantSum { .. }
+                            ) {
+                                // A two-asset deposit is rejected on chain by
+                                // cp_check, which reads both reserves rising as
+                                // a zero-sized swap and fails its tightness
+                                // test (sundae-v4's own cp_deposit.ak pins that
+                                // as a `fail` test). Zapping there would only
+                                // turn a cheap skip into a build failure, and a
+                                // lone order failing to build is quarantined
+                                // for good.
+                                Err("only constant-sum pools zap: the other \
+                                     curves reject a two-asset deposit on chain"
+                                    .to_string())
+                            } else if carries_route_constraint(&exec, order) {
+                                Err("route-constrained orders can't zap: \
+                                     check_intermediate_flow demands the deposit \
+                                     consume the swap's payout exactly, which the \
+                                     deposit's ceil-pin doesn't hit"
+                                    .to_string())
+                            } else {
+                                zap_candidate.try_add_zap(order, &pool_ident, &effective_pool)
+                            };
+                            match zap {
+                                Ok(()) => {
+                                    candidate = zap_candidate;
+                                    true
+                                }
+                                Err(zap_err) => {
+                                    skip_add_failed += 1;
+                                    tracing::info!(
+                                        error = %deposit_err,
+                                        zap_error = %zap_err,
+                                        order = %order.input,
+                                        "try_add failed",
+                                    );
+                                    false
+                                }
+                            }
                         }
                     }
                 }
@@ -1845,7 +1886,7 @@ impl Scooper {
         funding_is_predicted: bool,
     ) -> bool {
         let n_orders: usize = final_plan.batches.iter()
-            .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.claims.len())
+            .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len())
             .sum();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
@@ -1855,6 +1896,7 @@ impl Scooper {
                 b.swaps.iter().map(|o| o.order.input.clone())
                     .chain(b.deposits.iter().map(|o| o.order.input.clone()))
                     .chain(b.withdraws.iter().map(|o| o.order.input.clone()))
+                    .chain(b.zaps.iter().map(|o| o.order.input.clone()))
                     .chain(b.claims.iter().map(|o| o.order.input.clone()))
             })
             .collect();
@@ -2062,6 +2104,7 @@ impl Scooper {
                 b.swaps.iter().map(|s| &s.order)
                     .chain(b.deposits.iter().map(|d| &d.order))
                     .chain(b.withdraws.iter().map(|w| &w.order))
+                    .chain(b.zaps.iter().map(|z| &z.order))
             })
             .chain(final_plan.conversions.iter().map(|c| &c.order))
             .filter_map(|o| provisional_parent.get(&o.input).cloned())
@@ -2138,7 +2181,10 @@ impl Scooper {
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
                         PoolType::ConcentratedLiquidity { .. } => crate::metrics::PoolFamily::ConcentratedLiquidity,
                     };
-                    let n = (batch.swaps.len() + batch.deposits.len() + batch.withdraws.len()) as u64;
+                    let n = (batch.swaps.len()
+                        + batch.deposits.len()
+                        + batch.withdraws.len()
+                        + batch.zaps.len()) as u64;
                     self.metrics.record_pool_family_orders(family, n);
                 }
 
@@ -2151,6 +2197,7 @@ impl Scooper {
                         b.swaps.iter().map(|s| s.order.clone())
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
                             .chain(b.withdraws.iter().map(|w| w.order.clone()))
+                            .chain(b.zaps.iter().map(|z| z.order.clone()))
                     })
                     // Conversion legs consume their order too — a pure-
                     // conversion order (e.g. ADAb mint with no pool split)
@@ -2604,6 +2651,21 @@ impl Scooper {
 /// The error string from submit is `"ogmios submit failed (status): {json}"`.
 /// The JSON portion is the Ogmios error object with structure:
 ///   `{"code":...,"data":{"badInputs":["txhash#idx",...]}}`
+/// Whether the order's constraint list names the route module.
+fn carries_route_constraint(
+    exec: &ScooperExecution,
+    order: &crate::sundaev4::SundaeV4Order,
+) -> bool {
+    let Some(route) = exec.module_scripts.route_order.as_ref() else {
+        return false;
+    };
+    order
+        .datum
+        .constraints
+        .iter()
+        .any(|(h, _)| h.as_slice() == route.hash.as_ref())
+}
+
 /// Resolve the effective pool snapshot to scoop against — preferring an
 /// already-accumulated state, then the chain tracker's in-flight prediction
 /// (so we chain off our own pending tx), then the on-chain state.
