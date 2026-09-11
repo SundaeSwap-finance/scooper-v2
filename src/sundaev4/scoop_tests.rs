@@ -2025,8 +2025,8 @@ mod tests {
             BigInt::from(5_000_000),
             BigInt::from(0),
         ];
-        for i in 0..3 {
-            let leftover = &offered[i] - &(&zap.swap_deltas[i] + &zap.deposit_dx[i]);
+        for (i, offer) in offered.into_iter().enumerate() {
+            let leftover = &offer - &(&zap.swap_deltas[i] + &zap.deposit_dx[i]);
             assert!(
                 leftover < BigInt::from(16),
                 "asset {i} strands {leftover} of the offer",

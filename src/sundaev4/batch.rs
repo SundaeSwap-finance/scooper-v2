@@ -943,7 +943,7 @@ pub fn plan_zap_swap(
             let two = BigInt::from(2);
             while &hi - &lo > one {
                 let mid = &(&lo + &hi) / &two;
-                if split(&mid).map_or(false, |o| o.side_i_rich) {
+                if split(&mid).is_some_and(|o| o.side_i_rich) {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -955,12 +955,11 @@ pub fn plan_zap_swap(
                 if !s.is_positive() {
                     continue;
                 }
-                if let Some(o) = split(&s) {
-                    if o.minted.is_positive()
-                        && best.as_ref().map_or(true, |(m, _, _)| &o.minted > m)
-                    {
-                        best = Some((o.minted, s, o.dy));
-                    }
+                if let Some(o) = split(&s)
+                    && o.minted.is_positive()
+                    && best.as_ref().is_none_or(|(m, _, _)| &o.minted > m)
+                {
+                    best = Some((o.minted, s, o.dy));
                 }
             }
             let Some((_, s, dy)) = best else {
@@ -1134,14 +1133,13 @@ pub fn resolve_proportional_deposit(
     // The order's declared minimum (its min_received names this pool's LP
     // token — that's how the order matched the pool). Refuse to build a fill
     // the basic constraint would reject on-chain.
-    if let Constraint::Deposit { min_received, .. } = &order.constraint {
-        if let Some(min_lp) = declared_min_lp(min_received, &pool.pool_datum.identifier) {
-            if &lp_minted < min_lp {
-                return Err(format!(
-                    "deposit fill mints {lp_minted} LP, below the order's minimum {min_lp}"
-                ));
-            }
-        }
+    if let Constraint::Deposit { min_received, .. } = &order.constraint
+        && let Some(min_lp) = declared_min_lp(min_received, &pool.pool_datum.identifier)
+        && &lp_minted < min_lp
+    {
+        return Err(format!(
+            "deposit fill mints {lp_minted} LP, below the order's minimum {min_lp}"
+        ));
     }
 
     // Surplus = offered - dx for each pool asset (skip zeros).
