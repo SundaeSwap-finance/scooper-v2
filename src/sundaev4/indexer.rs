@@ -1724,8 +1724,9 @@ fn build_scoop_stats(
 pub(crate) fn derive_scooper_pallas_address_with_stake(
     secret_key_hex: &str,
     stake_keyhash_hex: Option<&str>,
+    network: crate::sundaev4::AddressNetwork,
 ) -> Result<Address> {
-    use pallas_addresses::{Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+    use pallas_addresses::{ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 
     let keyhash = derive_scooper_keyhash(secret_key_hex)?;
     let delegation = match stake_keyhash_hex {
@@ -1739,7 +1740,7 @@ pub(crate) fn derive_scooper_pallas_address_with_stake(
         None => ShelleyDelegationPart::Null,
     };
     let shelley = ShelleyAddress::new(
-        Network::Testnet,
+        network.pallas(),
         ShelleyPaymentPart::Key(keyhash),
         delegation,
     );

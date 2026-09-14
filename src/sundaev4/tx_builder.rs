@@ -342,13 +342,12 @@ pub fn build_multi_pool_scoop_tx(
             let dx = leg.dx.clone().unwrap().to_u64().context("conversion dx doesn't fit u64")?;
             let out =
                 leg.out.clone().unwrap().to_u64().context("conversion out doesn't fit u64")?;
-            // Network id from the scooper address config? Pot addresses are
-            // testnet on preview; derive from settings address network bit.
-            pieces.push(rt.deposit_pieces(name, dx, out, 0)?);
+            pieces.push(rt.deposit_pieces(name, dx, out, exec.network.id())?);
         }
         pieces
     };
 
+    let network = exec.network.pallas();
     let sk = parse_secret_key(&exec.scooper_secret_key)?;
     let pk = sk.public_key();
     let pk_bytes: [u8; 32] = pk.as_ref().try_into().unwrap();
@@ -1792,7 +1791,7 @@ pub fn build_multi_pool_scoop_tx(
 
     let pool_address = {
         let pool_addr = ShelleyAddress::new(
-            Network::Testnet,
+            network,
             ShelleyPaymentPart::Script(exec.module_scripts.pool.hash),
             ShelleyDelegationPart::Null,
         );
@@ -2047,7 +2046,7 @@ pub fn build_multi_pool_scoop_tx(
         let (dest_address, dest_datum): (Vec<u8>, Option<pallas_primitives::PlutusData>) =
             if let Some(cont_datum) = &partial_continuation {
                 let order_addr = ShelleyAddress::new(
-                    Network::Testnet,
+                    network,
                     ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
                     ShelleyDelegationPart::Null,
                 );
@@ -2056,7 +2055,7 @@ pub fn build_multi_pool_scoop_tx(
                 match &order.datum.destination {
                     crate::sundaev4::Destination::SelfDestination => {
                         let order_addr = ShelleyAddress::new(
-                            Network::Testnet,
+                            network,
                             ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
                             ShelleyDelegationPart::Null,
                         );
@@ -2070,7 +2069,7 @@ pub fn build_multi_pool_scoop_tx(
                         (order_addr.to_vec(), Some(cont.to_plutus()))
                     }
                     crate::sundaev4::Destination::Fixed(_, maybe_datum) => (
-                        resolve_destination(&order.datum.destination, &order.datum.owner)?,
+                        resolve_destination(&order.datum.destination, &order.datum.owner, network)?,
                         maybe_datum.clone(),
                     ),
                 }
@@ -2316,7 +2315,7 @@ pub fn build_multi_pool_scoop_tx(
         }
         let scooper_change_addr = {
             let addr = ShelleyAddress::new(
-                Network::Testnet,
+                network,
                 ShelleyPaymentPart::Key(scooper_keyhash),
                 ShelleyDelegationPart::Null,
             );
@@ -2580,7 +2579,7 @@ pub fn build_multi_pool_scoop_tx(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
                 address: {
                     let scooper_addr = ShelleyAddress::new(
-                        Network::Testnet,
+                        network,
                         ShelleyPaymentPart::Key(scooper_keyhash),
                         ShelleyDelegationPart::Null,
                     );
@@ -2631,7 +2630,7 @@ pub fn build_multi_pool_scoop_tx(
         // Conversion-primary orders live outside any pool batch.
         let order_addr_bytes = {
             let order_addr = ShelleyAddress::new(
-                Network::Testnet,
+                network,
                 ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
                 ShelleyDelegationPart::Null,
             );
@@ -2661,7 +2660,7 @@ pub fn build_multi_pool_scoop_tx(
         );
         let order_addr_bytes = {
             let order_addr = ShelleyAddress::new(
-                Network::Testnet,
+                network,
                 ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
                 ShelleyDelegationPart::Null,
             );
@@ -2718,7 +2717,7 @@ pub fn build_multi_pool_scoop_tx(
         (funding_oref_opt.as_ref(), funding_value_opt)
     {
         let scooper_addr = ShelleyAddress::new(
-            Network::Testnet,
+            network,
             ShelleyPaymentPart::Key(scooper_keyhash),
             ShelleyDelegationPart::Null,
         );
@@ -2813,7 +2812,7 @@ pub fn build_multi_pool_scoop_tx(
         ResolvedTxOut {
             address: {
                 let settings_addr = ShelleyAddress::new(
-                    Network::Testnet,
+                    network,
                     ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
                     ShelleyDelegationPart::Null,
                 );
@@ -2830,7 +2829,7 @@ pub fn build_multi_pool_scoop_tx(
     // its inline datum decodes as `OrderConfig`.
     let settings_addr_bytes = {
         let settings_addr = ShelleyAddress::new(
-            Network::Testnet,
+            network,
             ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
             ShelleyDelegationPart::Null,
         );
@@ -3046,24 +3045,7 @@ impl AnySecretKey {
 }
 
 fn parse_secret_key(key_str: &str) -> Result<AnySecretKey> {
-    let hex_str = if key_str.trim_start().starts_with('{') {
-        // Cardano JSON envelope: {"type":"...","cborHex":"5820<64hex>"}
-        let envelope: serde_json::Value =
-            serde_json::from_str(key_str).context("invalid signing key JSON envelope")?;
-        let cbor_hex = envelope["cborHex"]
-            .as_str()
-            .context("missing cborHex field in signing key envelope")?;
-        // Strip the CBOR prefix "5820" (bytes tag for 32-byte) or "5840" (64-byte).
-        if let Some(s) = cbor_hex.strip_prefix("5820") {
-            s.to_string()
-        } else if let Some(s) = cbor_hex.strip_prefix("5840") {
-            s.to_string()
-        } else {
-            anyhow::bail!("unexpected cborHex prefix (expected 5820 or 5840)")
-        }
-    } else {
-        key_str.to_string()
-    };
+    let hex_str = normalize_secret_key_hex(key_str)?;
     let bytes = hex::decode(&hex_str).context("invalid secret key hex")?;
     match bytes.len() {
         32 => {
@@ -3464,9 +3446,13 @@ fn build_fulfillment_value_from_order(
 }
 
 /// Resolve the order destination to a raw address byte vector.
-fn resolve_destination(dest: &Destination, owner: &crate::multisig::Multisig) -> Result<Vec<u8>> {
+fn resolve_destination(
+    dest: &Destination,
+    owner: &crate::multisig::Multisig,
+    network: Network,
+) -> Result<Vec<u8>> {
     match dest {
-        Destination::Fixed(plutus_addr, _datum) => plutus_address_to_bytes(plutus_addr),
+        Destination::Fixed(plutus_addr, _datum) => plutus_address_to_bytes(plutus_addr, network),
         Destination::SelfDestination => {
             // SelfDestination: send back to the owner's key hash
             match owner {
@@ -3476,7 +3462,7 @@ fn resolve_destination(dest: &Destination, owner: &crate::multisig::Multisig) ->
                         .try_into()
                         .map_err(|_| anyhow::anyhow!("owner keyhash not 28 bytes"))?;
                     let addr = ShelleyAddress::new(
-                        Network::Testnet,
+                        network,
                         ShelleyPaymentPart::Key(hash),
                         ShelleyDelegationPart::Null,
                     );
@@ -3560,7 +3546,7 @@ fn short_asset(a: &AssetClass) -> String {
     format!("{}.{}", pol_short, tk)
 }
 
-fn plutus_address_to_bytes(addr: &PlutusAddress) -> Result<Vec<u8>> {
+fn plutus_address_to_bytes(addr: &PlutusAddress, network: Network) -> Result<Vec<u8>> {
     let payment = match &addr.payment_credential {
         Credential::VerificationKey(hash) => ShelleyPaymentPart::Key(*hash),
         Credential::Script(hash) => ShelleyPaymentPart::Script(*hash),
@@ -3574,7 +3560,7 @@ fn plutus_address_to_bytes(addr: &PlutusAddress) -> Result<Vec<u8>> {
         _ => ShelleyDelegationPart::Null,
     };
 
-    let shelley = ShelleyAddress::new(Network::Testnet, payment, delegation);
+    let shelley = ShelleyAddress::new(network, payment, delegation);
     Ok(shelley.to_vec())
 }
 
@@ -3633,6 +3619,35 @@ fn legacy_value_to_internal(v: &pallas_primitives::alonzo::Value) -> crate::card
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod signing_key_tests {
+    use super::*;
+
+    /// A 128-byte bip32 key file signs with its first 64 bytes, and the
+    /// signature verifies under the public key embedded in the file — the key
+    /// the ledger checks the vkey witness against.
+    #[test]
+    fn bip32_extended_key_file_signature_verifies_under_embedded_public_key() {
+        let mut secret: [u8; 64] =
+            std::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(7));
+        secret[0] &= 0b1111_1000;
+        secret[31] = (secret[31] & 0b0011_1111) | 0b0100_0000;
+        let embedded = SecretKeyExtended::from_bytes(secret).unwrap().public_key();
+        let file = format!(
+            r#"{{"type": "PaymentExtendedSigningKeyShelley_ed25519_bip32", "cborHex": "5880{}{}{}"}}"#,
+            hex::encode(secret),
+            hex::encode(embedded.as_ref()),
+            "11".repeat(32)
+        );
+
+        let sk = parse_secret_key(&file).unwrap();
+        assert!(matches!(sk, AnySecretKey::Extended(_)));
+        let body_hash = [0x42u8; 32];
+        let signature = sk.sign(body_hash);
+        assert!(embedded.verify(body_hash, &signature));
+    }
+}
 
 #[cfg(test)]
 mod validity_tests {

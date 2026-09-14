@@ -234,6 +234,7 @@ impl TestEnv {
         let _ = TEST_CTX.set(ctx);
 
         let exec = ScooperExecution {
+            network: crate::sundaev4::AddressNetwork::Testnet,
             scooper_secret_key: SCOOPER_SECRET_KEY.to_string(),
             scooper_secret_key_file: None,
             scooper_stake_keyhash: None,

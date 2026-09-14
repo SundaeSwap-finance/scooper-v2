@@ -1746,7 +1746,11 @@ async fn bootstrap_v4(
     let mut scooper_addr_bytes: Vec<u8> = Vec::new();
     if let Some(ref exec) = protocol.execution {
         let mut candidates: Vec<pallas_addresses::Address> = Vec::new();
-        match sundaev4::derive_scooper_pallas_address_with_stake(&exec.scooper_secret_key, None) {
+        match sundaev4::derive_scooper_pallas_address_with_stake(
+            &exec.scooper_secret_key,
+            None,
+            exec.network,
+        ) {
             Err(e) => warn!("bootstrap v4: could not derive enterprise address: {e:#}"),
             Ok(addr) => {
                 scooper_addr_bytes = addr.to_vec();
@@ -1757,6 +1761,7 @@ async fn bootstrap_v4(
             match sundaev4::derive_scooper_pallas_address_with_stake(
                 &exec.scooper_secret_key,
                 Some(stake_kh),
+                exec.network,
             ) {
                 Err(e) => warn!("bootstrap v4: could not derive base address: {e:#}"),
                 Ok(addr) => {
@@ -1837,7 +1842,7 @@ async fn bootstrap_v4(
                     // Dummy address — only the script_ref field matters.
                     let dummy_addr =
                         pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
-                            pallas_addresses::Network::Testnet,
+                            protocol.network.pallas(),
                             pallas_addresses::ShelleyPaymentPart::Key(
                                 pallas_primitives::Hash::new([0u8; 28]),
                             ),
@@ -1872,7 +1877,7 @@ async fn bootstrap_v4(
         let mut persisted_txos: Vec<PersistedTxo> = Vec::new();
 
         let pool_addr = ShelleyAddress::new(
-            Network::Testnet,
+            protocol.network.pallas(),
             ShelleyPaymentPart::Script(protocol.pool_script_hash),
             ShelleyDelegationPart::Null,
         )
@@ -1895,7 +1900,7 @@ async fn bootstrap_v4(
             .first()
             .map(|h| {
                 ShelleyAddress::new(
-                    Network::Testnet,
+                    protocol.network.pallas(),
                     ShelleyPaymentPart::Script(*h),
                     ShelleyDelegationPart::Null,
                 )
@@ -1917,7 +1922,7 @@ async fn bootstrap_v4(
 
         if let Some(ref s) = settings {
             let settings_addr = ShelleyAddress::new(
-                Network::Testnet,
+                protocol.network.pallas(),
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
             )
@@ -1941,7 +1946,7 @@ async fn bootstrap_v4(
         // the order validator's config resolution.
         for oc in order_configs.values() {
             let settings_addr = ShelleyAddress::new(
-                Network::Testnet,
+                protocol.network.pallas(),
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
             )
@@ -1962,7 +1967,7 @@ async fn bootstrap_v4(
         // loader's "fee_settings" arm re-parses it from the persisted txo).
         if let Some(fs) = &fee_settings {
             let settings_addr = ShelleyAddress::new(
-                Network::Testnet,
+                protocol.network.pallas(),
                 ShelleyPaymentPart::Script(protocol.settings_script_hash),
                 ShelleyDelegationPart::Null,
             )
@@ -2003,7 +2008,7 @@ async fn bootstrap_v4(
         }
 
         let dummy_addr = ShelleyAddress::new(
-            Network::Testnet,
+            protocol.network.pallas(),
             ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
             ShelleyDelegationPart::Null,
         )
