@@ -496,6 +496,7 @@ pub fn pool_predictions_from_tx(
             ident,
             Arc::new(crate::sundaev4::SundaeV4Pool {
                 input: crate::cardano_types::TransactionInput::new(tx_hash, idx as u64),
+                address: converted.address.to_vec(),
                 value: converted.value,
                 pool_datum,
                 pool_type: old_pool.pool_type.clone(),
@@ -1104,6 +1105,7 @@ mod tests {
         fn dummy_pool(ident: &Ident, tx_byte: u8) -> Arc<crate::sundaev4::SundaeV4Pool> {
             Arc::new(crate::sundaev4::SundaeV4Pool {
                 input: TransactionInput::new([tx_byte; 32].into(), 0),
+                address: Vec::new(),
                 value: Default::default(),
                 pool_datum: PoolDatum {
                     assets: vec![],

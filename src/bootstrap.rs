@@ -49,6 +49,8 @@ pub enum BootstrapConfig {
 struct FetchedUtxo {
     tx_hash: [u8; 32],
     output_index: u64,
+    /// Bech32 address holding the UTxO.
+    address: String,
     value: Value,
     datum_cbor: Option<Vec<u8>>,
     slot: u64,
@@ -229,6 +231,7 @@ impl KupoProvider {
 struct KupoUtxo {
     transaction_id: String,
     output_index: u64,
+    address: String,
     value: KupoValue,
     datum_hash: Option<String>,
     datum_type: Option<String>,
@@ -343,6 +346,7 @@ impl BootstrapProvider for KupoProvider {
             result.push(FetchedUtxo {
                 tx_hash,
                 output_index: utxo.output_index,
+                address: utxo.address,
                 value,
                 datum_cbor,
                 slot: utxo.created_at.slot_no,
@@ -375,6 +379,7 @@ impl BootstrapProvider for KupoProvider {
             result.push(FetchedUtxo {
                 tx_hash,
                 output_index: utxo.output_index,
+                address: utxo.address,
                 value: parse_kupo_value(&utxo.value),
                 datum_cbor: None, // wallet UTxOs don't need datums
                 slot: utxo.created_at.slot_no,
@@ -674,6 +679,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 all_utxos.push(FetchedUtxo {
                     tx_hash,
                     output_index: utxo.tx_index,
+                    address: address.to_string(),
                     value,
                     datum_cbor,
                     slot,
@@ -1551,6 +1557,9 @@ async fn bootstrap_v4(
             pool_datum.identifier.clone(),
             Arc::new(sundaev4::SundaeV4Pool {
                 input,
+                address: pallas_addresses::Address::from_bech32(&utxo.address)
+                    .with_context(|| format!("bootstrap v4: pool address {}", utxo.address))?
+                    .to_vec(),
                 value: utxo.value.clone(),
                 pool_datum,
                 pool_type,
@@ -1876,12 +1885,6 @@ async fn bootstrap_v4(
     {
         let mut persisted_txos: Vec<PersistedTxo> = Vec::new();
 
-        let pool_addr = ShelleyAddress::new(
-            protocol.network.pallas(),
-            ShelleyPaymentPart::Script(protocol.pool_script_hash),
-            ShelleyDelegationPart::Null,
-        )
-        .to_vec();
         for pool in pools.values() {
             let datum_bytes = pool.pool_datum.clone().to_plutus_bytes();
             persisted_txos.push(PersistedTxo {
@@ -1889,8 +1892,8 @@ async fn bootstrap_v4(
                 txo_type: "pool".to_string(),
                 created_slot: tip_slot,
                 era: 7,
-                txo: encode_bootstrap_utxo(&pool_addr, &pool.value, Some(&datum_bytes)),
-                address: pool_addr.clone(),
+                txo: encode_bootstrap_utxo(&pool.address, &pool.value, Some(&datum_bytes)),
+                address: pool.address.clone(),
                 datum: None,
             });
         }

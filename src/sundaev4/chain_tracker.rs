@@ -379,6 +379,7 @@ mod tests {
         use crate::sundaev4::types::{PoolType, Rational};
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xaa; 32].into(), 0),
+            address: Vec::new(),
             value: Value::default(),
             pool_datum: PoolDatum {
                 assets: vec![],

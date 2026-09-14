@@ -1015,6 +1015,7 @@ mod tests {
 
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xaa; 32].into(), 0),
+            address: Vec::new(),
             value,
             pool_datum: PoolDatum {
                 assets: vec![
@@ -1090,6 +1091,7 @@ mod tests {
         value.insert(&token_a(), BigInt::from(b_reserve));
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xcc; 32].into(), 0),
+            address: Vec::new(),
             value,
             pool_datum: PoolDatum {
                 assets: vec![
@@ -1314,6 +1316,7 @@ mod tests {
 
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xbb; 32].into(), 0),
+            address: Vec::new(),
             value,
             pool_datum: PoolDatum {
                 assets: vec![
@@ -1350,6 +1353,7 @@ mod tests {
 
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([0xcc; 32].into(), 0),
+            address: Vec::new(),
             value,
             pool_datum: PoolDatum {
                 assets: vec![

@@ -1789,15 +1789,6 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 8: Build outputs ──────────────────────────────────────────────
 
-    let pool_address = {
-        let pool_addr = ShelleyAddress::new(
-            network,
-            ShelleyPaymentPart::Script(exec.module_scripts.pool.hash),
-            ShelleyDelegationPart::Null,
-        );
-        PallasBytes::from(pool_addr.to_vec())
-    };
-
     let mut outputs: Vec<TransactionOutput> = Vec::new();
 
     // Precompute per-batch net ADA delta for pool outputs.
@@ -1857,7 +1848,7 @@ pub fn build_multi_pool_scoop_tx(
         )?;
         let mut out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
-                address: pool_address.clone(),
+                address: PallasBytes::from(batch.pool.address.clone()),
                 value: pool_output_value,
                 datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(pool_datum_pd))),
                 script_ref: None,
@@ -2652,7 +2643,7 @@ pub fn build_multi_pool_scoop_tx(
         resolved_inputs.insert(
             batch.pool.input.clone(),
             ResolvedTxOut {
-                address: pool_address.to_vec(),
+                address: batch.pool.address.clone(),
                 value: batch.pool.value.clone(),
                 datum: DatumOption::InlineDatum(batch.pool.pool_datum.clone().to_plutus()),
                 script_ref: None,
@@ -2920,6 +2911,7 @@ pub fn build_multi_pool_scoop_tx(
         }
         let predicted_pool = SundaeV4Pool {
             input: predicted_input.clone(),
+            address: batch.pool.address.clone(),
             value: predicted_value,
             pool_datum: per_pool[out_idx].updated_datum.clone(),
             pool_type: batch.pool.pool_type.clone(),

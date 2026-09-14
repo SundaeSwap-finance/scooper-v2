@@ -1288,6 +1288,12 @@ pub struct ScriptRefInfo {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV4Pool {
     pub input: TransactionInput,
+    /// The pool UTxO's full address bytes, stake credential included. A scoop
+    /// pays the pool back to exactly this address: the pool validator requires
+    /// the continuation at the same address, and a pool may carry any stake
+    /// credential.
+    #[serde(serialize_with = "hex_ser::bytes")]
+    pub address: Vec<u8>,
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub pool_type: PoolType,

@@ -623,6 +623,22 @@ pub fn token_f() -> AssetClass {
     token(0x0B, 0x0C)
 }
 
+/// The pool validator's script address on `env`'s network, with an optional
+/// stake key hash as its delegation part.
+pub fn pool_script_address(env: &TestEnv, stake_keyhash: Option<[u8; 28]>) -> Vec<u8> {
+    use pallas_addresses::{ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
+    let delegation = match stake_keyhash {
+        Some(kh) => ShelleyDelegationPart::Key(kh.into()),
+        None => ShelleyDelegationPart::Null,
+    };
+    ShelleyAddress::new(
+        env.exec.network.pallas(),
+        ShelleyPaymentPart::Script(env.exec.module_scripts.pool.hash),
+        delegation,
+    )
+    .to_vec()
+}
+
 /// Create a token-to-token pool with the proper module pipeline (CP + FS + fairness).
 ///
 /// The pool's `actions` and `module_state` reference the real module script
@@ -677,6 +693,7 @@ pub fn make_pool(
 
     Arc::new(SundaeV4Pool {
         input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
         value,
         pool_datum: PoolDatum {
             assets: vec![
@@ -757,6 +774,7 @@ pub fn make_cl_pool(
 
     Arc::new(SundaeV4Pool {
         input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
         value,
         pool_datum: PoolDatum {
             assets: vec![
@@ -843,6 +861,7 @@ pub fn make_cs_pool(
 
     Arc::new(SundaeV4Pool {
         input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
         value,
         pool_datum: PoolDatum {
             assets: datum_assets,
