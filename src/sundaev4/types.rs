@@ -1002,9 +1002,51 @@ pub enum PoolConfig {
     },
 }
 
+/// The network id the scooper writes into every address it builds.
+///
+/// Not a v4 config key: `main` derives it from
+/// `acropolis.global.startup.network-name`, the key that already selects the
+/// chain, so the two cannot disagree. The `Testnet` default exists for
+/// directly-constructed test fixtures only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AddressNetwork {
+    #[default]
+    Testnet,
+    Mainnet,
+}
+
+impl AddressNetwork {
+    /// "mainnet" is the only network with network id 1; preprod, preview and
+    /// custom devnets all use id 0.
+    pub fn from_network_name(name: &str) -> Self {
+        if name == "mainnet" {
+            AddressNetwork::Mainnet
+        } else {
+            AddressNetwork::Testnet
+        }
+    }
+
+    pub fn pallas(self) -> pallas_addresses::Network {
+        match self {
+            AddressNetwork::Testnet => pallas_addresses::Network::Testnet,
+            AddressNetwork::Mainnet => pallas_addresses::Network::Mainnet,
+        }
+    }
+
+    pub fn id(self) -> u8 {
+        match self {
+            AddressNetwork::Testnet => 0,
+            AddressNetwork::Mainnet => 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ScooperExecution {
+    /// Set at startup by `SundaeV4Protocol::set_network`; see [`AddressNetwork`].
+    #[serde(skip)]
+    pub network: AddressNetwork,
     #[serde(default)]
     pub scooper_secret_key: String,
     #[serde(default)]
@@ -1109,31 +1151,70 @@ pub(crate) fn default_budget_padding() -> (u64, u64) {
 
 impl ScooperExecution {
     /// If `scooper_secret_key_file` is set, read the file and populate
-    /// `scooper_secret_key`. Call this once at startup.
+    /// `scooper_secret_key`. Either source is normalized to raw hex of a
+    /// 32-byte or 64-byte key — the two forms every downstream key reader
+    /// accepts. Call this once at startup.
     pub fn resolve_secret_key(&mut self) -> anyhow::Result<()> {
         if let Some(path) = &self.scooper_secret_key_file {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("reading secret key file: {path}"))?;
-            let trimmed = contents.trim();
-            // Handle Cardano CLI skey JSON format: { "cborHex": "5820<hex>" }
-            if trimmed.starts_with('{') {
-                let json: serde_json::Value = serde_json::from_str(trimmed)
-                    .with_context(|| format!("parsing skey JSON file: {path}"))?;
-                let cbor_hex = json["cborHex"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("skey file missing cborHex field: {path}"))?;
-                // Strip CBOR wrapping (5820 = 32-byte bytestring prefix)
-                self.scooper_secret_key =
-                    cbor_hex.strip_prefix("5820").unwrap_or(cbor_hex).to_string();
-            } else {
-                self.scooper_secret_key = trimmed.to_string();
-            }
+            self.scooper_secret_key = normalize_secret_key_hex(&contents)
+                .with_context(|| format!("secret key file: {path}"))?;
+        } else if !self.scooper_secret_key.is_empty() {
+            self.scooper_secret_key =
+                normalize_secret_key_hex(&self.scooper_secret_key).context("scooper-secret-key")?;
         }
         anyhow::ensure!(
             !self.scooper_secret_key.is_empty(),
             "scooper-secret-key or scooper-secret-key-file must be set"
         );
         Ok(())
+    }
+}
+
+/// Normalize a signing key to raw hex of a 32-byte (standard) or 64-byte
+/// (extended) ed25519 secret key.
+///
+/// Accepts raw hex, or a cardano-cli text envelope whose `cborHex` is a CBOR
+/// bytestring of:
+/// - 32 bytes (`5820`): `PaymentSigningKeyShelley_ed25519`;
+/// - 64 bytes (`5840`): a bare extended secret key;
+/// - 128 bytes (`5880`): `PaymentExtendedSigningKeyShelley_ed25519_bip32`,
+///   laid out `extended_secret(64) ‖ public_key(32) ‖ chain_code(32)`. The
+///   chain code only matters for HD derivation, so it is dropped. The embedded
+///   public key must match the one derived from the secret, so a file with a
+///   different layout is rejected instead of signing with the wrong key.
+pub fn normalize_secret_key_hex(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('{') {
+        return Ok(trimmed.to_string());
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_str(trimmed).context("invalid signing key JSON envelope")?;
+    let cbor_hex =
+        envelope["cborHex"].as_str().context("missing cborHex field in signing key envelope")?;
+    let cbor = hex::decode(cbor_hex).context("invalid cborHex")?;
+    let key = match cbor.as_slice() {
+        [0x58, len, rest @ ..] if *len as usize == rest.len() => rest,
+        _ => anyhow::bail!(
+            "cborHex must be a CBOR bytestring of 32, 64 or 128 bytes (prefix 5820, 5840 or 5880)"
+        ),
+    };
+    match key.len() {
+        32 | 64 => Ok(hex::encode(key)),
+        128 => {
+            use pallas_crypto::key::ed25519::SecretKeyExtended;
+            let secret: [u8; 64] = key[..64].try_into().unwrap();
+            let derived = SecretKeyExtended::from_bytes(secret)
+                .map_err(|e| anyhow::anyhow!("invalid extended ed25519 secret key: {e}"))?
+                .public_key();
+            anyhow::ensure!(
+                derived.as_ref() == &key[64..96],
+                "128-byte extended key: embedded public key does not match the secret key"
+            );
+            Ok(hex::encode(secret))
+        }
+        n => anyhow::bail!("signing key must be 32, 64 or 128 bytes, got {n}"),
     }
 }
 
@@ -1207,6 +1288,12 @@ pub struct ScriptRefInfo {
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
 pub struct SundaeV4Pool {
     pub input: TransactionInput,
+    /// The pool UTxO's full address bytes, stake credential included. A scoop
+    /// pays the pool back to exactly this address: the pool validator requires
+    /// the continuation at the same address, and a pool may carry any stake
+    /// credential.
+    #[serde(serialize_with = "hex_ser::bytes")]
+    pub address: Vec<u8>,
     pub value: Value,
     pub pool_datum: PoolDatum,
     pub pool_type: PoolType,
@@ -1370,11 +1457,104 @@ pub struct SundaeV4Protocol {
     #[serde(default)]
     #[allow(dead_code)]
     pub blueprint: Option<crate::blueprint::Blueprint>,
+    /// Set at startup by `set_network`; see [`AddressNetwork`].
+    #[serde(skip)]
+    pub network: AddressNetwork,
+}
+
+impl SundaeV4Protocol {
+    /// Record the address network here and on the execution config, which the
+    /// tx builder receives without the rest of the protocol config.
+    pub fn set_network(&mut self, network: AddressNetwork) {
+        self.network = network;
+        if let Some(exec) = &mut self.execution {
+            exec.network = network;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod secret_key_tests {
+    use super::normalize_secret_key_hex;
+    use pallas_crypto::key::ed25519::SecretKeyExtended;
+
+    /// A throwaway extended key with the ed25519 bit tweaks applied.
+    fn extended_secret() -> [u8; 64] {
+        let mut k: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        k[0] &= 0b1111_1000;
+        k[31] = (k[31] & 0b0011_1111) | 0b0100_0000;
+        k
+    }
+
+    fn envelope(type_: &str, cbor_hex: &str) -> String {
+        format!(
+            r#"{{"type": "{type_}", "description": "Payment Signing Key", "cborHex": "{cbor_hex}"}}"#
+        )
+    }
+
+    #[test]
+    fn bip32_extended_envelope_yields_the_64_byte_secret() {
+        let secret = extended_secret();
+        let public = SecretKeyExtended::from_bytes(secret).unwrap().public_key();
+        let chain_code = [0xccu8; 32];
+        let cbor_hex = format!(
+            "5880{}{}{}",
+            hex::encode(secret),
+            hex::encode(public.as_ref()),
+            hex::encode(chain_code)
+        );
+        let file = envelope("PaymentExtendedSigningKeyShelley_ed25519_bip32", &cbor_hex);
+        assert_eq!(
+            normalize_secret_key_hex(&file).unwrap(),
+            hex::encode(secret)
+        );
+    }
+
+    #[test]
+    fn bip32_extended_envelope_with_wrong_public_key_is_rejected() {
+        let cbor_hex = format!("5880{}{}", hex::encode(extended_secret()), "00".repeat(64));
+        let file = envelope("PaymentExtendedSigningKeyShelley_ed25519_bip32", &cbor_hex);
+        let err = normalize_secret_key_hex(&file).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn standard_and_bare_extended_envelopes_strip_the_cbor_header() {
+        let seed = "ab".repeat(32);
+        let file = envelope("PaymentSigningKeyShelley_ed25519", &format!("5820{seed}"));
+        assert_eq!(normalize_secret_key_hex(&file).unwrap(), seed);
+
+        let ext = hex::encode(extended_secret());
+        let file = envelope(
+            "PaymentExtendedSigningKeyShelley_ed25519",
+            &format!("5840{ext}"),
+        );
+        assert_eq!(normalize_secret_key_hex(&file).unwrap(), ext);
+    }
+
+    #[test]
+    fn raw_hex_passes_through_trimmed() {
+        let seed = "ab".repeat(32);
+        assert_eq!(
+            normalize_secret_key_hex(&format!("  {seed}\n")).unwrap(),
+            seed
+        );
+    }
+
+    #[test]
+    fn cbor_length_mismatch_is_rejected() {
+        // Header claims 32 bytes but carries 31.
+        let file = envelope(
+            "PaymentSigningKeyShelley_ed25519",
+            &format!("5820{}", "ab".repeat(31)),
+        );
+        assert!(normalize_secret_key_hex(&file).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

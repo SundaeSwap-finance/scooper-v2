@@ -920,6 +920,7 @@ mod tests {
 
         Arc::new(SundaeV4Pool {
             input: TransactionInput::new([ident_byte; 32].into(), 0),
+            address: Vec::new(),
             value,
             pool_datum: PoolDatum {
                 assets: vec![

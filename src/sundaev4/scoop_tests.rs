@@ -736,6 +736,107 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 1);
     }
 
+    /// Every address the builder constructs carries the configured network
+    /// id: the header byte's low nibble is 1 on mainnet. Before the network
+    /// was threaded through, all of them were hardcoded to testnet (0).
+    #[test]
+    fn mainnet_scoop_builds_only_mainnet_addresses() {
+        use pallas_primitives::conway::TransactionOutput;
+
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.exec.network = crate::sundaev4::AddressNetwork::Mainnet;
+        let pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _) =
+            env.build_and_eval(&[batch], &settings, 1000).expect("build_and_eval should succeed");
+
+        let network_id = |addr: &[u8]| addr[0] & 0x0f;
+        let mut outputs: Vec<&TransactionOutput> = result.tx_body.outputs.iter().collect();
+        outputs.extend(result.tx_body.collateral_return.as_ref());
+        assert!(outputs.len() >= 2, "expected pool and order outputs");
+        for o in outputs {
+            let TransactionOutput::PostAlonzo(b) = o else {
+                panic!("legacy output")
+            };
+            assert_eq!(
+                network_id(&b.address),
+                1,
+                "output address {}",
+                hex::encode(b.address.to_vec())
+            );
+        }
+        for (input, resolved) in &result.resolved_inputs {
+            assert_eq!(network_id(&resolved.address), 1, "resolved input {input:?}");
+        }
+    }
+
+    /// A pool with a stake credential is paid back to its own full address.
+    /// The pool validator requires the continuation at the input's address, so
+    /// a builder that rebuilt the address without the stake part produced a
+    /// scoop that fails evaluation.
+    #[test]
+    fn staked_pool_continuation_keeps_its_stake_credential() {
+        use pallas_primitives::conway::TransactionOutput;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut staked = (*make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        ))
+        .clone();
+        staked.address = pool_script_address(&env, Some([0x5a; 28]));
+        let pool = std::sync::Arc::new(staked);
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("a staked pool's scoop must build and evaluate");
+        assert!(!eval.budgets.is_empty());
+
+        let pool_outputs: Vec<Vec<u8>> = result
+            .tx_body
+            .outputs
+            .iter()
+            .filter_map(|o| match o {
+                TransactionOutput::PostAlonzo(b) if b.datum_option.is_some() => {
+                    Some(b.address.to_vec())
+                }
+                _ => None,
+            })
+            .filter(|addr| addr[1..29] == pool.address[1..29])
+            .collect();
+        assert_eq!(pool_outputs, vec![pool.address.clone()]);
+        assert_eq!(result.predicted_pools[0].2.address, pool.address);
+    }
+
     #[test]
     fn single_pool_reverse_direction() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);

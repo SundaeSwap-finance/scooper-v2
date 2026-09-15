@@ -77,6 +77,11 @@ async fn main() -> Result<()> {
     // Resolve the secret key file early so both manager_loop (bootstrap) and
     // scooper see the resolved key.
     let mut protocol = config.protocol.clone();
+    if let Some(ref mut v4) = protocol.v4 {
+        let network_name = config.network_name();
+        v4.set_network(sundaev4::AddressNetwork::from_network_name(&network_name));
+        info!(network_name, network = ?v4.network, "v4 address network");
+    }
     if let Some(ref mut v4) = protocol.v4
         && let Some(ref mut exec) = v4.execution
     {
