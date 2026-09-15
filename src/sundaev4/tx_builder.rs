@@ -209,6 +209,22 @@ const SCOOPER_CHANGE_MIN_ADA: u64 = 1_000_000;
 
 use crate::sundaev3::Ident;
 
+/// The scoop cannot balance without a wallet funding input: a pool or
+/// fulfillment output needs a min-ada top-up, or the order fee deductions do
+/// not equal the tx fee plus the designated pool's surplus delta. Callers
+/// build without funding first and retry with a funding input on this error,
+/// so a scoop spends a wallet UTxO only when it needs one.
+#[derive(Debug)]
+pub struct FundingRequired(pub String);
+
+impl std::fmt::Display for FundingRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FundingRequired {}
+
 /// Result of building a multi-pool scoop transaction.
 pub struct MultiPoolBuildResult {
     pub cbor: Vec<u8>,
@@ -2260,20 +2276,22 @@ pub fn build_multi_pool_scoop_tx(
     let total_funding_draw = total_pool_bump + total_fulfillment_subsidy;
     let mut wallet_change: Option<(u64, crate::cardano_types::Value)> = None;
     if funding_value_opt.is_none() && total_funding_draw > 0 {
-        bail!(
+        return Err(FundingRequired(format!(
             "min-ada support of {total_funding_draw} lovelace needed (pools \
              {total_pool_bump}, fulfillments {total_fulfillment_subsidy}) but \
              no funding UTxO was provided"
-        );
+        ))
+        .into());
     }
     if funding_value_opt.is_none() && total_fee_deducted != tx_fee + designated_required {
         // Without a change output there is nowhere for the deduction pot's
         // surplus (or shortfall) vs the tx fee to go — the ledger would
         // reject the tx as ValueNotConservedUTxO.
-        bail!(
+        return Err(FundingRequired(format!(
             "fee deductions ({total_fee_deducted}) != tx fee ({tx_fee}) and no \
              funding UTxO to absorb the difference in a change output"
-        );
+        ))
+        .into());
     }
     if let Some(funding_value) = funding_value_opt {
         use num_traits::ToPrimitive;

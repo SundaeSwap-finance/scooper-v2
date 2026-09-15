@@ -79,8 +79,9 @@ pub struct TestEnv {
     pub language_views: Vec<u8>,
     pub collateral_utxo: TransactionInput,
     pub collateral_value: Value,
-    pub funding_utxo: TransactionInput,
-    pub funding_value: Value,
+    /// Wallet funding input passed to the builder; `None` builds without
+    /// one, and tests may point it at the collateral UTxO.
+    pub funding: Option<(TransactionInput, Value)>,
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
 }
 
@@ -289,8 +290,7 @@ impl TestEnv {
             language_views,
             collateral_utxo,
             collateral_value,
-            funding_utxo,
-            funding_value,
+            funding: Some((funding_utxo, funding_value)),
             order_configs,
         }
     }
@@ -389,7 +389,7 @@ impl TestEnv {
             &self.order_configs,
             &std::collections::BTreeMap::new(), // strategy_executions
             None,                               // fee_settings (harness configs are fee-less)
-            Some((self.funding_utxo.clone(), &self.funding_value)),
+            self.funding.as_ref().map(|(i, v)| (i.clone(), v)),
             self.butane.as_ref(),
         )?;
 

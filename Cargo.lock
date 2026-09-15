@@ -4971,7 +4971,7 @@ dependencies = [
 
 [[package]]
 name = "scooper-v2"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "acropolis_common",
  "acropolis_module_block_unpacker",

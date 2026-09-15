@@ -678,15 +678,17 @@ impl Scooper {
             }
         };
 
-        // Optional funding UTxO: covers any min-ada bump on pool outputs
-        // (post-upgrades that grow datum size) and recycles the remainder
-        // back as scooper change. Must be distinct from the collateral UTxO
-        // and carry enough ada to cover a worst-case bump plus the change
-        // floor. We pick the smallest UTxO that clears the threshold to
-        // avoid tying up large balances. If none qualify, we still try to
-        // build — pools whose datum didn't grow won't need a bump, so the
-        // build can succeed without funding; pools that do need one will
-        // fail with a clear "bump needed" error.
+        // Funding UTxO candidate: covers min-ada bumps on pool or fulfillment
+        // outputs and any gap between the order fee deductions and the tx
+        // fee, returning the remainder as scooper change. It is spent only
+        // when the builder reports `FundingRequired` (see
+        // `build_and_submit_plan`); a scoop whose deductions cover the tx fee
+        // exactly spends no wallet UTxO. It must carry enough ada for a
+        // worst-case bump plus the change floor. We pick the smallest UTxO
+        // that clears the threshold to avoid tying up large balances. The
+        // collateral UTxO may also fund (the ledger allows one UTxO as both
+        // a spent input and collateral); other UTxOs are preferred so the
+        // collateral stays unspent for the next scoop.
         const MIN_FUNDING_ADA: u64 = 2_500_000;
         // Funding candidates: confirmed wallet UTxOs not consumed by any
         // in-flight tx, plus — when we can submit through the local node —
@@ -705,17 +707,17 @@ impl Scooper {
             .filter(|(i, _)| !consumed_wallet.contains(i))
             .map(|(i, v)| (i, v, false))
             .chain(predicted_wallet.iter().map(|(i, v)| (i, v, true)))
-            .filter(|(i, _, _)| *i != &collateral_input)
             .filter(|(_, v, _)| {
                 use num_traits::ToPrimitive;
                 v.get(&ada_asset).unwrap().to_u64().unwrap_or(0) >= MIN_FUNDING_ADA
             })
-            .min_by_key(|(_, v, is_predicted)| {
+            .min_by_key(|(i, v, is_predicted)| {
                 use num_traits::ToPrimitive;
-                // Prefer confirmed UTxOs at equal size; predicted only when
-                // nothing confirmed qualifies.
+                // Prefer confirmed UTxOs, then UTxOs other than the
+                // collateral, then the smallest.
                 (
                     *is_predicted,
+                    *i == &collateral_input,
                     v.get(&ada_asset).unwrap().to_u64().unwrap_or(0),
                 )
             });
@@ -723,17 +725,14 @@ impl Scooper {
         let funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> =
             funding.map(|(i, v, _)| (i.clone(), v.clone()));
         if funding_owned.is_none() {
-            // Fee redesign (SUNDAE-2587): the deduction pot's surplus over
-            // the tx fee lands on the scooper change output, which only
-            // exists when a funding UTxO is spent — without one, every
-            // build fails value conservation, and the shrink-to-isolate
-            // path would blame (and permanently quarantine) innocent
-            // orders. Skip the cycle until the wallet recovers.
+            // Unreachable while the collateral qualifies (its floor is above
+            // MIN_FUNDING_ADA). Kept as a guard: the batch search builds with
+            // this candidate, and a FundingRequired there would bail the
+            // search instead of sizing the batch.
             warn!(
                 min_ada = MIN_FUNDING_ADA,
                 wallet_utxos = v4_state.wallet_utxos.len(),
-                "no wallet UTxO available for funding; skipping scoop cycle \
-                 (fee-pot change output requires a funding input)"
+                "no wallet UTxO available for funding; skipping scoop cycle"
             );
             return false;
         }
@@ -1787,6 +1786,12 @@ impl Scooper {
                         funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                         self.v4_butane.as_ref(),
                     ) {
+                        // A missing funding input is a wallet condition, not
+                        // a defect of the order: take the temporary-quarantine
+                        // path, never the permanent one.
+                        Err(e) if e.is::<crate::sundaev4::tx_builder::FundingRequired>() => {
+                            (None, Some(format!("build: {e}")))
+                        }
                         Err(e) => (Some(format!("build: {e}")), None),
                         Ok(build) => {
                             let mut failure: Option<
@@ -1963,7 +1968,7 @@ impl Scooper {
         language_views: &[u8],
         collateral_input: &TransactionInput,
         collateral_value: &crate::cardano_types::Value,
-        funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
+        funding_available: &Option<(TransactionInput, crate::cardano_types::Value)>,
         strategy_executions: &BTreeMap<TransactionInput, pallas_primitives::PlutusData>,
         provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
         foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
@@ -1998,191 +2003,222 @@ impl Scooper {
             crate::sundaev4::tx_builder::ValidityWindow::new(tip_slot, self.now_slot(tip_slot));
 
         // Build → evaluate → rebuild with exact budgets.
-
-        let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan,
-            settings,
-            exec,
-            validity,
-            language_views,
-            &collateral_input.0,
-            collateral_value,
-            None,
-            &v4_state.ref_utxo_outputs,
-            None,
-            &v4_state.order_configs,
-            strategy_executions,
-            v4_state.fee_settings.as_deref(),
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-            self.v4_butane.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "final multi-pool tx build failed");
-                // Under-funded orders can never execute (a UTxO's ada is
-                // immutable), so quarantine permanently instead of retrying
-                // every cycle.
-                if e.to_string().contains("under-funded") {
-                    for input in &plan_order_inputs {
-                        self.quarantine.insert(
-                            input.clone(),
-                            Quarantine::Permanent {
-                                reason: "under-funded: fulfillment can't retain min-UTxO".into(),
-                            },
-                        );
+        //
+        // The first attempt spends no wallet UTxO. If either build reports
+        // FundingRequired, the whole sequence restarts with the funding input:
+        // adding an input shifts the spend redeemer indices, so budgets from a
+        // funding-less first pass do not carry over.
+        let mut funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> = None;
+        let (padded_budgets, final_tx) = loop {
+            let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+                &final_plan,
+                settings,
+                exec,
+                validity,
+                language_views,
+                &collateral_input.0,
+                collateral_value,
+                None,
+                &v4_state.ref_utxo_outputs,
+                None,
+                &v4_state.order_configs,
+                strategy_executions,
+                v4_state.fee_settings.as_deref(),
+                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+                self.v4_butane.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e)
+                    if e.is::<crate::sundaev4::tx_builder::FundingRequired>()
+                        && funding_owned.is_none()
+                        && funding_available.is_some() =>
+                {
+                    debug!(reason = %e, "scoop needs a funding input; rebuilding with one");
+                    funding_owned = funding_available.clone();
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, "final multi-pool tx build failed");
+                    // Under-funded orders can never execute (a UTxO's ada is
+                    // immutable), so quarantine permanently instead of retrying
+                    // every cycle.
+                    if e.to_string().contains("under-funded") {
+                        for input in &plan_order_inputs {
+                            self.quarantine.insert(
+                                input.clone(),
+                                Quarantine::Permanent {
+                                    reason: "under-funded: fulfillment can't retain min-UTxO"
+                                        .into(),
+                                },
+                            );
+                        }
+                        self.sync_quarantine_metrics();
                     }
-                    self.sync_quarantine_metrics();
+                    return false;
                 }
-                return false;
-            }
-        };
+            };
 
-        // Local eval. binary search already ran eval on this exact batch and
-        // got Ok, so this should succeed too — anything else is a scooper bug
-        // (race condition, builder non-determinism, etc.). Bail and dump on
-        // failure rather than guessing a budget.
-        let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
-        let padded_budgets: Vec<(
-            pallas_primitives::conway::RedeemersKey,
-            pallas_primitives::ExUnits,
-        )> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
-            &first_pass.tx_body,
-            &first_pass.redeemers,
-            &first_pass.resolved_inputs,
-            &first_pass.resolved_ref_inputs,
-            self.v4_script_store.as_ref().unwrap(),
-            &exec.plutus_v3_cost_model,
-            exec.plutus_v2_cost_model.as_deref(),
-            first_pass.tx_hash,
-            &exec.slot_config,
-            Some(&mut failure),
-        ) {
-            Ok(r) => {
-                // `budget_padding`'s doc says what the margin covers; the
-                // final tx is re-evaluated against these budgets before
-                // submit. Padding-vs-max-budget gating happens in
-                // `within_limits` during the fitness binary search.
-                let (pad_num, pad_den) = exec.budget_padding;
-                r.budgets
-                    .iter()
-                    .map(|(k, eu)| {
-                        let mut padded = *eu;
-                        padded.mem = eu.mem * pad_num / pad_den;
-                        padded.steps = eu.steps * pad_num / pad_den;
-                        (k.clone(), padded)
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                if let Some(cap) = failure {
-                    let ctx_dump = format!(
-                        "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
-                        first_pass.tx_hash_hex,
-                        hex::encode(cap.script_hash),
-                        cap.redeemer_key.tag,
-                        cap.redeemer_key.index,
-                    );
-                    let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
-                    let tx_dump = format!("/tmp/scoop-tx-{}.cbor", first_pass.tx_hash_hex);
-                    let _ = std::fs::write(&tx_dump, &first_pass.cbor);
+            // Local eval. binary search already ran eval on this exact batch and
+            // got Ok, so this should succeed too — anything else is a scooper bug
+            // (race condition, builder non-determinism, etc.). Bail and dump on
+            // failure rather than guessing a budget.
+            let mut failure: Option<crate::sundaev4::evaluator::FailedScriptContext> = None;
+            let padded_budgets: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                &first_pass.tx_body,
+                &first_pass.redeemers,
+                &first_pass.resolved_inputs,
+                &first_pass.resolved_ref_inputs,
+                self.v4_script_store.as_ref().unwrap(),
+                &exec.plutus_v3_cost_model,
+                exec.plutus_v2_cost_model.as_deref(),
+                first_pass.tx_hash,
+                &exec.slot_config,
+                Some(&mut failure),
+            ) {
+                Ok(r) => {
+                    // `budget_padding`'s doc says what the margin covers; the
+                    // final tx is re-evaluated against these budgets before
+                    // submit. Padding-vs-max-budget gating happens in
+                    // `within_limits` during the fitness binary search.
+                    let (pad_num, pad_den) = exec.budget_padding;
+                    r.budgets
+                        .iter()
+                        .map(|(k, eu)| {
+                            let mut padded = *eu;
+                            padded.mem = eu.mem * pad_num / pad_den;
+                            padded.steps = eu.steps * pad_num / pad_den;
+                            (k.clone(), padded)
+                        })
+                        .collect()
                 }
+                Err(e) => {
+                    if let Some(cap) = failure {
+                        let ctx_dump = format!(
+                            "/tmp/script-ctx-{}-{}-{:?}-{}.cbor",
+                            first_pass.tx_hash_hex,
+                            hex::encode(cap.script_hash),
+                            cap.redeemer_key.tag,
+                            cap.redeemer_key.index,
+                        );
+                        let _ = std::fs::write(&ctx_dump, &cap.context_cbor);
+                        let tx_dump = format!("/tmp/scoop-tx-{}.cbor", first_pass.tx_hash_hex);
+                        let _ = std::fs::write(&tx_dump, &first_pass.cbor);
+                    }
+                    warn!(
+                        error = %e,
+                        tx_hash = %first_pass.tx_hash_hex,
+                        "first_pass eval failed after binary-search Ok — likely a scooper bug; \
+                         context dumped to /tmp/script-ctx-* — aborting scoop cycle",
+                    );
+                    self.metrics
+                        .record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    return false;
+                }
+            };
+
+            // Compute the exact protocol fee from the first-pass size and the
+            // evaluated ex_units. The final rebuild changes per-order fee share
+            // (and therefore output ADA values), but those values stay in the
+            // same CBOR uint encoding bracket (5 bytes for amounts in the
+            // hundreds of thousands to billions of lovelace), so final size
+            // matches first_pass size to within 0–1 bytes. Add a small buffer
+            // anyway in case the encoding nudges, since fee underpayment fails
+            // the submit.
+            let total_eval_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
+            let total_eval_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
+            let computed_fee = crate::sundaev4::tx_builder::compute_tx_fee(
+                first_pass.cbor.len() as u64,
+                total_eval_mem,
+                total_eval_steps,
+                first_pass.total_ref_script_bytes,
+            ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
+
+            let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
+                &final_plan,
+                settings,
+                exec,
+                validity,
+                language_views,
+                &collateral_input.0,
+                collateral_value,
+                Some(&padded_budgets),
+                &v4_state.ref_utxo_outputs,
+                Some(computed_fee),
+                &v4_state.order_configs,
+                strategy_executions,
+                v4_state.fee_settings.as_deref(),
+                funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
+                self.v4_butane.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e)
+                    if e.is::<crate::sundaev4::tx_builder::FundingRequired>()
+                        && funding_owned.is_none()
+                        && funding_available.is_some() =>
+                {
+                    debug!(reason = %e, "scoop rebuild needs a funding input; restarting with one");
+                    funding_owned = funding_available.clone();
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, "final multi-pool tx rebuild failed");
+                    self.metrics
+                        .record_batch_failure(crate::metrics::BatchFailureReason::BuildError);
+                    return false;
+                }
+            };
+
+            // The declared budgets come from the first-pass tx and the rebuild
+            // can shift a script's cost. The node rejects any script that runs
+            // past its declared budget, and that rejection is indistinguishable
+            // from a lost race at submit time.
+            let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
+                &final_tx.tx_body,
+                &final_tx.redeemers,
+                &final_tx.resolved_inputs,
+                &final_tx.resolved_ref_inputs,
+                self.v4_script_store.as_ref().unwrap(),
+                &exec.plutus_v3_cost_model,
+                exec.plutus_v2_cost_model.as_deref(),
+                final_tx.tx_hash,
+                &exec.slot_config,
+                None,
+            ) {
+                Ok(r) => r
+                    .budgets
+                    .iter()
+                    .filter_map(|(k, raw)| {
+                        let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
+                        (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
+                            format!(
+                                "{:?}#{}: raw mem {} steps {} > declared mem {} steps {}",
+                                k.tag, k.index, raw.mem, raw.steps, declared.mem, declared.steps,
+                            )
+                        })
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "final tx eval failed — aborting scoop cycle");
+                    self.metrics
+                        .record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
+                    return false;
+                }
+            };
+            if !over_budget.is_empty() {
                 warn!(
-                    error = %e,
-                    tx_hash = %first_pass.tx_hash_hex,
-                    "first_pass eval failed after binary-search Ok — likely a scooper bug; \
-                     context dumped to /tmp/script-ctx-* — aborting scoop cycle",
+                    tx_hash = %final_tx.tx_hash_hex,
+                    over_budget = ?over_budget,
+                    "final tx exceeds declared budgets — aborting scoop cycle",
                 );
                 self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                 return false;
             }
+            break (padded_budgets, final_tx);
         };
-
-        // Compute the exact protocol fee from the first-pass size and the
-        // evaluated ex_units. The final rebuild changes per-order fee share
-        // (and therefore output ADA values), but those values stay in the
-        // same CBOR uint encoding bracket (5 bytes for amounts in the
-        // hundreds of thousands to billions of lovelace), so final size
-        // matches first_pass size to within 0–1 bytes. Add a small buffer
-        // anyway in case the encoding nudges, since fee underpayment fails
-        // the submit.
-        let total_eval_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
-        let total_eval_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
-        let computed_fee = crate::sundaev4::tx_builder::compute_tx_fee(
-            first_pass.cbor.len() as u64,
-            total_eval_mem,
-            total_eval_steps,
-            first_pass.total_ref_script_bytes,
-        ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
-
-        let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
-            &final_plan,
-            settings,
-            exec,
-            validity,
-            language_views,
-            &collateral_input.0,
-            collateral_value,
-            Some(&padded_budgets),
-            &v4_state.ref_utxo_outputs,
-            Some(computed_fee),
-            &v4_state.order_configs,
-            strategy_executions,
-            v4_state.fee_settings.as_deref(),
-            funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
-            self.v4_butane.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "final multi-pool tx rebuild failed");
-                self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::BuildError);
-                return false;
-            }
-        };
-
-        // The declared budgets come from the first-pass tx and the rebuild
-        // can shift a script's cost. The node rejects any script that runs
-        // past its declared budget, and that rejection is indistinguishable
-        // from a lost race at submit time.
-        let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
-            &final_tx.tx_body,
-            &final_tx.redeemers,
-            &final_tx.resolved_inputs,
-            &final_tx.resolved_ref_inputs,
-            self.v4_script_store.as_ref().unwrap(),
-            &exec.plutus_v3_cost_model,
-            exec.plutus_v2_cost_model.as_deref(),
-            final_tx.tx_hash,
-            &exec.slot_config,
-            None,
-        ) {
-            Ok(r) => r
-                .budgets
-                .iter()
-                .filter_map(|(k, raw)| {
-                    let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
-                    (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
-                        format!(
-                            "{:?}#{}: raw mem {} steps {} > declared mem {} steps {}",
-                            k.tag, k.index, raw.mem, raw.steps, declared.mem, declared.steps,
-                        )
-                    })
-                })
-                .collect(),
-            Err(e) => {
-                warn!(error = %e, tx_hash = %final_tx.tx_hash_hex, "final tx eval failed — aborting scoop cycle");
-                self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
-                return false;
-            }
-        };
-        if !over_budget.is_empty() {
-            warn!(
-                tx_hash = %final_tx.tx_hash_hex,
-                over_budget = ?over_budget,
-                "final tx exceeds declared budgets — aborting scoop cycle",
-            );
-            self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
-            return false;
-        }
+        let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
 
         let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
         let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();

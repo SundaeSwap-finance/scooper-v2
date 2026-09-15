@@ -837,6 +837,107 @@ mod tests {
         assert_eq!(result.predicted_pools[0].2.address, pool.address);
     }
 
+    fn one_order_batch(env: &TestEnv) -> crate::sundaev4::batch::Batch {
+        let pool = make_pool(
+            env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed")
+    }
+
+    /// A scoop whose deductions balance the tx fee spends no wallet UTxO: no
+    /// funding input, no change output. The harness checks lovelace
+    /// conservation and evaluates every script.
+    #[test]
+    fn balanced_scoop_builds_without_funding() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.funding = None;
+        let batch = one_order_batch(&env);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("a balanced scoop must build, conserve value, and evaluate without funding");
+        assert!(!eval.budgets.is_empty());
+        assert!(
+            result.wallet_change.is_none(),
+            "no change output without funding"
+        );
+        assert!(!result.tx_body.inputs.iter().any(|i| i == &env.collateral_utxo));
+    }
+
+    /// A scoop that cannot balance without a wallet input fails with the typed
+    /// `FundingRequired` error, which the scooper uses to retry with funding.
+    /// Here the pool holds too little ada for its continuation's min-UTxO, so
+    /// the output needs a top-up only a funding input can pay.
+    #[test]
+    fn min_ada_top_up_without_funding_reports_funding_required() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.funding = None;
+        let mut starved = (*make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        ))
+        .clone();
+        starved.value.insert(&ada(), BigInt::from(1_000_000i64));
+        let pool = std::sync::Arc::new(starved);
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let err = match env.build_and_eval(&[batch], &settings, 1000) {
+            Ok(_) => panic!("a min-ada top-up cannot be paid without funding"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is::<crate::sundaev4::tx_builder::FundingRequired>(),
+            "expected FundingRequired, got: {err:#}"
+        );
+    }
+
+    /// One wallet UTxO may be both the collateral and the funding input.
+    #[test]
+    fn collateral_utxo_can_also_fund_the_scoop() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.funding = Some((env.collateral_utxo.clone(), env.collateral_value.clone()));
+        let batch = one_order_batch(&env);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("collateral-as-funding scoop must build, conserve value, and evaluate");
+        assert!(!eval.budgets.is_empty());
+
+        let collateral = &env.collateral_utxo;
+        assert!(
+            result.tx_body.inputs.iter().any(|i| i == collateral),
+            "collateral spent as funding"
+        );
+        let collateral_set = result.tx_body.collateral.as_ref().expect("collateral set");
+        assert!(collateral_set.iter().any(|i| i == collateral));
+        assert!(result.wallet_change.is_some(), "funding returns change");
+    }
+
     #[test]
     fn single_pool_reverse_direction() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
