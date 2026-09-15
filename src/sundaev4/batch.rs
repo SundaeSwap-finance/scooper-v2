@@ -114,7 +114,8 @@ pub struct ResolvedDeposit {
 }
 
 /// A resolved proportional Withdraw. The user offers an exact amount of LP
-/// (`lp_burned`); the scooper burns it all and the pool pays out per-asset
+/// (`lp_burned`); the scooper returns it all to the pool's preminted reserve
+/// — nothing is burned on chain — and the pool pays out per-asset
 /// `dy[i] = floor(reserves[i] * lp_burned / total_lp)`. The pool keeps the
 /// floor remainder, so there's no withdraw surplus (in contrast to deposit).
 #[derive(Clone)]
