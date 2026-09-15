@@ -1426,7 +1426,7 @@ mod tests {
         // Roughly proportional but deliberately unround amounts.
         let order = make_basic_deposit_order(
             vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
-            lp_asset,
+            lp_asset.clone(),
             1,
             1,
         );
@@ -1448,6 +1448,95 @@ mod tests {
             .expect("pinned CS deposit should evaluate against real validators");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 1);
+
+        // The harness pool premints its whole supply, so the LP comes out of
+        // the reserve: nothing is minted and the pool UTxO hands over exactly
+        // the LP delivered.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "reserve-served deposit must not mint"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp - &dep.lp_minted
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &dep.lp_minted
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) - &dep.lp_minted
+        );
+    }
+
+    /// A pool whose reserve can't cover the deposit falls back to minting.
+    #[test]
+    fn cs_deposit_mints_when_reserve_is_short() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        // Leave one LP in the reserve — as if depositors hold the rest —
+        // keeping datum and pool value consistent.
+        let pool = {
+            let mut p = (*pool).clone();
+            let moved = &p.pool_datum.preminted_lp - &BigInt::from(1);
+            p.pool_datum.circulating_lp = &p.pool_datum.circulating_lp + &moved;
+            p.pool_datum.preminted_lp = BigInt::from(1);
+            let held = p.value.get(&lp_asset);
+            p.value.insert(&lp_asset, &held - &moved);
+            std::sync::Arc::new(p)
+        };
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
+            lp_asset.clone(),
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_deposit(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("deposit should resolve");
+        let plan = accum.into_plan();
+        let dep = &plan.batches[0].deposits[0];
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("minted CS deposit should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert!(
+            result.tx_body.mint.is_some(),
+            "a short reserve must fall back to minting"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.preminted_lp, BigInt::from(1));
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &dep.lp_minted
+        );
+        assert_eq!(after.value.get(&lp_asset), pool.value.get(&lp_asset));
     }
 
     /// Target-pinned CS withdraw (cs_check tag 4) on the same coprime pool.
@@ -1496,8 +1585,12 @@ mod tests {
                 t
             },
         };
-        let order =
-            make_basic_withdraw_order(lp_asset, 5_000_017, vec![(token_a(), 1), (token_e(), 1)], 1);
+        let order = make_basic_withdraw_order(
+            lp_asset.clone(),
+            5_000_017,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1516,6 +1609,25 @@ mod tests {
             .expect("pinned CS withdraw should evaluate against real validators");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 1);
+
+        // The withdrawn LP goes back into the reserve instead of being burned.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "returned LP must not be burned"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp + &wd.lp_burned
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp - &wd.lp_burned
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) + &wd.lp_burned
+        );
     }
 
     /// The proportional deposit path refuses an asymmetric basket with a
@@ -1585,7 +1697,7 @@ mod tests {
                 t
             },
         };
-        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset, 1, 1);
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset.clone(), 1, 1);
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1633,6 +1745,26 @@ mod tests {
             .expect("CS zap should evaluate against the real validators");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 1);
+
+        // Served from the reserve: no pool_mint in the tx, preminted down by
+        // the LP delivered, and the pool UTxO hands that LP over.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "reserve-served zap must not mint"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp - &zap.lp_minted
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &zap.lp_minted
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) - &zap.lp_minted
+        );
     }
 
     /// A batch holding nothing but zaps still counts as work. The dispatch
