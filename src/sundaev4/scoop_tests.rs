@@ -1720,9 +1720,9 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 1);
     }
 
-    /// A single-sided CS deposit can never validate (cs_check disallows
-    /// asymmetric deposits) — the resolver must refuse it with a message
-    /// that says so, rather than quarantine-looping.
+    /// The proportional deposit path refuses an asymmetric basket with a
+    /// message naming the on-chain rule. Filling such an order is the zap
+    /// path's job, not this one's.
     #[test]
     fn cs_single_sided_deposit_rejected() {
         use crate::sundaev4::accumulator::Accumulator;
@@ -1757,6 +1757,288 @@ mod tests {
             err.contains("asymmetric"),
             "error should explain the on-chain rule, got: {err}"
         );
+    }
+
+    /// A single-asset deposit into a two-asset CS pool fills as a zap: a
+    /// rebalancing swap entry (tag 3) followed by the target-pinned deposit
+    /// entry (tag 6) it makes possible, both on the same pool, settling into
+    /// one fulfillment.
+    #[test]
+    fn cs_zap_single_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset, 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("single-asset CS deposit should fill as a zap");
+
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 1);
+        let batch = &plan.batches[0];
+        assert_eq!(batch.zaps.len(), 1);
+        assert_eq!(
+            batch.ops_order.len(),
+            2,
+            "a zap emits a swap entry and a deposit entry",
+        );
+        let zap = &batch.zaps[0];
+        assert!(zap.lp_minted.is_positive(), "zap must mint LP");
+        assert!(
+            zap.target_delta_v.is_some(),
+            "CS deposit step must declare t"
+        );
+        assert!(
+            zap.swap_deltas.iter().any(|d| d.is_positive())
+                && zap.swap_deltas.iter().any(|d| d.is_negative()),
+            "the swap step must move value between assets",
+        );
+        // check_basic_consumption bounds what leaves the order by its
+        // declared offer, summed across both steps.
+        for i in 0..zap.swap_deltas.len() {
+            let net = &zap.swap_deltas[i] + &zap.deposit_dx[i];
+            let offered = if i == 0 {
+                BigInt::from(10_000_019)
+            } else {
+                BigInt::from(0)
+            };
+            assert!(
+                net <= offered,
+                "asset {i} consumes {net} of {offered} offered"
+            );
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("CS zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
+    }
+
+    /// A batch holding nothing but zaps still counts as work. The dispatch
+    /// loop reads `order_count` to decide whether a plan is worth building and
+    /// `order_inputs` to quarantine a failing one, so a zap missing from either
+    /// is a batch that never submits or an order that never backs off.
+    #[test]
+    fn zap_only_accumulator_reports_its_order() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset, 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("zap should resolve");
+
+        assert_eq!(accum.order_count(), 1);
+        assert!(!accum.is_empty());
+        assert_eq!(accum.order_inputs(), vec![&order.input]);
+    }
+
+    /// The two-asset curves reach the same split by bisection rather than by
+    /// the constant-sum closed form: the over-weighted side funds the swap and
+    /// the other side receives it, leaving a basket the deposit pin can take
+    /// whole.
+    #[test]
+    fn cp_zap_swap_splits_the_offer() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(
+            &env,
+            0xDD,
+            token_a(),
+            1_000_000_000,
+            token_e(),
+            2_000_000_000,
+        );
+        let offered = vec![BigInt::from(10_000_000), BigInt::from(0)];
+
+        let deltas = crate::sundaev4::batch::plan_zap_swap(
+            &pool.pool_type,
+            &pool.pool_datum.assets,
+            &pool.pool_datum.total_lp,
+            &offered,
+        )
+        .expect("a single-asset CP offer should split");
+
+        assert!(deltas[0].is_positive(), "the offered side funds the swap");
+        assert!(deltas[1].is_negative(), "the other side is paid out");
+        assert!(
+            deltas[0] < offered[0],
+            "the swap spends only part of the offer"
+        );
+        // The deposit pin is capped by whichever side is scarcer against the
+        // POST-swap reserves, so that is where the remaining basket has to be
+        // proportional.
+        let rem_a = &offered[0] - &deltas[0];
+        let rem_b = -&deltas[1];
+        let after_a = &pool.pool_datum.assets[0].1 + &deltas[0];
+        let after_b = &pool.pool_datum.assets[1].1 + &deltas[1];
+        let lhs = &rem_a * &after_b;
+        let rhs = &rem_b * &after_a;
+        let bigger = if lhs > rhs { lhs.clone() } else { rhs.clone() };
+        let gap = if lhs > rhs { &lhs - &rhs } else { &rhs - &lhs };
+        assert!(
+            &gap * &BigInt::from(1000) < bigger,
+            "split leaves the basket more than 0.1% off proportional",
+        );
+    }
+
+    /// An offer worth as much as the pool can't be rebalanced against it: the
+    /// walk toward the post-swap reserves would move them further each pass
+    /// than the pass corrects. The refusal has to name that, because the
+    /// downstream deposit would otherwise blame the basket's proportions.
+    #[test]
+    fn oversized_zap_offer_is_refused_by_name() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(45),
+            den: BigInt::from(10000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_603_884_794), (token_e(), 386_232_429)],
+            vec![BigInt::from(48), BigInt::from(398)],
+            cs_fee,
+        );
+        let offered = vec![
+            BigInt::from(2_649_386_506i64),
+            BigInt::from(2_929_443_229i64),
+        ];
+
+        let err = crate::sundaev4::batch::plan_zap_swap(
+            &pool.pool_type,
+            &pool.pool_datum.assets,
+            &pool.pool_datum.total_lp,
+            &offered,
+        )
+        .expect_err("an offer worth more than the pool must be refused");
+        assert!(
+            err.contains("too large to rebalance against"),
+            "refusal should name the size, got: {err}",
+        );
+    }
+
+    /// A partial basket on a three-asset CS pool zaps the same way: the two
+    /// offered assets fund one swap entry that pays out the third, and the
+    /// deposit entry then takes all three in proportion.
+    #[test]
+    fn cs_zap_partial_basket_three_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![
+                (token_a(), 1_000_000_000),
+                (token_e(), 1_000_000_000),
+                (token_f(), 1_000_000_000),
+            ],
+            vec![
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+            ],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_000), (token_e(), 5_000_000)],
+            lp_asset,
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("partial basket on a 3-asset CS pool should fill as a zap");
+
+        let plan = accum.into_plan();
+        let zap = &plan.batches[0].zaps[0];
+        assert_eq!(zap.swap_deltas.len(), 3);
+        assert!(zap.lp_minted.is_positive());
+        assert!(
+            zap.deposit_dx.iter().all(|d| d.is_positive()),
+            "the deposit step takes every pool asset",
+        );
+
+        // Aiming the target basket at the POST-swap reserves is what keeps the
+        // fill tight: a pre-swap target strands whichever side the swap moved
+        // furthest, and stranded assets inflate the fulfillment's min-UTxO.
+        let offered = [
+            BigInt::from(10_000_000),
+            BigInt::from(5_000_000),
+            BigInt::from(0),
+        ];
+        for (i, offer) in offered.into_iter().enumerate() {
+            let leftover = &offer - &(&zap.swap_deltas[i] + &zap.deposit_dx[i]);
+            assert!(
+                leftover < BigInt::from(16),
+                "asset {i} strands {leftover} of the offer",
+            );
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("3-asset CS zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
     }
 
     /// A route-module order whose constraint carries a non-empty pool
