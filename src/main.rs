@@ -45,6 +45,7 @@ use crate::sundaev3::{SundaeV3HistoricalState, SundaeV3Indexer, SundaeV3Update};
 use crate::sundaev4::{SundaeV4HistoricalState, SundaeV4Indexer};
 
 #[derive(clap::Parser, Clone, Debug)]
+#[command(version)]
 struct Args {
     #[arg(short, long)]
     config: Vec<String>,
