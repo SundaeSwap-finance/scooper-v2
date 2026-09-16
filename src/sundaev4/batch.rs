@@ -894,8 +894,12 @@ pub fn plan_zap_swap(
             }
             // The over-weighted side funds the swap, compared as
             // `offered_0/r_0` against `offered_1/r_1`.
-            let (i, j) = if &offered_per_pool[0] * reserves[1] > &offered_per_pool[1] * reserves[0]
-            {
+            let lhs = &offered_per_pool[0] * reserves[1];
+            let rhs = &offered_per_pool[1] * reserves[0];
+            if lhs == rhs {
+                return Err("zap basket is already proportional — a plain deposit fills it".into());
+            }
+            let (i, j) = if lhs > rhs {
                 (0usize, 1usize)
             } else {
                 (1usize, 0usize)
