@@ -400,12 +400,14 @@ pub fn build_multi_pool_scoop_tx(
     struct PerPoolData {
         transcript: Vec<TranscriptEntry>,
         updated_datum: PoolDatum,
-        /// Sum of LP minted by all deposits in this batch. Zero for swap-only
-        /// batches. Used to drive the pool_mint policy's LP mint entry below.
+        /// LP the preminted reserve could not cover, minted under pool_mint.
+        /// Zero whenever the reserve served every deposit — the usual case —
+        /// and for swap-only batches.
         lp_minted: BigInt,
-        /// Sum of LP burned by all withdraws in this batch. Zero unless there
-        /// are withdraws. The pool_mint entry uses `lp_minted - lp_burned`.
-        lp_burned: BigInt,
+        /// Net change of the preminted reserve: withdrawn LP returned minus
+        /// deposit LP drawn. The pool output's LP balance moves by exactly
+        /// this much.
+        lp_reserve_delta: BigInt,
         /// Effective dy for each swap in this batch (used for direct, non-
         /// routed fulfillment). Routed-order fulfillment reads from
         /// `route_states[route_idx].final_output` instead.
@@ -436,7 +438,10 @@ pub fn build_multi_pool_scoop_tx(
     let mut per_pool_running_circ_lp: Vec<BigInt> =
         batches.iter().map(|b| b.pool.pool_datum.circulating_lp.clone()).collect();
     let mut per_pool_lp_minted: Vec<BigInt> = vec![BigInt::from(0); m_pools];
-    let mut per_pool_lp_burned: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    // Deposits draw their LP from the preminted reserve and withdraws return
+    // theirs to it; only a deposit the reserve can't cover is minted.
+    let mut per_pool_running_preminted: Vec<BigInt> =
+        batches.iter().map(|b| b.pool.pool_datum.preminted_lp.clone()).collect();
     let mut per_pool_cum_gross_fb: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_cum_protocol_lp: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_transcripts: Vec<Vec<TranscriptEntry>> = vec![Vec::new(); m_pools];
@@ -556,6 +561,7 @@ pub fn build_multi_pool_scoop_tx(
         let running_assets = &mut per_pool_running_assets[batch_idx];
         let running_total_lp = &mut per_pool_running_total_lp[batch_idx];
         let running_circ_lp = &mut per_pool_running_circ_lp[batch_idx];
+        let running_preminted = &mut per_pool_running_preminted[batch_idx];
 
         let prev_assets = running_assets.clone();
 
@@ -767,7 +773,11 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 *running_total_lp = &*running_total_lp + &z.lp_minted;
                 *running_circ_lp = &*running_circ_lp + &z.lp_minted;
-                per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &z.lp_minted;
+                if *running_preminted >= z.lp_minted {
+                    *running_preminted = &*running_preminted - &z.lp_minted;
+                } else {
+                    per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &z.lp_minted;
+                }
                 if let Some(t) = &z.target_delta_v {
                     op_data_override = Some(t.clone().to_plutus());
                 }
@@ -780,7 +790,11 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 *running_total_lp = &*running_total_lp + &d.lp_minted;
                 *running_circ_lp = &*running_circ_lp + &d.lp_minted;
-                per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &d.lp_minted;
+                if *running_preminted >= d.lp_minted {
+                    *running_preminted = &*running_preminted - &d.lp_minted;
+                } else {
+                    per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &d.lp_minted;
+                }
                 // cs_check's target-pinned deposit reads the declared value
                 // delta t from operation_data.
                 if let Some(t) = &d.target_delta_v {
@@ -795,7 +809,7 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 *running_total_lp = &*running_total_lp - &w.lp_burned;
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
-                per_pool_lp_burned[batch_idx] = &per_pool_lp_burned[batch_idx] + &w.lp_burned;
+                *running_preminted = &*running_preminted + &w.lp_burned;
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
                 // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
                 // from asset deltas, so any sentinel tag works.
@@ -839,7 +853,7 @@ pub fn build_multi_pool_scoop_tx(
                 assets: running_assets.clone(),
                 total_lp: running_total_lp.clone(),
                 circulating_lp: running_circ_lp.clone(),
-                preminted_lp: batch.pool.pool_datum.preminted_lp.clone(),
+                preminted_lp: running_preminted.clone(),
             },
             fee_budget: submitted_fee_budget,
             operation_tag,
@@ -882,15 +896,14 @@ pub fn build_multi_pool_scoop_tx(
     for (i, batch) in batches.iter().enumerate() {
         let pool = &batch.pool;
         let final_total_lp = per_pool_running_total_lp[i].clone();
-        let final_circ_lp =
-            &pool.pool_datum.circulating_lp + &per_pool_lp_minted[i] - &per_pool_lp_burned[i];
+        let final_circ_lp = per_pool_running_circ_lp[i].clone();
         let final_assets_actual = per_pool_running_assets[i].clone();
 
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
             total_lp: final_total_lp,
             circulating_lp: final_circ_lp,
-            preminted_lp: pool.pool_datum.preminted_lp.clone(),
+            preminted_lp: per_pool_running_preminted[i].clone(),
             identifier: pool.pool_datum.identifier.clone(),
             actions: pool.pool_datum.actions.clone(),
             module_state: pool.pool_datum.module_state.clone(),
@@ -902,7 +915,7 @@ pub fn build_multi_pool_scoop_tx(
             transcript: std::mem::take(&mut per_pool_transcripts[i]),
             updated_datum,
             lp_minted: per_pool_lp_minted[i].clone(),
-            lp_burned: per_pool_lp_burned[i].clone(),
+            lp_reserve_delta: &per_pool_running_preminted[i] - &pool.pool_datum.preminted_lp,
             effective_swap_dys: std::mem::take(&mut per_pool_effective_swap_dys[i]),
             final_assets_actual,
         });
@@ -1328,20 +1341,16 @@ pub fn build_multi_pool_scoop_tx(
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
 
-    // pool_mint is only needed when the tx actually mints or burns LP tokens
-    // (deposits/withdraws). Pure-swap batches grow the protocol_lp gap inside
-    // each pool's datum but don't mint anything on chain — pool_lib's
-    // check_lp_accounting compares `circulating + preminted` (not total_lp)
-    // against `net_lp_minted`, so it's satisfied by 0 mint when only swaps
-    // happen. The gap can be minted later by a separate "claim" tx. Skipping
-    // pool_mint's ref script here drops ~5KB of ref_script_bytes per
-    // pure-swap scoop, which on the tiered Conway fee saves real lovelace.
-    let has_lp_mint_or_burn = {
+    // pool_mint is only needed when the preminted reserve couldn't cover a
+    // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
+    // pure-swap batches grow the protocol_lp gap inside the datum — pool_lib's
+    // check_lp_accounting compares `circulating + preminted` against
+    // `net_lp_minted`, which all of those leave at zero. Skipping pool_mint's
+    // ref script drops ~5KB of ref_script_bytes, which on the tiered Conway
+    // fee saves real lovelace.
+    let has_lp_mint = {
         use num_traits::Zero;
-        per_pool_lp_minted
-            .iter()
-            .zip(per_pool_lp_burned.iter())
-            .any(|(m, b)| !(m - b).clone().unwrap().is_zero())
+        per_pool_lp_minted.iter().any(|m| !m.clone().unwrap().is_zero())
     };
 
     let fs_redeemer = FeeSplitRedeemer::Operate {
@@ -1359,7 +1368,7 @@ pub fn build_multi_pool_scoop_tx(
         exec.module_scripts.fee_split.ref_utxo.0.clone(),
         exec.module_scripts.fairness.ref_utxo.0.clone(),
     ];
-    if has_lp_mint_or_burn {
+    if has_lp_mint {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
     if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
@@ -1915,10 +1924,12 @@ pub fn build_multi_pool_scoop_tx(
     for (pos, &batch_idx) in pool_output_order.iter().enumerate() {
         let batch = &batches[batch_idx];
         let pool_datum_pd = per_pool[batch_idx].updated_datum.clone().to_plutus();
+        let lp_asset = pool_lp_asset(exec, &batch.pool)?;
         let pool_output_value = build_pool_output_value(
             &batch.pool,
             &per_pool[batch_idx].final_assets_actual,
             pool_ada_deltas[batch_idx],
+            Some((&lp_asset, &per_pool[batch_idx].lp_reserve_delta)),
         )?;
         let mut out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
@@ -2459,22 +2470,19 @@ pub fn build_multi_pool_scoop_tx(
         wallet_change = Some(((outputs.len() - 1) as u64, change_val));
     }
 
-    // ── Step 8.5: LP mint/burn for deposits and withdraws ──────────────────
+    // ── Step 8.5: LP mint for deposits the reserve couldn't cover ─────────
     //
-    // Each pool with a non-zero net LP delta (`lp_minted - lp_burned`) emits
-    // one entry under the pool_mint policy with asset name
-    // `0014df10 ++ pool_ident`. Quantity is positive for net mint (deposit-
-    // heavy) and negative for net burn (withdraw-heavy). The minting redeemer
-    // is `PoolMintRedeemer::MintLP { pool_ident }` — the policy's `only_own_lp`
-    // check doesn't constrain sign, so the same redeemer covers both.
-    // The mint redeemer's index matches the policy's position in the sorted
-    // mint map (always 0 since we only use pool_mint).
+    // Each pool with LP left to mint emits one entry under the pool_mint
+    // policy with asset name `0014df10 ++ pool_ident`; the redeemer is
+    // `PoolMintRedeemer::MintLP { pool_idents }`. Withdraws never burn — the
+    // LP returns to the pool's preminted reserve. The mint redeemer's index
+    // matches the policy's position in the sorted mint map.
     let mint = {
         use num_traits::{ToPrimitive, Zero};
         use pallas_primitives::{NonEmptyKeyValuePairs, NonZeroInt};
         let mut asset_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
         for (i, batch) in batches.iter().enumerate() {
-            let net = &per_pool[i].lp_minted - &per_pool[i].lp_burned;
+            let net = per_pool[i].lp_minted.clone();
             if net.is_zero() {
                 continue;
             }
@@ -2528,7 +2536,7 @@ pub fn build_multi_pool_scoop_tx(
                 let pool_idents: Vec<_> = batches
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| !(&per_pool[*i].lp_minted - &per_pool[*i].lp_burned).is_zero())
+                    .filter(|(i, _)| !per_pool[*i].lp_minted.is_zero())
                     .map(|(_, b)| b.pool.pool_datum.identifier.clone())
                     .collect();
                 let r = PoolMintRedeemer::MintLP { pool_idents };
@@ -3004,6 +3012,11 @@ pub fn build_multi_pool_scoop_tx(
             }
             predicted_value.insert(asset, new_amount.clone());
         }
+        {
+            let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+            let cur = predicted_value.get(&lp_asset);
+            predicted_value.insert(&lp_asset, &cur + &per_pool[out_idx].lp_reserve_delta);
+        }
         // Set predicted ADA to match the actual pool output (input ADA + delta)
         {
             use num_traits::ToPrimitive;
@@ -3171,6 +3184,7 @@ fn build_pool_output_value(
     pool: &SundaeV4Pool,
     new_assets: &[(AssetClass, BigInt)],
     ada_delta: i64,
+    lp_reserve: Option<(&AssetClass, &BigInt)>,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
@@ -3223,6 +3237,24 @@ fn build_pool_output_value(
         }
     }
 
+    // LP moved between the preminted reserve and this scoop's orders.
+    if let Some((lp_asset, delta)) = lp_reserve {
+        let delta: i128 =
+            delta.clone().unwrap().to_i128().context("LP reserve delta doesn't fit in i128")?;
+        if delta != 0 {
+            let tokens = policy_map.entry(lp_asset.policy.clone()).or_default();
+            let next = tokens.get(&lp_asset.token).copied().unwrap_or(0) as i128 + delta;
+            anyhow::ensure!(
+                next >= 0,
+                "pool output LP balance would go negative ({next})"
+            );
+            if next == 0 {
+                tokens.remove(&lp_asset.token);
+            } else {
+                tokens.insert(lp_asset.token.clone(), next as u64);
+            }
+        }
+    }
     if policy_map.is_empty() {
         return Ok(ConwayValue::Coin(lovelace));
     }
