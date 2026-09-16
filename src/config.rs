@@ -97,7 +97,11 @@ mod tests {
     /// off; this test keeps it off for every environment config.
     #[test]
     fn peer_sharing_is_disabled_for_every_environment() {
-        for file in ["config/preview-v4.json", "config/preprod-v4.json", "config/mainnet.json"] {
+        for file in [
+            "config/preview-v4.json",
+            "config/preprod-v4.json",
+            "config/mainnet.json",
+        ] {
             let config = load_config([file]).expect("config loads");
             let acropolis = config.acropolis_config().expect("acropolis config builds");
             let enabled = acropolis
