@@ -309,10 +309,15 @@ pub fn build_multi_pool_scoop_tx(
     let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
     let n_withdraw_orders: usize = batches.iter().map(|b| b.withdraws.len()).sum();
+    let n_zap_orders: usize = batches.iter().map(|b| b.zaps.len()).sum();
     let n_claim_orders: usize = batches.iter().map(|b| b.claims.len()).sum();
     let n_conversion_orders: usize = plan.conversions.iter().filter(|c| c.primary).count();
-    let n_orders: usize =
-        n_swap_orders + n_deposit_orders + n_withdraw_orders + n_claim_orders + n_conversion_orders;
+    let n_orders: usize = n_swap_orders
+        + n_deposit_orders
+        + n_withdraw_orders
+        + n_zap_orders
+        + n_claim_orders
+        + n_conversion_orders;
     // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
     // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
     if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
@@ -470,6 +475,17 @@ pub fn build_multi_pool_scoop_tx(
         .iter()
         .map(|b| match &b.pool.pool_type {
             PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_SWAP),
+            PoolType::ConstantProduct { .. } => BigInt::from(100),
+            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+        })
+        .collect();
+
+    // Per-pool operation_tag for deposit entries. CS dispatches on tag==6
+    // (`tag_deposit` in cs_check.ak); CP/CL infer from asset deltas.
+    let per_pool_deposit_tag: Vec<BigInt> = batches
+        .iter()
+        .map(|b| match &b.pool.pool_type {
+            PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_DEPOSIT),
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         })
@@ -721,6 +737,42 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 (per_pool_swap_tag[batch_idx].clone(), fb)
             }
+            crate::sundaev4::batch::BatchOp::ZapSwap(i) => {
+                let z = &batch.zaps[*i];
+                op_data_override = Some(order_ref_to_plutus(&z.order.input));
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 + &z.swap_deltas[idx];
+                }
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type,
+                    &prev_assets,
+                    running_assets,
+                    running_total_lp,
+                );
+                tracing::debug!(
+                    walk = "op-zap-swap",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    zap_idx = *i,
+                    deltas = ?z.swap_deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    fee_budget = %fb,
+                    "streaming walk: zap swap op",
+                );
+                (per_pool_swap_tag[batch_idx].clone(), fb)
+            }
+            crate::sundaev4::batch::BatchOp::ZapDeposit(i) => {
+                let z = &batch.zaps[*i];
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 + &z.deposit_dx[idx];
+                }
+                *running_total_lp = &*running_total_lp + &z.lp_minted;
+                *running_circ_lp = &*running_circ_lp + &z.lp_minted;
+                per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &z.lp_minted;
+                if let Some(t) = &z.target_delta_v {
+                    op_data_override = Some(t.clone().to_plutus());
+                }
+                (per_pool_deposit_tag[batch_idx].clone(), BigInt::from(0))
+            }
             crate::sundaev4::batch::BatchOp::Deposit(i) => {
                 let d = &batch.deposits[*i];
                 for (idx, amt) in running_assets.iter_mut().enumerate() {
@@ -729,19 +781,12 @@ pub fn build_multi_pool_scoop_tx(
                 *running_total_lp = &*running_total_lp + &d.lp_minted;
                 *running_circ_lp = &*running_circ_lp + &d.lp_minted;
                 per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &d.lp_minted;
-                let dep_tag = match &pool_type {
-                    PoolType::ConstantSum { .. } => {
-                        BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
-                    }
-                    PoolType::ConstantProduct { .. } => BigInt::from(100),
-                    PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                };
                 // cs_check's target-pinned deposit reads the declared value
                 // delta t from operation_data.
                 if let Some(t) = &d.target_delta_v {
                     op_data_override = Some(t.clone().to_plutus());
                 }
-                (dep_tag, BigInt::from(0))
+                (per_pool_deposit_tag[batch_idx].clone(), BigInt::from(0))
             }
             crate::sundaev4::batch::BatchOp::Withdraw(i) => {
                 let w = &batch.withdraws[*i];
@@ -877,6 +922,7 @@ pub fn build_multi_pool_scoop_tx(
         Swap(usize),     // index into batch.swaps
         Deposit(usize),  // index into batch.deposits
         Withdraw(usize), // index into batch.withdraws
+        Zap(usize),      // index into batch.zaps
         Claim(usize),    // index into batch.claims
         /// Index into plan.conversions — a conversion leg that IS the
         /// order's primary op (pure-conversion orders; batch_idx unused).
@@ -907,12 +953,17 @@ pub fn build_multi_pool_scoop_tx(
                 kind: FlatOrderKind::Withdraw(wi),
                 order_ref: w.order.input.0.clone(),
             });
+            let zps = b.zaps.iter().enumerate().map(move |(zi, z)| FlatOrder {
+                batch_idx: bi,
+                kind: FlatOrderKind::Zap(zi),
+                order_ref: z.order.input.0.clone(),
+            });
             let cls = b.claims.iter().enumerate().map(move |(ci, c)| FlatOrder {
                 batch_idx: bi,
                 kind: FlatOrderKind::Claim(ci),
                 order_ref: c.order.input.0.clone(),
             });
-            swaps.chain(deps).chain(wds).chain(cls)
+            swaps.chain(deps).chain(wds).chain(zps).chain(cls)
         })
         .collect();
     let mut flat_orders = flat_orders;
@@ -1204,6 +1255,9 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Withdraw(i) => {
                 batches[flat.batch_idx].withdraws[*i].order.datum.config_token.clone()
             }
+            FlatOrderKind::Zap(i) => {
+                batches[flat.batch_idx].zaps[*i].order.datum.config_token.clone()
+            }
             FlatOrderKind::Claim(i) => {
                 batches[flat.batch_idx].claims[*i].order.datum.config_token.clone()
             }
@@ -1225,6 +1279,10 @@ pub fn build_multi_pool_scoop_tx(
                 FlatOrderKind::Withdraw(i) => (
                     &flat.order_ref,
                     &batches[flat.batch_idx].withdraws[*i].order.datum,
+                ),
+                FlatOrderKind::Zap(i) => (
+                    &flat.order_ref,
+                    &batches[flat.batch_idx].zaps[*i].order.datum,
                 ),
                 FlatOrderKind::Claim(i) => (
                     &flat.order_ref,
@@ -1927,6 +1985,7 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Swap(i) => &batches[fo_meta.batch_idx].swaps[*i].order,
             FlatOrderKind::Deposit(i) => &batches[fo_meta.batch_idx].deposits[*i].order,
             FlatOrderKind::Withdraw(i) => &batches[fo_meta.batch_idx].withdraws[*i].order,
+            FlatOrderKind::Zap(i) => &batches[fo_meta.batch_idx].zaps[*i].order,
             FlatOrderKind::Claim(i) => &batches[fo_meta.batch_idx].claims[*i].order,
             FlatOrderKind::Conversion(i) => &plan.conversions[*i].order,
         };
@@ -2138,6 +2197,21 @@ pub fn build_multi_pool_scoop_tx(
                     &dep.dx,
                     &lp_asset,
                     &dep.lp_minted,
+                    actual_fee,
+                )?
+            }
+            FlatOrderKind::Zap(i) => {
+                let z = &batches[fo_meta.batch_idx].zaps[*i];
+                let lp_asset = pool_lp_asset(exec, &batches[fo_meta.batch_idx].pool)?;
+                let net_in: Vec<BigInt> = (0..z.swap_deltas.len())
+                    .map(|k| &z.swap_deltas[k] + &z.deposit_dx[k])
+                    .collect();
+                build_deposit_fulfillment_value(
+                    &z.order.value,
+                    &batches[fo_meta.batch_idx].pool.pool_datum.assets,
+                    &net_in,
+                    &lp_asset,
+                    &z.lp_minted,
                     actual_fee,
                 )?
             }
@@ -2704,6 +2778,17 @@ pub fn build_multi_pool_scoop_tx(
                     address: order_addr_bytes.clone(),
                     value: wd.order.value.clone(),
                     datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
+                    script_ref: None,
+                },
+            );
+        }
+        for z in &batch.zaps {
+            resolved_inputs.insert(
+                z.order.input.clone(),
+                ResolvedTxOut {
+                    address: order_addr_bytes.clone(),
+                    value: z.order.value.clone(),
+                    datum: DatumOption::InlineDatum(z.order.datum.clone().to_plutus()),
                     script_ref: None,
                 },
             );
