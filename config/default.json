@@ -18,7 +18,8 @@
       "genesis-bootstrapper": {},
       "peer-network-interface": {
         "block-topic": "cardano.block.proposed",
-        "sync-point": "dynamic"
+        "sync-point": "dynamic",
+        "peer-sharing-enabled": false
       },
       "mithril-snapshot-fetcher": {
         "block-publish-topic": "cardano.block.proposed",

@@ -85,3 +85,25 @@ impl config::Source for LiteralSource {
         Ok(self.0.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scooper follows one configured node. Peer sharing defaults to `true`
+    /// upstream, which makes it dial peers it learned from that node — including,
+    /// on a host that also runs a node for another network, a peer that refuses
+    /// the handshake on a network-magic mismatch. `config/default.json` turns it
+    /// off; this test keeps it off for every environment config.
+    #[test]
+    fn peer_sharing_is_disabled_for_every_environment() {
+        for file in ["config/preview-v4.json", "config/preprod-v4.json", "config/mainnet.json"] {
+            let config = load_config([file]).expect("config loads");
+            let acropolis = config.acropolis_config().expect("acropolis config builds");
+            let enabled = acropolis
+                .get_bool("module.peer-network-interface.peer-sharing-enabled")
+                .unwrap_or(true);
+            assert!(!enabled, "{file}: peer sharing must be disabled");
+        }
+    }
+}
