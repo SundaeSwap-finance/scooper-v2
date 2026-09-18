@@ -31,8 +31,8 @@
     "cost-per-step-lovelace": 500000,
     "submit-url": "https://cardano-mainnet.blockfrost.io/api/v0/tx/submit?project_id=REPLACE_WITH_MAINNET_BLOCKFROST_PROJECT_ID",
     "fee": [
-     3,
-     1000
+     25,
+     10000
     ],
     "protocol-share": [
      1,
