@@ -34,7 +34,6 @@ impl PoolAllowlists {
         self.0.is_empty()
     }
 
-    /// Pool idents (hex) carrying an allowlist.
     pub fn restricted_idents(&self) -> impl Iterator<Item = (&String, usize)> {
         self.0.iter().map(|(ident, list)| (ident, list.credentials.len()))
     }

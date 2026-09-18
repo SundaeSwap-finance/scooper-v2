@@ -828,10 +828,8 @@ impl Scooper {
         // redeemer (in canonical input order).
         let mut strategy_executions: BTreeMap<TransactionInput, pallas_primitives::PlutusData> =
             BTreeMap::new();
-        // The allowlist gate reads a strategy order's `auth` and
-        // `final_destinations`, which the synthesized swap candidate below
-        // discards along with the Strategy constraint. Captured here, where
-        // the order is still decoded.
+        // The only site where a strategy order is still decoded; the
+        // allowlist gate needs its constraints downstream.
         let mut strategy_constraints: BTreeMap<
             TransactionInput,
             crate::sundaev4::StrategyConstraints,
@@ -1419,10 +1417,8 @@ impl Scooper {
                     if offer_asset == ask_asset {
                         continue;
                     }
-                    // Filtered after the overlay, not before: current_pool_view
-                    // re-inserts every pool the batch has already touched, so a
-                    // restricted pool filtered out of `pools_filtered` returns
-                    // as soon as one permitted order has used it.
+                    // Filtered after the overlay, never before — see
+                    // `PoolAllowlists::retain_visible`.
                     let pool_view = exec.pool_allowlists.retain_visible(
                         candidate.current_pool_view(&pools_filtered),
                         order,
