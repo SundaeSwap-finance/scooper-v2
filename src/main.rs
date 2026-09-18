@@ -82,6 +82,12 @@ async fn main() -> Result<()> {
         let network_name = config.network_name();
         v4.set_network(sundaev4::AddressNetwork::from_network_name(&network_name));
         info!(network_name, network = ?v4.network, "v4 address network");
+        // Refuse to start an executor that can't reference its own modules,
+        // rather than failing every scoop at build time.
+        if let Err(e) = v4.check_execution_ref_utxos() {
+            error!("{e}");
+            process::exit(1);
+        }
     }
     if let Some(ref mut v4) = protocol.v4
         && let Some(ref mut exec) = v4.execution
@@ -175,17 +181,17 @@ async fn main() -> Result<()> {
                 swap_order_hash: v4
                     .execution
                     .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.swap_order))
+                    .map(|e| module_hash(&e.module_scripts().swap_order))
                     .unwrap_or_default(),
                 basic_order_hash: v4
                     .execution
                     .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.basic_order))
+                    .map(|e| module_hash(&e.module_scripts().basic_order))
                     .unwrap_or_default(),
                 strategy_order_hash: v4
                     .execution
                     .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.strategy_order))
+                    .map(|e| module_hash(&e.module_scripts().strategy_order))
                     .unwrap_or_default(),
             };
             // Chained execution needs both the execute flag and an execution

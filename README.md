@@ -24,6 +24,8 @@ The scooper is powered by the [Acropolis](https://github.com/input-output-hk/acr
 
 State goes in SQLite at `persistence.sqlite.filename`, resolved against the working directory. Without a filename the whole index lives in memory and is rebuilt on every start. You should probably provide a filename.
 
+A v4 config needs `protocol.v4.module-scripts`: every module script in the deployment, keyed by role (`pool`, `order`, `fee-split`, `fairness`, `pool-mint` and `settings` are required; the pool-type and order-constraint modules are optional). The indexer classifies pools and order constraints by these hashes whether or not this scooper executes, so they describe the deployment rather than the operator. Each entry's `ref-utxo` — where the script is published on chain — is only needed to build transactions, so it may be omitted when running as an indexer; the scooper refuses to start if `execution` is set and any declared module lacks one.
+
 A v4 execution config needs these additional settings
 
 | Config key | Needs |

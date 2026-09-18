@@ -90,7 +90,7 @@ impl Blueprint {
 
         Ok(ScriptRefInfo {
             hash: script_hash,
-            ref_utxo,
+            ref_utxo: Some(ref_utxo),
             script_cbor: validator.compiled_code.clone(),
         })
     }
@@ -176,7 +176,7 @@ impl Blueprint {
 
             Ok(ScriptRefInfo {
                 hash: script_hash,
-                ref_utxo,
+                ref_utxo: Some(ref_utxo),
                 script_cbor: validator.compiled_code.clone(),
             })
         }
@@ -364,7 +364,7 @@ mod tests {
             hex::encode(info.hash),
             "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd"
         );
-        assert_eq!(info.ref_utxo.0.index, 0);
+        assert_eq!(info.ref_input().0.index, 0);
     }
 
     /// Smoke test against the deployed preview blueprint. Verifies that the

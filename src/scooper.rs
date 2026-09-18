@@ -1391,7 +1391,7 @@ impl Scooper {
                     // blend across parallel paths (min_received is their
                     // only on-chain output check).
                     let route_constraint_data =
-                        exec.module_scripts.route_order.as_ref().and_then(|m| {
+                        exec.module_scripts().route_order.as_ref().and_then(|m| {
                             order
                                 .datum
                                 .constraints
@@ -1524,7 +1524,7 @@ impl Scooper {
                     // cover the scoop cost.
                     if let Err(e) = &add_result {
                         let is_swap_module = exec
-                            .module_scripts
+                            .module_scripts()
                             .swap_order
                             .as_ref()
                             .map(|m| {
@@ -2885,7 +2885,7 @@ fn carries_route_constraint(
     exec: &ScooperExecution,
     order: &crate::sundaev4::SundaeV4Order,
 ) -> bool {
-    let Some(route) = exec.module_scripts.route_order.as_ref() else {
+    let Some(route) = exec.module_scripts().route_order.as_ref() else {
         return false;
     };
     order.datum.constraints.iter().any(|(h, _)| h.as_slice() == route.hash.as_ref())

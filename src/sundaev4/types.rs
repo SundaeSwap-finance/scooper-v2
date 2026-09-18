@@ -1061,7 +1061,10 @@ pub struct ScooperExecution {
     pub submit_url: String,
     pub fee: (u64, u64),
     pub protocol_share: (u64, u64),
-    pub module_scripts: ModuleScripts,
+    /// Set at startup by `SundaeV4Protocol::set_network`; read via
+    /// [`ScooperExecution::module_scripts`].
+    #[serde(skip)]
+    pub modules: Option<ModuleScripts>,
     pub plutus_v3_cost_model: Vec<i64>,
     /// PlutusV2 cost model — required only for partner-protocol legs whose
     /// validators are V2 (Butane's mint/spend/upgradable). Absent = V2
@@ -1150,6 +1153,12 @@ pub(crate) fn default_budget_padding() -> (u64, u64) {
 }
 
 impl ScooperExecution {
+    /// The deployment's module scripts, handed over by
+    /// `SundaeV4Protocol::set_network` at startup.
+    pub fn module_scripts(&self) -> &ModuleScripts {
+        self.modules.as_ref().expect("set_network populates execution modules")
+    }
+
     /// If `scooper_secret_key_file` is set, read the file and populate
     /// `scooper_secret_key`. Either source is normalized to raw hex of a
     /// 32-byte or 64-byte key — the two forms every downstream key reader
@@ -1267,18 +1276,82 @@ pub struct ModuleScripts {
     pub fee_constraint: Option<ScriptRefInfo>,
 }
 
+impl ModuleScripts {
+    /// Every module this deployment declares, as (config key, entry). The one
+    /// list behind the ref-UTxO watch set, the bootstrap script fetch and
+    /// `check_execution_ref_utxos` — they used to be maintained separately.
+    /// Hash of the `swap_order` constraint, or empty when this deployment
+    /// doesn't declare it — no order's constraint can then match it.
+    pub fn swap_order_hash(&self) -> Vec<u8> {
+        Self::opt_hash(&self.swap_order)
+    }
+
+    /// Hash of the `basic_order` constraint; see [`Self::swap_order_hash`].
+    pub fn basic_order_hash(&self) -> Vec<u8> {
+        Self::opt_hash(&self.basic_order)
+    }
+
+    /// Hash of the `strategy_order` constraint; see [`Self::swap_order_hash`].
+    pub fn strategy_order_hash(&self) -> Vec<u8> {
+        Self::opt_hash(&self.strategy_order)
+    }
+
+    fn opt_hash(slot: &Option<ScriptRefInfo>) -> Vec<u8> {
+        slot.as_ref().map(|s| s.hash.as_ref().to_vec()).unwrap_or_default()
+    }
+
+    pub fn entries(&self) -> Vec<(&'static str, &ScriptRefInfo)> {
+        let mut out: Vec<(&'static str, &ScriptRefInfo)> = vec![
+            ("pool", &self.pool),
+            ("order", &self.order),
+            ("fee-split", &self.fee_split),
+            ("fairness", &self.fairness),
+            ("pool-mint", &self.pool_mint),
+            ("settings", &self.settings),
+        ];
+        for (name, slot) in [
+            ("constant-product", &self.constant_product),
+            ("constant-sum", &self.constant_sum),
+            ("concentrated-liquidity", &self.concentrated_liquidity),
+            ("swap-order", &self.swap_order),
+            ("basic-order", &self.basic_order),
+            ("route-order", &self.route_order),
+            ("fairness-order", &self.fairness_order),
+            ("strategy-order", &self.strategy_order),
+            ("fee-constraint", &self.fee_constraint),
+        ] {
+            if let Some(sri) = slot {
+                out.push((name, sri));
+            }
+        }
+        out
+    }
+}
+
 #[serde_with::serde_as]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ScriptRefInfo {
     pub hash: ScriptHash,
-    #[serde_as(as = "serde_with::DisplayFromStr")]
-    pub ref_utxo: crate::cardano_types::TransactionInput,
+    /// Where the script is published on chain. Absent is legal for an
+    /// indexer-only deployment; `check_execution_ref_utxos` requires it
+    /// once execution is configured.
+    #[serde(default)]
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    pub ref_utxo: Option<crate::cardano_types::TransactionInput>,
     /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
     /// Hex-encoded script CBOR, populated from blueprint. Retained for serde round-trip.
     #[serde(default)]
     #[allow(dead_code)]
     pub script_cbor: Option<String>,
+}
+
+impl ScriptRefInfo {
+    /// The published script's UTxO. Only an executor reaches for this, and
+    /// `check_execution_ref_utxos` refuses to start an executor without it.
+    pub fn ref_input(&self) -> &crate::cardano_types::TransactionInput {
+        self.ref_utxo.as_ref().expect("execution config is validated to carry every ref-utxo")
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1442,6 +1515,10 @@ pub struct SundaeV4Protocol {
     pub settings_script_hash: ScriptHash,
     pub settings_nft: AssetClass,
     pub pool_nft_policy: ScriptHash,
+    /// Every module script in this deployment, by role. Required: the indexer
+    /// classifies pools and order constraints by these hashes whether or not
+    /// this operator executes. `ref-utxo` is what only an executor needs.
+    pub module_scripts: ModuleScripts,
     /// Token name (hex) of the FeeSettings settings node (docs/fee-system.md).
     /// Required to scoop fee-bearing OrderConfigs; the indexer tracks the
     /// node's UTxO + base_fee under this token at the settings address.
@@ -1463,12 +1540,39 @@ pub struct SundaeV4Protocol {
 }
 
 impl SundaeV4Protocol {
-    /// Record the address network here and on the execution config, which the
-    /// tx builder receives without the rest of the protocol config.
+    /// Record the address network and the deployment's module scripts on the
+    /// execution config, which the tx builder receives without the rest of
+    /// the protocol config.
     pub fn set_network(&mut self, network: AddressNetwork) {
         self.network = network;
+        let modules = self.module_scripts.clone();
         if let Some(exec) = &mut self.execution {
             exec.network = network;
+            exec.modules = Some(modules);
+        }
+    }
+
+    /// Ref UTxOs an executor must have been given. Everything the tx builder
+    /// unconditionally references, plus any optional module this deployment
+    /// declares — a declared module with no ref UTxO can never be scooped.
+    pub fn check_execution_ref_utxos(&self) -> Result<(), String> {
+        if self.execution.is_none() {
+            return Ok(());
+        }
+        let missing: Vec<&str> = self
+            .module_scripts
+            .entries()
+            .into_iter()
+            .filter(|(_, sri)| sri.ref_utxo.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "protocol.v4.execution is set, so these module-scripts entries need a ref-utxo: {}",
+                missing.join(", ")
+            ))
         }
     }
 }

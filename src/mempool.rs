@@ -1208,11 +1208,11 @@ mod tests {
 
         let tx = MultiEraTx::decode(&build.cbor).expect("tx decodes");
         let watch = ProtocolWatch {
-            pool_script_hash: env.exec.module_scripts.pool.hash,
-            order_script_hashes: vec![env.exec.module_scripts.order.hash],
+            pool_script_hash: env.exec.module_scripts().pool.hash,
+            order_script_hashes: vec![env.exec.module_scripts().order.hash],
             swap_order_hash: env
                 .exec
-                .module_scripts
+                .module_scripts()
                 .swap_order
                 .as_ref()
                 .unwrap()
@@ -1221,7 +1221,7 @@ mod tests {
                 .to_vec(),
             basic_order_hash: env
                 .exec
-                .module_scripts
+                .module_scripts()
                 .basic_order
                 .as_ref()
                 .unwrap()
@@ -1230,7 +1230,7 @@ mod tests {
                 .to_vec(),
             strategy_order_hash: env
                 .exec
-                .module_scripts
+                .module_scripts()
                 .strategy_order
                 .as_ref()
                 .map(|m| m.hash.as_ref().to_vec())
@@ -1290,8 +1290,8 @@ mod tests {
 
         let tx = MultiEraTx::decode(&result.cbor).expect("scoop tx decodes");
         let watch = ProtocolWatch {
-            pool_script_hash: env.exec.module_scripts.pool.hash,
-            order_script_hashes: vec![env.exec.module_scripts.order.hash],
+            pool_script_hash: env.exec.module_scripts().pool.hash,
+            order_script_hashes: vec![env.exec.module_scripts().order.hash],
             swap_order_hash: Vec::new(),
             basic_order_hash: Vec::new(),
             strategy_order_hash: Vec::new(),
