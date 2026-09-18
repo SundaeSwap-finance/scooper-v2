@@ -24,6 +24,48 @@
     "network-magic": 2,
     "execute": true
    },
+   "module-scripts": {
+    "pool": {
+     "hash": "f577d24cfa393efdb85482554acbdd5082f99acba9c17eab916cf87a",
+     "ref-utxo": "a2b26636eb37949a10a5981c650de0c74497bda2776bcf42e17e5d9402be0b15#0"
+    },
+    "order": {
+     "hash": "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b",
+     "ref-utxo": "cfd46884fdf1b6b2a91feb6ad7252f950e5dad80ad83b2939954795c093925da#0"
+    },
+    "pool-mint": {
+     "hash": "b8a18e251b3e5078c04203f1a9af52408064c5d3a4256cfcfe3f67dd",
+     "ref-utxo": "2a7b168ccffd79876d72e0be667135f023801228f2cb3b1b1090daef4d3096c6#0"
+    },
+    "settings": {
+     "hash": "43f2ee25b54dcd8150df9e9908ae890638844cd3a748ef05d8a09d09",
+     "ref-utxo": "d79180d547b06d6f97a042ee203172aac12204fd8e8cf48e5cbda86a1a0e6d99#0"
+    },
+    "fee-split": {
+     "hash": "6cec93b3ee519553eda356c36b9ef6ad91397495a4316c53fc2ce426",
+     "ref-utxo": "fac830483b6c9d216a87da316244596887394aaeeeae413dfbea8c47aae37b52#0"
+    },
+    "fairness": {
+     "hash": "f291de3ed5b01fa102764bfca6b6e8bc503a5899fc44fbc903b752c3",
+     "ref-utxo": "cff31307c7fad25428291f36c90e92eff2e5b5516f38c72944a952e6a50c8191#0"
+    },
+    "constant-sum": {
+     "hash": "fa7f4860b25488fd63f2a7f5be4e8711520d288074b01286c9f14344",
+     "ref-utxo": "3363062940377ce65d2775fea37b1e18e6672a42f4dc245d4161b5a343b910bf#0"
+    },
+    "basic-order": {
+     "hash": "4859acf5f46a50f383d16323a3c7eacf502ba732aa8874a7d3b7783e",
+     "ref-utxo": "d7b9325e631b6e2d486271462b478550f27920f1a672da4171c7eeed4228f868#0"
+    },
+    "strategy-order": {
+     "hash": "5b67b76ff03dd497083df1450caabb3a4a99feea53ad631e700173ee",
+     "ref-utxo": "3015dbd2b5571f15c900bf954674c9d42f522ba7788d48b6773c581d6dcf20c7#0"
+    },
+    "fee-constraint": {
+     "hash": "d7d1c09deb8bc8e15baae7895e57e86ab6d0cb10e2faaa6d96cd691b",
+     "ref-utxo": "04a51c07ad31edf2e8af96aa18b69afd4dabcbbcd5eb8a00a95dd4a320a242e5#0"
+    }
+   },
    "execution": {
     "scooper-secret-key": "0202020202020202020202020202020202020202020202020202020202020202",
     "max-tx-ex-mem": 16500000,
@@ -394,48 +436,6 @@
      "zero-slot": 0,
      "zero-time": 1666656000000,
      "slot-length": 1000
-    },
-    "module-scripts": {
-     "pool": {
-      "hash": "f577d24cfa393efdb85482554acbdd5082f99acba9c17eab916cf87a",
-      "ref-utxo": "a2b26636eb37949a10a5981c650de0c74497bda2776bcf42e17e5d9402be0b15#0"
-     },
-     "order": {
-      "hash": "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b",
-      "ref-utxo": "cfd46884fdf1b6b2a91feb6ad7252f950e5dad80ad83b2939954795c093925da#0"
-     },
-     "pool-mint": {
-      "hash": "b8a18e251b3e5078c04203f1a9af52408064c5d3a4256cfcfe3f67dd",
-      "ref-utxo": "2a7b168ccffd79876d72e0be667135f023801228f2cb3b1b1090daef4d3096c6#0"
-     },
-     "settings": {
-      "hash": "43f2ee25b54dcd8150df9e9908ae890638844cd3a748ef05d8a09d09",
-      "ref-utxo": "d79180d547b06d6f97a042ee203172aac12204fd8e8cf48e5cbda86a1a0e6d99#0"
-     },
-     "fee-split": {
-      "hash": "6cec93b3ee519553eda356c36b9ef6ad91397495a4316c53fc2ce426",
-      "ref-utxo": "fac830483b6c9d216a87da316244596887394aaeeeae413dfbea8c47aae37b52#0"
-     },
-     "fairness": {
-      "hash": "f291de3ed5b01fa102764bfca6b6e8bc503a5899fc44fbc903b752c3",
-      "ref-utxo": "cff31307c7fad25428291f36c90e92eff2e5b5516f38c72944a952e6a50c8191#0"
-     },
-     "constant-sum": {
-      "hash": "fa7f4860b25488fd63f2a7f5be4e8711520d288074b01286c9f14344",
-      "ref-utxo": "3363062940377ce65d2775fea37b1e18e6672a42f4dc245d4161b5a343b910bf#0"
-     },
-     "basic-order": {
-      "hash": "4859acf5f46a50f383d16323a3c7eacf502ba732aa8874a7d3b7783e",
-      "ref-utxo": "d7b9325e631b6e2d486271462b478550f27920f1a672da4171c7eeed4228f868#0"
-     },
-     "strategy-order": {
-      "hash": "5b67b76ff03dd497083df1450caabb3a4a99feea53ad631e700173ee",
-      "ref-utxo": "3015dbd2b5571f15c900bf954674c9d42f522ba7788d48b6773c581d6dcf20c7#0"
-     },
-     "fee-constraint": {
-      "hash": "d7d1c09deb8bc8e15baae7895e57e86ab6d0cb10e2faaa6d96cd691b",
-      "ref-utxo": "04a51c07ad31edf2e8af96aa18b69afd4dabcbbcd5eb8a00a95dd4a320a242e5#0"
-     }
     },
     "plutus-v2-cost-model": [
      100788,

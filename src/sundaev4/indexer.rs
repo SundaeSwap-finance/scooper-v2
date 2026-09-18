@@ -137,49 +137,14 @@ impl SundaeV4Indexer {
             .execution
             .as_ref()
             .and_then(|exec| derive_scooper_keyhash(&exec.scooper_secret_key).ok());
-        let ref_utxo_inputs = protocol
-            .execution
-            .as_ref()
-            .map(|exec| {
-                let scripts = &exec.module_scripts;
-                let mut set = [
-                    &scripts.pool,
-                    &scripts.order,
-                    &scripts.fee_split,
-                    &scripts.fairness,
-                    &scripts.pool_mint,
-                    &scripts.settings,
-                ]
-                .iter()
-                .map(|s| s.ref_utxo.clone())
-                .collect::<BTreeSet<_>>();
-                if let Some(cp) = &scripts.constant_product {
-                    set.insert(cp.ref_utxo.clone());
-                }
-                if let Some(cs) = &scripts.constant_sum {
-                    set.insert(cs.ref_utxo.clone());
-                }
-                if let Some(cl) = &scripts.concentrated_liquidity {
-                    set.insert(cl.ref_utxo.clone());
-                }
-                if let Some(so) = &scripts.swap_order {
-                    set.insert(so.ref_utxo.clone());
-                }
-                if let Some(bo) = &scripts.basic_order {
-                    set.insert(bo.ref_utxo.clone());
-                }
-                if let Some(ro) = &scripts.route_order {
-                    set.insert(ro.ref_utxo.clone());
-                }
-                if let Some(fo) = &scripts.fairness_order {
-                    set.insert(fo.ref_utxo.clone());
-                }
-                if let Some(st) = &scripts.strategy_order {
-                    set.insert(st.ref_utxo.clone());
-                }
-                set
-            })
-            .unwrap_or_default();
+        // Ref UTxOs to keep resolved for the tx builder. Empty without
+        // execution, since an indexer-only deployment declares no ref UTxOs.
+        let ref_utxo_inputs: BTreeSet<_> = protocol
+            .module_scripts
+            .entries()
+            .into_iter()
+            .filter_map(|(_, sri)| sri.ref_utxo.clone())
+            .collect();
         Self {
             state,
             event_tx,
@@ -217,25 +182,25 @@ impl SundaeV4Indexer {
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| e.module_scripts.constant_sum.as_ref())
+            .and_then(|e| e.module_scripts().constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
         let cp_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
+            .and_then(|e| e.module_scripts().constant_product.as_ref())
             .map(|cp| cp.hash.as_ref().to_vec());
         let cl_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
+            .and_then(|e| e.module_scripts().concentrated_liquidity.as_ref())
             .map(|cl| cl.hash.as_ref().to_vec());
         let fs_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
             .as_ref()
-            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+            .map(|e| e.module_scripts().fee_split.hash.as_ref().to_vec());
         let mut cache = self.module_configs.lock().await;
         for cfg in persisted_configs {
             let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
@@ -286,27 +251,9 @@ impl SundaeV4Indexer {
 
         // Constraint script hashes — used to find the right entry in the
         // order datum's `constraints: List<(hash, Data)>` list (PR #11).
-        let swap_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.swap_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.basic_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.strategy_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
+        let swap_order_hash = self.protocol.module_scripts.swap_order_hash();
+        let basic_order_hash = self.protocol.module_scripts.basic_order_hash();
+        let strategy_order_hash = self.protocol.module_scripts.strategy_order_hash();
 
         let cache = self.module_configs.lock().await;
         for txo in txos {
@@ -592,7 +539,14 @@ impl SundaeV4Indexer {
         let cs = cache.cs.get(&pool_datum.identifier);
         let cp = cache.cp.get(&pool_datum.identifier);
         let cl = cache.cl.get(&pool_datum.identifier);
-        detect_pool_type(pool_datum, self.protocol.execution.as_ref(), cs, cp, cl)
+        detect_pool_type(
+            pool_datum,
+            &self.protocol.module_scripts,
+            self.protocol.execution.as_ref(),
+            cs,
+            cp,
+            cl,
+        )
     }
 
     fn parse_pool(
@@ -696,7 +650,7 @@ impl SundaeV4Indexer {
         &self,
         tx: &MultiEraTx,
     ) -> Option<crate::sundaev4::types::ConstantSumConfig> {
-        let cs_hash = &self.protocol.execution.as_ref()?.module_scripts.constant_sum.as_ref()?.hash;
+        let cs_hash = &self.protocol.module_scripts.constant_sum.as_ref()?.hash;
         extract_cs_config_from_tx(tx, cs_hash)
     }
 }
@@ -927,66 +881,26 @@ impl ChainIndex for SundaeV4Indexer {
         // given module, these return None — harmless. We use the result to
         // populate per-pool config caches.
         let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
-        let cp_config_from_tx = self
-            .protocol
-            .execution
+        let modules = &self.protocol.module_scripts;
+        let cp_config_from_tx = modules
+            .constant_product
             .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
-            .and_then(|h| extract_cp_config_from_tx(&tx, &h));
-        let cl_config_from_tx = self
-            .protocol
-            .execution
+            .and_then(|cp| extract_cp_config_from_tx(&tx, &cp.hash));
+        let cl_config_from_tx = modules
+            .concentrated_liquidity
             .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
             .and_then(|cl| extract_cl_config_from_tx(&tx, &cl.hash));
-        let fs_config_from_tx =
-            self.protocol.execution.as_ref().and_then(|e| {
-                extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
-            });
-        let swap_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.swap_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.basic_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.strategy_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let cs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_sum.as_ref())
-            .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .map(|cl| cl.hash.as_ref().to_vec());
-        let fs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+        let fs_config_from_tx = extract_fee_split_config_from_tx(&tx, &modules.fee_split.hash);
+        let swap_order_hash = self.protocol.module_scripts.swap_order_hash();
+        let basic_order_hash = self.protocol.module_scripts.basic_order_hash();
+        let strategy_order_hash = self.protocol.module_scripts.strategy_order_hash();
+        let cs_module_hash_bytes: Option<Vec<u8>> =
+            modules.constant_sum.as_ref().map(|cs| cs.hash.as_ref().to_vec());
+        let cp_module_hash_bytes: Option<Vec<u8>> =
+            modules.constant_product.as_ref().map(|cp| cp.hash.as_ref().to_vec());
+        let cl_module_hash_bytes: Option<Vec<u8>> =
+            modules.concentrated_liquidity.as_ref().map(|cl| cl.hash.as_ref().to_vec());
+        let fs_module_hash_bytes: Option<Vec<u8>> = Some(modules.fee_split.hash.as_ref().to_vec());
 
         // Lock the persisted-config cache for the duration of output scanning:
         // pool outputs read from it, and Create writes a new entry.
@@ -1023,6 +937,7 @@ impl ChainIndex for SundaeV4Indexer {
                         cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
                     let pool_type = detect_pool_type(
                         &pd,
+                        &self.protocol.module_scripts,
                         self.protocol.execution.as_ref(),
                         resolved_cs,
                         resolved_cp,
@@ -1760,13 +1675,13 @@ fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {
 
 /// Detect the pool type from a pool datum's action modules.
 ///
-/// Matches the swap action's first module hash against known module script
-/// hashes from config. Defaults to ConstantProduct if no execution config
-/// is available or no match is found.
+/// Matches the swap action's first module hash against the deployment's
+/// module script hashes. Defaults to ConstantProduct if no match is found.
 ///
 /// Used by both the indexer (during chain sync) and bootstrap (during initial load).
 pub fn detect_pool_type(
     pool_datum: &PoolDatum,
+    modules: &crate::sundaev4::types::ModuleScripts,
     execution: Option<&crate::sundaev4::types::ScooperExecution>,
     cs_config_from_tx: Option<&crate::sundaev4::types::ConstantSumConfig>,
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
@@ -1775,23 +1690,15 @@ pub fn detect_pool_type(
     use crate::bigint::BigInt;
     use crate::sundaev4::types::{PoolType, Rational};
 
-    let Some(exec) = execution else {
-        return PoolType::ConstantProduct {
-            fee: Rational {
-                num: BigInt::from(0),
-                den: BigInt::from(1),
-            },
-        };
-    };
-
     // Look at every enabled action's first module and classify by which known
     // module hash it matches. CS and CP swap actions use different tags
     // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by tag.
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-    let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cl_hash =
-        exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let default_fee = execution.map(|e| e.fee).unwrap_or((0, 1));
+    let pool_config = execution.and_then(|e| e.pool_configs.get(&ident_hex));
+    let cs_hash = modules.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let cl_hash = modules.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let cp_hash = modules.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
@@ -1847,8 +1754,8 @@ pub fn detect_pool_type(
         None => {
             return PoolType::ConstantProduct {
                 fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
-                    num: BigInt::from(exec.fee.0),
-                    den: BigInt::from(exec.fee.1),
+                    num: BigInt::from(default_fee.0),
+                    den: BigInt::from(default_fee.1),
                 }),
             };
         }
@@ -1856,9 +1763,7 @@ pub fn detect_pool_type(
 
     if matched_kind == Some("cs") {
         // Priority: config file override > on-chain Create redeemer > defaults
-        if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
-            exec.pool_configs.get(&ident_hex)
-        {
+        if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) = pool_config {
             return PoolType::ConstantSum {
                 prices: prices.iter().map(|p| BigInt::from(*p)).collect(),
                 fee: Rational {
@@ -1897,16 +1802,16 @@ pub fn detect_pool_type(
         return PoolType::ConstantSum {
             prices: vec![BigInt::from(1); pool_datum.assets.len()],
             fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
+                num: BigInt::from(default_fee.0),
+                den: BigInt::from(default_fee.1),
             },
             bounty_k: Rational {
                 num: BigInt::from(0),
                 den: BigInt::from(1),
             },
             balance_fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
+                num: BigInt::from(default_fee.0),
+                den: BigInt::from(default_fee.1),
             },
         };
     }
@@ -1917,7 +1822,7 @@ pub fn detect_pool_type(
             sqrt_price_a,
             sqrt_price_b,
             fee,
-        }) = exec.pool_configs.get(&ident_hex)
+        }) = pool_config
         {
             info!(pool = %ident_hex, "CL pool config from operator override");
             return PoolType::ConcentratedLiquidity {
@@ -1960,8 +1865,8 @@ pub fn detect_pool_type(
                 den: BigInt::from(1),
             },
             fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
+                num: BigInt::from(default_fee.0),
+                den: BigInt::from(default_fee.1),
             },
         };
     }
@@ -1971,8 +1876,8 @@ pub fn detect_pool_type(
     // `verify_module_state` hashes the config we send.
     PoolType::ConstantProduct {
         fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
-            num: BigInt::from(exec.fee.0),
-            den: BigInt::from(exec.fee.1),
+            num: BigInt::from(default_fee.0),
+            den: BigInt::from(default_fee.1),
         }),
     }
 }

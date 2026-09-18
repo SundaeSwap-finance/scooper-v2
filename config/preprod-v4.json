@@ -14,6 +14,48 @@
    "settings-nft": "ecd76a8c8cf574d44b38a016246c1c6f9a75f5baa8417db8e59c81c5.",
    "pool-nft-policy": "a7a054cbb875e4882f1f3248a078643e66f3d00271c0a74f4d85b477",
    "starting-point": "133125563.2b4689a94028646768ee686fdc88daa2bcce2709933cca4c540b1f63da1d0fce",
+   "module-scripts": {
+    "pool": {
+     "hash": "ae364bd4888823a4c8932845a19c5b3891480a9a2e6ba068afd35ee7",
+     "ref-utxo": "d93735bd25876ca35bce28fc1307637774fc9f2023a118845dabab070f89ce9d#0"
+    },
+    "order": {
+     "hash": "2d066c461f37f3a41d2b2e57df0bff04cdf1ac799d06cb103f685ff2",
+     "ref-utxo": "b5ad7198aaca2bee2813a4568af5f21db4dfa704fa0f783359a7e4b9857efcbe#0"
+    },
+    "pool-mint": {
+     "hash": "a7a054cbb875e4882f1f3248a078643e66f3d00271c0a74f4d85b477",
+     "ref-utxo": "be8892e1385339d7000bed38fa2f22ed0e6b2f028e3ef7ddf39e83b89c02f748#0"
+    },
+    "settings": {
+     "hash": "726a1160a888c6d08934c4e001eb166e81dda300c2500d8b53fb4130",
+     "ref-utxo": "471002b45ecc6bf10ec403b17fe914a9d3c7d3f2221b38606d24eb5c12b31385#0"
+    },
+    "fee-split": {
+     "hash": "1735ce824f52913fdae7e03a9005c35b4eb56aaa793c51d1b20e904d",
+     "ref-utxo": "8afe88bcb19cccc5ebdc3666733c796fc6a0b9bfa47f233a2b15877f71686528#0"
+    },
+    "fairness": {
+     "hash": "e2a916c7a20f53970e7270dd27918b5104a3dfe06dcf47ecd0395844",
+     "ref-utxo": "40982ac55d21b7911b9fea6f39afb396aba0213501ef7bacb7a95e6cf92f6b23#0"
+    },
+    "constant-sum": {
+     "hash": "b22b5293a1d6265a5a02564436bf35f6f3cef85654f565c2759cce4b",
+     "ref-utxo": "e4ebd18f0f884c0f74854c2b91d3e58952075c1a174c378070057c506a8f605f#0"
+    },
+    "basic-order": {
+     "hash": "e6d77b2d7cca04e2c9b8af99ed0a798cbd69e702fa1c2d8fde989dae",
+     "ref-utxo": "85f1c6a17afa243629ef066816137e02b66c8af03e5a0cb3b8d50eadcfee7a5d#0"
+    },
+    "strategy-order": {
+     "hash": "3e32ea28c902aef16682b96bd7236347a55a216d7e4cc5ff7b0c5f9a",
+     "ref-utxo": "73b25c73846b863d94074235763f1986c8e9afdcdfbd0fae5c95d88031fbe82c#0"
+    },
+    "fee-constraint": {
+     "hash": "ab835b719a82f620d5517b7fe846b4db1c8caadd024befe63efce5b6",
+     "ref-utxo": "1a7f2feed5902d13d1b8f59a6396d27c43968cf2f1d6c163a7dcaa33e828a2fe#0"
+    }
+   },
    "execution": {
     "scooper-secret-key-file": "/home/ec2-user/scooper-v1/preprod-scooper.skey",
     "submit-url": "http://localhost:1337",
@@ -381,48 +423,6 @@
      "zero-slot": 86400,
      "zero-time": 1655769600000,
      "slot-length": 1000
-    },
-    "module-scripts": {
-     "pool": {
-      "hash": "ae364bd4888823a4c8932845a19c5b3891480a9a2e6ba068afd35ee7",
-      "ref-utxo": "d93735bd25876ca35bce28fc1307637774fc9f2023a118845dabab070f89ce9d#0"
-     },
-     "order": {
-      "hash": "2d066c461f37f3a41d2b2e57df0bff04cdf1ac799d06cb103f685ff2",
-      "ref-utxo": "b5ad7198aaca2bee2813a4568af5f21db4dfa704fa0f783359a7e4b9857efcbe#0"
-     },
-     "pool-mint": {
-      "hash": "a7a054cbb875e4882f1f3248a078643e66f3d00271c0a74f4d85b477",
-      "ref-utxo": "be8892e1385339d7000bed38fa2f22ed0e6b2f028e3ef7ddf39e83b89c02f748#0"
-     },
-     "settings": {
-      "hash": "726a1160a888c6d08934c4e001eb166e81dda300c2500d8b53fb4130",
-      "ref-utxo": "471002b45ecc6bf10ec403b17fe914a9d3c7d3f2221b38606d24eb5c12b31385#0"
-     },
-     "fee-split": {
-      "hash": "1735ce824f52913fdae7e03a9005c35b4eb56aaa793c51d1b20e904d",
-      "ref-utxo": "8afe88bcb19cccc5ebdc3666733c796fc6a0b9bfa47f233a2b15877f71686528#0"
-     },
-     "fairness": {
-      "hash": "e2a916c7a20f53970e7270dd27918b5104a3dfe06dcf47ecd0395844",
-      "ref-utxo": "40982ac55d21b7911b9fea6f39afb396aba0213501ef7bacb7a95e6cf92f6b23#0"
-     },
-     "constant-sum": {
-      "hash": "b22b5293a1d6265a5a02564436bf35f6f3cef85654f565c2759cce4b",
-      "ref-utxo": "e4ebd18f0f884c0f74854c2b91d3e58952075c1a174c378070057c506a8f605f#0"
-     },
-     "basic-order": {
-      "hash": "e6d77b2d7cca04e2c9b8af99ed0a798cbd69e702fa1c2d8fde989dae",
-      "ref-utxo": "85f1c6a17afa243629ef066816137e02b66c8af03e5a0cb3b8d50eadcfee7a5d#0"
-     },
-     "strategy-order": {
-      "hash": "3e32ea28c902aef16682b96bd7236347a55a216d7e4cc5ff7b0c5f9a",
-      "ref-utxo": "73b25c73846b863d94074235763f1986c8e9afdcdfbd0fae5c95d88031fbe82c#0"
-     },
-     "fee-constraint": {
-      "hash": "ab835b719a82f620d5517b7fe846b4db1c8caadd024befe63efce5b6",
-      "ref-utxo": "1a7f2feed5902d13d1b8f59a6396d27c43968cf2f1d6c163a7dcaa33e828a2fe#0"
-     }
     },
     "max-tx-ex-mem": 16500000,
     "cost-per-pool-lovelace": 1000000,

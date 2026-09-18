@@ -1095,13 +1095,11 @@ async fn bootstrap_v3(
 /// (preloaded persisted entries plus any we've recovered earlier in this pass).
 fn needs_cs_lookup(
     pool_datum: &sundaev4::PoolDatum,
+    modules: &sundaev4::ModuleScripts,
     execution: Option<&sundaev4::ScooperExecution>,
     cs_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
-        return false;
-    };
-    let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() else {
+    let Some(cs_script) = modules.constant_sum.as_ref() else {
         return false;
     };
     // CS swap actions use tag=3 (cs_check.ak's tag_swap), not tag=100. Match by
@@ -1115,7 +1113,7 @@ fn needs_cs_lookup(
     }
     // It's CS. Skip lookup if we already have an answer from any source.
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-    if exec.pool_configs.contains_key(&ident_hex) {
+    if execution.is_some_and(|e| e.pool_configs.contains_key(&ident_hex)) {
         return false;
     }
     if cs_configs.contains_key(&pool_datum.identifier) {
@@ -1129,13 +1127,10 @@ fn needs_cs_lookup(
 /// hash.
 fn needs_cp_lookup(
     pool_datum: &sundaev4::PoolDatum,
-    execution: Option<&sundaev4::ScooperExecution>,
+    modules: &sundaev4::ModuleScripts,
     cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
-        return false;
-    };
-    let Some(cp) = exec.module_scripts.constant_product.as_ref() else {
+    let Some(cp) = modules.constant_product.as_ref() else {
         return false;
     };
     let cp_hash = cp.hash;
@@ -1156,13 +1151,10 @@ fn needs_cp_lookup(
 /// its config (the spa/spb bounds + fee).
 fn needs_cl_lookup(
     pool_datum: &sundaev4::PoolDatum,
-    execution: Option<&sundaev4::ScooperExecution>,
+    modules: &sundaev4::ModuleScripts,
     cl_configs: &std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
-        return false;
-    };
-    let Some(cl_script) = exec.module_scripts.concentrated_liquidity.as_ref() else {
+    let Some(cl_script) = modules.concentrated_liquidity.as_ref() else {
         return false;
     };
     let is_cl = pool_datum.actions.iter().any(|a| {
@@ -1208,14 +1200,11 @@ async fn lookup_pool_module_configs(
     need_cp: bool,
     need_cl: bool,
 ) -> Result<RecoveredPoolConfigs> {
-    let exec = protocol
-        .execution
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
-    let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
-    let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash);
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
-    let fs_hash = exec.module_scripts.fee_split.hash;
+    let modules = &protocol.module_scripts;
+    let cs_hash = modules.constant_sum.as_ref().map(|s| s.hash);
+    let cl_hash = modules.concentrated_liquidity.as_ref().map(|s| s.hash);
+    let cp_hash = modules.constant_product.as_ref().map(|s| s.hash);
+    let fs_hash = modules.fee_split.hash;
 
     let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
     asset_name.extend_from_slice(ident.to_bytes());
@@ -1326,23 +1315,14 @@ async fn bootstrap_v4(
     // Blockfrost on every bootstrap. New entries discovered in this pass get
     // appended below. We split the flat persisted rows by module_hash into
     // per-module maps so callers can look up by pool ident.
-    let cs_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.constant_sum.as_ref())
-        .map(|cs| cs.hash.as_ref().to_vec());
-    let cp_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.constant_product.as_ref())
-        .map(|cp| cp.hash.as_ref().to_vec());
-    let cl_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-        .map(|cl| cl.hash.as_ref().to_vec());
+    let cs_module_hash: Option<Vec<u8>> =
+        protocol.module_scripts.constant_sum.as_ref().map(|cs| cs.hash.as_ref().to_vec());
+    let cp_module_hash: Option<Vec<u8>> =
+        protocol.module_scripts.constant_product.as_ref().map(|cp| cp.hash.as_ref().to_vec());
+    let cl_module_hash: Option<Vec<u8>> =
+        protocol.module_scripts.concentrated_liquidity.as_ref().map(|cl| cl.hash.as_ref().to_vec());
     let fs_module_hash: Option<Vec<u8>> =
-        protocol.execution.as_ref().map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+        Some(protocol.module_scripts.fee_split.hash.as_ref().to_vec());
 
     let persisted_configs =
         dao.load_module_configs().await.context("bootstrap v4: load persisted module configs")?;
@@ -1426,9 +1406,15 @@ async fn bootstrap_v4(
         // Recover any per-module configs we don't yet have for this pool. One
         // call walks the pool's tx history (first tx → walk back from latest)
         // and gathers every module config it can find.
-        let need_cs = needs_cs_lookup(&pool_datum, protocol.execution.as_ref(), &cs_configs);
-        let need_cp = needs_cp_lookup(&pool_datum, protocol.execution.as_ref(), &cp_configs);
-        let need_cl = needs_cl_lookup(&pool_datum, protocol.execution.as_ref(), &cl_configs);
+        let modules = &protocol.module_scripts;
+        let need_cs = needs_cs_lookup(
+            &pool_datum,
+            modules,
+            protocol.execution.as_ref(),
+            &cs_configs,
+        );
+        let need_cp = needs_cp_lookup(&pool_datum, modules, &cp_configs);
+        let need_cl = needs_cl_lookup(&pool_datum, modules, &cl_configs);
         let need_fs = !fs_configs.contains_key(&pool_datum.identifier);
         if need_cs || need_cp || need_cl || need_fs {
             let recovered = lookup_pool_module_configs(
@@ -1524,7 +1510,7 @@ async fn bootstrap_v4(
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
                         module_hash: fs_module_hash
                             .clone()
-                            .expect("fs_module_hash known when execution present"),
+                            .expect("fs_module_hash is always known"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -1547,6 +1533,7 @@ async fn bootstrap_v4(
         let resolved_cl = cl_configs.get(&pool_datum.identifier);
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
+            &protocol.module_scripts,
             protocol.execution.as_ref(),
             resolved_cs,
             resolved_cp,
@@ -1601,24 +1588,9 @@ async fn bootstrap_v4(
                 continue;
             };
             let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-            let swap_order_hash: Vec<u8> = protocol
-                .execution
-                .as_ref()
-                .and_then(|e| e.module_scripts.swap_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
-                .unwrap_or_default();
-            let basic_order_hash: Vec<u8> = protocol
-                .execution
-                .as_ref()
-                .and_then(|e| e.module_scripts.basic_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
-                .unwrap_or_default();
-            let strategy_order_hash: Vec<u8> = protocol
-                .execution
-                .as_ref()
-                .and_then(|e| e.module_scripts.strategy_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
-                .unwrap_or_default();
+            let swap_order_hash = protocol.module_scripts.swap_order_hash();
+            let basic_order_hash = protocol.module_scripts.basic_order_hash();
+            let strategy_order_hash = protocol.module_scripts.strategy_order_hash();
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
                 .and_then(|data| {
@@ -1801,44 +1773,10 @@ async fn bootstrap_v4(
     // Fetch reference script UTxOs if execution is configured.
     // The scooper needs these to build the ScriptStore for tx evaluation.
     let mut ref_utxo_outputs = std::collections::BTreeMap::new();
-    if let Some(ref exec) = protocol.execution {
+    if protocol.execution.is_some() {
         info!("bootstrap: fetching V4 reference script UTxOs...");
-        let scripts = &exec.module_scripts;
-        let mut all_refs: Vec<&crate::sundaev4::ScriptRefInfo> = vec![
-            &scripts.fee_split,
-            &scripts.fairness,
-            &scripts.pool,
-            &scripts.order,
-            &scripts.pool_mint,
-            &scripts.settings,
-        ];
-        if let Some(ref cp) = scripts.constant_product {
-            all_refs.push(cp);
-        }
-        if let Some(ref cs) = scripts.constant_sum {
-            all_refs.push(cs);
-        }
-        if let Some(ref cl) = scripts.concentrated_liquidity {
-            all_refs.push(cl);
-        }
-        if let Some(ref so) = scripts.swap_order {
-            all_refs.push(so);
-        }
-        if let Some(ref bo) = scripts.basic_order {
-            all_refs.push(bo);
-        }
-        if let Some(ref ro) = scripts.route_order {
-            all_refs.push(ro);
-        }
-        if let Some(ref fo) = scripts.fairness_order {
-            all_refs.push(fo);
-        }
-        if let Some(ref so) = scripts.strategy_order {
-            all_refs.push(so);
-        }
-        if let Some(ref fc) = scripts.fee_constraint {
-            all_refs.push(fc);
-        }
+        let all_refs: Vec<&crate::sundaev4::ScriptRefInfo> =
+            protocol.module_scripts.entries().into_iter().map(|(_, sri)| sri).collect();
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {
@@ -1863,7 +1801,9 @@ async fn bootstrap_v4(
                         datum: crate::cardano_types::RawDatum::None,
                         script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(script)),
                     };
-                    ref_utxo_outputs.insert(script_ref.ref_utxo.clone(), txo);
+                    if let Some(ref_utxo) = &script_ref.ref_utxo {
+                        ref_utxo_outputs.insert(ref_utxo.clone(), txo);
+                    }
                 }
                 Err(e) => {
                     warn!(hash = %hash_hex, "bootstrap v4: could not fetch script CBOR: {e:#}");

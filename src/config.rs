@@ -110,4 +110,35 @@ mod tests {
             assert!(!enabled, "{file}: peer sharing must be disabled");
         }
     }
+
+    /// Module hashes describe the deployment, not the operator. An
+    /// execution-free config still has to classify order constraints and pool
+    /// types — when they lived under `execution`, every order on such a node
+    /// decoded as invalid and every pool as zero-fee constant product.
+    #[test]
+    fn module_hashes_survive_a_config_with_no_execution() {
+        let config = load_config(["config/mainnet.json"]).expect("config loads");
+        let v4 = config.protocol.v4.expect("mainnet configures v4");
+        assert!(
+            v4.execution.is_none(),
+            "this test needs an indexer-only config"
+        );
+        assert!(!v4.module_scripts.swap_order_hash().is_empty());
+        assert!(!v4.module_scripts.basic_order_hash().is_empty());
+        assert!(v4.module_scripts.constant_product.is_some());
+        v4.check_execution_ref_utxos().expect("no execution, so no ref-utxo requirement");
+    }
+
+    /// An executor that can't reference a module it declares would fail every
+    /// scoop at build time, so startup refuses it.
+    #[test]
+    fn execution_without_a_ref_utxo_is_rejected() {
+        let mut config = load_config(["config/preprod-v4.json"]).expect("config loads");
+        let v4 = config.protocol.v4.as_mut().expect("preprod configures v4");
+        assert!(v4.execution.is_some());
+        v4.check_execution_ref_utxos().expect("preprod ships every ref-utxo");
+        v4.module_scripts.fairness.ref_utxo = None;
+        let err = v4.check_execution_ref_utxos().expect_err("missing ref-utxo must be caught");
+        assert!(err.contains("fairness"), "{err}");
+    }
 }

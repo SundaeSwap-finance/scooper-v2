@@ -1317,9 +1317,9 @@ mod tests {
 
         let ref_inputs =
             result.tx_body.reference_inputs.as_ref().expect("scoop has reference inputs");
-        let ms = &env.exec.module_scripts;
+        let ms = &env.exec.module_scripts();
         assert!(
-            !ref_inputs.contains(&ms.settings.ref_utxo.0),
+            !ref_inputs.contains(&ms.settings.ref_input().0),
             "settings validator ref script attached but never executed"
         );
         let executed = [
@@ -1331,7 +1331,7 @@ mod tests {
         ];
         for (name, info) in executed {
             assert!(
-                ref_inputs.contains(&info.ref_utxo.0),
+                ref_inputs.contains(&info.ref_input().0),
                 "{name} ref script missing"
             );
         }
@@ -1618,7 +1618,7 @@ mod tests {
         );
 
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -1691,7 +1691,7 @@ mod tests {
             cs_fee,
         );
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -1767,7 +1767,7 @@ mod tests {
             p.pool_datum.circulating_lp = circ.clone();
             p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &circ;
             let lp = crate::cardano_types::AssetClass {
-                policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+                policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
                 token: {
                     let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                     t.extend_from_slice(&[0xDD; 28]);
@@ -1780,7 +1780,7 @@ mod tests {
         };
 
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -1852,7 +1852,7 @@ mod tests {
             cs_fee,
         );
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -1892,7 +1892,7 @@ mod tests {
             cs_fee,
         );
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -1990,7 +1990,7 @@ mod tests {
             cs_fee,
         );
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -2121,7 +2121,7 @@ mod tests {
             cs_fee,
         );
         let lp_asset = crate::cardano_types::AssetClass {
-            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            policy: env.exec.module_scripts().pool_mint.hash.to_vec(),
             token: {
                 let mut t = vec![0x00, 0x14, 0xdf, 0x10];
                 t.extend_from_slice(&[0xDD; 28]);
@@ -2226,7 +2226,7 @@ mod tests {
         // Dispatch-equivalent: parse the whitelist off the order and filter
         // the pool view before routing.
         let route_hash =
-            env.exec.module_scripts.route_order.as_ref().unwrap().hash.as_ref().to_vec();
+            env.exec.module_scripts().route_order.as_ref().unwrap().hash.as_ref().to_vec();
         let wl = parse_route_whitelist(
             order.datum.find_constraint_by_hash(&route_hash).expect("order carries route module"),
         )
@@ -2521,7 +2521,7 @@ mod tests {
             };
             ShelleyAddress::new(
                 Network::Testnet,
-                ShelleyPaymentPart::Script(env.exec.module_scripts.order.hash),
+                ShelleyPaymentPart::Script(env.exec.module_scripts().order.hash),
                 ShelleyDelegationPart::Null,
             )
             .to_vec()
@@ -2550,8 +2550,8 @@ mod tests {
         let parsed = <crate::sundaev4::OrderDatum as AsPlutus>::from_plutus(datum).unwrap();
         let c = crate::sundaev4::Constraint::from_order_datum(
             &parsed,
-            env.exec.module_scripts.swap_order.as_ref().unwrap().hash.as_ref(),
-            env.exec.module_scripts.basic_order.as_ref().unwrap().hash.as_ref(),
+            env.exec.module_scripts().swap_order.as_ref().unwrap().hash.as_ref(),
+            env.exec.module_scripts().basic_order.as_ref().unwrap().hash.as_ref(),
         )
         .unwrap();
         match c {

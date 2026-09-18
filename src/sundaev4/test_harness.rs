@@ -242,7 +242,7 @@ impl TestEnv {
             submit_url: String::new(),
             fee: (3, 1000),
             protocol_share: (1, 2),
-            module_scripts,
+            modules: Some(module_scripts),
             plutus_v3_cost_model: PLUTUS_V3_COST_MODEL.to_vec(),
             slot_config: crate::sundaev4::types::SlotConfig {
                 zero_slot: 0,
@@ -496,7 +496,7 @@ impl TestEnv {
         vec![
             (
                 self.exec
-                    .module_scripts
+                    .module_scripts()
                     .constant_product
                     .as_ref()
                     .expect("harness blueprint includes constantProduct")
@@ -504,9 +504,9 @@ impl TestEnv {
                     .to_vec(),
                 cp_hash,
             ),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+            (self.exec.module_scripts().fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec.module_scripts().fairness.hash.to_vec(),
                 fairness_hash,
             ),
         ]
@@ -516,14 +516,14 @@ impl TestEnv {
     pub fn action_modules(&self) -> Vec<Vec<u8>> {
         vec![
             self.exec
-                .module_scripts
+                .module_scripts()
                 .constant_product
                 .as_ref()
                 .expect("harness blueprint includes constantProduct")
                 .hash
                 .to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec.module_scripts().fee_split.hash.to_vec(),
+            self.exec.module_scripts().fairness.hash.to_vec(),
         ]
     }
 
@@ -533,7 +533,7 @@ impl TestEnv {
     pub fn cs_module_state(&self, prices: &[BigInt], fee: &Rational) -> Vec<(Vec<u8>, Vec<u8>)> {
         let cs_script = self
             .exec
-            .module_scripts
+            .module_scripts()
             .constant_sum
             .as_ref()
             .expect("blueprint must include constantSum validator for CS tests");
@@ -566,9 +566,9 @@ impl TestEnv {
 
         vec![
             (cs_script.hash.to_vec(), cs_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+            (self.exec.module_scripts().fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec.module_scripts().fairness.hash.to_vec(),
                 fairness_hash,
             ),
         ]
@@ -578,14 +578,14 @@ impl TestEnv {
     pub fn cs_action_modules(&self) -> Vec<Vec<u8>> {
         let cs_script = self
             .exec
-            .module_scripts
+            .module_scripts()
             .constant_sum
             .as_ref()
             .expect("blueprint must include constantSum validator for CS tests");
         vec![
             cs_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec.module_scripts().fee_split.hash.to_vec(),
+            self.exec.module_scripts().fairness.hash.to_vec(),
         ]
     }
 }
@@ -633,7 +633,7 @@ pub fn pool_script_address(env: &TestEnv, stake_keyhash: Option<[u8; 28]>) -> Ve
     };
     ShelleyAddress::new(
         env.exec.network.pallas(),
-        ShelleyPaymentPart::Script(env.exec.module_scripts.pool.hash),
+        ShelleyPaymentPart::Script(env.exec.module_scripts().pool.hash),
         delegation,
     )
     .to_vec()
@@ -665,7 +665,7 @@ pub fn make_pool(
     let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10]; // 0014df10
     lp_name.extend_from_slice(&ident_bytes);
 
-    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let pool_mint_policy = env.exec.module_scripts().pool_mint.hash.to_vec();
 
     let nft_asset = AssetClass {
         policy: pool_mint_policy.clone(),
@@ -748,7 +748,7 @@ pub fn make_cl_pool(
     nft_name.extend_from_slice(&ident_bytes);
     let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
     lp_name.extend_from_slice(&ident_bytes);
-    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let pool_mint_policy = env.exec.module_scripts().pool_mint.hash.to_vec();
     let nft_asset = AssetClass {
         policy: pool_mint_policy.clone(),
         token: nft_name,
@@ -830,7 +830,7 @@ pub fn make_cs_pool(
     let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
     lp_name.extend_from_slice(&ident_bytes);
 
-    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let pool_mint_policy = env.exec.module_scripts().pool_mint.hash.to_vec();
 
     let nft_asset = AssetClass {
         policy: pool_mint_policy.clone(),

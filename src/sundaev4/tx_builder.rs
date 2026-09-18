@@ -1123,7 +1123,7 @@ pub fn build_multi_pool_scoop_tx(
                     bounty_k: bounty_k.clone(),
                     balance_fee: balance_fee.clone(),
                 };
-                if let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() {
+                if let Some(cs_script) = exec.module_scripts().constant_sum.as_ref() {
                     let cs_cred = cs_script.hash.as_ref();
                     let stored = batch
                         .pool
@@ -1158,7 +1158,7 @@ pub fn build_multi_pool_scoop_tx(
                     sqrt_price_b: sqrt_price_b.clone(),
                     fee: fee.clone(),
                 };
-                if let Some(cl_script) = exec.module_scripts.concentrated_liquidity.as_ref() {
+                if let Some(cl_script) = exec.module_scripts().concentrated_liquidity.as_ref() {
                     let cl_cred = cl_script.hash.as_ref();
                     let stored = batch
                         .pool
@@ -1363,22 +1363,22 @@ pub fn build_multi_pool_scoop_tx(
     // ── Step 6: Reference inputs ───────────────────────────────────────────
 
     let mut all_ref_inputs: Vec<TransactionInput> = vec![
-        exec.module_scripts.pool.ref_utxo.0.clone(),
-        exec.module_scripts.order.ref_utxo.0.clone(),
-        exec.module_scripts.fee_split.ref_utxo.0.clone(),
-        exec.module_scripts.fairness.ref_utxo.0.clone(),
+        exec.module_scripts().pool.ref_input().0.clone(),
+        exec.module_scripts().order.ref_input().0.clone(),
+        exec.module_scripts().fee_split.ref_input().0.clone(),
+        exec.module_scripts().fairness.ref_input().0.clone(),
     ];
     if has_lp_mint {
-        all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
+        all_ref_inputs.push(exec.module_scripts().pool_mint.ref_input().0.clone());
     }
-    if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
-        all_ref_inputs.push(cp.ref_utxo.0.clone());
+    if has_cp && let Some(cp) = &exec.module_scripts().constant_product {
+        all_ref_inputs.push(cp.ref_input().0.clone());
     }
-    if has_cs && let Some(cs) = &exec.module_scripts.constant_sum {
-        all_ref_inputs.push(cs.ref_utxo.0.clone());
+    if has_cs && let Some(cs) = &exec.module_scripts().constant_sum {
+        all_ref_inputs.push(cs.ref_input().0.clone());
     }
-    if has_cl && let Some(cl) = &exec.module_scripts.concentrated_liquidity {
-        all_ref_inputs.push(cl.ref_utxo.0.clone());
+    if has_cl && let Some(cl) = &exec.module_scripts().concentrated_liquidity {
+        all_ref_inputs.push(cl.ref_input().0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -1410,7 +1410,7 @@ pub fn build_multi_pool_scoop_tx(
     // Fee-constraint mode (docs/fee-system.md): active when any order's
     // OrderConfig requires the fee constraint. Every continuation execution
     // is charged exactly base_fee; terminal fills keep terminal settlement.
-    let fee_sri = exec.module_scripts.fee_constraint.as_ref();
+    let fee_sri = exec.module_scripts().fee_constraint.as_ref();
     let fee_active =
         fee_sri.map(|sri| required_constraint_hashes.contains(sri.hash.as_ref())).unwrap_or(false);
     let fee_base: Option<u64> = if fee_active {
@@ -1427,12 +1427,12 @@ pub fn build_multi_pool_scoop_tx(
 
     let constraint_script_refs = |hash: &[u8]| -> Option<&ScriptRefInfo> {
         for slot in [
-            &exec.module_scripts.swap_order,
-            &exec.module_scripts.basic_order,
-            &exec.module_scripts.route_order,
-            &exec.module_scripts.fairness_order,
-            &exec.module_scripts.strategy_order,
-            &exec.module_scripts.fee_constraint,
+            &exec.module_scripts().swap_order,
+            &exec.module_scripts().basic_order,
+            &exec.module_scripts().route_order,
+            &exec.module_scripts().fairness_order,
+            &exec.module_scripts().strategy_order,
+            &exec.module_scripts().fee_constraint,
         ] {
             if let Some(sri) = slot
                 && sri.hash.as_ref() == hash
@@ -1444,7 +1444,7 @@ pub fn build_multi_pool_scoop_tx(
     };
     for h in &required_constraint_hashes {
         if let Some(sri) = constraint_script_refs(h) {
-            all_ref_inputs.push(sri.ref_utxo.0.clone());
+            all_ref_inputs.push(sri.ref_input().0.clone());
         } else {
             tracing::warn!(
                 hash = %hex::encode(h),
@@ -1549,7 +1549,7 @@ pub fn build_multi_pool_scoop_tx(
 
     // Always present: order, fee_split, fairness
     let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![(
-        reward_account(&exec.module_scripts.order.hash),
+        reward_account(&exec.module_scripts().order.hash),
         order_validator_redeemer.to_plutus(),
     )];
     // fee_split and fairness are POOL action modules — the pool datum's
@@ -1558,17 +1558,17 @@ pub fn build_multi_pool_scoop_tx(
     // redeemers would just burn budget (or fail).
     if m_pools > 0 {
         withdrawals.push((
-            reward_account(&exec.module_scripts.fee_split.hash),
+            reward_account(&exec.module_scripts().fee_split.hash),
             fs_redeemer.to_plutus(),
         ));
         withdrawals.push((
-            reward_account(&exec.module_scripts.fairness.hash),
+            reward_account(&exec.module_scripts().fairness.hash),
             fairness_redeemer.to_plutus(),
         ));
     }
 
     // Conditionally add CP withdrawal
-    if has_cp && let Some(cp_script) = &exec.module_scripts.constant_product {
+    if has_cp && let Some(cp_script) = &exec.module_scripts().constant_product {
         let cp_redeemer = ConstantProductRedeemer::Operate {
             entries: cp_entries,
         };
@@ -1576,7 +1576,7 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // Conditionally add CS withdrawal
-    if has_cs && let Some(cs_script) = &exec.module_scripts.constant_sum {
+    if has_cs && let Some(cs_script) = &exec.module_scripts().constant_sum {
         let cs_redeemer = ConstantSumRedeemer::Operate {
             entries: cs_entries,
         };
@@ -1584,7 +1584,7 @@ pub fn build_multi_pool_scoop_tx(
     }
 
     // Conditionally add CL withdrawal
-    if has_cl && let Some(cl_script) = &exec.module_scripts.concentrated_liquidity {
+    if has_cl && let Some(cl_script) = &exec.module_scripts().concentrated_liquidity {
         let cl_redeemer = ConcentratedLiquidityRedeemer::Operate {
             entries: cl_entries,
         };
@@ -1612,17 +1612,17 @@ pub fn build_multi_pool_scoop_tx(
     let classify_hash = |h: &[u8]| -> Option<&'static str> {
         let matches =
             |s: &Option<ScriptRefInfo>| s.as_ref().is_some_and(|si| si.hash.as_ref() == h);
-        if matches(&exec.module_scripts.swap_order) {
+        if matches(&exec.module_scripts().swap_order) {
             Some("swap_order")
-        } else if matches(&exec.module_scripts.basic_order) {
+        } else if matches(&exec.module_scripts().basic_order) {
             Some("basic_order")
-        } else if matches(&exec.module_scripts.route_order) {
+        } else if matches(&exec.module_scripts().route_order) {
             Some("route_order")
-        } else if matches(&exec.module_scripts.fairness_order) {
+        } else if matches(&exec.module_scripts().fairness_order) {
             Some("fairness_order")
-        } else if matches(&exec.module_scripts.strategy_order) {
+        } else if matches(&exec.module_scripts().strategy_order) {
             Some("strategy_order")
-        } else if matches(&exec.module_scripts.fee_constraint) {
+        } else if matches(&exec.module_scripts().fee_constraint) {
             Some("fee_constraint")
         } else {
             None
@@ -1636,7 +1636,7 @@ pub fn build_multi_pool_scoop_tx(
     // RouteStep = (pool_input_index, transcript_step_index) per pool it flows
     // through, in hop (flow) order.
     let route_order_hash =
-        exec.module_scripts.route_order.as_ref().map(|s| s.hash.as_ref().to_vec());
+        exec.module_scripts().route_order.as_ref().map(|s| s.hash.as_ref().to_vec());
 
     // Per route (indexed by RouteRef.route_idx), the ordered list of
     // (pool_input_index, transcript_step_index). We gate to serial routes
@@ -2099,7 +2099,7 @@ pub fn build_multi_pool_scoop_tx(
                 let (_, remaining) = order.swap_offered();
                 let new_remaining = remaining - fill;
                 let swap_hash = exec
-                    .module_scripts
+                    .module_scripts()
                     .swap_order
                     .as_ref()
                     .context("partial fill requires the swap_order module config")?
@@ -2124,7 +2124,7 @@ pub fn build_multi_pool_scoop_tx(
             if let Some(cont_datum) = &partial_continuation {
                 let order_addr = ShelleyAddress::new(
                     network,
-                    ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                    ShelleyPaymentPart::Script(exec.module_scripts().order.hash),
                     ShelleyDelegationPart::Null,
                 );
                 (order_addr.to_vec(), Some(cont_datum.clone()))
@@ -2133,7 +2133,7 @@ pub fn build_multi_pool_scoop_tx(
                     crate::sundaev4::Destination::SelfDestination => {
                         let order_addr = ShelleyAddress::new(
                             network,
-                            ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                            ShelleyPaymentPart::Script(exec.module_scripts().order.hash),
                             ShelleyDelegationPart::Null,
                         );
                         // Continuation fee accounting (strategy.ak): the ONE
@@ -2526,7 +2526,7 @@ pub fn build_multi_pool_scoop_tx(
                 let bv: Vec<u8> = b.0.clone().into();
                 av.cmp(&bv)
             });
-            let policy = exec.module_scripts.pool_mint.hash;
+            let policy = exec.module_scripts().pool_mint.hash;
             let mint_redeemer_data = if asset_pairs.is_empty() {
                 None
             } else {
@@ -2722,7 +2722,7 @@ pub fn build_multi_pool_scoop_tx(
         let order_addr_bytes = {
             let order_addr = ShelleyAddress::new(
                 network,
-                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                ShelleyPaymentPart::Script(exec.module_scripts().order.hash),
                 ShelleyDelegationPart::Null,
             );
             order_addr.to_vec()
@@ -2752,7 +2752,7 @@ pub fn build_multi_pool_scoop_tx(
         let order_addr_bytes = {
             let order_addr = ShelleyAddress::new(
                 network,
-                ShelleyPaymentPart::Script(exec.module_scripts.order.hash),
+                ShelleyPaymentPart::Script(exec.module_scripts().order.hash),
                 ShelleyDelegationPart::Null,
             );
             order_addr.to_vec()
@@ -2915,7 +2915,7 @@ pub fn build_multi_pool_scoop_tx(
             address: {
                 let settings_addr = ShelleyAddress::new(
                     network,
-                    ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
+                    ShelleyPaymentPart::Script(exec.module_scripts().settings.hash),
                     ShelleyDelegationPart::Null,
                 );
                 settings_addr.to_vec()
@@ -2932,7 +2932,7 @@ pub fn build_multi_pool_scoop_tx(
     let settings_addr_bytes = {
         let settings_addr = ShelleyAddress::new(
             network,
-            ShelleyPaymentPart::Script(exec.module_scripts.settings.hash),
+            ShelleyPaymentPart::Script(exec.module_scripts().settings.hash),
             ShelleyDelegationPart::Null,
         );
         settings_addr.to_vec()
@@ -3295,7 +3295,7 @@ fn pool_lp_asset(exec: &ScooperExecution, pool: &SundaeV4Pool) -> Result<AssetCl
     let mut name = vec![0x00, 0x14, 0xdf, 0x10];
     name.extend_from_slice(pool.pool_datum.identifier.to_bytes());
     Ok(AssetClass {
-        policy: exec.module_scripts.pool_mint.hash.as_ref().to_vec(),
+        policy: exec.module_scripts().pool_mint.hash.as_ref().to_vec(),
         token: name,
     })
 }
