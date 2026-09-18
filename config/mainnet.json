@@ -1,5 +1,16 @@
 {
   "protocol": {
+    "v4": {
+      "pool-script-hash": "21c9b7b965646069f9becebf8b4c3cedaf84c19b109eaa5980a14a26",
+      "order-script-hashes": [
+        "07eb2fb09d9dd6603870ce6f84c8f8506249152173ddf0c77f1f07ec"
+      ],
+      "settings-script-hash": "808db58d7d66d348b0cc7d83c202ef1d19534d00bf6c463a531020ad",
+      "settings-nft": "371738e95ab3f0afba69c6b0896df05d7851a5307a830677b77c2ead.",
+      "pool-nft-policy": "d9d5985e0657933005d6eb953aeadad29aa8c36f17e493e2962584ec",
+      "fee-settings-token": "0019b58b8d626ebe1f2ad80fbc01f9125f54b6c6a4d2b45d31178bc72c337f35",
+      "starting-point": "198098274.6f93456920a2c1d2648d42bce9f144b45e16787ad223bf422e340cdc7f20b7fc"
+    },
     "v3": {
       "order-script-hashes": [
         "fa6a58bbe2d0ff05534431c8e2f0ef2cbdc1602a8456e4b13c8f3077"
