@@ -1094,6 +1094,11 @@ pub struct ScooperExecution {
     /// or any pool the operator wants to skip).
     #[serde(default)]
     pub blacklisted_pools: std::collections::BTreeSet<String>,
+    /// Per-pool trading allowlists, keyed by pool ident (hex). A pool named
+    /// here is closed: only the listed credentials may trade on it. Absent =
+    /// unrestricted.
+    #[serde(default)]
+    pub pool_allowlists: crate::sundaev4::access::PoolAllowlists,
     /// Lovelace charged against an order's budget for each pool its route
     /// touches. 0 = no limit. Together with `cost_per_step_lovelace` this
     /// gates router fan-out by what the order paid for: a 1-ADA order gets a

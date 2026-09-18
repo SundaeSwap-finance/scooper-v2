@@ -255,6 +255,7 @@ impl TestEnv {
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
             blacklisted_pools: std::collections::BTreeSet::new(),
+            pool_allowlists: Default::default(),
             cost_per_pool_lovelace: 0,
             cost_per_step_lovelace: 0,
             strategy_peers: Vec::new(),
