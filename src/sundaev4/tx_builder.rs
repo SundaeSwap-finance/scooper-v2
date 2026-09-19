@@ -1541,11 +1541,7 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 7: Build withdrawal map ───────────────────────────────────────
 
-    fn reward_account(script_hash: &Hash<28>) -> PallasBytes {
-        let mut account = vec![0xf0u8];
-        account.extend_from_slice(script_hash.as_ref());
-        PallasBytes::from(account)
-    }
+    let reward_account = |script_hash: &Hash<28>| script_reward_account(exec.network, script_hash);
 
     // Always present: order, fee_split, fairness
     let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![(
@@ -3129,6 +3125,15 @@ fn compute_script_ref_hash(script_ref: &crate::cardano_types::ScriptRef) -> Hash
     }
 }
 
+/// Script reward account for a withdrawal: header 0xf0 | network id, then
+/// the 28-byte script hash. Mainnet is 0xf1; every testnet is 0xf0. A
+/// hardcoded 0xf0 built testnet withdrawals into mainnet scoops.
+pub fn script_reward_account(network: AddressNetwork, script_hash: &Hash<28>) -> PallasBytes {
+    let mut account = vec![0xf0u8 | network.id()];
+    account.extend_from_slice(script_hash.as_ref());
+    PallasBytes::from(account)
+}
+
 /// Either a 32-byte standard ed25519 key or a 64-byte Cardano-extended key.
 /// Cardano HD-derived keys (BIP32 / CIP-1852) are always extended; the
 /// standard form is only useful for one-off keys provided as a raw seed.
@@ -3834,5 +3839,22 @@ mod validity_tests {
         };
         let w = ValidityWindow::new(500, 500);
         assert_eq!(w.ttl - w.start, VALIDITY_RANGE);
+    }
+}
+
+#[cfg(test)]
+mod reward_account_tests {
+    use super::*;
+
+    #[test]
+    fn reward_account_header_follows_the_network() {
+        let hash: Hash<28> =
+            "4e1a435f8d55f26068150579c18964e58078082b899e6bb560be7cd5".parse().unwrap();
+        let mainnet: Vec<u8> = script_reward_account(AddressNetwork::Mainnet, &hash).to_vec();
+        let testnet: Vec<u8> = script_reward_account(AddressNetwork::Testnet, &hash).to_vec();
+        assert_eq!(mainnet[0], 0xf1, "mainnet script reward account");
+        assert_eq!(testnet[0], 0xf0, "testnet script reward account");
+        assert_eq!(&mainnet[1..], hash.as_ref());
+        assert_eq!(mainnet.len(), 29);
     }
 }
