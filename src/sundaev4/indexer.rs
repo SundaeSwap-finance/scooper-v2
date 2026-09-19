@@ -140,45 +140,7 @@ impl SundaeV4Indexer {
         let ref_utxo_inputs = protocol
             .execution
             .as_ref()
-            .map(|exec| {
-                let scripts = &exec.module_scripts;
-                let mut set = [
-                    &scripts.pool,
-                    &scripts.order,
-                    &scripts.fee_split,
-                    &scripts.fairness,
-                    &scripts.pool_mint,
-                    &scripts.settings,
-                ]
-                .iter()
-                .map(|s| s.ref_utxo.clone())
-                .collect::<BTreeSet<_>>();
-                if let Some(cp) = &scripts.constant_product {
-                    set.insert(cp.ref_utxo.clone());
-                }
-                if let Some(cs) = &scripts.constant_sum {
-                    set.insert(cs.ref_utxo.clone());
-                }
-                if let Some(cl) = &scripts.concentrated_liquidity {
-                    set.insert(cl.ref_utxo.clone());
-                }
-                if let Some(so) = &scripts.swap_order {
-                    set.insert(so.ref_utxo.clone());
-                }
-                if let Some(bo) = &scripts.basic_order {
-                    set.insert(bo.ref_utxo.clone());
-                }
-                if let Some(ro) = &scripts.route_order {
-                    set.insert(ro.ref_utxo.clone());
-                }
-                if let Some(fo) = &scripts.fairness_order {
-                    set.insert(fo.ref_utxo.clone());
-                }
-                if let Some(st) = &scripts.strategy_order {
-                    set.insert(st.ref_utxo.clone());
-                }
-                set
-            })
+            .map(|exec| module_ref_utxos(&exec.module_scripts))
             .unwrap_or_default();
         Self {
             state,
@@ -742,6 +704,61 @@ impl SundaeV4Indexer {
     }
 }
 
+/// The reference-script UTxOs the indexer must keep so the evaluator's
+/// script store holds every module a scoop can invoke. Every module in the
+/// config is tracked: a module missing here fails eval with
+/// "script … not found in store" on every scoop that references it, which is
+/// how the fee_constraint module went missing on mainnet.
+pub fn module_ref_utxos(
+    scripts: &crate::sundaev4::types::ModuleScripts,
+) -> BTreeSet<crate::cardano_types::TransactionInput> {
+    let required = [
+        &scripts.pool,
+        &scripts.order,
+        &scripts.fee_split,
+        &scripts.fairness,
+        &scripts.pool_mint,
+        &scripts.settings,
+    ];
+    let optional = [
+        &scripts.constant_product,
+        &scripts.constant_sum,
+        &scripts.concentrated_liquidity,
+        &scripts.swap_order,
+        &scripts.basic_order,
+        &scripts.route_order,
+        &scripts.fairness_order,
+        &scripts.strategy_order,
+        &scripts.fee_constraint,
+    ];
+    required
+        .into_iter()
+        .chain(optional.into_iter().filter_map(|o| o.as_ref()))
+        .map(|s| s.ref_utxo.clone())
+        .collect()
+}
+
+/// True when `reward_account` is the script reward account for `script_hash`
+/// on any network. A reward account is one header byte (0xe0/0xe1 key,
+/// 0xf0/0xf1 script; low nibble = network id) followed by the 28-byte
+/// credential. Matching on the credential and the script nibble keeps the
+/// extractors network-agnostic: the previous `0xf0 || hash` comparison was
+/// the testnet form and never matched on mainnet, so every mainnet pool fell
+/// back to default module configs.
+pub fn is_script_reward_account(reward_account: &[u8], script_hash: &ScriptHash) -> bool {
+    reward_account.len() == 29
+        && reward_account[0] >> 4 == 0xf
+        && &reward_account[1..] == script_hash.as_ref()
+}
+
+/// Index of `script_hash`'s withdrawal in the tx's canonical (sorted)
+/// withdrawal set — the index a `Reward` redeemer refers to.
+fn withdrawal_index_of_script(tx: &MultiEraTx, script_hash: &ScriptHash) -> Option<usize> {
+    tx.withdrawals_sorted_set()
+        .iter()
+        .position(|(account, _)| is_script_reward_account(account, script_hash))
+}
+
 /// Free-function form: try to extract a `ConstantSumConfig` from a tx's
 /// CS module Create withdrawal redeemer. Used by both the live indexer and
 /// the bootstrap path (which fetches a historical tx via Blockfrost).
@@ -751,10 +768,7 @@ pub fn extract_cs_config_from_tx(
 ) -> Option<crate::sundaev4::types::ConstantSumConfig> {
     use crate::sundaev4::types::{ConstantSumConfig, ConstantSumRedeemer};
 
-    let mut account = vec![0xf0u8];
-    account.extend_from_slice(cs_script_hash.as_ref());
-    let sorted = tx.withdrawals_sorted_set();
-    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let wd_index = withdrawal_index_of_script(tx, cs_script_hash)?;
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
@@ -782,10 +796,7 @@ pub fn extract_fee_split_config_from_tx(
 ) -> Option<crate::sundaev4::types::FeeSplitConfig> {
     use crate::sundaev4::types::FeeSplitRedeemer;
 
-    let mut account = vec![0xf0u8];
-    account.extend_from_slice(fs_script_hash.as_ref());
-    let sorted = tx.withdrawals_sorted_set();
-    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let wd_index = withdrawal_index_of_script(tx, fs_script_hash)?;
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
@@ -806,10 +817,7 @@ pub fn extract_cp_config_from_tx(
 ) -> Option<crate::sundaev4::types::ConstantProductConfig> {
     use crate::sundaev4::types::ConstantProductRedeemer;
 
-    let mut account = vec![0xf0u8];
-    account.extend_from_slice(cp_script_hash.as_ref());
-    let sorted = tx.withdrawals_sorted_set();
-    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let wd_index = withdrawal_index_of_script(tx, cp_script_hash)?;
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
@@ -830,10 +838,7 @@ pub fn extract_cl_config_from_tx(
 ) -> Option<crate::sundaev4::types::ConcentratedLiquidityConfig> {
     use crate::sundaev4::types::ConcentratedLiquidityRedeemer;
 
-    let mut account = vec![0xf0u8];
-    account.extend_from_slice(cl_script_hash.as_ref());
-    let sorted = tx.withdrawals_sorted_set();
-    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let wd_index = withdrawal_index_of_script(tx, cl_script_hash)?;
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
@@ -856,10 +861,7 @@ pub fn extract_fee_split_config_for_pool_from_tx(
 ) -> Option<crate::sundaev4::types::FeeSplitConfig> {
     use crate::sundaev4::types::FeeSplitRedeemer;
 
-    let mut account = vec![0xf0u8];
-    account.extend_from_slice(fs_script_hash.as_ref());
-    let sorted = tx.withdrawals_sorted_set();
-    let wd_index = sorted.iter().position(|(k, _)| *k == account.as_slice())?;
+    let wd_index = withdrawal_index_of_script(tx, fs_script_hash)?;
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
@@ -2015,5 +2017,127 @@ pub fn detect_pool_type(
             num: BigInt::from(exec.fee.0),
             den: BigInt::from(exec.fee.1),
         }),
+    }
+}
+
+#[cfg(test)]
+mod mainnet_create_tx_tests {
+    //! The mainnet SPRINKLES/JIMMIES pool's Create transaction
+    //! (4b814760…, slot 198130613), fetched from Blockfrost. Its withdrawals
+    //! are mainnet script reward accounts (header 0xf1). Until this fixture
+    //! existed, the extractors compared against `0xf0 || hash` — the testnet
+    //! form — matched nothing on mainnet, and every scooper fell back to
+    //! default module configs that fail eval.
+    use super::*;
+    use crate::bigint::BigInt;
+    use crate::sundaev4::types::Rational;
+
+    const CREATE_TX_HEX: &str =
+        include_str!("../../test/fixtures/mainnet-pool-create-4b814760.hex");
+    const CS_HASH: &str = "4e1a435f8d55f26068150579c18964e58078082b899e6bb560be7cd5";
+    const FEE_SPLIT_HASH: &str = "1351c687e6359b0030086fc7ddd6cd389f55f97faba3f531c5535688";
+
+    fn create_tx() -> Vec<u8> {
+        hex::decode(CREATE_TX_HEX.trim()).expect("fixture is hex")
+    }
+
+    fn ratio(num: i64, den: i64) -> Rational {
+        Rational {
+            num: BigInt::from(num),
+            den: BigInt::from(den),
+        }
+    }
+
+    #[test]
+    fn mainnet_create_tx_yields_the_constant_sum_config() {
+        let bytes = create_tx();
+        let tx = MultiEraTx::decode(&bytes).expect("decodes");
+        let cs_hash: ScriptHash = CS_HASH.parse().unwrap();
+        let cfg = extract_cs_config_from_tx(&tx, &cs_hash)
+            .expect("the Create redeemer carries the constant-sum config");
+        assert_eq!(cfg.prices, vec![BigInt::from(1), BigInt::from(1)]);
+        assert_eq!(cfg.fee, ratio(25, 10000));
+        assert_eq!(cfg.bounty_k, ratio(25, 20000));
+        assert_eq!(cfg.balance_fee, ratio(0, 1));
+    }
+
+    #[test]
+    fn mainnet_create_tx_yields_the_fee_split_config() {
+        let bytes = create_tx();
+        let tx = MultiEraTx::decode(&bytes).expect("decodes");
+        let fs_hash: ScriptHash = FEE_SPLIT_HASH.parse().unwrap();
+        let cfg = extract_fee_split_config_from_tx(&tx, &fs_hash)
+            .expect("the Create redeemer carries the fee_split config");
+        assert_eq!(cfg.protocol_share, ratio(1, 5));
+    }
+
+    #[test]
+    fn script_reward_account_matches_on_credential_and_script_nibble_only() {
+        let hash: ScriptHash = CS_HASH.parse().unwrap();
+        let mut mainnet = vec![0xf1u8];
+        mainnet.extend_from_slice(hash.as_ref());
+        let mut testnet = vec![0xf0u8];
+        testnet.extend_from_slice(hash.as_ref());
+        let mut key_account = vec![0xe1u8];
+        key_account.extend_from_slice(hash.as_ref());
+        let mut other_credential = hash.as_ref().to_vec();
+        other_credential[0] ^= 0xff;
+        let mut other_script = vec![0xf1u8];
+        other_script.extend_from_slice(&other_credential);
+
+        assert!(is_script_reward_account(&mainnet, &hash));
+        assert!(is_script_reward_account(&testnet, &hash));
+        assert!(
+            !is_script_reward_account(&key_account, &hash),
+            "a key credential is not the script"
+        );
+        assert!(!is_script_reward_account(&other_script, &hash));
+        assert!(
+            !is_script_reward_account(&mainnet[1..], &hash),
+            "a bare credential has no header"
+        );
+    }
+
+    #[test]
+    fn every_configured_module_ref_utxo_is_tracked() {
+        use crate::cardano_types::TransactionInput;
+        use crate::sundaev4::types::{ModuleScripts, ScriptRefInfo};
+        let mut n = 0u64;
+        let mut next = |hash_hex: &str| {
+            n += 1;
+            ScriptRefInfo {
+                hash: hash_hex.parse().unwrap(),
+                ref_utxo: TransactionInput::new([n as u8; 32].into(), 0),
+                script_cbor: None,
+            }
+        };
+        let scripts = ModuleScripts {
+            constant_product: Some(next(CS_HASH)),
+            fee_split: next(FEE_SPLIT_HASH),
+            fairness: next(CS_HASH),
+            pool: next(CS_HASH),
+            order: next(CS_HASH),
+            pool_mint: next(CS_HASH),
+            settings: next(CS_HASH),
+            constant_sum: Some(next(CS_HASH)),
+            concentrated_liquidity: Some(next(CS_HASH)),
+            swap_order: Some(next(CS_HASH)),
+            basic_order: Some(next(CS_HASH)),
+            route_order: Some(next(CS_HASH)),
+            fairness_order: Some(next(CS_HASH)),
+            strategy_order: Some(next(CS_HASH)),
+            fee_constraint: Some(next(CS_HASH)),
+        };
+        let tracked = module_ref_utxos(&scripts);
+        assert_eq!(
+            tracked.len(),
+            15,
+            "six required modules and nine optional ones"
+        );
+        let fee_constraint_ref = scripts.fee_constraint.as_ref().unwrap().ref_utxo.clone();
+        assert!(
+            tracked.contains(&fee_constraint_ref),
+            "fee_constraint is invoked by every scoop and must be in the store"
+        );
     }
 }
