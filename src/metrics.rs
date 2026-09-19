@@ -206,6 +206,9 @@ pub struct OpsSnapshot {
     /// Orders skipped because they name an OrderConfig token that isn't
     /// indexed (typically never minted) — undispatchable until it appears.
     pub config_missing_orders: usize,
+    /// Pools carrying a configured trading allowlist. Answers "is the
+    /// restriction actually live" without reading config off the host.
+    pub restricted_pools: usize,
     /// True while the scooper is sitting out cycles after a lost race.
     pub backoff_active: bool,
 }
@@ -694,6 +697,12 @@ pub async fn render_metrics(
         "scooper_config_missing_orders",
         "Orders skipped for referencing an unindexed OrderConfig",
         ops.config_missing_orders,
+    );
+    write_gauge(
+        &mut out,
+        "scooper_restricted_pools",
+        "Pools with a configured trading allowlist",
+        ops.restricted_pools,
     );
     write_gauge(
         &mut out,

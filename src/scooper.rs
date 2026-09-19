@@ -82,6 +82,9 @@ pub struct Scooper {
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
     logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
+    /// Allowlist preconditions, checked once against on-chain settings. `None`
+    /// until the first cycle that has them.
+    allowlists_ok: Option<bool>,
     /// Unconfirmed orders observed in the local node's mempool, shared with
     /// the mempool monitor. None = chained execution disabled.
     v4_provisional: Option<crate::mempool::SharedProvisional>,
@@ -133,6 +136,7 @@ impl Scooper {
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
+            allowlists_ok: None,
         })
     }
 
@@ -636,6 +640,18 @@ impl Scooper {
             }
         };
 
+        if self.allowlists_ok.is_none() {
+            self.allowlists_ok = Some(crate::sundaev4::access::verify_config(
+                &exec.pool_allowlists,
+                exec.module_scripts.strategy_order.as_ref(),
+                settings.datum.authorized_scoopers.as_ref(),
+                &v4_state.pools,
+            ));
+        }
+        if self.allowlists_ok == Some(false) {
+            return false;
+        }
+
         // The network tip (actual chain tip, falling back to the last block we
         // processed) anchors the validity interval's *start*; wall clock
         // anchors everything that means "now", including the TTL.
@@ -812,6 +828,12 @@ impl Scooper {
         // redeemer (in canonical input order).
         let mut strategy_executions: BTreeMap<TransactionInput, pallas_primitives::PlutusData> =
             BTreeMap::new();
+        // The only site where a strategy order is still decoded; the
+        // allowlist gate needs its constraints downstream.
+        let mut strategy_constraints: BTreeMap<
+            TransactionInput,
+            crate::sundaev4::StrategyConstraints,
+        > = BTreeMap::new();
         // A claim-hinted intent that matched: executes as a dedicated
         // single-order plan, short-circuiting the normal accumulation cycle.
         let mut pending_claim_plan: Option<crate::sundaev4::batch::ScoopPlan> = None;
@@ -921,6 +943,10 @@ impl Scooper {
                         );
                     }
                     strategy_executions.insert(order.input.clone(), sse_pd);
+                    if let crate::sundaev4::Constraint::Strategy { constraints } = &order.constraint
+                    {
+                        strategy_constraints.insert(order.input.clone(), constraints.clone());
+                    }
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
                         input: order.input.clone(),
                         value: order.value.clone(),
@@ -1044,6 +1070,7 @@ impl Scooper {
                 provisional_spent: prov_spent,
                 foreign_pools: foreign_count,
                 config_missing_orders: n_config_missing as usize,
+                restricted_pools: exec.pool_allowlists.restricted_idents().count(),
                 backoff_active: self.backoff_until_after_slot.is_some(),
             });
         }
@@ -1222,6 +1249,7 @@ impl Scooper {
         let mut skip_no_pool = 0u32;
         let mut skip_add_failed = 0u32;
         let mut skip_no_route = 0u32;
+        let mut skip_not_allowlisted = 0u32;
         let mut skip_route_failed = 0u32;
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
@@ -1254,6 +1282,7 @@ impl Scooper {
             // with both assets" picked a suboptimal pool and rejected the
             // order when a better pool existed.
             let is_provisional = provisional_inputs.contains(&order.input);
+            let order_strategy = strategy_constraints.get(&order.input);
             if is_provisional && n_confirmed_added > 0 {
                 // Provisional orders ride their own tx; the loop re-runs
                 // immediately after this one submits, so they only wait one
@@ -1270,6 +1299,15 @@ impl Scooper {
                         skip_no_pool += 1;
                         continue;
                     };
+                    if !exec.pool_allowlists.permits(&pool_ident, order, order_strategy) {
+                        trace!(
+                            order = %order.input,
+                            pool = %pool_ident,
+                            "order dispatch: not on the pool's allowlist",
+                        );
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
                     tracing::info!(order = %order.input, kind = "deposit", matched_pool = %pool_ident, "order dispatch");
                     let effective_pool = pick_effective_pool(
                         &candidate,
@@ -1339,6 +1377,15 @@ impl Scooper {
                         skip_no_pool += 1;
                         continue;
                     };
+                    if !exec.pool_allowlists.permits(&pool_ident, order, order_strategy) {
+                        trace!(
+                            order = %order.input,
+                            pool = %pool_ident,
+                            "order dispatch: not on the pool's allowlist",
+                        );
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
                     tracing::info!(order = %order.input, kind = "withdraw", matched_pool = %pool_ident, "order dispatch");
                     let effective_pool = pick_effective_pool(
                         &candidate,
@@ -1370,7 +1417,13 @@ impl Scooper {
                     if offer_asset == ask_asset {
                         continue;
                     }
-                    let pool_view = candidate.current_pool_view(&pools_filtered);
+                    // Filtered after the overlay, never before — see
+                    // `PoolAllowlists::retain_visible`.
+                    let pool_view = exec.pool_allowlists.retain_visible(
+                        candidate.current_pool_view(&pools_filtered),
+                        order,
+                        order_strategy,
+                    );
                     // Per-order fan-out limits: the order's tx-fee budget
                     // buys it a number of pools and routing steps. Orders
                     // paying more get more elaborate routes.
@@ -1611,6 +1664,7 @@ impl Scooper {
                 skip_no_pool,
                 skip_add_failed,
                 skip_no_route,
+                skip_not_allowlisted,
                 skip_route_failed,
                 "no orders could be added to batch"
             );
@@ -2642,6 +2696,14 @@ impl Scooper {
         if in_flight_pools.contains(ident)
             || exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes()))
         {
+            return None;
+        }
+        let strategy = match &order.constraint {
+            crate::sundaev4::Constraint::Strategy { constraints } => Some(constraints),
+            _ => None,
+        };
+        if !exec.pool_allowlists.permits(ident, order, strategy) {
+            debug!(order = %order.input, pool = %pool_hex, "claim intent's order is not on the pool's allowlist");
             return None;
         }
         let PoolType::ConstantSum {

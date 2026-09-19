@@ -2266,6 +2266,88 @@ mod tests {
         assert!(!eval.budgets.is_empty());
     }
 
+    /// A pool's trading allowlist must be applied to the view the router
+    /// receives. `current_pool_view` re-inserts every pool the batch has
+    /// touched, so filtering the map it falls back to lets a restricted pool
+    /// return as soon as one permitted order has used it.
+    #[test]
+    fn allowlist_survives_the_accumulator_overlay() {
+        use crate::multisig::Multisig;
+        use crate::sundaev4::SundaeV4Order;
+        use crate::sundaev4::access::{PoolAllowlist, PoolAllowlists};
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        /// Reassign an order's owner. The harness builds every order under
+        /// 0xAA, which is the credential the allowlist below admits.
+        fn with_owner(order: Arc<SundaeV4Order>, owner: Multisig) -> Arc<SundaeV4Order> {
+            let mut inner = Arc::try_unwrap(order).expect("sole ownership");
+            inner.datum.owner = owner;
+            Arc::new(inner)
+        }
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let deep = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            2_000_000_000,
+            token_b(),
+            2_000_000_000,
+        );
+        let thin = make_pool(&env, 0xBB, token_a(), 500_000_000, token_b(), 500_000_000);
+        let mut pools = BTreeMap::new();
+        pools.insert(deep.pool_datum.identifier.clone(), deep.clone());
+        pools.insert(thin.pool_datum.identifier.clone(), thin.clone());
+
+        let allowlists = PoolAllowlists(BTreeMap::from([(
+            hex::encode(deep.pool_datum.identifier.to_bytes()),
+            PoolAllowlist {
+                credentials: BTreeSet::from([hex::encode([0xAAu8; 28])]),
+            },
+        )]));
+
+        let permitted = make_order(token_a(), 10_000_000, token_b(), 1, 1);
+        let denied = with_owner(
+            make_order(token_a(), 10_000_000, token_b(), 1, 2),
+            Multisig::Signature(vec![0xCC; 28]),
+        );
+        assert!(allowlists.permits(&deep.pool_datum.identifier, &permitted, None));
+        assert!(!allowlists.permits(&deep.pool_datum.identifier, &denied, None));
+
+        // A permitted order takes the deep pool, which puts it in the batch.
+        let route = router::find_optimal_route(
+            &pools,
+            &[],
+            &token_a(),
+            &token_b(),
+            permitted.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("route exists");
+        assert_eq!(
+            route.hops[0].splits[0].pool.ident,
+            deep.pool_datum.identifier
+        );
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&permitted, &route, &pools).expect("permitted order executes");
+
+        // Filtering the fallback map is not enough.
+        let upstream = allowlists.retain_visible(pools.clone(), &denied, None);
+        assert!(!upstream.contains_key(&deep.pool_datum.identifier));
+        assert!(
+            accum.current_pool_view(&upstream).contains_key(&deep.pool_datum.identifier),
+            "the overlay re-admits a pool filtered out upstream",
+        );
+
+        // Filtering what the router is handed keeps it out.
+        let view = allowlists.retain_visible(accum.current_pool_view(&pools), &denied, None);
+        assert!(!view.contains_key(&deep.pool_datum.identifier));
+        assert!(view.contains_key(&thin.pool_datum.identifier));
+    }
+
     /// A swap expressed via the BASIC constraint module routes — and
     /// BLENDS across two disjoint paths — through the real validators.
     /// Pools: direct A/B (1B/1B) plus A/E and E/B (1B each), so the blend

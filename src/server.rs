@@ -156,6 +156,7 @@ pub async fn admin_server(
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
     v4_routing_costs: Option<(u64, u64)>,
+    v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: ModuleStatePreimages,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -171,6 +172,7 @@ pub async fn admin_server(
         v4_state,
         v4_fee,
         v4_routing_costs,
+        v4_pool_allowlists,
         v4_module_preimages: Arc::new(v4_module_preimages),
         resync_tx,
         event_tx,
@@ -294,6 +296,9 @@ struct AdminServer {
     /// fan-out gating knobs, mirrored here so executability reporting
     /// agrees with what dispatch will actually do.
     v4_routing_costs: Option<(u64, u64)>,
+    /// Per-pool trading allowlists, mirrored from the execution config so
+    /// listings and intent probes agree with what dispatch will do.
+    v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: Arc<ModuleStatePreimages>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
@@ -523,6 +528,17 @@ impl AdminServer {
                     o.input.0.transaction_id.as_ref() == key.0.as_slice()
                         && o.input.0.index == key.1
                 });
+                // Mirror dispatch: a restricted pool is invisible to an order
+                // whose credentials aren't on its allowlist, so a swap intent
+                // blocked this way reports as unroutable.
+                let strategy = order.and_then(|o| match &o.constraint {
+                    crate::sundaev4::Constraint::Strategy { constraints } => Some(constraints),
+                    _ => None,
+                });
+                let visible = match order {
+                    Some(o) => self.v4_pool_allowlists.retain_visible(pools.clone(), o, strategy),
+                    None => pools.clone(),
+                };
                 let probe: serde_json::Value = match (order, &i.hint) {
                     (None, _) => serde_json::json!("order-not-indexed"),
                     // The order validator's withdraw handler demands the
@@ -539,11 +555,21 @@ impl AdminServer {
                                        against an existing config)",
                         })
                     }
+                    (Some(_), Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }))
+                        if !visible.keys().any(|id| &hex::encode(id.to_bytes()) == pool)
+                            && pools.keys().any(|id| &hex::encode(id.to_bytes()) == pool) =>
+                    {
+                        serde_json::json!({
+                            "state": "not-permitted",
+                            "pool": pool,
+                            "detail": "this scooper does not serve the order's credentials                                        on that pool",
+                        })
+                    }
                     (
                         Some(order),
                         Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }),
-                    ) => Self::probe_claim(order, i, pool, &pools),
-                    (Some(order), None) => Self::probe_swap(order, i, &pools),
+                    ) => Self::probe_claim(order, i, pool, &visible),
+                    (Some(order), None) => Self::probe_swap(order, i, &visible),
                 };
                 serde_json::json!({
                     "status": "pending",
@@ -1380,10 +1406,14 @@ impl AdminServer {
         let mut json_map = serde_json::Map::new();
 
         for (ident, pool) in &state.pools {
-            json_map.insert(
-                hex::encode(ident.to_bytes()),
-                Self::v4_pool_json(pool, &self.v4_module_preimages),
-            );
+            let ident_hex = hex::encode(ident.to_bytes());
+            let mut json = Self::v4_pool_json(pool, &self.v4_module_preimages);
+            if self.v4_pool_allowlists.0.contains_key(&ident_hex)
+                && let Some(obj) = json.as_object_mut()
+            {
+                obj.insert("restricted".into(), true.into());
+            }
+            json_map.insert(ident_hex, json);
         }
 
         serde_json::to_string_pretty(&json_map).unwrap()
