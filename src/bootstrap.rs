@@ -906,6 +906,223 @@ impl BootstrapProvider for BlockfrostProvider {
 // Orchestration
 // ──────────────────────────────────────────────────────────────────────────────
 
+fn make_provider(config: &BootstrapConfig) -> Box<dyn BootstrapProvider + Send + Sync> {
+    match config {
+        BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
+        BootstrapConfig::Blockfrost { url, project_id } => {
+            Box::new(BlockfrostProvider::new(url, project_id))
+        }
+    }
+}
+
+/// Which of a pool's module configs are still unknown: (cs, cp, cl, fee_split).
+///
+/// Pure, so the decision that gates a chain lookup can be tested without one.
+fn missing_module_configs(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    cs_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig>,
+    cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
+    cl_configs: &std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig>,
+    fs_configs: &std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig>,
+) -> (bool, bool, bool, bool) {
+    (
+        needs_cs_lookup(pool_datum, execution, cs_configs),
+        needs_cp_lookup(pool_datum, execution, cp_configs),
+        needs_cl_lookup(pool_datum, execution, cl_configs),
+        !fs_configs.contains_key(&pool_datum.identifier),
+    )
+}
+
+/// Recover, from chain, the module config of every known pool that the DB does
+/// not yet have one for. Runs on every start, whatever the DB looks like.
+///
+/// A pool's constant-sum config is hash-pinned in its datum and lives only in
+/// its Create redeemer. Until now the only code that recovered it ran inside
+/// `run_bootstrap`, and `run_bootstrap` runs only when `tip_slot == 0` — a DB
+/// that has never indexed a block. So a scooper that started once with a bad
+/// config, or was stopped mid-sync, or simply joined after a pool was created,
+/// carried a tip and never bootstrapped again: the config was unrecoverable,
+/// the indexer fell back to guessed defaults, and every scoop against that pool
+/// failed eval. Seen in the wild on the first third-party mainnet scooper.
+///
+/// Returns the idents whose configs changed, so the caller can re-classify the
+/// pools already loaded into memory with the old defaults.
+pub async fn recover_missing_module_configs(
+    config: &BootstrapConfig,
+    protocol: &SundaeV4Protocol,
+    state: &Arc<Mutex<SundaeV4HistoricalState>>,
+    persistence: &Arc<dyn crate::persistence::Persistence>,
+) -> Result<Vec<Ident>> {
+    let Some(exec) = protocol.execution.as_ref() else {
+        return Ok(vec![]);
+    };
+    let dao = persistence.indexer_dao("sundae_v4");
+
+    let cs_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.constant_sum.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let cp_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.constant_product.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let cl_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.concentrated_liquidity.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let fs_module_hash: Vec<u8> = exec.module_scripts.fee_split.hash.as_ref().to_vec();
+
+    // What the DB already knows.
+    let mut cs_configs = std::collections::BTreeMap::new();
+    let mut cp_configs = std::collections::BTreeMap::new();
+    let mut cl_configs = std::collections::BTreeMap::new();
+    let mut fs_configs = std::collections::BTreeMap::new();
+    for cfg in dao.load_module_configs().await.context("recover: load persisted module configs")? {
+        let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
+            .context("recover: persisted module config CBOR malformed")?;
+        let ident = Ident::new(&cfg.pool_id);
+        if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
+            cs_configs.insert(ident, sundaev4::ConstantSumConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+            cp_configs.insert(ident, sundaev4::ConstantProductConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == cl_module_hash.as_ref() {
+            cl_configs.insert(
+                ident,
+                sundaev4::ConcentratedLiquidityConfig::from_plutus(pd)?,
+            );
+        } else if cfg.module_hash == fs_module_hash {
+            fs_configs.insert(ident, sundaev4::FeeSplitConfig::from_plutus(pd)?);
+        }
+    }
+
+    // The pools we currently track, snapshotted so the lock is not held across
+    // network calls.
+    let pools: Vec<(Ident, sundaev4::PoolDatum, u64)> = {
+        let locked = state.lock().await;
+        let latest = locked.latest();
+        latest
+            .pools
+            .values()
+            .map(|p| {
+                (
+                    p.pool_datum.identifier.clone(),
+                    p.pool_datum.clone(),
+                    p.slot,
+                )
+            })
+            .collect()
+    };
+
+    let mut provider: Option<Box<dyn BootstrapProvider + Send + Sync>> = None;
+    let mut persisted: Vec<crate::persistence::PersistedModuleConfig> = Vec::new();
+    let mut changed: Vec<Ident> = Vec::new();
+    let mut max_slot = 0u64;
+
+    for (ident, pool_datum, slot) in pools {
+        let (need_cs, need_cp, need_cl, need_fs) = missing_module_configs(
+            &pool_datum,
+            Some(exec),
+            &cs_configs,
+            &cp_configs,
+            &cl_configs,
+            &fs_configs,
+        );
+        if !(need_cs || need_cp || need_cl || need_fs) {
+            continue;
+        }
+        let ident_hex = hex::encode(ident.to_bytes());
+        info!(pool = %ident_hex, need_cs, need_cp, need_cl, need_fs, "v4: pool is missing module config(s); recovering from chain");
+
+        let provider = provider.get_or_insert_with(|| make_provider(config));
+        let recovered =
+            lookup_pool_module_configs(&**provider, protocol, &ident, need_cs, need_cp, need_cl)
+                .await
+                .with_context(|| {
+                    format!("v4: failed to recover module configs for pool {ident_hex}")
+                })?;
+
+        let mut push = |module_hash: Vec<u8>, cbor: Vec<u8>| {
+            persisted.push(crate::persistence::PersistedModuleConfig {
+                pool_id: ident.to_bytes().to_vec(),
+                module_hash,
+                config_cbor: cbor,
+                created_slot: slot,
+            });
+        };
+        let mut any = false;
+        if need_cs {
+            match recovered.cs {
+                Some(cfg) => {
+                    push(
+                        cs_module_hash.clone().expect("cs hash known when need_cs"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered constant-sum config");
+                }
+                // A CS pool with no recoverable config can never be scooped.
+                // Say so once, loudly; do not fall through to defaults.
+                None => {
+                    warn!(pool = %ident_hex, "v4: constant-sum pool but no Create redeemer found in its tx history; scoops against it WILL fail eval")
+                }
+            }
+        }
+        if need_cp {
+            match recovered.cp {
+                Some(cfg) => {
+                    push(
+                        cp_module_hash.clone().expect("cp hash known when need_cp"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered constant-product config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no constant-product config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if need_cl {
+            match recovered.cl {
+                Some(cfg) => {
+                    push(
+                        cl_module_hash.clone().expect("cl hash known when need_cl"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered concentrated-liquidity config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no concentrated-liquidity config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if need_fs {
+            match recovered.fee_split {
+                Some(cfg) => {
+                    push(fs_module_hash.clone(), minicbor::to_vec(cfg.to_plutus())?);
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered fee_split config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no fee_split config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if any {
+            changed.push(ident);
+            max_slot = max_slot.max(slot);
+        }
+    }
+
+    if !persisted.is_empty() {
+        // Upsert: the table keeps the earliest created_slot per (pool, module).
+        let mut changes = crate::persistence::TxChanges::new(max_slot, 0);
+        changes.module_configs = persisted;
+        dao.apply_tx_changes(changes).await.context("recover: persist recovered module configs")?;
+        info!(
+            pools = changed.len(),
+            "v4: persisted recovered module configs"
+        );
+    }
+    Ok(changed)
+}
+
 pub async fn run_bootstrap(
     config: &BootstrapConfig,
     v3_protocol: Option<&SundaeV3Protocol>,
@@ -914,12 +1131,7 @@ pub async fn run_bootstrap(
     v4_state: &Option<Arc<Mutex<SundaeV4HistoricalState>>>,
     persistence: &Arc<dyn crate::persistence::Persistence>,
 ) -> Result<BootstrapResult> {
-    let provider: Box<dyn BootstrapProvider + Send + Sync> = match config {
-        BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
-        BootstrapConfig::Blockfrost { url, project_id } => {
-            Box::new(BlockfrostProvider::new(url, project_id))
-        }
-    };
+    let provider = make_provider(config);
 
     let (tip_slot, tip_hash) = provider.fetch_tip().await?;
     info!(tip_slot, tip_hash = %tip_hash, "bootstrap: fetched chain tip");
@@ -2203,5 +2415,117 @@ mod live_smoke_tests {
             eprintln!("NOTE: no CS pools currently on preview — skipping deep verification");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recover_missing_configs_tests {
+    //! The decision that gates chain recovery of a pool's module configs.
+    //! Until this pass existed, that recovery ran only inside a first-ever
+    //! bootstrap (`tip_slot == 0`), so any DB carrying a tip could never learn
+    //! a config it lacked. These pin the decision itself; the network walk is
+    //! covered by the `#[ignore]`d live smoke tests.
+
+    use super::missing_module_configs;
+    use crate::bigint::BigInt;
+    use crate::sundaev4::test_harness::{TestEnv, make_cs_pool, token_a, token_b};
+    use crate::sundaev4::{ConstantSumConfig, PoolConfig, PoolType, Rational, SundaeV4Pool};
+    use std::collections::BTreeMap;
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+
+    fn cs_pool(env: &TestEnv) -> std::sync::Arc<SundaeV4Pool> {
+        make_cs_pool(
+            env,
+            0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+        )
+    }
+
+    /// A constant-sum pool nothing knows about needs its CS and fee-split
+    /// configs recovered — and must not ask for CP or CL, whose lookups would
+    /// come back empty and log noise for a pool that never had them.
+    #[test]
+    fn unknown_cs_pool_asks_for_cs_and_fee_split_only() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let (cs, cp, cl, fs) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!((cs, cp, cl, fs), (true, false, false, true));
+    }
+
+    /// Once the cache has the pool's CS config, recovery stops asking for it.
+    /// This is the state every start after a successful recovery should be in,
+    /// so it must be cheap: no network call at all.
+    #[test]
+    fn known_cs_config_is_not_requested_again() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let mut cs_configs = BTreeMap::new();
+        if let PoolType::ConstantSum {
+            prices,
+            fee,
+            bounty_k,
+            balance_fee,
+        } = pool.pool_type.clone()
+        {
+            cs_configs.insert(
+                pool.pool_datum.identifier.clone(),
+                ConstantSumConfig {
+                    prices,
+                    fee,
+                    bounty_k,
+                    balance_fee,
+                },
+            );
+        } else {
+            panic!("make_cs_pool must yield a constant-sum pool type");
+        }
+        let (cs, _, _, _) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &cs_configs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(!cs, "a cached CS config must suppress the chain lookup");
+    }
+
+    /// An operator `pool-configs` override also suppresses the lookup, as it
+    /// always has. (Whether that override can *express* a given pool is a
+    /// separate problem: it forces bounty_k to 0/1.)
+    #[test]
+    fn operator_override_suppresses_cs_lookup() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let mut exec = env.exec.clone();
+        exec.pool_configs.insert(
+            hex::encode(pool.pool_datum.identifier.to_bytes()),
+            PoolConfig::ConstantSum {
+                prices: vec![1_000_000, 1_000_000],
+                fee: (3, 1000),
+            },
+        );
+        let (cs, _, _, _) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(!cs, "an operator override must suppress the chain lookup");
     }
 }

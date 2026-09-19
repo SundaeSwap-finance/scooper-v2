@@ -268,6 +268,47 @@ impl SundaeV4Indexer {
         Ok(())
     }
 
+    /// Re-derive `pool_type` and `fee_split_config` for the given pools from
+    /// the (freshly rehydrated) module-config cache.
+    ///
+    /// `load()` classifies every pool it finds in the DB against the cache as
+    /// it stood then. When a config is recovered afterwards the cache is
+    /// refreshed, but the pools already in memory keep the defaults they were
+    /// classified with — and those are exactly the values the first scoop would
+    /// build against. Recompute them in place.
+    pub async fn reclassify_pools(
+        &self,
+        state: &Arc<Mutex<SundaeV4HistoricalState>>,
+        idents: &[Ident],
+    ) -> Result<()> {
+        let cache = self.module_configs.lock().await;
+        let mut locked = state.lock().await;
+        let tip_slot = locked.latest().tip_slot;
+        let s = locked.update_slot(tip_slot)?;
+        let mut n = 0usize;
+        for ident in idents {
+            let Some(existing) = s.pools.get(ident) else {
+                continue;
+            };
+            let mut pool = (**existing).clone();
+            pool.pool_type = detect_pool_type(
+                &pool.pool_datum,
+                self.protocol.execution.as_ref(),
+                cache.cs.get(ident),
+                cache.cp.get(ident),
+                cache.cl.get(ident),
+            );
+            pool.fee_split_config = cache.fee_split.get(ident).cloned();
+            s.pools.insert(ident.clone(), Arc::new(pool));
+            n += 1;
+        }
+        info!(
+            pools = n,
+            "v4: re-classified pools with recovered module configs"
+        );
+        Ok(())
+    }
+
     pub async fn load(&mut self) -> Result<()> {
         let txos = self.dao.load_txos().await?;
         let datums = self.dao.load_datums().await?;
