@@ -5,11 +5,6 @@
   }
  },
  "protocol": {
-  "bootstrap": {
-   "source": "blockfrost",
-   "url": "https://cardano-mainnet.blockfrost.io/api/v0",
-   "project-id": "REPLACE_WITH_MAINNET_BLOCKFROST_PROJECT_ID"
-  },
   "v4": {
    "pool-script-hash": "21c9b7b965646069f9becebf8b4c3cedaf84c19b109eaa5980a14a26",
    "order-script-hashes": [
@@ -25,7 +20,6 @@
     "execute": true
    },
    "execution": {
-    "scooper-secret-key": "REPLACE_WITH_SCOOPER_SECRET_KEY",
     "max-tx-ex-mem": 16500000,
     "cost-per-pool-lovelace": 1000000,
     "cost-per-step-lovelace": 500000,
@@ -774,7 +768,8 @@
     "partial-fill-margin": [
      3,
      2
-    ]
+    ],
+    "scooper-secret-key-file": "REPLACE_WITH_PATH_TO/scooper-v2/keys/scooper.skey.hex"
    },
    "fee-settings-token": "0019b58b8d626ebe1f2ad80fbc01f9125f54b6c6a4d2b45d31178bc72c337f35"
   }
@@ -788,14 +783,16 @@
   "module": {
    "peer-network-interface": {
     "node-addresses": [
-     "backbone.cardano.iog.io:3001",
-     "backbone.mainnet.cardanofoundation.org:3001",
-     "backbone.mainnet.emurgornd.com:3001"
+     "localhost:3001"
     ]
    },
    "mithril-snapshot-fetcher": {
     "aggregator-url": "https://aggregator.release-mainnet.api.mithril.network/aggregator",
     "genesis-key": "5b3139312c36362c3134302c3138352c3133382c31312c3233372c3230372c3235302c3134342c32372c322c3138382c33302c31322c38312c3135352c3230342c31302c3137392c37352c32332c3133382c3139362c3231372c352c31342c32302c35372c37392c33392c3137365d"
+   },
+   "genesis-bootstrapper": {
+    "byron-genesis-file": "REPLACE_WITH_PATH_TO/cardano-node/share/mainnet/byron-genesis.json",
+    "shelley-genesis-file": "REPLACE_WITH_PATH_TO/cardano-node/share/mainnet/shelley-genesis.json"
    }
   }
  },
