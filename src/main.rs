@@ -479,6 +479,38 @@ async fn manager_loop(
             }
         }
 
+        // Module-config recovery used to live only inside run_bootstrap, and
+        // run_bootstrap runs only on a DB that has never indexed a block. Any
+        // scooper that started once with a bad config, stopped mid-sync, or
+        // joined after a pool was created therefore never learned that pool's
+        // config and scooped it with guessed defaults that fail eval. Recover
+        // whatever is missing on every start, then re-classify the pools that
+        // were loaded with the wrong defaults.
+        if let (Some(bootstrap_config), Some(v4_proto), Some(v4_state)) =
+            (&protocol.bootstrap, protocol.v4.as_ref(), &v4_state)
+        {
+            match bootstrap::recover_missing_module_configs(
+                bootstrap_config,
+                v4_proto,
+                v4_state,
+                &persistence,
+            )
+            .await
+            {
+                Ok(changed) if !changed.is_empty() => {
+                    if let Some((ref mut v4_index, _)) = v4_index_and_config {
+                        if let Err(e) = v4_index.rehydrate_module_configs().await {
+                            warn!("v4: module-config rehydrate after recovery failed: {e:#}");
+                        } else if let Err(e) = v4_index.reclassify_pools(v4_state, &changed).await {
+                            warn!("v4: re-classifying recovered pools failed: {e:#}");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("v4: module-config recovery failed: {e:#}"),
+            }
+        }
+
         if let Some((v3_index, v3_config)) = v3_index_and_config {
             let start = bootstrap_point.clone().unwrap_or_else(|| v3_config.starting_point.clone());
             indexer.add_index(v3_index, start, force_restart).await.unwrap();
