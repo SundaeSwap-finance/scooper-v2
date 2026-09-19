@@ -153,7 +153,6 @@ fn encode_bootstrap_utxo(
 trait BootstrapProvider {
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>>;
     async fn fetch_tip(&self) -> Result<(u64, String)>;
 
     /// Fetch pool UTxOs by discovering addresses that hold NFTs under the given policy.
@@ -219,6 +218,22 @@ struct KupoProvider {
 }
 
 impl KupoProvider {
+    /// Datum by hash; `Ok(None)` when Kupo does not know it, an error otherwise.
+    async fn fetch_datum_opt(&self, datum_hash: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/datums/{}", self.url, datum_hash);
+        let resp = self.client.get(&url).send().await.context("kupo: fetch datum")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp: KupoDatumResponse = resp
+            .error_for_status()
+            .context("kupo: datum status")?
+            .json()
+            .await
+            .context("kupo: parse datum")?;
+        hex::decode(&resp.datum).context("kupo: invalid datum hex").map(Some)
+    }
+
     fn new(url: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -329,16 +344,19 @@ impl BootstrapProvider for KupoProvider {
 
             // Resolve datum: inline datums have datum_type="inline" and datum is the CBOR hex.
             // Hash datums have datum_type="hash" and datum_hash is set.
+            // A fetch failure is an error, not a missing datum: the bootstrap
+            // skips a pool whose datum is None, and a snapshot persisted
+            // without that pool is never repaired. Only "Kupo has no such
+            // datum" (404) is a missing datum.
             let datum_cbor = if utxo.datum_type.as_deref() == Some("inline") {
                 utxo.datum.as_deref().and_then(|d| hex::decode(d).ok())
             } else if let Some(ref dh) = utxo.datum_hash {
-                match self.fetch_datum(dh).await {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) => {
-                        warn!(datum_hash = %dh, "kupo: could not fetch datum: {e:#}");
-                        None
-                    }
-                }
+                self.fetch_datum_opt(dh).await.with_context(|| {
+                    format!(
+                        "kupo: datum {dh} for {}#{}",
+                        utxo.transaction_id, utxo.output_index
+                    )
+                })?
             } else {
                 None
             };
@@ -386,22 +404,6 @@ impl BootstrapProvider for KupoProvider {
             });
         }
         Ok(result)
-    }
-
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/datums/{}", self.url, datum_hash);
-        let resp: KupoDatumResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("kupo: fetch datum")?
-            .error_for_status()
-            .context("kupo: datum status")?
-            .json()
-            .await
-            .context("kupo: parse datum")?;
-        hex::decode(&resp.datum).context("kupo: invalid datum hex")
     }
 
     async fn fetch_tip(&self) -> Result<(u64, String)> {
@@ -459,11 +461,79 @@ impl BootstrapProvider for KupoProvider {
 // Blockfrost provider
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Blockfrost rate-limits per project as a token bucket: a burst of 500
+/// requests, refilled at 10 per second, and HTTP 429 beyond that. The
+/// provider keeps the same bucket locally so a bootstrap spends the burst
+/// and then settles at the refill rate instead of tripping 429 in a loop.
+const BLOCKFROST_BURST: f64 = 500.0;
+const BLOCKFROST_REFILL_PER_SEC: f64 = 10.0;
+/// Attempts per request before a network error or 5xx becomes an error.
+/// 429 is not counted: it clears within seconds and is retried until it does.
+const BLOCKFROST_MAX_ATTEMPTS: u32 = 6;
+/// Longest single back-off between attempts.
+const BLOCKFROST_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Local mirror of Blockfrost's token bucket.
+struct RateBucket {
+    tokens: f64,
+    refilled_at: tokio::time::Instant,
+}
+
+impl RateBucket {
+    fn full(now: tokio::time::Instant) -> Self {
+        Self {
+            tokens: BLOCKFROST_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Credit the refill since the last call, then take one token if there is
+    /// one. Returns how long to wait for the next token otherwise.
+    fn take(&mut self, now: tokio::time::Instant) -> Result<(), std::time::Duration> {
+        let elapsed = now.saturating_duration_since(self.refilled_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * BLOCKFROST_REFILL_PER_SEC).min(BLOCKFROST_BURST);
+        self.refilled_at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return Ok(());
+        }
+        Err(std::time::Duration::from_secs_f64(
+            (1.0 - self.tokens) / BLOCKFROST_REFILL_PER_SEC,
+        ))
+    }
+
+    /// The server said we are over: our mirror is ahead of it, so empty it.
+    fn drain(&mut self) {
+        self.tokens = 0.0;
+    }
+}
+
+/// How long to wait before attempt `attempt + 1`: the server's `Retry-After`
+/// when it sends one, else 1s doubling per attempt, capped.
+fn blockfrost_retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> std::time::Duration {
+    let backoff = std::time::Duration::from_secs(1u64 << attempt.min(10));
+    let wanted = match retry_after_secs {
+        Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
+        None => backoff,
+    };
+    wanted.min(BLOCKFROST_MAX_RETRY_DELAY)
+}
+
+/// Blockfrost serves `inline_datum` on a UTxO as the datum's CBOR in hex.
+/// Anything else (null, an object) yields None and the caller falls back to
+/// the datum endpoint.
+fn blockfrost_inline_datum_cbor(inline_datum: &serde_json::Value) -> Option<Vec<u8>> {
+    inline_datum.as_str().and_then(|hex_str| hex::decode(hex_str).ok())
+}
+
 struct BlockfrostProvider {
     client: reqwest::Client,
     url: String,
     project_id: String,
     network: Network,
+    bucket: Mutex<RateBucket>,
+    /// Block hash → slot, so a page of UTxOs from the same block costs one call.
+    block_slots: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl BlockfrostProvider {
@@ -478,7 +548,103 @@ impl BlockfrostProvider {
             url: url.trim_end_matches('/').to_string(),
             project_id: project_id.to_string(),
             network,
+            bucket: Mutex::new(RateBucket::full(tokio::time::Instant::now())),
+            block_slots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Take one token from the bucket, sleeping until one is available.
+    /// Callers awaiting concurrently are serialised by the lock.
+    async fn throttle(&self) {
+        let mut bucket = self.bucket.lock().await;
+        loop {
+            match bucket.take(tokio::time::Instant::now()) {
+                Ok(()) => return,
+                Err(wait) => tokio::time::sleep(wait).await,
+            }
+        }
+    }
+
+    /// One paced GET with the project id. A 429 drains the local bucket and
+    /// is retried until it clears; a network error or 5xx is retried with
+    /// back-off up to BLOCKFROST_MAX_ATTEMPTS. Every other status is returned
+    /// as-is for the caller to interpret.
+    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        let mut failures = 0u32;
+        let mut rate_limited = 0u32;
+        loop {
+            self.throttle().await;
+            let sent = self.client.get(url).header("project_id", &self.project_id).send().await;
+            let (status, retry_after) = match sent {
+                Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    self.bucket.lock().await.drain();
+                    rate_limited += 1;
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let delay = blockfrost_retry_delay(rate_limited.min(4) - 1, retry_after);
+                    warn!(
+                        rate_limited,
+                        delay_ms = delay.as_millis() as u64,
+                        "blockfrost: 429 Too Many Requests; backing off and retrying {url}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(resp) if resp.status().is_server_error() => (resp.status().to_string(), None),
+                Ok(resp) => return Ok(resp),
+                Err(e) => (format!("{e:#}"), None),
+            };
+            failures += 1;
+            if failures >= BLOCKFROST_MAX_ATTEMPTS {
+                anyhow::bail!("blockfrost: {status} after {failures} attempts: GET {url}");
+            }
+            let delay = blockfrost_retry_delay(failures - 1, retry_after);
+            warn!(
+                attempt = failures,
+                delay_ms = delay.as_millis() as u64,
+                "blockfrost: {status}; retrying {url}"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Datum CBOR by hash; `Ok(None)` when Blockfrost has no such datum
+    /// (a hash-only output whose datum was never posted), an error otherwise.
+    async fn fetch_datum_opt(&self, datum_hash: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/scripts/datum/{}/cbor", self.url, datum_hash);
+        let resp = self.get(&url).await.context("blockfrost: fetch datum")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp: BlockfrostDatumCbor = resp
+            .error_for_status()
+            .context("blockfrost: datum status")?
+            .json()
+            .await
+            .context("blockfrost: parse datum")?;
+        hex::decode(&resp.cbor).context("blockfrost: invalid datum CBOR hex").map(Some)
+    }
+
+    /// Slot of a block by hash, cached for the life of the provider.
+    async fn block_slot(&self, block_hash: &str) -> Result<u64> {
+        if let Some(slot) = self.block_slots.lock().await.get(block_hash) {
+            return Ok(*slot);
+        }
+        let block_url = format!("{}/blocks/{}", self.url, block_hash);
+        let block: BlockfrostBlockForUtxo = self
+            .get(&block_url)
+            .await?
+            .error_for_status()
+            .context("blockfrost: block status")?
+            .json()
+            .await
+            .context("blockfrost: parse block")?;
+        let slot = block.slot.unwrap_or(0);
+        self.block_slots.lock().await.insert(block_hash.to_string(), slot);
+        Ok(slot)
     }
 
     fn script_address(&self, script_hash: &ScriptHash) -> String {
@@ -595,13 +761,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 "{}/addresses/{}/utxos?page={}&count=100",
                 self.url, address, page
             );
-            let resp = self
-                .client
-                .get(&url)
-                .header("project_id", &self.project_id)
-                .send()
-                .await
-                .context("blockfrost: fetch UTxOs")?;
+            let resp = self.get(&url).await.context("blockfrost: fetch UTxOs")?;
 
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 break;
@@ -627,53 +787,27 @@ impl BootstrapProvider for BlockfrostProvider {
 
                 let value = parse_blockfrost_value(&utxo.amount);
 
-                // Resolve datum
-                let datum_cbor = if utxo.inline_datum.is_some() {
-                    // Blockfrost returns inline datum as JSON; we need the CBOR.
-                    // Fall back to the datum CBOR endpoint using data_hash.
-                    if let Some(ref dh) = utxo.data_hash {
-                        match self.fetch_datum(dh).await {
-                            Ok(bytes) => Some(bytes),
-                            Err(e) => {
-                                warn!(datum_hash = %dh, "blockfrost: could not fetch inline datum CBOR: {e:#}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else if let Some(ref dh) = utxo.data_hash {
-                    match self.fetch_datum(dh).await {
-                        Ok(bytes) => Some(bytes),
-                        Err(e) => {
-                            warn!(datum_hash = %dh, "blockfrost: could not fetch datum: {e:#}");
-                            None
-                        }
-                    }
-                } else {
-                    None
+                // Resolve the datum. The UTxO row carries an inline datum as
+                // CBOR hex, so that costs nothing; only hash-only outputs need
+                // the datum endpoint. A fetch failure is an error, not a
+                // missing datum: bootstrap_v3/v4 skip a pool whose datum is
+                // None, and a snapshot persisted without that pool is never
+                // repaired.
+                let inline = utxo.inline_datum.as_ref().and_then(blockfrost_inline_datum_cbor);
+                let datum_cbor = match (inline, &utxo.data_hash) {
+                    (Some(bytes), _) => Some(bytes),
+                    (None, Some(dh)) => self.fetch_datum_opt(dh).await.with_context(|| {
+                        format!(
+                            "blockfrost: datum {dh} for {}#{}",
+                            utxo.tx_hash, utxo.tx_index
+                        )
+                    })?,
+                    (None, None) => None,
                 };
 
-                // Get slot from block hash
-                let slot = if let Some(ref block_hash) = utxo.block {
-                    let block_url = format!("{}/blocks/{}", self.url, block_hash);
-                    match self
-                        .client
-                        .get(&block_url)
-                        .header("project_id", &self.project_id)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => resp
-                            .json::<BlockfrostBlockForUtxo>()
-                            .await
-                            .ok()
-                            .and_then(|b| b.slot)
-                            .unwrap_or(0),
-                        Err(_) => 0,
-                    }
-                } else {
-                    0
+                let slot = match utxo.block {
+                    Some(ref block_hash) => self.block_slot(block_hash).await?,
+                    None => 0,
                 };
 
                 all_utxos.push(FetchedUtxo {
@@ -694,30 +828,10 @@ impl BootstrapProvider for BlockfrostProvider {
         Ok(all_utxos)
     }
 
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/scripts/datum/{}/cbor", self.url, datum_hash);
-        let resp: BlockfrostDatumCbor = self
-            .client
-            .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
-            .await
-            .context("blockfrost: fetch datum")?
-            .error_for_status()
-            .context("blockfrost: datum status")?
-            .json()
-            .await
-            .context("blockfrost: parse datum")?;
-        hex::decode(&resp.cbor).context("blockfrost: invalid datum CBOR hex")
-    }
-
     async fn fetch_tip(&self) -> Result<(u64, String)> {
         let url = format!("{}/blocks/latest", self.url);
         let resp: BlockfrostBlock = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch latest block")?
             .error_for_status()
@@ -744,13 +858,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 "{}/assets/policy/{}?page={}&count=100",
                 self.url, policy_hex, page
             );
-            let resp = self
-                .client
-                .get(&url)
-                .header("project_id", &self.project_id)
-                .send()
-                .await
-                .context("blockfrost: fetch policy assets")?;
+            let resp = self.get(&url).await.context("blockfrost: fetch policy assets")?;
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 break;
             }
@@ -782,7 +890,7 @@ impl BootstrapProvider for BlockfrostProvider {
         let mut addresses = std::collections::BTreeSet::new();
         for asset in &nft_assets {
             let url = format!("{}/assets/{}/addresses", self.url, asset);
-            let resp = self.client.get(&url).header("project_id", &self.project_id).send().await;
+            let resp = self.get(&url).await;
             if let Ok(resp) = resp
                 && let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await
             {
@@ -810,10 +918,7 @@ impl BootstrapProvider for BlockfrostProvider {
     async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>> {
         let url = format!("{}/scripts/{}/cbor", self.url, script_hash);
         let resp: serde_json::Value = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch script cbor")?
             .error_for_status()
@@ -834,10 +939,7 @@ impl BootstrapProvider for BlockfrostProvider {
             self.url, asset_unit
         );
         let history: Vec<BlockfrostAssetHistory> = self
-            .client
             .get(&history_url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch asset history")?
             .error_for_status()
@@ -870,10 +972,7 @@ impl BootstrapProvider for BlockfrostProvider {
             self.url, asset_unit,
         );
         let rows: Vec<BlockfrostAssetTx> = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch asset transactions")?
             .error_for_status()
@@ -887,10 +986,7 @@ impl BootstrapProvider for BlockfrostProvider {
     async fn fetch_tx_cbor(&self, tx_hash: &str) -> Result<Vec<u8>> {
         let tx_url = format!("{}/txs/{}/cbor", self.url, tx_hash);
         let resp: BlockfrostTxCbor = self
-            .client
             .get(&tx_url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch tx cbor")?
             .error_for_status()
@@ -2308,6 +2404,108 @@ async fn bootstrap_v4(
         "V4 bootstrap complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod blockfrost_pacing_tests {
+    //! A fresh free-tier Blockfrost key answers >10 req/s with 429. Before
+    //! these guards, a mainnet bootstrap with v3 enabled hit that within
+    //! seconds, logged "could not fetch inline datum CBOR", dropped the pool,
+    //! and persisted a snapshot that could never regain it.
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_doubles_from_one_second_and_caps() {
+        assert_eq!(blockfrost_retry_delay(0, None), Duration::from_secs(1));
+        assert_eq!(blockfrost_retry_delay(1, None), Duration::from_secs(2));
+        assert_eq!(blockfrost_retry_delay(3, None), Duration::from_secs(8));
+        assert_eq!(blockfrost_retry_delay(9, None), BLOCKFROST_MAX_RETRY_DELAY);
+        assert_eq!(blockfrost_retry_delay(40, None), BLOCKFROST_MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_delay_honours_a_longer_retry_after_but_not_a_shorter_one() {
+        assert_eq!(blockfrost_retry_delay(0, Some(5)), Duration::from_secs(5));
+        assert_eq!(blockfrost_retry_delay(3, Some(2)), Duration::from_secs(8));
+        assert_eq!(
+            blockfrost_retry_delay(0, Some(600)),
+            BLOCKFROST_MAX_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn inline_datum_is_cbor_hex_not_json() {
+        // The mainnet SPRINKLES/JIMMIES pool datum starts like this on the
+        // /addresses/{addr}/utxos row; reading it here saves one call per UTxO.
+        let hex_str = serde_json::Value::String("d8799f581c9f91de10ff".to_string());
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&hex_str).as_deref(),
+            Some(&hex::decode("d8799f581c9f91de10ff").unwrap()[..])
+        );
+        assert_eq!(blockfrost_inline_datum_cbor(&serde_json::Value::Null), None);
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&serde_json::json!({"constructor": 0})),
+            None
+        );
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&serde_json::Value::String("zz".into())),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_spends_the_burst_then_settles_at_the_refill_rate() {
+        let provider = BlockfrostProvider::new("https://cardano-mainnet.blockfrost.io/api/v0", "x");
+        let start = tokio::time::Instant::now();
+        for _ in 0..500 {
+            provider.throttle().await;
+        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the burst costs no waiting"
+        );
+        for _ in 0..20 {
+            provider.throttle().await;
+        }
+        // 20 more tokens at 10/s: 2s, give or take float rounding.
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1990) && waited <= Duration::from_millis(2010),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_429_drains_the_bucket_so_the_next_call_waits_a_full_token() {
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = RateBucket::full(t0);
+        assert!(bucket.take(t0).is_ok());
+        bucket.drain();
+        let wait = bucket.take(t0).unwrap_err();
+        assert!(
+            wait >= Duration::from_millis(99) && wait <= Duration::from_millis(101),
+            "{wait:?}"
+        );
+        // Half a second later, five tokens have refilled.
+        let t1 = t0 + Duration::from_millis(500);
+        for _ in 0..5 {
+            assert!(bucket.take(t1).is_ok());
+        }
+        assert!(bucket.take(t1).is_err());
+    }
+
+    #[test]
+    fn bucket_never_holds_more_than_the_burst() {
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = RateBucket::full(t0);
+        let later = t0 + Duration::from_secs(3600);
+        for _ in 0..(BLOCKFROST_BURST as usize) {
+            assert!(bucket.take(later).is_ok());
+        }
+        assert!(bucket.take(later).is_err());
+    }
 }
 
 #[cfg(test)]
