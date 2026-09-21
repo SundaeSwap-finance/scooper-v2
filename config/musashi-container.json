@@ -1,0 +1,23 @@
+{
+  "persistence": {
+    "sqlite": {
+      "filename": "/app/data/scooper-musashi.db"
+    }
+  },
+  "protocol": {
+    "bootstrap": {
+      "source": "blockfrost",
+      "url": "http://blockfrost-api:3000",
+      "project-id": "musashi"
+    }
+  },
+  "acropolis": {
+    "module": {
+      "peer-network-interface": {
+        "node-addresses": [
+          "musashi-node:3010"
+        ]
+      }
+    }
+  }
+}

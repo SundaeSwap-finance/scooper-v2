@@ -26,19 +26,26 @@ hex = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
+minicbor = { version = "0.26", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = "0.34"
-pallas-codec = "0.34"
-pallas-crypto = "0.34"
-pallas-primitives = "0.34"
-pallas-network = "0.34"
-pallas-traverse = "0.34"
+pallas-addresses = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+pallas-codec = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+pallas-crypto = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112", features = [
+  "unstable",
+] }
+pallas-network = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+pallas-traverse = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112", features = [
+  "unstable",
+] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 rustls-pemfile = "2"
 url = "2"
-plutus-parser = { version = "0.6", features = ["derive"] }
+plutus-parser = { version = "0.6", default-features = false, features = [
+  "derive",
+  "pallas-v1",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3"
@@ -76,6 +83,12 @@ required-features = ["route-bench"]
 criterion = "0.8"
 proptest = "1"
 tokio = { version = "1.46.1", features = ["full", "test-util"] }
+
+# plutus-parser's "pallas-v1" feature pulls its own pallas-primitives from
+# crates.io (1.0.0-alpha.3): redirect it to the same fork so there is exactly
+# one PlutusData type in the build.
+[patch.crates-io]
+pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
 
 # The profile that 'dist' will build with
 [profile.dist]

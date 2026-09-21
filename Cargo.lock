@@ -11,8 +11,8 @@ dependencies = [
  "anyhow",
  "hex",
  "pallas",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-primitives 0.34.0",
+ "pallas-traverse 0.34.0",
  "tracing",
 ]
 
@@ -120,7 +120,7 @@ dependencies = [
  "mithril-client",
  "mithril-common",
  "pallas",
- "pallas-traverse",
+ "pallas-traverse 0.34.0",
  "serde_json",
  "tikv-jemalloc-ctl",
  "tokio",
@@ -905,7 +905,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes",
- "rand_core 0.6.4",
+ "rand_core 0.5.1",
  "serde",
  "unicode-normalization",
 ]
@@ -2221,7 +2221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3576,7 +3576,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0452a60c1863c1f50b5f77cd295e8d2786849f35883f0b9e18e7e6e1b5691b0"
 dependencies = [
  "half",
- "minicbor-derive",
+ "minicbor-derive 0.15.3",
+]
+
+[[package]]
+name = "minicbor"
+version = "0.26.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a309f581ade7597820083bc275075c4c6986e57e53f8d26f88507cfefc8c987"
+dependencies = [
+ "half",
+ "minicbor-derive 0.16.2",
 ]
 
 [[package]]
@@ -3590,6 +3600,17 @@ name = "minicbor-derive"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd2209fff77f705b00c737016a48e73733d7fbccb8b007194db148f03561fb70"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "minicbor-derive"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9882ef5c56df184b8ffc107fc6c61e33ee3a654b021961d790a78571bb9d67a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4219,14 +4240,14 @@ version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d226f911706ad38bee86537456f44afab1b3e1ad17e7f3b60669328d1055a74"
 dependencies = [
- "pallas-addresses",
- "pallas-codec",
+ "pallas-addresses 0.34.0",
+ "pallas-codec 0.34.0",
  "pallas-configs",
- "pallas-crypto",
+ "pallas-crypto 0.34.0",
  "pallas-hardano",
- "pallas-network",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-network 0.34.0",
+ "pallas-primitives 0.34.0",
+ "pallas-traverse 0.34.0",
  "pallas-txbuilder",
  "pallas-utxorpc",
 ]
@@ -4242,9 +4263,24 @@ dependencies = [
  "crc",
  "cryptoxide 0.4.4",
  "hex",
- "pallas-codec",
- "pallas-crypto",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "pallas-addresses"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "base58",
+ "bech32 0.11.1",
+ "crc",
+ "cryptoxide 0.4.4",
+ "hex",
+ "pallas-codec 1.4.0",
+ "pallas-crypto 1.4.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4255,11 +4291,11 @@ checksum = "7b37dc3764eb229251e9cf6df0c3f27ee8778948ca5c923a03e5f7721d23265a"
 dependencies = [
  "chrono",
  "hex",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-addresses 0.34.0",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "pallas-primitives 0.34.0",
+ "pallas-traverse 0.34.0",
  "rand 0.8.8",
 ]
 
@@ -4276,6 +4312,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallas-codec"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "hex",
+ "minicbor 0.26.5",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pallas-configs"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4284,10 +4331,10 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "num-rational",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
+ "pallas-addresses 0.34.0",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "pallas-primitives 0.34.0",
  "serde",
  "serde_json",
  "serde_with 3.23.0",
@@ -4301,11 +4348,24 @@ checksum = "5f4c3dfc9286db9f1e54f35b2d8e7924dfdb17f480139ed2c113db6759578e48"
 dependencies = [
  "cryptoxide 0.4.4",
  "hex",
- "pallas-codec",
+ "pallas-codec 0.34.0",
  "rand_core 0.6.4",
  "serde",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "pallas-crypto"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "cryptoxide 0.4.4",
+ "hex",
+ "pallas-codec 1.4.0",
+ "rand_core 0.10.1",
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4315,8 +4375,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c72dfc654ede66b45f8a749ea23b4327abd7a0a095df9ecf3a4505a225057b3"
 dependencies = [
  "binary-layout",
- "pallas-network",
- "pallas-traverse",
+ "pallas-network 0.34.0",
+ "pallas-traverse 0.34.0",
  "tap",
  "thiserror 1.0.69",
  "tracing",
@@ -4331,12 +4391,29 @@ dependencies = [
  "byteorder",
  "hex",
  "itertools 0.13.0",
- "pallas-codec",
- "pallas-crypto",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
  "rand 0.8.8",
  "serde",
  "socket2 0.5.10",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pallas-network"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "byteorder",
+ "hex",
+ "itertools 0.14.0",
+ "pallas-codec 1.4.0",
+ "pallas-crypto 1.4.0",
+ "rand 0.10.2",
+ "socket2 0.6.5",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -4351,8 +4428,20 @@ dependencies = [
  "bech32 0.9.1",
  "hex",
  "log",
- "pallas-codec",
- "pallas-crypto",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pallas-primitives"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "hex",
+ "pallas-codec 1.4.0",
+ "pallas-crypto 1.4.0",
  "serde",
  "serde_json",
 ]
@@ -4365,13 +4454,29 @@ checksum = "27248fd22bc84b13b0ad44ec58b23dcb4aa52e1b19efbe5d4065833055b2d4da"
 dependencies = [
  "hex",
  "itertools 0.13.0",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
+ "pallas-addresses 0.34.0",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "pallas-primitives 0.34.0",
  "paste",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "pallas-traverse"
+version = "1.4.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas?rev=4c294e632fa5159bc65e82dec5007a62cf6f5112#4c294e632fa5159bc65e82dec5007a62cf6f5112"
+dependencies = [
+ "hex",
+ "itertools 0.14.0",
+ "pallas-addresses 1.4.0",
+ "pallas-codec 1.4.0",
+ "pallas-crypto 1.4.0",
+ "pallas-primitives 1.4.0",
+ "paste",
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4381,11 +4486,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d2d7c5d633515e73153c7efb97b611a2a065d3743992d1ffbd69761fce8f21c"
 dependencies = [
  "hex",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-addresses 0.34.0",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "pallas-primitives 0.34.0",
+ "pallas-traverse 0.34.0",
  "pallas-wallet",
  "serde",
  "serde_json",
@@ -4399,10 +4504,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16741298d56d690ac343ce63db095d7084637319f6e3b2a1d7647fa89d5763fb"
 dependencies = [
  "pallas-applying",
- "pallas-codec",
- "pallas-crypto",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-codec 0.34.0",
+ "pallas-crypto 0.34.0",
+ "pallas-primitives 0.34.0",
+ "pallas-traverse 0.34.0",
  "prost-types",
  "utxorpc-spec",
 ]
@@ -4417,7 +4522,7 @@ dependencies = [
  "bip39",
  "cryptoxide 0.4.4",
  "ed25519-bip32",
- "pallas-crypto",
+ "pallas-crypto 0.34.0",
  "rand 0.8.8",
  "thiserror 1.0.69",
 ]
@@ -4713,8 +4818,8 @@ checksum = "6247a46d17c9cd18b77bfe672efd8d6d2802792f4d14c1a048db58d1dcaf1a51"
 dependencies = [
  "hex",
  "indexmap 2.14.2",
- "minicbor 0.25.1",
- "pallas-primitives",
+ "minicbor 0.26.5",
+ "pallas-primitives 1.4.0",
  "plutus-parser-derive",
  "thiserror 2.0.20",
 ]
@@ -4950,7 +5055,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5357,7 +5462,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5440,7 +5545,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5608,15 +5713,15 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "minicbor 0.25.1",
+ "minicbor 0.26.5",
  "num-bigint",
  "num-traits",
- "pallas-addresses",
- "pallas-codec",
- "pallas-crypto",
- "pallas-network",
- "pallas-primitives",
- "pallas-traverse",
+ "pallas-addresses 1.4.0",
+ "pallas-codec 1.4.0",
+ "pallas-crypto 1.4.0",
+ "pallas-network 1.4.0",
+ "pallas-primitives 1.4.0",
+ "pallas-traverse 1.4.0",
  "plutus-parser",
  "proptest",
  "reqwest",
@@ -6488,10 +6593,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7316,7 +7421,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

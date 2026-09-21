@@ -162,7 +162,7 @@ const PROTOCOL_VERSION: amaru_kernel::cardano::protocol_version::ProtocolVersion
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::MintedTransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -326,7 +326,7 @@ pub fn evaluate_scoop_tx(
 /// Determine which script hash to evaluate and build the ScriptPurpose.
 pub(crate) fn resolve_script_and_purpose(
     key: &RedeemersKey,
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::MintedTransactionBody<'_>,
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
 ) -> Result<(Hash<28>, ScriptPurpose)> {
     match key.tag {

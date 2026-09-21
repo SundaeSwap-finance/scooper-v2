@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use num_traits::Signed;
 use pallas_addresses::{Address, ScriptHash};
 use pallas_crypto::hash::Hasher;
-use pallas_primitives::conway::RedeemerTag;
+use pallas_traverse::MultiEraRedeemerTag;
 use pallas_traverse::{Era, MultiEraOutput, MultiEraTx};
 use plutus_parser::{AsPlutus, PlutusData};
 use tokio::sync::{Mutex, broadcast};
@@ -731,9 +731,9 @@ impl SundaeV4Indexer {
 
     fn parse_redeemer<T: AsPlutus>(&self, tx: &MultiEraTx, spend_index: usize) -> Option<T> {
         let redeemers = tx.redeemers();
-        let redeemer = redeemers
-            .iter()
-            .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)?;
+        let redeemer = redeemers.iter().find(|r| {
+            r.multi_era_tag() == MultiEraRedeemerTag::Spend && r.index() == spend_index as u32
+        })?;
         T::from_plutus(redeemer.data().clone()).ok()
     }
 
@@ -817,9 +817,9 @@ pub fn extract_cs_config_from_tx(
 
     let wd_index = withdrawal_index_of_script(tx, cs_script_hash)?;
     let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let redeemer = redeemers.iter().find(|r| {
+        r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32
+    })?;
     let parsed: ConstantSumRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantSumRedeemer::Create { initial_state, .. } => {
@@ -845,9 +845,9 @@ pub fn extract_fee_split_config_from_tx(
 
     let wd_index = withdrawal_index_of_script(tx, fs_script_hash)?;
     let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let redeemer = redeemers.iter().find(|r| {
+        r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32
+    })?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config, .. } => Some(config),
@@ -866,9 +866,9 @@ pub fn extract_cp_config_from_tx(
 
     let wd_index = withdrawal_index_of_script(tx, cp_script_hash)?;
     let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let redeemer = redeemers.iter().find(|r| {
+        r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32
+    })?;
     let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
@@ -887,9 +887,9 @@ pub fn extract_cl_config_from_tx(
 
     let wd_index = withdrawal_index_of_script(tx, cl_script_hash)?;
     let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let redeemer = redeemers.iter().find(|r| {
+        r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32
+    })?;
     let parsed: ConcentratedLiquidityRedeemer =
         AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
@@ -920,8 +920,9 @@ pub fn extract_ss_config_candidates(
         return vec![];
     };
     let redeemers = tx.redeemers();
-    let Some(redeemer) =
-        redeemers.iter().find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)
+    let Some(redeemer) = redeemers
+        .iter()
+        .find(|r| r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32)
     else {
         return vec![];
     };
@@ -945,10 +946,10 @@ pub fn extract_ss_config_candidates(
                 let Some(spend_index) = inputs.iter().position(|k| *k == key) else {
                     continue;
                 };
-                let Some(spend) = redeemers
-                    .iter()
-                    .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)
-                else {
+                let Some(spend) = redeemers.iter().find(|r| {
+                    r.multi_era_tag() == MultiEraRedeemerTag::Spend
+                        && r.index() == spend_index as u32
+                }) else {
                     continue;
                 };
                 let Ok(PoolRedeemer::Action { transcript, .. }) =
@@ -1031,9 +1032,9 @@ pub fn extract_fee_split_config_for_pool_from_tx(
 
     let wd_index = withdrawal_index_of_script(tx, fs_script_hash)?;
     let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+    let redeemer = redeemers.iter().find(|r| {
+        r.multi_era_tag() == MultiEraRedeemerTag::Reward && r.index() == wd_index as u32
+    })?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config, .. } => Some(config),

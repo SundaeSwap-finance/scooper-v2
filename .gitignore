@@ -5,6 +5,8 @@
 *.db
 logs.txt
 config/*.bak
+*.skey
+/docker-build
 
 /bench/route-quality/data/cache/
 /bench/route-quality/results/
