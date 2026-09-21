@@ -5,3 +5,5 @@
 *.db
 logs.txt
 config/*.bak
+*.skey
+/docker-build

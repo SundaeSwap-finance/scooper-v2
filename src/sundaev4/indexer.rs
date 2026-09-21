@@ -684,7 +684,7 @@ impl SundaeV4Indexer {
         let redeemers = tx.redeemers();
         let redeemer = redeemers
             .iter()
-            .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)?;
+            .find(|r| r.tag() == RedeemerTag::Spend.into() && r.index() == spend_index as u32)?;
         T::from_plutus(redeemer.data().clone()).ok()
     }
 
@@ -717,7 +717,7 @@ pub fn extract_cs_config_from_tx(
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+        .find(|r| r.tag() == RedeemerTag::Reward.into() && r.index() == wd_index as u32)?;
     let parsed: ConstantSumRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantSumRedeemer::Create { initial_state, .. } => {
@@ -748,7 +748,7 @@ pub fn extract_fee_split_config_from_tx(
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+        .find(|r| r.tag() == RedeemerTag::Reward.into() && r.index() == wd_index as u32)?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config, .. } => Some(config),
@@ -772,7 +772,7 @@ pub fn extract_cp_config_from_tx(
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+        .find(|r| r.tag() == RedeemerTag::Reward.into() && r.index() == wd_index as u32)?;
     let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
@@ -796,7 +796,7 @@ pub fn extract_cl_config_from_tx(
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+        .find(|r| r.tag() == RedeemerTag::Reward.into() && r.index() == wd_index as u32)?;
     let parsed: ConcentratedLiquidityRedeemer =
         AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
@@ -822,7 +822,7 @@ pub fn extract_fee_split_config_for_pool_from_tx(
     let redeemers = tx.redeemers();
     let redeemer = redeemers
         .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
+        .find(|r| r.tag() == RedeemerTag::Reward.into() && r.index() == wd_index as u32)?;
     let parsed: FeeSplitRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         FeeSplitRedeemer::Create { config, .. } => Some(config),

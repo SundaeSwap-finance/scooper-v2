@@ -2125,8 +2125,8 @@ mod tests {
                 _ => None,
             })
             .expect("continuation output at the order address");
-        let datum_cbor = match &cont.datum_option {
-            Some(pallas_primitives::conway::PseudoDatumOption::Data(d)) => {
+        let datum_cbor = match cont.datum_option.as_deref() {
+            Some(pallas_primitives::conway::DatumOption::Data(d)) => {
                 minicbor::to_vec(&d.0).unwrap()
             }
             _ => panic!("continuation must carry an inline datum"),

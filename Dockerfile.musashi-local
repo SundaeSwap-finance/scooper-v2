@@ -1,0 +1,38 @@
+# LOCAL-ONLY, uncommitted: builds inside Docker like the real Dockerfile, but
+# also pulls in ../acropolis-patched and ../pallas-patched (sibling clones
+# with local Dijkstra fixes) as extra build contexts, since scooper-v2's
+# Cargo.toml [patch] sections point at them by relative path and a normal
+# single-context `docker build` can't see outside the repo root.
+#
+# Build with:
+#   docker build -f Dockerfile.musashi-local \
+#     --build-context acropolis-patched=../acropolis-patched \
+#     --build-context pallas-patched=../pallas-patched \
+#     -t scooper-v2:musashi-local .
+FROM rust:1.98-bookworm AS builder
+WORKDIR /build
+COPY . /build/scooper-v2
+COPY --from=acropolis-patched . /build/acropolis-patched
+COPY --from=pallas-patched . /build/pallas-patched
+WORKDIR /build/scooper-v2
+RUN cargo build --locked --release
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 10001 scooper && \
+    useradd -u 10001 -g scooper -m scooper
+
+COPY --from=builder /build/scooper-v2/target/release/scooper-v2 /usr/local/bin/scooper-v2
+
+RUN mkdir -p /app/data && chown scooper:scooper /app/data
+VOLUME /app/data
+
+USER scooper
+WORKDIR /app
+EXPOSE 9999 9998
+
+ENTRYPOINT ["scooper-v2"]
+CMD ["--config", "/app/config.json"]

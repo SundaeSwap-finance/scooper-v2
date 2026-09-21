@@ -432,13 +432,13 @@ impl TestEnv {
                 .outputs
                 .iter()
                 .map(|o| match o {
-                    pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b) => {
+                    pallas_primitives::conway::TransactionOutput::PostAlonzo(b) => {
                         match &b.value {
-                            pallas_primitives::conway::Value::Coin(c) => *c,
-                            pallas_primitives::conway::Value::Multiasset(c, _) => *c,
+                            pallas_primitives::conway::Value::Coin(c) => c,
+                            pallas_primitives::conway::Value::Multiasset(c, _) => c,
                         }
                     }
-                    pallas_primitives::conway::PseudoTransactionOutput::Legacy(_) => 0,
+                    pallas_primitives::conway::TransactionOutput::Legacy(_) => &0,
                 })
                 .sum();
             anyhow::ensure!(

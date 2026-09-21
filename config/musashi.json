@@ -1,0 +1,34 @@
+{
+  "log": {
+    "level": "debug"
+  },
+  "persistence": {
+    "sqlite": {
+      "filename": "scooper-musashi.db"
+    }
+  },
+  "protocol": {},
+  "acropolis": {
+    "global": {
+      "startup": {
+        "network-name": "musashi"
+      }
+    },
+    "module": {
+      "genesis-bootstrapper": {
+        "byron-genesis-file": "config/musashi/byron-genesis.json",
+        "shelley-genesis-file": "config/musashi/shelley-genesis.json",
+        "first-block-era": "conway",
+        "shelley-start-epoch": 0
+      },
+      "peer-network-interface": {
+        "node-addresses": [
+          "localhost:3010"
+        ]
+      },
+      "mithril-snapshot-fetcher": {
+        "download-max-age": "never"
+      }
+    }
+  }
+}

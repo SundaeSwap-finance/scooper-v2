@@ -305,7 +305,7 @@ impl SundaeV3Indexer {
         let redeemers = tx.redeemers();
         let redeemer = redeemers
             .iter()
-            .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)?;
+            .find(|r| r.tag() == RedeemerTag::Spend.into() && r.index() == spend_index as u32)?;
         T::from_plutus(redeemer.data().clone()).ok()
     }
 

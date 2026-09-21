@@ -25,19 +25,26 @@ hex = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
+minicbor = { version = "0.26", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = "0.34"
-pallas-codec = "0.34"
-pallas-crypto = "0.34"
-pallas-primitives = "0.34"
-pallas-network = "0.34"
-pallas-traverse = "0.34"
+pallas-addresses = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors" }
+pallas-codec = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors" }
+pallas-crypto = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors" }
+pallas-primitives = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors", features = [
+  "unstable",
+] }
+pallas-network = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors" }
+pallas-traverse = { git = "https://github.com/geofflittle/pallas.git", branch = "feat/dijkstra-era-accessors", features = [
+  "unstable",
+] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 rustls-pemfile = "2"
 url = "2"
-plutus-parser = { version = "0.6", features = ["derive"] }
+plutus-parser = { version = "0.6", default-features = false, features = [
+  "derive",
+  "pallas-v1",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3"
@@ -56,6 +63,55 @@ tracing-subscriber = { version = "0.3", features = [
 
 [dev-dependencies]
 proptest = "1"
+
+# LOCAL-ONLY, uncommitted: routes the acropolis_* deps at a local clone
+# (../acropolis-patched, rev 2c0a32c) with one workaround patch — Era::try_from
+# treats any era >= 7 as Conway instead of bailing, so header decoding survives
+# Musashi's Dijkstra-era (era 7) blocks. Not a real fix (acropolis_common::Era
+# still has no Dijkstra variant, so anything era-specific downstream still
+# treats these blocks as Conway) — just enough to keep chain-sync alive for
+# local testing. Remove this section once acropolis has real Dijkstra support.
+[patch."https://github.com/input-output-hk/acropolis.git"]
+acropolis_common = { path = "../acropolis-patched/common" }
+acropolis_module_block_unpacker = { path = "../acropolis-patched/modules/block_unpacker" }
+acropolis_module_custom_indexer = { path = "../acropolis-patched/modules/custom_indexer" }
+acropolis_module_genesis_bootstrapper = { path = "../acropolis-patched/modules/genesis_bootstrapper" }
+acropolis_module_mithril_snapshot_fetcher = { path = "../acropolis-patched/modules/mithril_snapshot_fetcher" }
+acropolis_module_peer_network_interface = { path = "../acropolis-patched/modules/peer_network_interface" }
+
+# LOCAL-ONLY, uncommitted: routes all pallas-* deps at a local clone
+# (../pallas-patched, geofflittle/pallas branch feat/dijkstra-era-accessors)
+# with one added fix — pallas-network's LocalTxSubmission ShelleyBasedEra enum
+# stopped at Conway (index 6), so any node reply tagged with the Dijkstra era
+# (index 7 — confirmed live against cardano-cli's own
+# "ShelleyBasedEraDijkstra" output) failed to decode with UnknownVariant(7),
+# for both accepted and rejected local-node tx submissions. Added a Dijkstra
+# variant (see pallas-network/src/miniprotocols/localtxsubmission/protocol.rs)
+# so submission responses decode past the era tag. Does NOT (yet) address
+# ApplyTxError/ConwayLedgerFailure's nested failure-reason types, which are
+# still Conway-shaped — a Reject response whose failure detail uses a
+# Dijkstra-only failure variant may still fail to decode past the era tag.
+# Remove this whole section (and revert to the branch's git source) once
+# geofflittle/pallas or upstream pallas gains real Dijkstra support for the
+# LocalTxSubmission/LocalTxMonitor mini-protocols.
+[patch."https://github.com/geofflittle/pallas.git"]
+pallas-addresses = { path = "../pallas-patched/pallas-addresses" }
+pallas-codec = { path = "../pallas-patched/pallas-codec" }
+pallas-crypto = { path = "../pallas-patched/pallas-crypto" }
+pallas-primitives = { path = "../pallas-patched/pallas-primitives" }
+pallas-network = { path = "../pallas-patched/pallas-network" }
+pallas-traverse = { path = "../pallas-patched/pallas-traverse" }
+# Pulled in transitively; has its own exhaustive match over ShelleyBasedEra
+# (a JSON-serialization mirror enum) that needed a Dijkstra arm too.
+pallas-hardano = { path = "../pallas-patched/pallas-hardano" }
+
+# LOCAL-ONLY, uncommitted: plutus-parser's "pallas-v1" feature pulls its own
+# pallas-primitives from crates.io (version 1.0.0-alpha.3) instead of our
+# geofflittle/pallas fork — a second, incompatible copy of PlutusData etc.
+# Redirect crates.io pallas-primitives to the same local clone everything
+# else uses, so there's exactly one PlutusData type in the build.
+[patch.crates-io]
+pallas-primitives = { path = "../pallas-patched/pallas-primitives" }
 
 # The profile that 'dist' will build with
 [profile.dist]

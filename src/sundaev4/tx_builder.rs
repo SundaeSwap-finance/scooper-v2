@@ -233,7 +233,7 @@ pub struct MultiPoolBuildResult {
     /// Total byte size of all reference scripts attached to this tx — used to
     /// compute the Conway-era ref-script fee component on the rebuild pass.
     pub total_ref_script_bytes: u64,
-    pub tx_body: conway::PseudoTransactionBody<TransactionOutput>,
+    pub tx_body: conway::MintedTransactionBody<'static>,
     pub resolved_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
     pub resolved_ref_inputs: BTreeMap<crate::cardano_types::TransactionInput, ResolvedTxOut>,
     pub redeemers: Vec<(RedeemersKey, pallas_primitives::PlutusData, ExUnits)>,
@@ -1863,12 +1863,13 @@ pub fn build_multi_pool_scoop_tx(
             pool_ada_deltas[batch_idx],
         )?;
         let mut out = TransactionOutput::PostAlonzo(
-            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            conway::PostAlonzoTransactionOutput {
                 address: PallasBytes::from(batch.pool.address.clone()),
                 value: pool_output_value,
-                datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(pool_datum_pd))),
+                datum_option: Some(conway::DatumOption::Data(CborWrap(pool_datum_pd.into())).into()),
                 script_ref: None,
-            },
+            }
+            .into(),
         );
         // Reach the minUtxo by recomputing from the serialized output. Adding
         // lovelace can grow the CBOR by 1 byte (and therefore the requirement
@@ -2198,12 +2199,13 @@ pub fn build_multi_pool_scoop_tx(
             }
         };
         let out = TransactionOutput::PostAlonzo(
-            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            conway::PostAlonzoTransactionOutput {
                 address: PallasBytes::from(dest_address),
                 value: fulfillment_value,
-                datum_option: dest_datum.map(|d| conway::PseudoDatumOption::Data(CborWrap(d))),
+                datum_option: dest_datum.map(|d| conway::DatumOption::Data(CborWrap(d.into())).into()),
                 script_ref: None,
-            },
+            }
+            .into(),
         );
         // The output must clear the ledger's min-UTxO on its own ada: the
         // scooper does NOT subsidise orders (its fee take only reimburses
@@ -2295,7 +2297,7 @@ pub fn build_multi_pool_scoop_tx(
     }
     if let Some(funding_value) = funding_value_opt {
         use num_traits::ToPrimitive;
-        use pallas_primitives::NonEmptyKeyValuePairs;
+        use pallas_codec::utils::NonEmptyKeyValuePairs;
         let ada_asset_local = AssetClass {
             policy: vec![],
             token: vec![],
@@ -2333,7 +2335,7 @@ pub fn build_multi_pool_scoop_tx(
         // Mirror native tokens from funding into the change output.
         let mut multiasset_pairs: Vec<(
             Hash<28>,
-            NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>,
+            BTreeMap<PallasBytes, PositiveCoin>,
         )> = Vec::new();
         for (policy_bytes, tokens) in &funding_value.0 {
             if policy_bytes.is_empty() {
@@ -2348,21 +2350,22 @@ pub fn build_multi_pool_scoop_tx(
                 }
             }
             if !token_pairs.is_empty() {
-                multiasset_pairs.push((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)));
+                multiasset_pairs.push((policy_hash, BTreeMap::from_iter(token_pairs)));
             }
         }
         let change_value = if multiasset_pairs.is_empty() {
             ConwayValue::Coin(change_ada)
         } else {
-            ConwayValue::Multiasset(change_ada, NonEmptyKeyValuePairs::Def(multiasset_pairs))
+            ConwayValue::Multiasset(change_ada, BTreeMap::from_iter(multiasset_pairs))
         };
         outputs.push(TransactionOutput::PostAlonzo(
-            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            conway::PostAlonzoTransactionOutput {
                 address: scooper_change_addr,
                 value: change_value,
                 datum_option: None,
                 script_ref: None,
-            },
+            }
+            .into(),
         ));
         // Non-fatal: warn if pallas wouldn't have accepted this change output
         // (e.g. funding UTxO carried a lot of tokens and 1 ADA isn't enough
@@ -2397,7 +2400,8 @@ pub fn build_multi_pool_scoop_tx(
     // mint map (always 0 since we only use pool_mint).
     let mint = {
         use num_traits::{ToPrimitive, Zero};
-        use pallas_primitives::{NonEmptyKeyValuePairs, NonZeroInt};
+        use pallas_codec::utils::NonEmptyKeyValuePairs;
+        use pallas_primitives::NonZeroInt;
         let mut asset_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
         for (i, batch) in batches.iter().enumerate() {
             let net = &per_pool[i].lp_minted - &per_pool[i].lp_burned;
@@ -2498,10 +2502,10 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 map_entries.push((
                     policy.policy,
-                    NonEmptyKeyValuePairs::Def(policy.asset_pairs),
+                    BTreeMap::from_iter(policy.asset_pairs),
                 ));
             }
-            Some(NonEmptyKeyValuePairs::Def(map_entries))
+            Some(BTreeMap::from_iter(map_entries))
         }
     };
 
@@ -2525,7 +2529,7 @@ pub fn build_multi_pool_scoop_tx(
         .collect();
     redeemer_pairs.sort_by_key(|(k, _)| (k.tag as u8, k.index));
 
-    let redeemers = Redeemers::Map(pallas_primitives::NonEmptyKeyValuePairs::Def(
+    let redeemers = Redeemers::Map(BTreeMap::from_iter(
         redeemer_pairs,
     ));
 
@@ -2566,14 +2570,14 @@ pub fn build_multi_pool_scoop_tx(
 
     let ttl = validity.ttl;
 
-    let body = conway::PseudoTransactionBody {
+    let body = conway::MintedTransactionBody {
         inputs: sorted_inputs.into(),
         outputs,
         fee: tx_fee,
         ttl: Some(ttl),
         certificates: None,
-        withdrawals: Some(pallas_primitives::NonEmptyKeyValuePairs::Def(
-            withdrawals.into_iter().map(|(account, _)| (account, 0u64)).collect(),
+        withdrawals: Some(BTreeMap::from_iter(
+            withdrawals.into_iter().map(|(account, _)| (account, 0u64)),
         )),
         auxiliary_data_hash: None,
         validity_interval_start: Some(validity.start),
@@ -2585,7 +2589,7 @@ pub fn build_multi_pool_scoop_tx(
         ),
         network_id: None,
         collateral_return: Some(TransactionOutput::PostAlonzo(
-            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            conway::PostAlonzoTransactionOutput {
                 address: {
                     let scooper_addr = ShelleyAddress::new(
                         network,
@@ -2597,7 +2601,8 @@ pub fn build_multi_pool_scoop_tx(
                 value: build_collateral_return_value(collateral_value, (tx_fee * 3).div_ceil(2))?,
                 datum_option: None,
                 script_ref: None,
-            },
+            }
+            .into(),
         )),
         total_collateral: Some((tx_fee * 3).div_ceil(2)),
         reference_inputs: pallas_primitives::NonEmptySet::from_vec(all_ref_inputs.clone()),
@@ -2625,7 +2630,7 @@ pub fn build_multi_pool_scoop_tx(
         bootstrap_witness: None,
         plutus_v1_script: None,
         plutus_data: None,
-        redeemer: Some(redeemers),
+        redeemer: Some(redeemers.into()),
         plutus_v2_script: None,
         plutus_v3_script: None,
     };
@@ -2790,22 +2795,22 @@ pub fn build_multi_pool_scoop_tx(
                 ResolvedTxOut {
                     address: body.address.to_vec(),
                     value: conway_value_to_internal(&body.value),
-                    datum: match &body.datum_option {
-                        Some(conway::PseudoDatumOption::Data(d)) => {
+                    datum: match body.datum_option.as_deref() {
+                        Some(conway::DatumOption::Data(d)) => {
                             let pd: pallas_primitives::PlutusData =
                                 minicbor::decode(&minicbor::to_vec(&d.0).unwrap())
                                     .expect("re-decode inline datum");
                             DatumOption::InlineDatum(pd)
                         }
-                        Some(conway::PseudoDatumOption::Hash(h)) => DatumOption::DatumHash(*h),
+                        Some(conway::DatumOption::Hash(h)) => DatumOption::DatumHash(*h),
                         None => DatumOption::None,
                     },
                     script_ref: body.script_ref.as_ref().map(|sr| {
                         let (tag, bytes): (u8, &[u8]) = match &sr.0 {
-                            conway::PseudoScript::PlutusV1Script(s) => (1, s.0.as_ref()),
-                            conway::PseudoScript::PlutusV2Script(s) => (2, s.0.as_ref()),
-                            conway::PseudoScript::PlutusV3Script(s) => (3, s.0.as_ref()),
-                            conway::PseudoScript::NativeScript(_) => (0, &[]),
+                            conway::ScriptRef::PlutusV1Script(s) => (1, s.0.as_ref()),
+                            conway::ScriptRef::PlutusV2Script(s) => (2, s.0.as_ref()),
+                            conway::ScriptRef::PlutusV3Script(s) => (3, s.0.as_ref()),
+                            conway::ScriptRef::NativeScript(_) => (0, &[]),
                         };
                         let mut pre = Vec::with_capacity(1 + bytes.len());
                         pre.push(tag);
@@ -2939,11 +2944,13 @@ pub fn build_multi_pool_scoop_tx(
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
     }
 
-    let tx = conway::PseudoTx {
-        transaction_body: body,
-        transaction_witness_set: witness_set,
+    let tx = conway::MintedTx {
+        transaction_body: body.into(),
+        transaction_witness_set: witness_set.into(),
         success: true,
-        auxiliary_data: pallas_primitives::Nullable::<conway::AuxiliaryData>::Null,
+        auxiliary_data: pallas_primitives::Nullable::<
+            pallas_codec::utils::KeepRaw<conway::AuxiliaryData>,
+        >::Null,
     };
 
     let tx_cbor = minicbor::to_vec(&tx).context("encode tx")?;
@@ -2987,7 +2994,7 @@ pub fn build_multi_pool_scoop_tx(
         tx_hash: body_hash,
         tx_hash_hex,
         total_ref_script_bytes,
-        tx_body: tx.transaction_body,
+        tx_body: tx.transaction_body.unwrap(),
         resolved_inputs,
         resolved_ref_inputs,
         redeemers: redeemer_info,
@@ -3088,7 +3095,7 @@ fn build_pool_output_value(
     ada_delta: i64,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
-    use pallas_primitives::NonEmptyKeyValuePairs;
+    use pallas_codec::utils::NonEmptyKeyValuePairs;
 
     // Start from the pool's current ADA
     let ada_asset = AssetClass {
@@ -3142,7 +3149,7 @@ fn build_pool_output_value(
         return Ok(ConwayValue::Coin(lovelace));
     }
 
-    let multiasset_pairs: Vec<(Hash<28>, NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>)> =
+    let multiasset_pairs: Vec<(Hash<28>, BTreeMap<PallasBytes, PositiveCoin>)> =
         policy_map
             .into_iter()
             .filter_map(|(policy, tokens)| {
@@ -3156,7 +3163,7 @@ fn build_pool_output_value(
                 if token_pairs.is_empty() {
                     None
                 } else {
-                    Some((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)))
+                    Some((policy_hash, BTreeMap::from_iter(token_pairs)))
                 }
             })
             .collect();
@@ -3167,7 +3174,7 @@ fn build_pool_output_value(
 
     Ok(ConwayValue::Multiasset(
         lovelace,
-        NonEmptyKeyValuePairs::Def(multiasset_pairs),
+        BTreeMap::from_iter(multiasset_pairs),
     ))
 }
 
@@ -3198,7 +3205,7 @@ fn build_deposit_fulfillment_value(
     fee: u64,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
-    use pallas_primitives::NonEmptyKeyValuePairs;
+    use pallas_codec::utils::NonEmptyKeyValuePairs;
 
     let ada_asset = AssetClass {
         policy: vec![],
@@ -3251,12 +3258,12 @@ fn build_deposit_fulfillment_value(
                     )
                 })
                 .collect();
-            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+            (policy_hash, BTreeMap::from_iter(token_pairs))
         })
         .collect();
     Ok(ConwayValue::Multiasset(
         lovelace,
-        NonEmptyKeyValuePairs::Def(multiasset_pairs),
+        BTreeMap::from_iter(multiasset_pairs),
     ))
 }
 
@@ -3275,7 +3282,7 @@ fn build_withdraw_fulfillment_value(
     fee: u64,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
-    use pallas_primitives::NonEmptyKeyValuePairs;
+    use pallas_codec::utils::NonEmptyKeyValuePairs;
 
     let ada_asset = AssetClass {
         policy: vec![],
@@ -3328,12 +3335,12 @@ fn build_withdraw_fulfillment_value(
                     )
                 })
                 .collect();
-            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+            (policy_hash, BTreeMap::from_iter(token_pairs))
         })
         .collect();
     Ok(ConwayValue::Multiasset(
         lovelace,
-        NonEmptyKeyValuePairs::Def(multiasset_pairs),
+        BTreeMap::from_iter(multiasset_pairs),
     ))
 }
 
@@ -3343,7 +3350,7 @@ fn build_withdraw_fulfillment_value(
 /// token quantities and requiring the lovelace to fit u64.
 fn value_to_conway(result: &crate::cardano_types::Value) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
-    use pallas_primitives::NonEmptyKeyValuePairs;
+    use pallas_codec::utils::NonEmptyKeyValuePairs;
 
     let ada_asset = AssetClass {
         policy: vec![],
@@ -3392,13 +3399,13 @@ fn value_to_conway(result: &crate::cardano_types::Value) -> Result<ConwayValue> 
                     )
                 })
                 .collect();
-            (policy_hash, NonEmptyKeyValuePairs::Def(token_pairs))
+            (policy_hash, BTreeMap::from_iter(token_pairs))
         })
         .collect();
 
     Ok(ConwayValue::Multiasset(
         lovelace,
-        NonEmptyKeyValuePairs::Def(multiasset_pairs),
+        BTreeMap::from_iter(multiasset_pairs),
     ))
 }
 
@@ -3491,7 +3498,7 @@ fn build_collateral_return_value(
     total_collateral: u64,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
-    use pallas_primitives::NonEmptyKeyValuePairs;
+    use pallas_codec::utils::NonEmptyKeyValuePairs;
 
     let ada_asset = crate::cardano_types::AssetClass {
         policy: vec![],
@@ -3513,7 +3520,7 @@ fn build_collateral_return_value(
         );
     }
 
-    let mut policy_pairs: Vec<(Hash<28>, NonEmptyKeyValuePairs<PallasBytes, PositiveCoin>)> =
+    let mut policy_pairs: Vec<(Hash<28>, BTreeMap<PallasBytes, PositiveCoin>)> =
         Vec::new();
 
     for (policy_bytes, tokens) in &value.0 {
@@ -3529,7 +3536,7 @@ fn build_collateral_return_value(
             }
         }
         if !token_pairs.is_empty() {
-            policy_pairs.push((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)));
+            policy_pairs.push((policy_hash, BTreeMap::from_iter(token_pairs)));
         }
     }
 
@@ -3538,7 +3545,7 @@ fn build_collateral_return_value(
     } else {
         Ok(ConwayValue::Multiasset(
             return_lovelace,
-            NonEmptyKeyValuePairs::Def(policy_pairs),
+            BTreeMap::from_iter(policy_pairs),
         ))
     }
 }

@@ -541,7 +541,7 @@ pub async fn submit_via_node(
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
-        Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(hex::encode(&reason.0))),
+        Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(format!("{reason:?}"))),
         Err(e) => Err(NodeSubmitError::Transport(e.to_string())),
     }
 }
