@@ -435,6 +435,10 @@
      "fee-constraint": {
       "hash": "d7d1c09deb8bc8e15baae7895e57e86ab6d0cb10e2faaa6d96cd691b",
       "ref-utxo": "04a51c07ad31edf2e8af96aa18b69afd4dabcbbcd5eb8a00a95dd4a320a242e5#0"
+     },
+     "stableswap": {
+      "hash": "a44e0058459a223752be78dc4df7ca86446ba22ef95c7ee690e0b5a3",
+      "ref-utxo": "d25422f6ffd60ed1a3501b6ac7b8c8c2b08e58efab8263419f9416e6a1111fdd#0"
      }
     },
     "plutus-v2-cost-model": [

@@ -34,6 +34,8 @@ A v4 execution config needs these additional settings
 | `server.tls_cert` / `tls_key` | Cert and key, if TLS is enabled |
 | `server.public_address` | `-p 9998:9998` |
 
+Pool families: constant product, constant sum, concentrated liquidity, and stableswap. Stableswap pools need `module-scripts.stableswap` and carry a config that changes on chain; see [docs/stableswap.md](./docs/stableswap.md) for how they are recognised, priced, and what to do when the module is deployed.
+
 The server listens on `server.address` (`0.0.0.0:9999` by default) and serves `/dashboard`, `/status`, `/health`, `/metrics`, `/failures`, `/events` (SSE), `/pause`, `/resync-from-acropolis`, and per-protocol `/v3/…` and `/v4/…` listings of `pools`, `orders`, `spent-orders`, and `spent-pools`. Setting `server.public_address` opens a second listener carrying only the strategy-intent endpoints and `/health`.
 
 ### Docker

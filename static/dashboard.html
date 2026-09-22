@@ -1120,6 +1120,7 @@
     if (!pt) return '<span class="badge badge-yellow">?</span>';
     if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
     if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
+    if (pt.StableSwap) return '<span class="badge badge-green">SS</span>';
     var keys = Object.keys(pt);
     return '<span class="badge badge-yellow">' + (keys[0] || '?') + '</span>';
   }
