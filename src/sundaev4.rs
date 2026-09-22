@@ -19,6 +19,8 @@ pub use indexer::*;
 pub use types::*;
 
 #[cfg(test)]
+mod cost_bench;
+#[cfg(test)]
 mod scoop_tests;
 #[cfg(test)]
 pub(crate) mod test_harness;
