@@ -138,16 +138,14 @@ transactions (the sundae-v4 CLI's `update-rates` / `scoop-stableswap
    }
    ```
 
-   Preview: `config/preview-v4.json` still carries the module published on
-   2026-09-22 before the `attribution` field was added: hash
-   `a44e0058459a223752be78dc4df7ca86446ba22ef95c7ee690e0b5a3`, ref
-   `d25422f6ffd60ed1a3501b6ac7b8c8c2b08e58efab8263419f9416e6a1111fdd#0`.
-   TODO: replace both with the values of the republished module (sundae-v4
-   `3c2574d` or later) once `test/devnet/STABLESWAP.md` in sundae-v4
-   records the redeploy. The republished module applied to the preview
-   `pool_mint` policy (`b8a18e25…`) hashes to
-   `9db7ce54fb25f4390a89bb715a022fe79a86b9a043aa22c31c27380a` (untraced);
-   the ref UTxO exists only after the redeploy. Preprod: the ref UTxO and
+   Preview: `config/preview-v4.json` names the republished module — the
+   build that carries the `attribution` field (sundae-v4 `3c2574d` or
+   later) — at hash
+   `9db7ce54fb25f4390a89bb715a022fe79a86b9a043aa22c31c27380a` and ref
+   `849ff000d1b17e974f8024bf962e82d9317cbc28fc8be7010e52462f28ada689#0`.
+   The superseded hash `a44e0058…` still backs the two older preview
+   pools until their governance module-swap lands; a scooper on this
+   config does not serve those two until then. Preprod: the ref UTxO and
    hash are set when the republished script is published there.
 3. Restart the scooper. The indexer tracks the new reference UTxO, and
    startup recovery fetches the config of every stableswap pool that
