@@ -588,6 +588,54 @@ impl TestEnv {
             self.exec.module_scripts.fairness.hash.to_vec(),
         ]
     }
+
+    /// `module_state` entries for a stableswap pool: the config hash under
+    /// the stableswap module credential, plus fee_split and fairness as for
+    /// every pool.
+    pub fn ss_module_state(&self, config: &StableSwapConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let ss_script = self
+            .exec
+            .module_scripts
+            .stableswap
+            .as_ref()
+            .expect("blueprint must include the stableswap validator for SS tests");
+        let ss_hash = crate::sundaev4::ss_math::config_hash(config);
+
+        let fs_config = FeeSplitConfig {
+            protocol_share: Rational {
+                num: BigInt::from(self.exec.protocol_share.0),
+                den: BigInt::from(self.exec.protocol_share.1),
+            },
+        };
+        let fs_cbor = minicbor::to_vec(fs_config.to_plutus()).unwrap();
+        let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
+        let fairness_hash = vec![0x80];
+
+        vec![
+            (ss_script.hash.to_vec(), ss_hash),
+            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+            (
+                self.exec.module_scripts.fairness.hash.to_vec(),
+                fairness_hash,
+            ),
+        ]
+    }
+
+    /// The action entry modules list for stableswap pools:
+    /// `[ss_hash, fs_hash, fairness_hash]`.
+    pub fn ss_action_modules(&self) -> Vec<Vec<u8>> {
+        let ss_script = self
+            .exec
+            .module_scripts
+            .stableswap
+            .as_ref()
+            .expect("blueprint must include the stableswap validator for SS tests");
+        vec![
+            ss_script.hash.to_vec(),
+            self.exec.module_scripts.fee_split.hash.to_vec(),
+            self.exec.module_scripts.fairness.hash.to_vec(),
+        ]
+    }
 }
 
 // ─── Shared test helpers ──────────────────────────────────────────────────
@@ -890,6 +938,95 @@ pub fn make_cs_pool(
                 den: BigInt::from(1),
             },
         },
+        slot: 100,
+        fee_split_config: None,
+    })
+}
+
+/// A stableswap config at unit-scale rates and no rate manager (the
+/// shape a pool with two same-decimal assets and a fixed 1:1 peg uses).
+pub fn ss_config(amp: i64, fee: Rational, rates: [i64; 2]) -> StableSwapConfig {
+    StableSwapConfig {
+        linear_amplification: BigInt::from(amp),
+        fee,
+        rates: vec![BigInt::from(rates[0]), BigInt::from(rates[1])],
+        rate_manager: None,
+        monotone_rates: false,
+        max_rate_step: None,
+    }
+}
+
+/// Create a stableswap pool with the proper module pipeline (SS + FS +
+/// fairness). Like `make_cs_pool`, with `PoolType::StableSwap` and the
+/// config hash in `module_state`. `total_lp` follows the module's Create
+/// rule `D / calc_precision` so LP-denominated budgets have the on-chain
+/// scale.
+pub fn make_ss_pool(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: StableSwapConfig,
+) -> Arc<SundaeV4Pool> {
+    assert_eq!(assets.len(), 2, "stableswap pools hold exactly two assets");
+    let ident_bytes = vec![ident_byte; 28];
+
+    let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+    nft_name.extend_from_slice(&ident_bytes);
+    let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+    lp_name.extend_from_slice(&ident_bytes);
+
+    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let nft_asset = AssetClass {
+        policy: pool_mint_policy.clone(),
+        token: nft_name,
+    };
+    let lp_asset = AssetClass {
+        policy: pool_mint_policy,
+        token: lp_name,
+    };
+
+    let reserves: Vec<BigInt> = assets.iter().map(|(_, r)| BigInt::from(*r)).collect();
+    let d = crate::sundaev4::ss_math::SsParams::from_config(&config)
+        .d_of(&reserves)
+        .expect("D for the initial reserves");
+    let total_lp = &d / &BigInt::from(crate::sundaev4::ss_math::CALC_PRECISION);
+    let circulating_lp = BigInt::from(0);
+    let preminted_lp = total_lp.clone();
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(50_000_000i64));
+    for (asset, reserve) in &assets {
+        value.insert(asset, BigInt::from(*reserve));
+    }
+    value.insert(&nft_asset, BigInt::from(1i64));
+    value.insert(&lp_asset, preminted_lp.clone());
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = ident_byte;
+
+    let datum_assets: Vec<(AssetClass, BigInt)> =
+        assets.iter().map(|(a, r)| (a.clone(), BigInt::from(*r))).collect();
+
+    Arc::new(SundaeV4Pool {
+        input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
+        value,
+        pool_datum: PoolDatum {
+            assets: datum_assets,
+            total_lp,
+            circulating_lp,
+            preminted_lp,
+            identifier: Ident::new(&ident_bytes),
+            actions: vec![ActionEntry {
+                tag: BigInt::from(100),
+                enabled: true,
+                modules: env.ss_action_modules(),
+            }],
+            module_state: env.ss_module_state(&config),
+            min_surplus: BigInt::from(0),
+            extension: crate::sundaev4::types::plutus_void(),
+        },
+        pool_type: PoolType::StableSwap { config },
         slot: 100,
         fee_split_config: None,
     })

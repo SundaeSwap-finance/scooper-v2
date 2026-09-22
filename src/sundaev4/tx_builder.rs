@@ -68,6 +68,68 @@ fn order_ref_to_plutus(
     })
 }
 
+/// `SwapStep { raw_swap_result, next_sum_invariant }` for a stableswap swap
+/// entry, derived from the reserves the walk moved: the module pins both
+/// values with `exchange_invariant` / `liquidity_invariant`, and the step
+/// builder runs those same checks before it returns. The trader's `dy`
+/// (`before_out − after_out`) must equal what the curve pays after the fee;
+/// a mismatch means the walk and the pricing disagree, so the tx is refused.
+fn ss_swap_op_data(
+    config: &crate::sundaev4::types::StableSwapConfig,
+    before: &[(AssetClass, BigInt)],
+    after: &[(AssetClass, BigInt)],
+    lp_before: &BigInt,
+) -> Result<pallas_primitives::PlutusData> {
+    use num_traits::Signed;
+    if before.len() != 2 || after.len() != 2 {
+        bail!("stableswap pool must hold exactly two assets");
+    }
+    let (in_idx, out_idx) = if after[0].1 > before[0].1 {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let dx = &after[in_idx].1 - &before[in_idx].1;
+    let takes = &before[out_idx].1 - &after[out_idx].1;
+    if !dx.is_positive() || !takes.is_positive() {
+        bail!("stableswap swap entry must raise one reserve and lower the other");
+    }
+    let p = swap_math::ss_params(config);
+    let reserves: Vec<BigInt> = before.iter().map(|(_, q)| q.clone()).collect();
+    let step = crate::sundaev4::ss_math::swap_step(&p, &reserves, lp_before, in_idx, &dx, None)
+        .map_err(|e| anyhow::anyhow!("stableswap swap step: {e}"))?;
+    if step.dy != takes {
+        bail!(
+            "stableswap swap entry pays {takes} but the curve pays {} for {dx}",
+            step.dy
+        );
+    }
+    Ok(crate::sundaev4::types::SwapStep {
+        raw_swap_result: step.raw,
+        next_sum_invariant: step.next_d,
+    }
+    .to_plutus())
+}
+
+/// `LiquidityStep { target_delta_d, next_sum_invariant }` for a stableswap
+/// deposit or withdraw entry: the declared delta plus `D` for the reserves
+/// the entry leaves.
+fn ss_liquidity_op_data(
+    config: &crate::sundaev4::types::StableSwapConfig,
+    target_delta_d: &BigInt,
+    after: &[(AssetClass, BigInt)],
+) -> Result<pallas_primitives::PlutusData> {
+    let p = swap_math::ss_params(config);
+    let reserves: Vec<BigInt> = after.iter().map(|(_, q)| q.clone()).collect();
+    let next_d =
+        p.d_of(&reserves).map_err(|e| anyhow::anyhow!("stableswap liquidity step: {e}"))?;
+    Ok(crate::sundaev4::types::LiquidityStep {
+        target_delta_d: target_delta_d.clone(),
+        next_sum_invariant: next_d,
+    }
+    .to_plutus())
+}
+
 // Upper bound on the *real* fee any single scoop tx can have under our
 // current cost model — used to size collateral selection so the
 // collateral_return output stays above min_utxo even when the rebuild
@@ -479,7 +541,9 @@ pub fn build_multi_pool_scoop_tx(
     let per_pool_swap_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
-            PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_SWAP),
+            PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
+                BigInt::from(crate::sundaev4::types::TAG_SWAP)
+            }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         })
@@ -490,7 +554,9 @@ pub fn build_multi_pool_scoop_tx(
     let per_pool_deposit_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
-            PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_DEPOSIT),
+            PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
+                BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
+            }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         })
@@ -816,7 +882,7 @@ pub fn build_multi_pool_scoop_tx(
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                    PoolType::ConstantSum { .. } => {
+                    PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                 };
@@ -828,6 +894,42 @@ pub fn build_multi_pool_scoop_tx(
                 (wd_tag, BigInt::from(0))
             }
         };
+
+        // Stableswap entries carry typed operation_data the module reads
+        // (ss_check.ak): SwapStep for swaps, LiquidityStep for deposits and
+        // withdrawals. Both replace the order-ref stamp / CS delta above.
+        // The budget above was computed from the same before/after reserves,
+        // so the D values here agree with it.
+        if let PoolType::StableSwap { config } = &pool_type {
+            use crate::sundaev4::batch::BatchOp;
+            // fee_budget is pinned on lp_before: the running LP before this
+            // entry's protocol share lands.
+            let lp_before = running_total_lp.clone();
+            op_data_override = Some(match op {
+                BatchOp::Swap(_) | BatchOp::Continuation(_) | BatchOp::ZapSwap(_) => {
+                    ss_swap_op_data(config, &prev_assets, running_assets, &lp_before)?
+                }
+                BatchOp::Deposit(i) => {
+                    let t = batch.deposits[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap deposit without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets)?
+                }
+                BatchOp::ZapDeposit(i) => {
+                    let t = batch.zaps[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap zap deposit without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets)?
+                }
+                BatchOp::Withdraw(i) => {
+                    let t = batch.withdraws[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap withdraw without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets)?
+                }
+                BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
+            });
+        }
 
         // Per-entry protocol_lp share. fee_split.Operate's check is
         // *cumulative* per pool: protocol_lp = floor(total_gross * ps_num /
@@ -1054,6 +1156,7 @@ pub fn build_multi_pool_scoop_tx(
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
+    let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -1181,6 +1284,47 @@ pub fn build_multi_pool_scoop_tx(
                 cl_entries.push(CLOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
                     config: cl_cfg,
+                });
+            }
+            PoolType::StableSwap { config } => {
+                // The entry re-sends the config preimage and D for the pool
+                // input. The module verifies the preimage against the input
+                // datum's module_state slot, so a stale preimage (a rate
+                // update this scooper has not indexed) can only fail on chain
+                // — refuse to build instead.
+                let ss_script = exec.module_scripts.stableswap.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pool {} is stableswap but no stableswap module script is configured",
+                        batch.pool.pool_datum.identifier
+                    )
+                })?;
+                let ss_cred = ss_script.hash.as_ref();
+                let stored = batch
+                    .pool
+                    .pool_datum
+                    .module_state
+                    .iter()
+                    .find(|(cred, _)| cred.as_slice() == ss_cred)
+                    .map(|(_, h)| h.clone());
+                let expected = crate::sundaev4::ss_math::config_hash(config);
+                if stored.as_deref() != Some(expected.as_slice()) {
+                    bail!(
+                        "pool {}: stableswap config preimage hash {} does not match the pool's \
+                         module_state {:?}; the held rates are stale or the config is unknown",
+                        batch.pool.pool_datum.identifier,
+                        hex::encode(&expected),
+                        stored.map(hex::encode),
+                    );
+                }
+                let reserves: Vec<BigInt> =
+                    batch.pool.pool_datum.assets.iter().map(|(_, q)| q.clone()).collect();
+                let sum_invariant = swap_math::ss_params(config).d_of(&reserves).map_err(|e| {
+                    anyhow::anyhow!("pool {}: {e}", batch.pool.pool_datum.identifier)
+                })?;
+                ss_entries.push(crate::sundaev4::types::SSOperateEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                    config: config.clone(),
+                    sum_invariant,
                 });
             }
         }
@@ -1340,6 +1484,7 @@ pub fn build_multi_pool_scoop_tx(
     let has_cp = !cp_entries.is_empty();
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
+    let has_ss = !ss_entries.is_empty();
 
     // pool_mint is only needed when the preminted reserve couldn't cover a
     // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
@@ -1379,6 +1524,9 @@ pub fn build_multi_pool_scoop_tx(
     }
     if has_cl && let Some(cl) = &exec.module_scripts.concentrated_liquidity {
         all_ref_inputs.push(cl.ref_utxo.0.clone());
+    }
+    if has_ss && let Some(ss) = &exec.module_scripts.stableswap {
+        all_ref_inputs.push(ss.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -1585,6 +1733,14 @@ pub fn build_multi_pool_scoop_tx(
             entries: cl_entries,
         };
         withdrawals.push((reward_account(&cl_script.hash), cl_redeemer.to_plutus()));
+    }
+
+    // Conditionally add stableswap withdrawal
+    if has_ss && let Some(ss_script) = &exec.module_scripts.stableswap {
+        let ss_redeemer = crate::sundaev4::types::StableSwapRedeemer::Operate {
+            entries: ss_entries,
+        };
+        withdrawals.push((reward_account(&ss_script.hash), ss_redeemer.to_plutus()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in

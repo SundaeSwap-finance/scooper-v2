@@ -1288,9 +1288,13 @@ impl Scooper {
                             // fills as a zap: a rebalancing swap, then the
                             // deposit that swap makes possible.
                             let mut zap_candidate = accum.clone();
+                            // Constant-sum and stableswap admit a swap
+                            // followed by a proportional deposit in one
+                            // transcript; the other curves do not.
                             let zap = if !matches!(
                                 effective_pool.pool_type,
                                 crate::sundaev4::PoolType::ConstantSum { .. }
+                                    | crate::sundaev4::PoolType::StableSwap { .. }
                             ) {
                                 // A two-asset deposit is rejected on chain by
                                 // cp_check, which reads both reserves rising as
@@ -1300,8 +1304,9 @@ impl Scooper {
                                 // turn a cheap skip into a build failure, and a
                                 // lone order failing to build is quarantined
                                 // for good.
-                                Err("only constant-sum pools zap: the other \
-                                     curves reject a two-asset deposit on chain"
+                                Err("only constant-sum and stableswap pools zap: \
+                                     the other curves reject a two-asset deposit \
+                                     on chain"
                                     .to_string())
                             } else if carries_route_constraint(&exec, order) {
                                 Err("route-constrained orders can't zap: \
@@ -2381,6 +2386,7 @@ impl Scooper {
                         PoolType::ConcentratedLiquidity { .. } => {
                             crate::metrics::PoolFamily::ConcentratedLiquidity
                         }
+                        PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
                     };
                     let n = (batch.swaps.len()
                         + batch.deposits.len()
