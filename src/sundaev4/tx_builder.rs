@@ -68,17 +68,20 @@ fn order_ref_to_plutus(
     })
 }
 
-/// `SwapStep { raw_swap_result, next_sum_invariant }` for a stableswap swap
-/// entry, derived from the reserves the walk moved: the module pins both
-/// values with `exchange_invariant` / `liquidity_invariant`, and the step
-/// builder runs those same checks before it returns. The trader's `dy`
-/// (`before_out − after_out`) must equal what the curve pays after the fee;
-/// a mismatch means the walk and the pricing disagree, so the tx is refused.
+/// `SwapStep { raw_swap_result, next_sum_invariant, attribution }` for a
+/// stableswap swap entry, derived from the reserves the walk moved: the
+/// module pins the first two values with `exchange_invariant` /
+/// `liquidity_invariant`, and the step builder runs those same checks
+/// before it returns. The trader's `dy` (`before_out − after_out`) must
+/// equal what the curve pays after the fee; a mismatch means the walk and
+/// the pricing disagree, so the tx is refused. `attribution` is the serving
+/// order's reference (unread by the module).
 fn ss_swap_op_data(
     config: &crate::sundaev4::types::StableSwapConfig,
     before: &[(AssetClass, BigInt)],
     after: &[(AssetClass, BigInt)],
     lp_before: &BigInt,
+    attribution: pallas_primitives::PlutusData,
 ) -> Result<pallas_primitives::PlutusData> {
     use num_traits::Signed;
     if before.len() != 2 || after.len() != 2 {
@@ -107,17 +110,19 @@ fn ss_swap_op_data(
     Ok(crate::sundaev4::types::SwapStep {
         raw_swap_result: step.raw,
         next_sum_invariant: step.next_d,
+        attribution,
     }
     .to_plutus())
 }
 
-/// `LiquidityStep { target_delta_d, next_sum_invariant }` for a stableswap
-/// deposit or withdraw entry: the declared delta plus `D` for the reserves
-/// the entry leaves.
+/// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
+/// a stableswap deposit or withdraw entry: the declared delta plus `D` for
+/// the reserves the entry leaves, and the serving order's reference.
 fn ss_liquidity_op_data(
     config: &crate::sundaev4::types::StableSwapConfig,
     target_delta_d: &BigInt,
     after: &[(AssetClass, BigInt)],
+    attribution: pallas_primitives::PlutusData,
 ) -> Result<pallas_primitives::PlutusData> {
     let p = swap_math::ss_params(config);
     let reserves: Vec<BigInt> = after.iter().map(|(_, q)| q.clone()).collect();
@@ -126,6 +131,7 @@ fn ss_liquidity_op_data(
     Ok(crate::sundaev4::types::LiquidityStep {
         target_delta_d: target_delta_d.clone(),
         next_sum_invariant: next_d,
+        attribution,
     }
     .to_plutus())
 }
@@ -897,35 +903,60 @@ pub fn build_multi_pool_scoop_tx(
 
         // Stableswap entries carry typed operation_data the module reads
         // (ss_check.ak): SwapStep for swaps, LiquidityStep for deposits and
-        // withdrawals. Both replace the order-ref stamp / CS delta above.
-        // The budget above was computed from the same before/after reserves,
-        // so the D values here agree with it.
+        // withdrawals. Both replace the order-ref stamp / CS delta above;
+        // the serving order's reference moves into their `attribution`
+        // slot (Void when a step serves no order). The budget above was
+        // computed from the same before/after reserves, so the D values
+        // here agree with it.
         if let PoolType::StableSwap { config } = &pool_type {
             use crate::sundaev4::batch::BatchOp;
             // fee_budget is pinned on lp_before: the running LP before this
             // entry's protocol share lands.
             let lp_before = running_total_lp.clone();
+            let served_order = match op {
+                BatchOp::Swap(i) => Some(&batch.swaps[*i].order.input),
+                BatchOp::Continuation(i) => {
+                    Some(&routes[batch.continuations[*i].route.route_idx].order.input)
+                }
+                BatchOp::ZapSwap(i) | BatchOp::ZapDeposit(i) => Some(&batch.zaps[*i].order.input),
+                BatchOp::Deposit(i) => Some(&batch.deposits[*i].order.input),
+                BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
+                BatchOp::Claim(i) => Some(&batch.claims[*i].order.input),
+            };
+            let attribution = served_order.map(order_ref_to_plutus).unwrap_or_else(|| {
+                pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+                })
+            });
             op_data_override = Some(match op {
                 BatchOp::Swap(_) | BatchOp::Continuation(_) | BatchOp::ZapSwap(_) => {
-                    ss_swap_op_data(config, &prev_assets, running_assets, &lp_before)?
+                    ss_swap_op_data(
+                        config,
+                        &prev_assets,
+                        running_assets,
+                        &lp_before,
+                        attribution,
+                    )?
                 }
                 BatchOp::Deposit(i) => {
                     let t = batch.deposits[*i].target_delta_v.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("stableswap deposit without a declared target delta")
                     })?;
-                    ss_liquidity_op_data(config, t, running_assets)?
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
                 }
                 BatchOp::ZapDeposit(i) => {
                     let t = batch.zaps[*i].target_delta_v.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("stableswap zap deposit without a declared target delta")
                     })?;
-                    ss_liquidity_op_data(config, t, running_assets)?
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
                 }
                 BatchOp::Withdraw(i) => {
                     let t = batch.withdraws[*i].target_delta_v.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("stableswap withdraw without a declared target delta")
                     })?;
-                    ss_liquidity_op_data(config, t, running_assets)?
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
                 }
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             });

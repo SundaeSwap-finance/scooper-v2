@@ -836,23 +836,28 @@ pub const TAG_UPDATE_RATES: u64 = 7;
 // Stableswap transcript operation_data (lib/modules/ss_check.ak)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// `operation_data` of a stableswap tag-3 swap step. Both values are
-/// computed off-chain (`ss_math`) and pinned on chain: `raw_swap_result` is
-/// the gross output in numeraire units at `calc_precision` scale, before the
-/// fee; `next_sum_invariant` is `D` for the post-step reserves.
+/// `operation_data` of a stableswap tag-3 swap step. The first two values
+/// are computed off-chain (`ss_math`) and pinned on chain: `raw_swap_result`
+/// is the gross output in numeraire units at `calc_precision` scale, before
+/// the fee; `next_sum_invariant` is `D` for the post-step reserves.
+/// `attribution` is not read by the module: the scooper stamps the serving
+/// order's output reference there (the encoding it writes into
+/// `operation_data` for the other curves), or Void when no order is served.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SwapStep {
     pub raw_swap_result: BigInt,
     pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
 }
 
 /// `operation_data` of a stableswap tag-6 deposit or tag-4 withdraw step.
 /// `target_delta_d` is the declared change in `D` (scaled), positive for a
-/// deposit and negative for a withdrawal.
+/// deposit and negative for a withdrawal. `attribution` as on `SwapStep`.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LiquidityStep {
     pub target_delta_d: BigInt,
     pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
 }
 
 /// `operation_data` of a stableswap tag-7 rate update. `rates` replaces the

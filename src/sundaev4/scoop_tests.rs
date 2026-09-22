@@ -14,6 +14,7 @@ mod tests {
     use crate::sundaev4::test_harness::*;
     use crate::sundaev4::tx_builder::TX_FEE;
     use num_traits::Signed;
+    use plutus_parser::AsPlutus;
 
     const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
 
@@ -1588,6 +1589,31 @@ mod tests {
             rewards >= 3,
             "expected stableswap + fee_split + fairness withdrawals, got {rewards}"
         );
+        // The swap entry's operation_data is a three-field SwapStep whose
+        // `attribution` names the serving order (the module leaves it unread).
+        let step = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) => {
+                        Some(transcript)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pool spend redeemer")
+            .remove(0);
+        let swap = crate::sundaev4::types::SwapStep::from_plutus(step.operation_data)
+            .expect("stableswap swap entry carries a SwapStep");
+        let served = crate::sundaev4::types::OutputRef::from_plutus(swap.attribution)
+            .expect("attribution is an output reference");
+        assert_eq!(
+            served.transaction_id,
+            orders[0].input.0.transaction_id.to_vec()
+        );
+        assert_eq!(served.output_index, orders[0].input.0.index);
         let after = &result.predicted_pools[0].2;
         assert_eq!(after.pool_datum.assets[0].1, BigInt::from(1_010_000_000));
         assert_eq!(

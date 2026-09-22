@@ -102,8 +102,12 @@ graph build.
 Per stableswap pool in a scoop:
 
 - transcript entries carry `operation_tag` 3 / 4 / 6 with typed
-  `operation_data`: `SwapStep { raw_swap_result, next_sum_invariant }` or
-  `LiquidityStep { target_delta_d, next_sum_invariant }`;
+  `operation_data`: `SwapStep { raw_swap_result, next_sum_invariant,
+  attribution }` or `LiquidityStep { target_delta_d, next_sum_invariant,
+  attribution }`. The module does not read `attribution`; the scooper
+  writes the serving order's output reference there (the same encoding it
+  stamps into `operation_data` on the other curves), or Void for a step
+  that serves no order;
 - `fee_budget` is split with fee_split's cumulative floor, as for every
   module;
 - the stableswap module withdraws zero with
@@ -134,12 +138,17 @@ transactions (the sundae-v4 CLI's `update-rates` / `scoop-stableswap
    }
    ```
 
-   Preview (deployed 2026-09-22): hash
+   Preview: `config/preview-v4.json` still carries the module published on
+   2026-09-22 before the `attribution` field was added: hash
    `a44e0058459a223752be78dc4df7ca86446ba22ef95c7ee690e0b5a3`, ref
-   `d25422f6ffd60ed1a3501b6ac7b8c8c2b08e58efab8263419f9416e6a1111fdd#0`
-   (`config/preview-v4.json`). Preprod: hash
-   `9bde06cfc81448951e7c4d65e6ac2dfd822d6a90863eff6f597c91a1`; the ref
-   UTxO is set when the script is published there.
+   `d25422f6ffd60ed1a3501b6ac7b8c8c2b08e58efab8263419f9416e6a1111fdd#0`.
+   TODO: replace both with the values of the republished module (sundae-v4
+   `3c2574d` or later) once `test/devnet/STABLESWAP.md` in sundae-v4
+   records the redeploy. The republished module applied to the preview
+   `pool_mint` policy (`b8a18e25…`) hashes to
+   `9db7ce54fb25f4390a89bb715a022fe79a86b9a043aa22c31c27380a` (untraced);
+   the ref UTxO exists only after the redeploy. Preprod: the ref UTxO and
+   hash are set when the republished script is published there.
 3. Restart the scooper. The indexer tracks the new reference UTxO, and
    startup recovery fetches the config of every stableswap pool that
    already exists.
