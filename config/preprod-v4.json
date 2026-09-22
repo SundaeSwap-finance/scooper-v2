@@ -429,8 +429,8 @@
      }
     },
     "max-tx-ex-mem": 16500000,
-    "cost-per-pool-lovelace": 1000000,
-    "cost-per-step-lovelace": 500000,
+    "cost-per-pool-lovelace": 250000,
+    "cost-per-step-lovelace": 125000,
     "partial-fill-margin": [
      3,
      2
