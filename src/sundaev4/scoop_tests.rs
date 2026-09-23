@@ -2134,10 +2134,8 @@ mod tests {
         assert!(!eval.budgets.is_empty());
     }
 
-    /// A pool's trading allowlist must be applied to the view the router
-    /// receives. `current_pool_view` re-inserts every pool the batch has
-    /// touched, so filtering the map it falls back to lets a restricted pool
-    /// return as soon as one permitted order has used it.
+    /// A restricted pool stays out of a denied order's route after a permitted
+    /// order has put it in the batch (see `PoolAllowlists::retain_visible`).
     #[test]
     fn allowlist_survives_the_accumulator_overlay() {
         use crate::multisig::Multisig;

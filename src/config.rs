@@ -111,8 +111,8 @@ mod tests {
         }
     }
 
-    /// The allowlist overlay parses through config-rs, not just serde_json,
-    /// and restricts the pool it names.
+    /// The preview allowlist overlay loads through config-rs and restricts the
+    /// pool it names.
     #[test]
     fn preview_allowlist_overlay_restricts_its_pool() {
         let config = load_config([

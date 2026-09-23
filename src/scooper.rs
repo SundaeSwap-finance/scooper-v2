@@ -824,8 +824,7 @@ impl Scooper {
         // redeemer (in canonical input order).
         let mut strategy_executions: BTreeMap<TransactionInput, pallas_primitives::PlutusData> =
             BTreeMap::new();
-        // The only site where a strategy order is still decoded; the
-        // allowlist gate needs its constraints downstream.
+        // For the allowlist gate (`PoolAllowlists::permits`).
         let mut strategy_constraints: BTreeMap<
             TransactionInput,
             crate::sundaev4::StrategyConstraints,

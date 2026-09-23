@@ -206,8 +206,7 @@ pub struct OpsSnapshot {
     /// Orders skipped because they name an OrderConfig token that isn't
     /// indexed (typically never minted) — undispatchable until it appears.
     pub config_missing_orders: usize,
-    /// Pools carrying a configured trading allowlist. Answers "is the
-    /// restriction actually live" without reading config off the host.
+    /// Pools carrying a configured trading allowlist.
     pub restricted_pools: usize,
     /// True while the scooper is sitting out cycles after a lost race.
     pub backoff_active: bool,

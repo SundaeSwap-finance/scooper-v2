@@ -2,9 +2,8 @@
 //!
 //! A pool named in the config is closed: the scooper serves an order against
 //! it only when every credential that can act on that order is listed. This is
-//! scooper policy, not a chain rule — a denied order stays valid on chain and
-//! simply never gets picked up, so the guarantee holds only while every
-//! authorized scooper runs the same list.
+//! scooper policy, not a chain rule — a denied order stays valid on chain, so
+//! the guarantee holds only while every authorized scooper runs the same list.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,9 +158,8 @@ fn destination_listed(dest: &Destination, listed: &BTreeSet<Vec<u8>>) -> bool {
     }
 }
 
-/// Report the configured allowlists against chain state, once, on the first
-/// cycle with settings loaded. Nothing here stops the scooper: the list only
-/// binds this process, so the operator is told where that leaves gaps.
+/// Log each configured pool's status, and warn where chain settings let other
+/// parties fill what this scooper declines.
 pub fn log_config(
     allowlists: &PoolAllowlists,
     authorized_scoopers: Option<&Vec<Multisig>>,
@@ -273,7 +271,7 @@ mod tests {
 
     #[test]
     fn uppercase_hex_still_restricts() {
-        // POOL's hex has no letters, so key the list by a pool whose has.
+        // POOL's hex (0x11…) has no letters to change case.
         let lettered = Ident::new(&[0xAB; 28]);
         let lists = parse(serde_json::json!({
             hex::encode_upper(lettered.to_bytes()): { "credentials": [hex::encode_upper(ALICE)] }
@@ -286,7 +284,7 @@ mod tests {
 
     #[test]
     fn keys_differing_only_in_case_are_one_pool() {
-        // ALICE's bytes, since POOL's hex has no letters to change case.
+        // POOL's hex (0x11…) has no letters to change case.
         let err = parse(serde_json::json!({
             hex::encode(ALICE): { "credentials": [] },
             hex::encode_upper(ALICE): { "credentials": [] },
@@ -497,8 +495,6 @@ mod tests {
 
     #[test]
     fn retain_visible_drops_a_restricted_pool_from_an_overlay_map() {
-        // The map handed in is the accumulator's view, which re-inserts pools
-        // the batch already touched — exactly the map that must be filtered.
         let other = Ident::new(&[0x99; 28]);
         let map = pool_map(&[pool(), other.clone()]);
         let denied = order(sig(STRANGER), fixed_to(STRANGER));

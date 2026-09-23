@@ -58,7 +58,7 @@ A pool that isn't listed is unrestricted. Your scooper serves an order against a
 
 A restricted pool is invisible to a denied order, including as a hop inside a longer route.
 
-**The list binds only your scooper.** A denied order stays valid on chain, and any other authorized scooper can fill it. A restriction holds only if every authorized scooper runs the same list, so pool allowlists have to be coordinated across operators. They aren't a per-operator setting. If the settings datum authorizes any scooper (no `authorized_scoopers` list), anyone can fill what you decline. The scooper logs a warning at startup in that case.
+**The list binds only your scooper.** A denied order stays valid on chain, and any other authorized scooper can fill it. A restriction holds only if every authorized scooper runs the same list, so pool allowlists have to be coordinated across operators. If the settings datum authorizes any scooper (no `authorized_scoopers` list), anyone can fill what you decline. The scooper logs a warning at startup in that case.
 
 The scooper refuses to start if an ident or credential isn't 28-byte hex, a pool is listed twice, or a pool entry has a field other than `credentials`. Hex case doesn't matter. A misspelled `pool-allowlists` key is ignored like any other unknown key, so check that the restriction is live:
 

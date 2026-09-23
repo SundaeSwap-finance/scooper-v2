@@ -528,8 +528,6 @@ impl AdminServer {
                     o.input.0.transaction_id.as_ref() == key.0.as_slice()
                         && o.input.0.index == key.1
                 });
-                // Mirror dispatch: a restricted pool is invisible to an order
-                // whose credentials aren't on its allowlist.
                 let visible = match order {
                     Some(o) => self.v4_pool_allowlists.retain_visible(
                         pools.clone(),
