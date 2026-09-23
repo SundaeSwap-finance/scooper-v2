@@ -110,4 +110,21 @@ mod tests {
             assert!(!enabled, "{file}: peer sharing must be disabled");
         }
     }
+
+    /// The preview allowlist overlay loads through config-rs and restricts the
+    /// pool it names.
+    #[test]
+    fn preview_allowlist_overlay_restricts_its_pool() {
+        let config = load_config([
+            "config/preview-v4.json",
+            "config/preview-allowlist-test.json",
+        ])
+        .expect("config loads");
+        let exec = config.protocol.v4.and_then(|v4| v4.execution).expect("v4 execution config");
+        let pool = crate::sundaev3::Ident::new(
+            &hex::decode("3b809fd966274082c16ea6e670dd7c5d384a44a8989a70fd9fe4cc45").unwrap(),
+        );
+        assert!(exec.pool_allowlists.is_restricted(&pool));
+        assert_eq!(exec.pool_allowlists.0.len(), 1);
+    }
 }

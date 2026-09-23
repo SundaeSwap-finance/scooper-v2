@@ -474,6 +474,14 @@ impl Constraint {
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
 
+    /// The strategy constraints, for a strategy order.
+    pub fn strategy(&self) -> Option<&StrategyConstraints> {
+        match self {
+            Constraint::Strategy { constraints } => Some(constraints),
+            _ => None,
+        }
+    }
+
     /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
     /// the constraint. Returns `None` for non-Swap orders — the scooper's
     /// batching path only handles swaps.
@@ -1094,6 +1102,11 @@ pub struct ScooperExecution {
     /// or any pool the operator wants to skip).
     #[serde(default)]
     pub blacklisted_pools: std::collections::BTreeSet<String>,
+    /// Per-pool trading allowlists, keyed by pool ident (hex). A pool named
+    /// here is closed: only the listed credentials may trade on it. Absent =
+    /// unrestricted.
+    #[serde(default)]
+    pub pool_allowlists: crate::sundaev4::access::PoolAllowlists,
     /// Lovelace charged against an order's budget for each pool its route
     /// touches. 0 = no limit. Together with `cost_per_step_lovelace` this
     /// gates router fan-out by what the order paid for: a 1-ADA order gets a
