@@ -82,8 +82,8 @@ pub struct Scooper {
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
     logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
-    /// Whether the allowlist config has been reported against chain state.
-    allowlists_logged: bool,
+    /// Whether the pool access config has been reported against chain state.
+    access_config_logged: bool,
     /// Unconfirmed orders observed in the local node's mempool, shared with
     /// the mempool monitor. None = chained execution disabled.
     v4_provisional: Option<crate::mempool::SharedProvisional>,
@@ -135,7 +135,7 @@ impl Scooper {
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
-            allowlists_logged: false,
+            access_config_logged: false,
         })
     }
 
@@ -639,13 +639,14 @@ impl Scooper {
             }
         };
 
-        if !self.allowlists_logged {
+        if !self.access_config_logged {
             crate::sundaev4::access::log_config(
                 &exec.pool_allowlists,
                 settings.datum.authorized_scoopers.as_ref(),
                 &v4_state.pools,
             );
-            self.allowlists_logged = true;
+            crate::sundaev4::access::log_blacklist(&exec.blacklisted_pools, &v4_state.pools);
+            self.access_config_logged = true;
         }
 
         // The network tip (actual chain tip, falling back to the last block we
@@ -1220,7 +1221,7 @@ impl Scooper {
         let pools_filtered: std::collections::BTreeMap<_, _> = v4_state
             .pools
             .iter()
-            .filter(|(ident, _)| !exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes())))
+            .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);
@@ -2687,9 +2688,7 @@ impl Scooper {
 
         let (ident, pool) =
             v4_state.pools.iter().find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)?;
-        if in_flight_pools.contains(ident)
-            || exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes()))
-        {
+        if in_flight_pools.contains(ident) || exec.blacklisted_pools.contains(ident) {
             return None;
         }
         if !exec.pool_allowlists.permits(ident, order, order.constraint.strategy()) {

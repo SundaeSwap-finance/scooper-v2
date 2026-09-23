@@ -69,6 +69,22 @@ The scooper refuses to start if an ident or credential isn't 28-byte hex, a pool
 
 [`config/preview-allowlist-test.json`](./config/preview-allowlist-test.json) is a preview overlay that closes one pool to an unreachable credential. Pass it as a second `--config` to watch every order on that pool get turned away.
 
+### Pool blacklist
+
+`protocol.v4.execution.blacklisted-pools` lists pool idents, in hex, that your scooper never scoops:
+
+```json
+{
+  "protocol": { "v4": { "execution": { "blacklisted-pools": [
+    "3b809fd966274082c16ea6e670dd7c5d384a44a8989a70fd9fe4cc45"
+  ] } } }
+}
+```
+
+A blacklisted pool is left out of every batch: swaps (including as a hop inside a longer route), deposits, withdrawals and constant-sum claims. Use it for a pool the scooper can't currently fulfill, such as one whose on-chain config it can't recover.
+
+The scooper refuses to start if an entry isn't 28-byte hex or a pool is listed twice. Hex case doesn't matter. A misspelled `blacklisted-pools` key is ignored like any other unknown key, so check that the blacklist is live: at startup, each blacklisted pool logs `pool is blacklisted`. A blacklisted pool that isn't indexed logs a warning instead, usually because the ident is mistyped.
+
 ### Docker
 
 Images are published to `ghcr.io/sundaeswap-finance/scooper-v2`, tagged with the version.

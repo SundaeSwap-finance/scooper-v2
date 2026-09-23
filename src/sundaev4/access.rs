@@ -1,6 +1,6 @@
-//! Operator-configured per-pool trading allowlists.
+//! Operator-configured per-pool access: trading allowlists and the blacklist.
 //!
-//! A pool named in the config is closed: the scooper serves an order against
+//! A pool named in the allowlists is closed: the scooper serves an order against
 //! it only when every credential that can act on that order is listed. This is
 //! scooper policy, not a chain rule — a denied order stays valid on chain, so
 //! the guarantee holds only while every authorized scooper runs the same list.
@@ -41,9 +41,13 @@ impl TryFrom<BTreeMap<String, RawPoolAllowlist>> for PoolAllowlists {
     fn try_from(raw: BTreeMap<String, RawPoolAllowlist>) -> Result<Self, String> {
         let mut out = BTreeMap::new();
         for (ident, list) in raw {
-            let credentials =
-                list.credentials.iter().map(|c| hash28(c)).collect::<Result<_, _>>()?;
-            if out.insert(Ident::new(&hash28(&ident)?), PoolAllowlist { credentials }).is_some() {
+            let credentials = list
+                .credentials
+                .iter()
+                .map(|c| hash28("pool-allowlists", c))
+                .collect::<Result<_, _>>()?;
+            let pool = Ident::new(&hash28("pool-allowlists", &ident)?);
+            if out.insert(pool, PoolAllowlist { credentials }).is_some() {
                 return Err(format!("pool-allowlists names pool {ident} twice"));
             }
         }
@@ -51,10 +55,39 @@ impl TryFrom<BTreeMap<String, RawPoolAllowlist>> for PoolAllowlists {
     }
 }
 
-fn hash28(s: &str) -> Result<Vec<u8>, String> {
+/// Pools the scooper never scoops, such as one whose on-chain config it
+/// can't recover.
+///
+/// Configured as hex strings but held as bytes, so an entry's hex casing
+/// can't leave the pool open.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct PoolBlacklist(pub BTreeSet<Ident>);
+
+impl TryFrom<Vec<String>> for PoolBlacklist {
+    type Error = String;
+
+    fn try_from(raw: Vec<String>) -> Result<Self, String> {
+        let mut out = BTreeSet::new();
+        for ident in raw {
+            if !out.insert(Ident::new(&hash28("blacklisted-pools", &ident)?)) {
+                return Err(format!("blacklisted-pools names pool {ident} twice"));
+            }
+        }
+        Ok(Self(out))
+    }
+}
+
+impl PoolBlacklist {
+    pub fn contains(&self, pool: &Ident) -> bool {
+        self.0.contains(pool)
+    }
+}
+
+fn hash28(key: &str, s: &str) -> Result<Vec<u8>, String> {
     match hex::decode(s) {
         Ok(b) if b.len() == 28 => Ok(b),
-        _ => Err(format!("pool-allowlists: {s:?} is not a 28-byte hex hash")),
+        _ => Err(format!("{key}: {s:?} is not a 28-byte hex hash")),
     }
 }
 
@@ -154,6 +187,21 @@ fn destination_listed(dest: &Destination, listed: &BTreeSet<Vec<u8>>) -> bool {
                 Credential::Script(h) => h.as_slice(),
             };
             listed.contains(hash)
+        }
+    }
+}
+
+/// Log each blacklisted pool, and warn on idents that aren't indexed.
+pub fn log_blacklist(blacklist: &PoolBlacklist, indexed_pools: &BTreeMap<Ident, impl Sized>) {
+    for ident in &blacklist.0 {
+        if indexed_pools.contains_key(ident) {
+            tracing::info!(pool = %ident, "pool is blacklisted");
+        } else {
+            tracing::warn!(
+                pool = %ident,
+                "blacklisted-pools names a pool that is not indexed; if this ident is \
+                 mistyped the intended pool is not blacklisted",
+            );
         }
     }
 }
@@ -291,6 +339,38 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    fn parse_blacklist(json: serde_json::Value) -> Result<PoolBlacklist, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn uppercase_hex_still_blacklists() {
+        // POOL's hex (0x11…) has no letters to change case.
+        let lettered = Ident::new(&[0xAB; 28]);
+        let blacklist =
+            parse_blacklist(serde_json::json!([hex::encode_upper(lettered.to_bytes())])).unwrap();
+        assert!(blacklist.contains(&lettered));
+        assert!(!blacklist.contains(&pool()));
+    }
+
+    #[test]
+    fn blacklist_entries_differing_only_in_case_are_one_pool() {
+        let err = parse_blacklist(serde_json::json!([
+            hex::encode(ALICE),
+            hex::encode_upper(ALICE)
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn non_hash_blacklist_entries_are_rejected() {
+        for bad in ["11", "not hex"] {
+            let err = parse_blacklist(serde_json::json!([bad])).unwrap_err();
+            assert!(err.to_string().contains("blacklisted-pools"), "{err}");
+        }
     }
 
     #[test]

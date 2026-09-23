@@ -127,4 +127,23 @@ mod tests {
         assert!(exec.pool_allowlists.is_restricted(&pool));
         assert_eq!(exec.pool_allowlists.0.len(), 1);
     }
+
+    /// An uppercase blacklist entry loads through config-rs and still
+    /// blacklists the pool.
+    #[test]
+    fn uppercase_blacklist_entry_still_blacklists_the_pool() {
+        let pool = crate::sundaev3::Ident::new(&[0xab; 28]);
+        let overlay = serde_json::json!({
+            "protocol": { "v4": { "execution": { "blacklisted-pools": ["AB".repeat(28)] } } }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "scooper-blacklist-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, overlay.to_string()).unwrap();
+        let config = load_config(["config/preview-v4.json", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        let exec = config.expect("config loads").protocol.v4.and_then(|v4| v4.execution);
+        assert!(exec.expect("v4 execution config").blacklisted_pools.contains(&pool));
+    }
 }

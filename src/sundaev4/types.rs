@@ -1096,12 +1096,10 @@ pub struct ScooperExecution {
     /// differs from cardano-node's (~0.04%). Default: (21, 20), 5%.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
-    /// Pool idents (hex) to exclude from scooping. Useful as an operator
-    /// escape hatch for pools the scooper can't currently fulfill (e.g. a
-    /// pool whose on-chain config the scooper hasn't been able to recover,
-    /// or any pool the operator wants to skip).
+    /// Pool idents (hex) to exclude from scooping; see
+    /// [`crate::sundaev4::access::PoolBlacklist`].
     #[serde(default)]
-    pub blacklisted_pools: std::collections::BTreeSet<String>,
+    pub blacklisted_pools: crate::sundaev4::access::PoolBlacklist,
     /// Per-pool trading allowlists, keyed by pool ident (hex). A pool named
     /// here is closed: only the listed credentials may trade on it. Absent =
     /// unrestricted.
