@@ -529,14 +529,13 @@ impl AdminServer {
                         && o.input.0.index == key.1
                 });
                 // Mirror dispatch: a restricted pool is invisible to an order
-                // whose credentials aren't on its allowlist, so a swap intent
-                // blocked this way reports as unroutable.
-                let strategy = order.and_then(|o| match &o.constraint {
-                    crate::sundaev4::Constraint::Strategy { constraints } => Some(constraints),
-                    _ => None,
-                });
+                // whose credentials aren't on its allowlist.
                 let visible = match order {
-                    Some(o) => self.v4_pool_allowlists.retain_visible(pools.clone(), o, strategy),
+                    Some(o) => self.v4_pool_allowlists.retain_visible(
+                        pools.clone(),
+                        o,
+                        o.constraint.strategy(),
+                    ),
                     None => pools.clone(),
                 };
                 let probe: serde_json::Value = match (order, &i.hint) {
@@ -562,14 +561,32 @@ impl AdminServer {
                         serde_json::json!({
                             "state": "not-permitted",
                             "pool": pool,
-                            "detail": "this scooper does not serve the order's credentials                                        on that pool",
+                            "detail": "this scooper does not serve the order's credentials \
+                                       on that pool",
                         })
                     }
                     (
                         Some(order),
                         Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }),
                     ) => Self::probe_claim(order, i, pool, &visible),
-                    (Some(order), None) => Self::probe_swap(order, i, &visible),
+                    (Some(order), None) => {
+                        let probe = Self::probe_swap(order, i, &visible);
+                        // A route that runs only through pools this order is
+                        // barred from would otherwise read as "no-route" or
+                        // "below-floor".
+                        if visible.len() < pools.len()
+                            && probe["state"] != "dispatchable"
+                            && Self::probe_swap(order, i, &pools)["state"] == "dispatchable"
+                        {
+                            serde_json::json!({
+                                "state": "not-permitted",
+                                "detail": "a route exists, but only through pools where \
+                                           this scooper does not serve the order's credentials",
+                            })
+                        } else {
+                            probe
+                        }
+                    }
                 };
                 serde_json::json!({
                     "status": "pending",
@@ -1342,6 +1359,14 @@ impl AdminServer {
                 }));
                 continue;
             }
+            if !self.v4_pool_allowlists.permits(&ident, order, order.constraint.strategy()) {
+                non_executable.push(serde_json::json!({
+                    "order": order.input.to_string(),
+                    "reason": "this pool is allowlist-restricted and this scooper does not \
+                               serve the order's credentials on it",
+                }));
+                continue;
+            }
             // Mirror the router's fan-out gate: an order's max_per_execution
             // buys its route budget, and one that can't afford a single pool
             // touch will never dispatch, no matter how in-range the swap is.
@@ -1408,7 +1433,7 @@ impl AdminServer {
         for (ident, pool) in &state.pools {
             let ident_hex = hex::encode(ident.to_bytes());
             let mut json = Self::v4_pool_json(pool, &self.v4_module_preimages);
-            if self.v4_pool_allowlists.0.contains_key(&ident_hex)
+            if self.v4_pool_allowlists.is_restricted(ident)
                 && let Some(obj) = json.as_object_mut()
             {
                 obj.insert("restricted".into(), true.into());

@@ -2171,9 +2171,9 @@ mod tests {
         pools.insert(thin.pool_datum.identifier.clone(), thin.clone());
 
         let allowlists = PoolAllowlists(BTreeMap::from([(
-            hex::encode(deep.pool_datum.identifier.to_bytes()),
+            deep.pool_datum.identifier.clone(),
             PoolAllowlist {
-                credentials: BTreeSet::from([hex::encode([0xAAu8; 28])]),
+                credentials: BTreeSet::from([vec![0xAAu8; 28]]),
             },
         )]));
 

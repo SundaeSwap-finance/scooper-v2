@@ -82,9 +82,8 @@ pub struct Scooper {
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
     logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
-    /// Allowlist preconditions, checked once against on-chain settings. `None`
-    /// until the first cycle that has them.
-    allowlists_ok: Option<bool>,
+    /// Whether the allowlist config has been reported against chain state.
+    allowlists_logged: bool,
     /// Unconfirmed orders observed in the local node's mempool, shared with
     /// the mempool monitor. None = chained execution disabled.
     v4_provisional: Option<crate::mempool::SharedProvisional>,
@@ -136,7 +135,7 @@ impl Scooper {
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
-            allowlists_ok: None,
+            allowlists_logged: false,
         })
     }
 
@@ -640,16 +639,13 @@ impl Scooper {
             }
         };
 
-        if self.allowlists_ok.is_none() {
-            self.allowlists_ok = Some(crate::sundaev4::access::verify_config(
+        if !self.allowlists_logged {
+            crate::sundaev4::access::log_config(
                 &exec.pool_allowlists,
-                exec.module_scripts.strategy_order.as_ref(),
                 settings.datum.authorized_scoopers.as_ref(),
                 &v4_state.pools,
-            ));
-        }
-        if self.allowlists_ok == Some(false) {
-            return false;
+            );
+            self.allowlists_logged = true;
         }
 
         // The network tip (actual chain tip, falling back to the last block we
@@ -943,8 +939,7 @@ impl Scooper {
                         );
                     }
                     strategy_executions.insert(order.input.clone(), sse_pd);
-                    if let crate::sundaev4::Constraint::Strategy { constraints } = &order.constraint
-                    {
+                    if let Some(constraints) = order.constraint.strategy() {
                         strategy_constraints.insert(order.input.clone(), constraints.clone());
                     }
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
@@ -1070,7 +1065,7 @@ impl Scooper {
                 provisional_spent: prov_spent,
                 foreign_pools: foreign_count,
                 config_missing_orders: n_config_missing as usize,
-                restricted_pools: exec.pool_allowlists.restricted_idents().count(),
+                restricted_pools: exec.pool_allowlists.0.len(),
                 backoff_active: self.backoff_until_after_slot.is_some(),
             });
         }
@@ -2698,11 +2693,7 @@ impl Scooper {
         {
             return None;
         }
-        let strategy = match &order.constraint {
-            crate::sundaev4::Constraint::Strategy { constraints } => Some(constraints),
-            _ => None,
-        };
-        if !exec.pool_allowlists.permits(ident, order, strategy) {
+        if !exec.pool_allowlists.permits(ident, order, order.constraint.strategy()) {
             debug!(order = %order.input, pool = %pool_hex, "claim intent's order is not on the pool's allowlist");
             return None;
         }

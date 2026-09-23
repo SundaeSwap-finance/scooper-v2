@@ -474,6 +474,14 @@ impl Constraint {
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
 
+    /// The strategy constraints, for a strategy order.
+    pub fn strategy(&self) -> Option<&StrategyConstraints> {
+        match self {
+            Constraint::Strategy { constraints } => Some(constraints),
+            _ => None,
+        }
+    }
+
     /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
     /// the constraint. Returns `None` for non-Swap orders — the scooper's
     /// batching path only handles swaps.

@@ -14,28 +14,58 @@ use crate::multisig::Multisig;
 use crate::sundaev3::{Credential, Ident};
 use crate::sundaev4::types::{Destination, StrategyConstraints, SundaeV4Order};
 
-/// Credentials permitted to trade on one pool.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// Credentials permitted to trade on one pool: 28-byte key or script hashes.
+/// A script hash here satisfies the destination check for everything that
+/// script pays, so the script's own rules decide who receives the assets.
+#[derive(Clone, Debug, Default)]
 pub struct PoolAllowlist {
-    /// Hex-encoded 28-byte credential hashes. A script hash here satisfies the
-    /// destination check for everything that script pays, so the script's own
-    /// rules decide who receives the assets.
-    pub credentials: BTreeSet<String>,
+    pub credentials: BTreeSet<Vec<u8>>,
 }
 
-/// Allowlists by pool ident (hex). A pool absent from the map is unrestricted.
+/// Allowlists by pool ident. A pool absent from the map is unrestricted.
+///
+/// Configured as hex strings but held as bytes, so a key's hex casing can't
+/// decide whether it matches.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(transparent)]
-pub struct PoolAllowlists(pub BTreeMap<String, PoolAllowlist>);
+#[serde(try_from = "BTreeMap<String, RawPoolAllowlist>")]
+pub struct PoolAllowlists(pub BTreeMap<Ident, PoolAllowlist>);
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawPoolAllowlist {
+    credentials: BTreeSet<String>,
+}
+
+impl TryFrom<BTreeMap<String, RawPoolAllowlist>> for PoolAllowlists {
+    type Error = String;
+
+    fn try_from(raw: BTreeMap<String, RawPoolAllowlist>) -> Result<Self, String> {
+        let mut out = BTreeMap::new();
+        for (ident, list) in raw {
+            let credentials =
+                list.credentials.iter().map(|c| hash28(c)).collect::<Result<_, _>>()?;
+            if out.insert(Ident::new(&hash28(&ident)?), PoolAllowlist { credentials }).is_some() {
+                return Err(format!("pool-allowlists names pool {ident} twice"));
+            }
+        }
+        Ok(Self(out))
+    }
+}
+
+fn hash28(s: &str) -> Result<Vec<u8>, String> {
+    match hex::decode(s) {
+        Ok(b) if b.len() == 28 => Ok(b),
+        _ => Err(format!("pool-allowlists: {s:?} is not a 28-byte hex hash")),
+    }
+}
 
 impl PoolAllowlists {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub fn restricted_idents(&self) -> impl Iterator<Item = (&String, usize)> {
-        self.0.iter().map(|(ident, list)| (ident, list.credentials.len()))
+    pub fn is_restricted(&self, pool: &Ident) -> bool {
+        self.0.contains_key(pool)
     }
 
     /// Whether the scooper may serve `order` against `pool`.
@@ -49,7 +79,7 @@ impl PoolAllowlists {
         order: &SundaeV4Order,
         strategy: Option<&StrategyConstraints>,
     ) -> bool {
-        let Some(list) = self.0.get(&hex::encode(pool.to_bytes())) else {
+        let Some(list) = self.0.get(pool) else {
             return true;
         };
         let listed = &list.credentials;
@@ -94,9 +124,9 @@ impl PoolAllowlists {
 /// Testing leaves for membership instead would pass any node with no
 /// credential leaves — `AllOf([])`, `AtLeast(0, [])`, a bare `Before` — each of
 /// which anyone satisfies.
-fn satisfiable_without_listed(m: &Multisig, listed: &BTreeSet<String>) -> bool {
+fn satisfiable_without_listed(m: &Multisig, listed: &BTreeSet<Vec<u8>>) -> bool {
     match m {
-        Multisig::Signature(k) | Multisig::Script(k) => !listed.contains(&hex::encode(k)),
+        Multisig::Signature(k) | Multisig::Script(k) => !listed.contains(k),
         // A time bound restricts when, never who.
         Multisig::Before(_) | Multisig::After(_) => true,
         Multisig::AllOf(xs) => xs.iter().all(|x| satisfiable_without_listed(x, listed)),
@@ -116,7 +146,7 @@ fn satisfiable_without_listed(m: &Multisig, listed: &BTreeSet<String>) -> bool {
 ///
 /// `SelfDestination` returns the assets to the order script under the order's
 /// own datum, so the owner check is what governs it.
-fn destination_listed(dest: &Destination, listed: &BTreeSet<String>) -> bool {
+fn destination_listed(dest: &Destination, listed: &BTreeSet<Vec<u8>>) -> bool {
     match dest {
         Destination::SelfDestination => true,
         Destination::Fixed(addr, _) => {
@@ -124,57 +154,43 @@ fn destination_listed(dest: &Destination, listed: &BTreeSet<String>) -> bool {
                 Credential::VerificationKey(h) => h.as_slice(),
                 Credential::Script(h) => h.as_slice(),
             };
-            listed.contains(&hex::encode(hash))
+            listed.contains(hash)
         }
     }
 }
 
-/// Check the preconditions a configured allowlist depends on. Returns false
-/// when the scooper must not run: a scooper that reports a restriction it
-/// cannot deliver is worse than one that refuses to start.
-///
-/// Called once, on the first cycle with settings loaded.
-pub fn verify_config(
+/// Report the configured allowlists against chain state, once, on the first
+/// cycle with settings loaded. Nothing here stops the scooper: the list only
+/// binds this process, so the operator is told where that leaves gaps.
+pub fn log_config(
     allowlists: &PoolAllowlists,
-    strategy_module: Option<&crate::sundaev4::types::ScriptRefInfo>,
     authorized_scoopers: Option<&Vec<Multisig>>,
     indexed_pools: &BTreeMap<Ident, impl Sized>,
-) -> bool {
+) {
     if allowlists.is_empty() {
-        return true;
+        return;
     }
-    let mut ok = true;
     if authorized_scoopers.is_none() {
-        tracing::error!(
+        tracing::warn!(
             "pool-allowlists are configured but the settings datum authorizes any \
-             scooper: an unrestricted scooper set makes the allowlist unenforceable",
+             scooper: anyone can fill orders this scooper declines",
         );
-        ok = false;
     }
-    if strategy_module.is_none() {
-        // Without the module hash a strategy order decodes as a plain swap,
-        // hiding its `auth` and `final_destinations` from the gate.
-        tracing::error!(
-            "pool-allowlists are configured but module-scripts.strategy-order is unset: \
-             strategy orders would bypass the auth and destination checks",
-        );
-        ok = false;
-    }
-    for (ident, count) in allowlists.restricted_idents() {
-        match hex::decode(ident).ok().filter(|b| indexed_pools.contains_key(&Ident::new(b))) {
-            Some(_) => tracing::info!(
+    for (ident, list) in &allowlists.0 {
+        if indexed_pools.contains_key(ident) {
+            tracing::info!(
                 pool = %ident,
-                credentials = count,
+                credentials = list.credentials.len(),
                 "pool is allowlist-restricted",
-            ),
-            None => tracing::warn!(
+            );
+        } else {
+            tracing::warn!(
                 pool = %ident,
                 "pool-allowlists names a pool that is not indexed; if this ident is \
                  mistyped the pool is not restricted at all",
-            ),
+            );
         }
     }
-    ok
 }
 
 #[cfg(test)]
@@ -189,8 +205,8 @@ mod tests {
     const STRANGER: [u8; 28] = [0xCC; 28];
     const POOL: [u8; 28] = [0x11; 28];
 
-    fn listed(hashes: &[[u8; 28]]) -> BTreeSet<String> {
-        hashes.iter().map(hex::encode).collect()
+    fn listed(hashes: &[[u8; 28]]) -> BTreeSet<Vec<u8>> {
+        hashes.iter().map(|h| h.to_vec()).collect()
     }
 
     fn sig(h: [u8; 28]) -> Multisig {
@@ -242,11 +258,53 @@ mod tests {
     /// Alice and Bob are listed on POOL; STRANGER never is.
     fn allowlists() -> PoolAllowlists {
         PoolAllowlists(BTreeMap::from([(
-            hex::encode(POOL),
+            pool(),
             PoolAllowlist {
                 credentials: listed(&[ALICE, BOB]),
             },
         )]))
+    }
+
+    // ── Config parsing ───────────────────────────────────────────────────
+
+    fn parse(json: serde_json::Value) -> Result<PoolAllowlists, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn uppercase_hex_still_restricts() {
+        // POOL's hex has no letters, so key the list by a pool whose has.
+        let lettered = Ident::new(&[0xAB; 28]);
+        let lists = parse(serde_json::json!({
+            hex::encode_upper(lettered.to_bytes()): { "credentials": [hex::encode_upper(ALICE)] }
+        }))
+        .unwrap();
+        assert!(lists.is_restricted(&lettered));
+        assert!(lists.permits(&lettered, &order(sig(ALICE), fixed_to(ALICE)), None));
+        assert!(!lists.permits(&lettered, &order(sig(STRANGER), fixed_to(STRANGER)), None));
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_are_one_pool() {
+        // ALICE's bytes, since POOL's hex has no letters to change case.
+        let err = parse(serde_json::json!({
+            hex::encode(ALICE): { "credentials": [] },
+            hex::encode_upper(ALICE): { "credentials": [] },
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn non_hash_entries_are_rejected() {
+        for bad in [
+            serde_json::json!({ "11": { "credentials": [] } }),
+            serde_json::json!({ "not hex": { "credentials": [] } }),
+            serde_json::json!({ hex::encode(POOL): { "credentials": ["aabb"] } }),
+            serde_json::json!({ hex::encode(POOL): { "credentails": [] } }),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "accepted {bad}");
+        }
     }
 
     // ── Multisig satisfiability ──────────────────────────────────────────
@@ -395,7 +453,7 @@ mod tests {
     #[test]
     fn script_credential_matches_when_listed() {
         let lists = PoolAllowlists(BTreeMap::from([(
-            hex::encode(POOL),
+            pool(),
             PoolAllowlist {
                 credentials: listed(&[ALICE, STRANGER]),
             },
