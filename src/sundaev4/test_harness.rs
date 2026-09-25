@@ -333,6 +333,12 @@ impl TestEnv {
     /// Load the Cardano-Swaps fixture: the mainnet runtime constants and
     /// the orders from the replay fixtures, with the swap script admitted
     /// to the eval store and its reference UTxO to `ref_utxo_outputs`.
+    // `cfg(test)` although the rest of this harness is also built for feature
+    // `route-bench`: this method imports `cardano_swaps::replay_tests`, which
+    // only exists under `cfg(test)`. Without it, any build with
+    // `--features route-bench` (the bench, CI's `clippy --all-features`) fails
+    // on that import. The bench does not use this method.
+    #[cfg(test)]
     pub fn enable_cardano_swaps(
         &mut self,
     ) -> &crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
