@@ -639,11 +639,37 @@ pub enum PoolType {
         sqrt_price_b: Rational,
         fee: Rational,
     },
+    /// Curve-style stableswap (`validators/modules/stableswap.ak`). The whole
+    /// config preimage rides along: the Operate redeemer re-sends it, the
+    /// output datum's `module_state` slot is its hash, and `rates` may change
+    /// on chain through a manager-signed tag-7 step, so the scooper must
+    /// always price against the config it holds for the pool's current UTxO.
+    StableSwap {
+        config: StableSwapConfig,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Module config types
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// `StableSwapConfig` (`validators/modules/stableswap.ak`). Stored in the
+/// pool datum's `module_state` as `blake2b_256(serialise_data(config))`; the
+/// preimage travels in every `StableSwapRedeemer::Operate` entry.
+///
+/// `rates` is one positive multiplier per pool asset, positionally aligned
+/// with the pool's `assets`. A tag-7 transcript step (rate update, signed by
+/// `rate_manager`) replaces it and the module rewrites the hash; the other
+/// fields change only through an Upgrade ceremony.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StableSwapConfig {
+    pub linear_amplification: BigInt,
+    pub fee: Rational,
+    pub rates: Vec<BigInt>,
+    pub rate_manager: Option<Multisig>,
+    pub monotone_rates: bool,
+    pub max_rate_step: Option<Rational>,
+}
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantProductConfig {
@@ -809,6 +835,47 @@ pub const TAG_WITHDRAW: u64 = 4;
 pub const TAG_CLAIM: u64 = 5;
 /// Constant-sum proportional-deposit step.
 pub const TAG_DEPOSIT: u64 = 6;
+/// Stableswap rate-update step (`ss_check.tag_update_rates`). Admitted only
+/// as the first transcript entry, manager-signed; the scooper never builds
+/// one but must recognise it when it indexes a scoop.
+pub const TAG_UPDATE_RATES: u64 = 7;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stableswap transcript operation_data (lib/modules/ss_check.ak)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `operation_data` of a stableswap tag-3 swap step. The first two values
+/// are computed off-chain (`ss_math`) and pinned on chain: `raw_swap_result`
+/// is the gross output in numeraire units at `calc_precision` scale, before
+/// the fee; `next_sum_invariant` is `D` for the post-step reserves.
+/// `attribution` is not read by the module: the scooper stamps the serving
+/// order's output reference there (the encoding it writes into
+/// `operation_data` for the other curves), or Void when no order is served.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SwapStep {
+    pub raw_swap_result: BigInt,
+    pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
+}
+
+/// `operation_data` of a stableswap tag-6 deposit or tag-4 withdraw step.
+/// `target_delta_d` is the declared change in `D` (scaled), positive for a
+/// deposit and negative for a withdrawal. `attribution` as on `SwapStep`.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LiquidityStep {
+    pub target_delta_d: BigInt,
+    pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
+}
+
+/// `operation_data` of a stableswap tag-7 rate update. `rates` replaces the
+/// config's rate vector for every later step and for the output datum's
+/// config hash.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RateUpdate {
+    pub rates: Vec<BigInt>,
+    pub next_sum_invariant: BigInt,
+}
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantProductRedeemer {
@@ -889,6 +956,38 @@ pub struct CLOperateEntry {
 pub struct CSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: ConstantSumConfig,
+}
+
+// `Create` carries the whole config; `AsPlutus` has no `Box` support and the
+// enum is parsed, not stored, so the size gap is harmless.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum StableSwapRedeemer {
+    /// `initial_state` stays field 0 (pool_mint hashes it for module_state).
+    /// `sum_invariant` is `D` for the pool's initial reserves.
+    Create {
+        initial_state: StableSwapConfig,
+        pool_output_index: u64,
+        sum_invariant: BigInt,
+    },
+    Operate {
+        entries: Vec<SSOperateEntry>,
+    },
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `StableSwapRedeemer::Operate`. `config` is the config
+/// as stored in the pool INPUT's `module_state`; `sum_invariant` is `D` for
+/// the pool input's reserves at `config.rates`, which the module checks
+/// before it walks the transcript.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct SSOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: StableSwapConfig,
+    pub sum_invariant: BigInt,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1248,6 +1347,11 @@ pub struct ModuleScripts {
     /// Optional: only required when scooping concentrated-liquidity pools.
     #[serde(default)]
     pub concentrated_liquidity: Option<ScriptRefInfo>,
+    /// Optional: only required when scooping stableswap pools. Without it
+    /// the scooper cannot classify a stableswap pool and skips it (see
+    /// `detect_pool_type`).
+    #[serde(default)]
+    pub stableswap: Option<ScriptRefInfo>,
     /// Per-class constraint validators (modular order constraints, PR #11).
     /// Every order's OrderConfig lists which constraint hashes it requires;
     /// the order_validator's withdraw handler requires each listed constraint

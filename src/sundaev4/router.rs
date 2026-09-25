@@ -52,6 +52,42 @@ pub enum PoolViewType {
         spb_den: BigInt,
         lp: BigInt,
     },
+    /// Curve-style stableswap, direction-oriented: `rate_in` / `rate_out`
+    /// are the config rates of the view's in / out asset. `d` is the sum
+    /// invariant for the view's reserves at those rates, computed once at
+    /// graph build so the split solver's many probes skip one Newton each.
+    StableSwap {
+        amp: BigInt,
+        rate_in: BigInt,
+        rate_out: BigInt,
+        d: BigInt,
+    },
+}
+
+/// The stableswap swap for a view: `dx` of the in asset against the out
+/// asset at the view's reserves. `None` when the module would refuse the
+/// step (no output, or a self-check failure).
+fn ss_view_swap(pool: &PoolView, dx: &BigInt) -> Option<crate::sundaev4::ss_math::SsSwapResult> {
+    let PoolViewType::StableSwap {
+        amp,
+        rate_in,
+        rate_out,
+        d,
+    } = &pool.view_type
+    else {
+        return None;
+    };
+    let p = crate::sundaev4::ss_math::SsParams {
+        amp: amp.clone(),
+        fee: crate::sundaev4::types::Rational {
+            num: BigInt::from(pool.fee_num),
+            den: BigInt::from(pool.fee_den),
+        },
+        rates: vec![rate_in.clone(), rate_out.clone()],
+    };
+    let reserves = [pool.reserve_in.clone(), pool.reserve_out.clone()];
+    // total_lp only feeds the step's fee budget, which the router does not read.
+    crate::sundaev4::ss_math::swap_step(&p, &reserves, &BigInt::from(0), 0, dx, Some(d)).ok()
 }
 
 /// Lightweight pool view for the router (direction-aware).
@@ -159,6 +195,9 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
+        // The curve is asymptotic in the out reserve: the pinned output is
+        // always below it, and a fee-bearing step never lowers D.
+        PoolViewType::StableSwap { .. } => None,
         PoolViewType::Conversion {
             rate_num, rate_den, ..
         } => {
@@ -320,6 +359,9 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
                 &fee_den,
             )
         }
+        PoolViewType::StableSwap { .. } => {
+            ss_view_swap(pool, dx).map(|s| s.dy).unwrap_or_else(|| BigInt::from(0))
+        }
     };
     // Cap at reserve_out — can't withdraw more than the pool holds.
     // (CP naturally stays below reserves; CS can exceed them.)
@@ -414,6 +456,49 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
                 }
                 &fee_mult * &va0 * &vb0 * spa_num * &scale() / &denom
             }
+        }
+        PoolViewType::StableSwap {
+            amp,
+            rate_in,
+            rate_out,
+            d,
+        } => {
+            // Implicit differentiation of 4A(x+y) + D = 4AD + D³/(4xy) on the
+            // scaled reserves gives |dy/dx| = (16A·x²y² + D³·y) / (16A·x²y² + D³·x).
+            // Evaluate at the curve point the allocation reaches (fee excluded,
+            // as the exchange invariant sees it), then convert scaled units to
+            // token units (× rate_in / rate_out) and apply the output-side fee.
+            let p = BigInt::from(crate::sundaev4::ss_math::CALC_PRECISION);
+            let x_before = &(&pool.reserve_in * rate_in) * &p;
+            let y_before = &(&pool.reserve_out * rate_out) * &p;
+            let (x, y) = if raw_allocated.is_positive() {
+                let in_after = &pool.reserve_in + raw_allocated;
+                match crate::sundaev4::ss_math::get_raw_swap_rated(
+                    amp,
+                    d,
+                    &in_after,
+                    rate_in,
+                    &pool.reserve_out,
+                    rate_out,
+                ) {
+                    Ok(raw) => (&(&in_after * rate_in) * &p, &y_before - &raw),
+                    Err(_) => return BigInt::from(0),
+                }
+            } else {
+                (x_before, y_before)
+            };
+            if !x.is_positive() || !y.is_positive() {
+                return BigInt::from(0);
+            }
+            let sixteen_a_x2y2 = &(&(&BigInt::from(16) * amp) * &(&x * &x)) * &(&y * &y);
+            let d3 = &(d * d) * d;
+            let num = &sixteen_a_x2y2 + &(&d3 * &y);
+            let den = &sixteen_a_x2y2 + &(&d3 * &x);
+            let denom = &(&fee_den * rate_out) * &den;
+            if !denom.is_positive() {
+                return BigInt::from(0);
+            }
+            &(&(&fee_mult * rate_in) * &num) * &scale() / &denom
         }
     }
 }
@@ -547,6 +632,48 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         Some(cap) if raw > cap => cap,
                         _ => raw,
                     }
+                }
+                PoolViewType::StableSwap {
+                    rate_in, rate_out, ..
+                } => {
+                    // No closed form: the marginal falls monotonically in dx,
+                    // so bisect for the largest dx whose marginal still meets
+                    // λ. The bracket's top is well past any allocation that
+                    // could matter (several times the pool's depth in input
+                    // units); a marginal still above λ there means the pool
+                    // takes everything the caller has.
+                    if marginal_at_allocation(pool, &BigInt::from(0)) < *lambda {
+                        return BigInt::from(0);
+                    }
+                    let depth_in_input_units = if rate_in.is_positive() {
+                        &(&pool.reserve_out * rate_out) / rate_in
+                    } else {
+                        BigInt::from(0)
+                    };
+                    let mut hi = &(&(&pool.reserve_in + &depth_in_input_units) * &BigInt::from(4))
+                        + &BigInt::from(1);
+                    if marginal_at_allocation(pool, &hi) >= *lambda {
+                        return hi;
+                    }
+                    let mut lo = BigInt::from(0);
+                    let two = BigInt::from(2);
+                    let one = BigInt::from(1);
+                    for _ in 0..64 {
+                        let width = &hi - &lo;
+                        // Stop at one part per million of the bracket; the
+                        // split solver only needs the allocation's scale.
+                        let tol = &hi / &BigInt::from(1_000_000u64);
+                        if width <= one || width <= tol {
+                            break;
+                        }
+                        let mid = &(&lo + &hi) / &two;
+                        if marginal_at_allocation(pool, &mid) >= *lambda {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
                 }
             }
         })
@@ -834,6 +961,30 @@ fn build_graph(
                     Box::new(move |i, j| PoolViewType::ConstantSum {
                         price_in: prices[i].clone(),
                         price_out: prices[j].clone(),
+                    }),
+                )
+            }
+            PoolType::StableSwap { config } => {
+                let fn_num = config.fee.num.clone().unwrap().to_u64().unwrap_or(0);
+                let fn_den = config.fee.den.clone().unwrap().to_u64().unwrap_or(1);
+                let params = swap_math::ss_params(config);
+                let reserves: Vec<BigInt> = assets.iter().map(|(_, q)| q.clone()).collect();
+                // A pool whose D cannot be derived (wrong shape, or a config
+                // the module would reject) gets no edges.
+                let Ok(d) = params.d_of(&reserves) else {
+                    tracing::warn!(pool = %ident, "stableswap pool skipped by the router: D not derivable");
+                    continue;
+                };
+                let amp = params.amp.clone();
+                let rates = params.rates.clone();
+                (
+                    fn_num,
+                    fn_den,
+                    Box::new(move |i, j| PoolViewType::StableSwap {
+                        amp: amp.clone(),
+                        rate_in: rates[i].clone(),
+                        rate_out: rates[j].clone(),
+                        d: d.clone(),
                     }),
                 )
             }

@@ -601,6 +601,21 @@ pub fn compute_swap_result(
             }
             dy
         }
+        PoolType::StableSwap { config } => {
+            // ss_check.check_swap: the gross output is the smallest scaled
+            // y-solution of the curve at D_before, floored to token units;
+            // the fee is ceil'd off it and stays in the out reserve. A step
+            // the module's own two-sided checks refuse is unfillable (dy = 0).
+            if assets.len() != 2 || input_idx > 1 || output_idx > 1 || input_idx == output_idx {
+                return BigInt::from(0);
+            }
+            let p = swap_math::ss_params(config);
+            let reserves: Vec<BigInt> = assets.iter().map(|(_, q)| q.clone()).collect();
+            match super::ss_math::swap_step(&p, &reserves, total_lp, input_idx, dx, None) {
+                Ok(s) => s.dy,
+                Err(_) => BigInt::from(0),
+            }
+        }
         PoolType::ConcentratedLiquidity {
             sqrt_price_a,
             sqrt_price_b,
@@ -889,7 +904,15 @@ pub fn plan_zap_swap(
 
             Ok((0..n).map(|i| &give[i] - &pay[i]).collect())
         }
-        PoolType::ConstantProduct { .. } | PoolType::ConcentratedLiquidity { .. } => {
+        PoolType::ConstantProduct { .. }
+        | PoolType::ConcentratedLiquidity { .. }
+        | PoolType::StableSwap { .. } => {
+            // Stableswap's deposit pin mints floor(lp · t / D) with
+            // t = min_i floor(have_i · D / r_i), so the LP minted after a
+            // swap of `s` peaks where the two per-asset caps cross — the same
+            // shape as the LP-proportional caps below. The bisection finds
+            // that crossing; `resolve_deposit_basket` then applies the exact
+            // D-based pin to the post-swap reserves.
             if n != 2 {
                 return Err("zap on this curve needs a two-asset pool".into());
             }
@@ -1058,6 +1081,29 @@ pub fn resolve_deposit_basket(
             let after_lp = total_lp * (&v_b + &t) / &v_b; // floor
             let lp_minted = &after_lp - total_lp;
             (dx, lp_minted, Some(t))
+        }
+        // Target-pinned deposit (ss_check tag 6): same shape as constant
+        // sum with D in place of V. `t = min_i floor(offered_i · D / r_i)`;
+        // each reserve moves by ceil(r_i · t / D) and total_lp becomes
+        // floor(lp · (D + t) / D). The declared `t` rides in the entry's
+        // LiquidityStep operation_data.
+        crate::sundaev4::types::PoolType::StableSwap { config } => {
+            let p = swap_math::ss_params(config);
+            let reserves_owned: Vec<BigInt> = reserves.iter().map(|r| (*r).clone()).collect();
+            let t = super::ss_math::deposit_target_for_holdings(
+                &p,
+                &reserves_owned,
+                offered_per_pool,
+                None,
+            )?;
+            if !t.is_positive() {
+                return Err("deposit can't be filled — a stableswap deposit must \
+                     offer both pool assets in proportion (asymmetric \
+                     deposits are disallowed on-chain)"
+                    .into());
+            }
+            let step = super::ss_math::liquidity_step(&p, &reserves_owned, total_lp, &t, None)?;
+            (step.deltas, step.lp_delta, Some(t))
         }
         // Constant product AND concentrated liquidity share the same
         // proportional pinning. CP's validator bounds LP by per-asset
@@ -1267,6 +1313,33 @@ pub fn resolve_proportional_withdraw(
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
+            Ok(ResolvedWithdraw {
+                order: order.clone(),
+                lp_burned: actual_burn,
+                dy,
+                target_delta_v: Some(t),
+            })
+        }
+        // Target-pinned withdraw (ss_check tag 4): the entry declares a
+        // negative D delta t; each reserve moves by ceil(r_i · t / D) (so
+        // the user receives at most floor(r_i · |t| / D)) and total_lp
+        // becomes floor(lp · (D + t) / D). `t` is chosen so the burn is
+        // exactly the offered LP.
+        crate::sundaev4::types::PoolType::StableSwap { config } => {
+            let p = swap_math::ss_params(config);
+            let reserves: Vec<BigInt> =
+                pool.pool_datum.assets.iter().map(|(_, q)| q.clone()).collect();
+            let t =
+                super::ss_math::withdraw_target_for_lp(&p, &reserves, total_lp, &lp_burned, None)?;
+            let step = super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, None)?;
+            let actual_burn = -&step.lp_delta;
+            if !actual_burn.is_positive() || actual_burn > lp_burned {
+                return Err("withdraw pin does not burn the offered LP".into());
+            }
+            let dy: Vec<BigInt> = step.deltas.iter().map(|d| -d).collect();
+            if dy.iter().all(|q| !q.is_positive()) {
+                return Err("withdraw pays out zero of every reserve".into());
+            }
             Ok(ResolvedWithdraw {
                 order: order.clone(),
                 lp_burned: actual_burn,

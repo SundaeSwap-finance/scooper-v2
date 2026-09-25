@@ -1299,12 +1299,31 @@ impl AdminServer {
         preimages: &ModuleStatePreimages,
     ) -> serde_json::Value {
         let mut pool_json = serde_json::to_value(pool).unwrap_or_default();
+        // A stableswap pool's config is per pool (and its rates move on
+        // chain), so its preimage comes from the pool record, not the
+        // startup map.
+        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> =
+            if let crate::sundaev4::PoolType::StableSwap { config } = &pool.pool_type {
+                use plutus_parser::AsPlutus;
+                let cbor = minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default();
+                Some((
+                    pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(),
+                    cbor,
+                ))
+            } else {
+                None
+            };
         if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
             let mut enriched = serde_json::Map::new();
             for (module_hash, state_bytes) in &pool.pool_datum.module_state {
                 let state_hex = hex::encode(state_bytes);
                 // Try to find a preimage whose blake2b-256 matches state_bytes
-                let value_hex = preimages.get(state_bytes).map(hex::encode);
+                let value_hex = preimages.get(state_bytes).map(hex::encode).or_else(|| {
+                    ss_preimage
+                        .as_ref()
+                        .filter(|(h, _)| h == state_bytes)
+                        .map(|(_, cbor)| hex::encode(cbor))
+                });
                 let mut entry = serde_json::Map::new();
                 entry.insert("state".into(), state_hex.into());
                 if let Some(v) = value_hex {

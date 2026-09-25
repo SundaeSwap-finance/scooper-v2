@@ -10,6 +10,7 @@ mod indexer;
 pub mod intents;
 pub mod router;
 pub mod script_context;
+pub mod ss_math;
 pub mod submit;
 pub mod swap_math;
 pub mod tx_builder;

@@ -1021,12 +1021,14 @@ fn missing_module_configs(
     cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
     cl_configs: &std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig>,
     fs_configs: &std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig>,
-) -> (bool, bool, bool, bool) {
+    ss_configs: &std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig>,
+) -> (bool, bool, bool, bool, bool) {
     (
         needs_cs_lookup(pool_datum, execution, cs_configs),
         needs_cp_lookup(pool_datum, execution, cp_configs),
         needs_cl_lookup(pool_datum, execution, cl_configs),
         !fs_configs.contains_key(&pool_datum.identifier),
+        needs_ss_lookup(pool_datum, execution, ss_configs),
     )
 }
 
@@ -1062,12 +1064,15 @@ pub async fn recover_missing_module_configs(
     let cl_module_hash: Option<Vec<u8>> =
         exec.module_scripts.concentrated_liquidity.as_ref().map(|m| m.hash.as_ref().to_vec());
     let fs_module_hash: Vec<u8> = exec.module_scripts.fee_split.hash.as_ref().to_vec();
+    let ss_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.stableswap.as_ref().map(|m| m.hash.as_ref().to_vec());
 
     // What the DB already knows.
     let mut cs_configs = std::collections::BTreeMap::new();
     let mut cp_configs = std::collections::BTreeMap::new();
     let mut cl_configs = std::collections::BTreeMap::new();
     let mut fs_configs = std::collections::BTreeMap::new();
+    let mut ss_configs = std::collections::BTreeMap::new();
     for cfg in dao.load_module_configs().await.context("recover: load persisted module configs")? {
         let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
             .context("recover: persisted module config CBOR malformed")?;
@@ -1083,6 +1088,8 @@ pub async fn recover_missing_module_configs(
             );
         } else if cfg.module_hash == fs_module_hash {
             fs_configs.insert(ident, sundaev4::FeeSplitConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
+            ss_configs.insert(ident, sundaev4::StableSwapConfig::from_plutus(pd)?);
         }
     }
 
@@ -1110,27 +1117,38 @@ pub async fn recover_missing_module_configs(
     let mut max_slot = 0u64;
 
     for (ident, pool_datum, slot) in pools {
-        let (need_cs, need_cp, need_cl, need_fs) = missing_module_configs(
+        let (need_cs, need_cp, need_cl, need_fs, need_ss) = missing_module_configs(
             &pool_datum,
             Some(exec),
             &cs_configs,
             &cp_configs,
             &cl_configs,
             &fs_configs,
+            &ss_configs,
         );
-        if !(need_cs || need_cp || need_cl || need_fs) {
+        if !(need_cs || need_cp || need_cl || need_fs || need_ss) {
             continue;
         }
         let ident_hex = hex::encode(ident.to_bytes());
-        info!(pool = %ident_hex, need_cs, need_cp, need_cl, need_fs, "v4: pool is missing module config(s); recovering from chain");
+        info!(pool = %ident_hex, need_cs, need_cp, need_cl, need_fs, need_ss, "v4: pool is missing module config(s); recovering from chain");
 
+        let ss_expected = if need_ss {
+            ss_slot_hash(&pool_datum, Some(exec))
+        } else {
+            None
+        };
         let provider = provider.get_or_insert_with(|| make_provider(config));
-        let recovered =
-            lookup_pool_module_configs(&**provider, protocol, &ident, need_cs, need_cp, need_cl)
-                .await
-                .with_context(|| {
-                    format!("v4: failed to recover module configs for pool {ident_hex}")
-                })?;
+        let recovered = lookup_pool_module_configs(
+            &**provider,
+            protocol,
+            &ident,
+            need_cs,
+            need_cp,
+            need_cl,
+            ss_expected.as_deref(),
+        )
+        .await
+        .with_context(|| format!("v4: failed to recover module configs for pool {ident_hex}"))?;
 
         let mut push = |module_hash: Vec<u8>, cbor: Vec<u8>| {
             persisted.push(crate::persistence::PersistedModuleConfig {
@@ -1185,6 +1203,21 @@ pub async fn recover_missing_module_configs(
                 }
                 None => {
                     warn!(pool = %ident_hex, "v4: no concentrated-liquidity config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if need_ss {
+            match recovered.ss {
+                Some(cfg) => {
+                    push(
+                        ss_module_hash.clone().expect("ss hash known when need_ss"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered stableswap config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: stableswap pool but no redeemer in its tx history hashes to its module_state; scoops against it are refused")
                 }
             }
         }
@@ -1432,6 +1465,45 @@ fn needs_cs_lookup(
     true
 }
 
+/// True iff this pool is stableswap *and* the config we hold (if any) does
+/// not hash to the datum's `module_state` slot. Unlike the other modules the
+/// config changes on chain (tag-7 rate updates), so "known" means "hashes to
+/// the current datum", not "present". There is no operator override.
+fn needs_ss_lookup(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    ss_configs: &std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig>,
+) -> bool {
+    let Some(exec) = execution else {
+        return false;
+    };
+    let Some(ss_script) = exec.module_scripts.stableswap.as_ref() else {
+        return false;
+    };
+    let is_ss = pool_datum.actions.iter().any(|a| {
+        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == ss_script.hash.as_ref())
+    });
+    if !is_ss {
+        return false;
+    }
+    !ss_configs.get(&pool_datum.identifier).is_some_and(|cfg| {
+        crate::sundaev4::ss_math::config_matches_datum(cfg, pool_datum, ss_script.hash.as_ref())
+    })
+}
+
+/// The stableswap `module_state` slot value of a pool datum, if any.
+fn ss_slot_hash(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+) -> Option<Vec<u8>> {
+    let ss_hash = execution?.module_scripts.stableswap.as_ref()?.hash;
+    pool_datum
+        .module_state
+        .iter()
+        .find(|(cred, _)| cred.as_slice() == ss_hash.as_ref())
+        .map(|(_, h)| h.clone())
+}
+
 /// True iff this pool is constant-product *and* we don't already know its
 /// config. Same logic as `needs_cs_lookup` but matched against the CP module
 /// hash.
@@ -1493,6 +1565,8 @@ struct RecoveredPoolConfigs {
     cs: Option<sundaev4::ConstantSumConfig>,
     cp: Option<sundaev4::ConstantProductConfig>,
     cl: Option<sundaev4::ConcentratedLiquidityConfig>,
+    /// The stableswap config whose hash the pool's current datum names.
+    ss: Option<sundaev4::StableSwapConfig>,
     fee_split: Option<sundaev4::FeeSplitConfig>,
 }
 
@@ -1515,6 +1589,9 @@ async fn lookup_pool_module_configs(
     need_cs: bool,
     need_cp: bool,
     need_cl: bool,
+    // `Some(slot hash)` when the stableswap config is wanted: the candidate
+    // that hashes to it is the one in force for the pool's current UTxO.
+    ss_expected: Option<&[u8]>,
 ) -> Result<RecoveredPoolConfigs> {
     let exec = protocol
         .execution
@@ -1522,6 +1599,13 @@ async fn lookup_pool_module_configs(
         .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
     let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash);
+    let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash);
+    let pick_ss = |tx: &pallas_traverse::MultiEraTx| -> Option<sundaev4::StableSwapConfig> {
+        let (h, expected) = (ss_hash.as_ref()?, ss_expected?);
+        sundaev4::extract_ss_config_candidates(tx, h)
+            .into_iter()
+            .find(|c| crate::sundaev4::ss_math::config_hash(c) == expected)
+    };
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
     let fs_hash = exec.module_scripts.fee_split.hash;
 
@@ -1537,6 +1621,7 @@ async fn lookup_pool_module_configs(
     let want_cs = need_cs && cs_hash.is_some();
     let want_cp = need_cp;
     let want_cl = need_cl && cl_hash.is_some();
+    let want_ss = ss_expected.is_some() && ss_hash.is_some();
 
     // Step 1: first tx (mint). Pool Create + per-module Create withdrawals are
     // here, so for static configs this single call is enough.
@@ -1554,12 +1639,16 @@ async fn lookup_pool_module_configs(
     if want_cl && let Some(h) = cl_hash.as_ref() {
         out.cl = sundaev4::extract_cl_config_from_tx(&first_tx, h);
     }
+    if want_ss {
+        out.ss = pick_ss(&first_tx);
+    }
     out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, &fs_hash);
 
     let still_missing = |c: &RecoveredPoolConfigs| {
         (want_cs && c.cs.is_none())
             || (want_cp && c.cp.is_none())
             || (want_cl && c.cl.is_none())
+            || (want_ss && c.ss.is_none())
             || c.fee_split.is_none()
     };
     if !still_missing(&out) {
@@ -1601,6 +1690,9 @@ async fn lookup_pool_module_configs(
                 && let Some(h) = cl_hash.as_ref()
             {
                 out.cl = sundaev4::extract_cl_config_from_tx(&tx, h);
+            }
+            if want_ss && out.ss.is_none() {
+                out.ss = pick_ss(&tx);
             }
             if out.fee_split.is_none() {
                 out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, &fs_hash);
@@ -1651,6 +1743,11 @@ async fn bootstrap_v4(
         .map(|cl| cl.hash.as_ref().to_vec());
     let fs_module_hash: Option<Vec<u8>> =
         protocol.execution.as_ref().map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+    let ss_module_hash: Option<Vec<u8>> = protocol
+        .execution
+        .as_ref()
+        .and_then(|e| e.module_scripts.stableswap.as_ref())
+        .map(|ss| ss.hash.as_ref().to_vec());
 
     let persisted_configs =
         dao.load_module_configs().await.context("bootstrap v4: load persisted module configs")?;
@@ -1661,6 +1758,8 @@ async fn bootstrap_v4(
     let mut cl_configs: std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig> =
         std::collections::BTreeMap::new();
     let mut fs_configs: std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig> =
+        std::collections::BTreeMap::new();
+    let mut ss_configs: std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig> =
         std::collections::BTreeMap::new();
     for cfg in persisted_configs {
         let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
@@ -1681,6 +1780,10 @@ async fn bootstrap_v4(
             let parsed = sundaev4::FeeSplitConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted FS config decode failed")?;
             fs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
+            let parsed = sundaev4::StableSwapConfig::from_plutus(pd)
+                .context("bootstrap v4: persisted SS config decode failed")?;
+            ss_configs.insert(Ident::new(&cfg.pool_id), parsed);
         }
         // Unknown module hashes are ignored; they may belong to modules not
         // configured in this protocol.
@@ -1737,8 +1840,14 @@ async fn bootstrap_v4(
         let need_cs = needs_cs_lookup(&pool_datum, protocol.execution.as_ref(), &cs_configs);
         let need_cp = needs_cp_lookup(&pool_datum, protocol.execution.as_ref(), &cp_configs);
         let need_cl = needs_cl_lookup(&pool_datum, protocol.execution.as_ref(), &cl_configs);
+        let need_ss = needs_ss_lookup(&pool_datum, protocol.execution.as_ref(), &ss_configs);
+        let ss_expected = if need_ss {
+            ss_slot_hash(&pool_datum, protocol.execution.as_ref())
+        } else {
+            None
+        };
         let need_fs = !fs_configs.contains_key(&pool_datum.identifier);
-        if need_cs || need_cp || need_cl || need_fs {
+        if need_cs || need_cp || need_cl || need_ss || need_fs {
             let recovered = lookup_pool_module_configs(
                 provider,
                 protocol,
@@ -1746,6 +1855,7 @@ async fn bootstrap_v4(
                 need_cs,
                 need_cp,
                 need_cl,
+                ss_expected.as_deref(),
             )
             .await
             .with_context(|| {
@@ -1775,6 +1885,33 @@ async fn bootstrap_v4(
                     pool = %hex::encode(pool_datum.identifier.to_bytes()),
                     "bootstrap v4: recovered CS pool config"
                 );
+            }
+            if need_ss {
+                match recovered.ss {
+                    Some(ss_cfg) => {
+                        let cbor = minicbor::to_vec(ss_cfg.clone().to_plutus())
+                            .context("bootstrap v4: encode StableSwapConfig CBOR")?;
+                        new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
+                            pool_id: pool_datum.identifier.to_bytes().to_vec(),
+                            module_hash: ss_module_hash
+                                .clone()
+                                .expect("ss_module_hash known when need_ss"),
+                            config_cbor: cbor,
+                            created_slot: utxo.slot,
+                        });
+                        ss_configs.insert(pool_datum.identifier.clone(), ss_cfg);
+                        info!(
+                            pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                            "bootstrap v4: recovered stableswap pool config"
+                        );
+                    }
+                    // Not fatal: the pool is skipped at build time (its
+                    // placeholder config fails the module_state check).
+                    None => warn!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "bootstrap v4: stableswap pool but no redeemer in its tx history hashes to its module_state; scoops against it are refused"
+                    ),
+                }
             }
             if need_cp {
                 if let Some(cp_cfg) = recovered.cp {
@@ -1853,12 +1990,19 @@ async fn bootstrap_v4(
         let resolved_cs = cs_configs.get(&pool_datum.identifier);
         let resolved_cp = cp_configs.get(&pool_datum.identifier);
         let resolved_cl = cl_configs.get(&pool_datum.identifier);
+        // Only a config that hashes to the current datum is handed on.
+        let resolved_ss = ss_configs.get(&pool_datum.identifier).filter(|cfg| {
+            ss_module_hash.as_ref().is_some_and(|h| {
+                crate::sundaev4::ss_math::config_matches_datum(cfg, &pool_datum, h)
+            })
+        });
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
             protocol.execution.as_ref(),
             resolved_cs,
             resolved_cp,
             resolved_cl,
+            resolved_ss,
         );
         let fs_cfg = fs_configs.get(&pool_datum.identifier).cloned();
         pools.insert(
@@ -2128,6 +2272,9 @@ async fn bootstrap_v4(
         }
         if let Some(ref cl) = scripts.concentrated_liquidity {
             all_refs.push(cl);
+        }
+        if let Some(ref ss) = scripts.stableswap {
+            all_refs.push(ss);
         }
         if let Some(ref so) = scripts.swap_order {
             all_refs.push(so);
@@ -2652,15 +2799,82 @@ mod recover_missing_configs_tests {
     fn unknown_cs_pool_asks_for_cs_and_fee_split_only() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let pool = cs_pool(&env);
-        let (cs, cp, cl, fs) = missing_module_configs(
+        let (cs, cp, cl, fs, ss) = missing_module_configs(
             &pool.pool_datum,
             Some(&env.exec),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         );
-        assert_eq!((cs, cp, cl, fs), (true, false, false, true));
+        assert_eq!((cs, cp, cl, fs, ss), (true, false, false, true, false));
+    }
+
+    /// A stableswap pool asks for its config until the cached config hashes
+    /// to the datum's module_state; a cached config a rate update has left
+    /// behind asks again (the rates changed on chain, the hash with them).
+    #[test]
+    fn stableswap_lookup_is_gated_by_the_datum_hash() {
+        use crate::sundaev4::test_harness::{make_ss_pool, ss_config, token_a, token_b};
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = ss_config(
+            200,
+            Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+            [1, 1],
+        );
+        let pool = make_ss_pool(
+            &env,
+            0x5A,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            cfg.clone(),
+        );
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(ss, "an unknown stableswap config must be looked up");
+
+        let mut ss_configs = BTreeMap::new();
+        ss_configs.insert(pool.pool_datum.identifier.clone(), cfg.clone());
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &ss_configs,
+        );
+        assert!(
+            !ss,
+            "a cached config that hashes to the datum suppresses the lookup"
+        );
+
+        let mut stale = cfg.clone();
+        stale.rates = vec![BigInt::from(1), BigInt::from(2)];
+        ss_configs.insert(pool.pool_datum.identifier.clone(), stale);
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &ss_configs,
+        );
+        assert!(
+            ss,
+            "a cached config with other rates must be looked up again"
+        );
     }
 
     /// Once the cache has the pool's CS config, recovery stops asking for it.
@@ -2690,10 +2904,11 @@ mod recover_missing_configs_tests {
         } else {
             panic!("make_cs_pool must yield a constant-sum pool type");
         }
-        let (cs, _, _, _) = missing_module_configs(
+        let (cs, _, _, _, _) = missing_module_configs(
             &pool.pool_datum,
             Some(&env.exec),
             &cs_configs,
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -2716,9 +2931,10 @@ mod recover_missing_configs_tests {
                 fee: (3, 1000),
             },
         );
-        let (cs, _, _, _) = missing_module_configs(
+        let (cs, _, _, _, _) = missing_module_configs(
             &pool.pool_datum,
             Some(&exec),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),

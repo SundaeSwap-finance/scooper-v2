@@ -117,6 +117,9 @@ pub struct PoolModuleConfigCache {
     pub cs: BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>,
     pub cp: BTreeMap<Ident, crate::sundaev4::types::ConstantProductConfig>,
     pub cl: BTreeMap<Ident, crate::sundaev4::types::ConcentratedLiquidityConfig>,
+    /// Stableswap configs carry the pool's current `rates`; a tag-7 update
+    /// replaces the entry (the persisted row is upserted).
+    pub ss: BTreeMap<Ident, crate::sundaev4::types::StableSwapConfig>,
     pub fee_split: BTreeMap<Ident, crate::sundaev4::types::FeeSplitConfig>,
 }
 
@@ -173,8 +176,15 @@ impl SundaeV4Indexer {
     pub async fn rehydrate_module_configs(&self) -> Result<()> {
         use crate::sundaev4::types::{
             ConcentratedLiquidityConfig, ConstantProductConfig, ConstantSumConfig, FeeSplitConfig,
+            StableSwapConfig,
         };
         let persisted_configs = self.dao.load_module_configs().await?;
+        let ss_module_hash: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.stableswap.as_ref())
+            .map(|ss| ss.hash.as_ref().to_vec());
         let cs_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -218,12 +228,17 @@ impl SundaeV4Indexer {
                 let parsed = FeeSplitConfig::from_plutus(pd)
                     .context("could not parse persisted FeeSplitConfig")?;
                 cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
+            } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
+                let parsed = StableSwapConfig::from_plutus(pd)
+                    .context("could not parse persisted StableSwapConfig")?;
+                cache.ss.insert(Ident::new(&cfg.pool_id), parsed);
             }
         }
         info!(
             cs = cache.cs.len(),
             cp = cache.cp.len(),
             cl = cache.cl.len(),
+            ss = cache.ss.len(),
             fs = cache.fee_split.len(),
             "v4: hydrated per-module pool configs from DB",
         );
@@ -253,12 +268,14 @@ impl SundaeV4Indexer {
                 continue;
             };
             let mut pool = (**existing).clone();
+            let ss = self.cached_ss_config(&pool.pool_datum, &cache);
             pool.pool_type = detect_pool_type(
                 &pool.pool_datum,
                 self.protocol.execution.as_ref(),
                 cache.cs.get(ident),
                 cache.cp.get(ident),
                 cache.cl.get(ident),
+                ss.as_ref(),
             );
             pool.fee_split_config = cache.fee_split.get(ident).cloned();
             s.pools.insert(ident.clone(), Arc::new(pool));
@@ -595,7 +612,33 @@ impl SundaeV4Indexer {
         let cs = cache.cs.get(&pool_datum.identifier);
         let cp = cache.cp.get(&pool_datum.identifier);
         let cl = cache.cl.get(&pool_datum.identifier);
-        detect_pool_type(pool_datum, self.protocol.execution.as_ref(), cs, cp, cl)
+        let ss = self.cached_ss_config(pool_datum, cache);
+        detect_pool_type(
+            pool_datum,
+            self.protocol.execution.as_ref(),
+            cs,
+            cp,
+            cl,
+            ss.as_ref(),
+        )
+    }
+
+    /// The cached stableswap config for a pool, only when its hash is the
+    /// one the datum's `module_state` names. A cached config a rate update
+    /// has left behind is not returned: pricing against it would build a tx
+    /// the module rejects.
+    fn cached_ss_config(
+        &self,
+        pool_datum: &PoolDatum,
+        cache: &PoolModuleConfigCache,
+    ) -> Option<crate::sundaev4::types::StableSwapConfig> {
+        let ss_hash = self.protocol.execution.as_ref()?.module_scripts.stableswap.as_ref()?.hash;
+        resolve_ss_config(
+            pool_datum,
+            ss_hash.as_ref(),
+            &[],
+            cache.ss.get(&pool_datum.identifier),
+        )
     }
 
     fn parse_pool(
@@ -724,6 +767,7 @@ pub fn module_ref_utxos(
         &scripts.constant_product,
         &scripts.constant_sum,
         &scripts.concentrated_liquidity,
+        &scripts.stableswap,
         &scripts.swap_order,
         &scripts.basic_order,
         &scripts.route_order,
@@ -849,6 +893,127 @@ pub fn extract_cl_config_from_tx(
         ConcentratedLiquidityRedeemer::Create { initial_state } => Some(initial_state),
         _ => None,
     }
+}
+
+/// Every `StableSwapConfig` a tx vouches for, from its stableswap module
+/// withdrawal redeemer:
+/// - `Create { initial_state, .. }`: the initial config;
+/// - `Operate { entries }`: each entry's `config` (the config as stored in
+///   that pool's INPUT), and — when the entry's pool spend redeemer opens
+///   with a tag-7 rate update — the same config with the updated `rates`
+///   (the config the OUTPUT datum hashes).
+///
+/// Which candidate a pool output uses is decided by [`resolve_ss_config`]
+/// against the datum's `module_state`; this function only enumerates.
+pub fn extract_ss_config_candidates(
+    tx: &MultiEraTx,
+    ss_script_hash: &ScriptHash,
+) -> Vec<crate::sundaev4::types::StableSwapConfig> {
+    use crate::sundaev4::types::{
+        PoolRedeemer, RateUpdate, StableSwapConfig, StableSwapRedeemer, TAG_UPDATE_RATES,
+    };
+
+    let Some(wd_index) = withdrawal_index_of_script(tx, ss_script_hash) else {
+        return vec![];
+    };
+    let redeemers = tx.redeemers();
+    let Some(redeemer) =
+        redeemers.iter().find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)
+    else {
+        return vec![];
+    };
+    let Ok(parsed) = StableSwapRedeemer::from_plutus(redeemer.data().clone()) else {
+        return vec![];
+    };
+    match parsed {
+        StableSwapRedeemer::Create { initial_state, .. } => vec![initial_state],
+        StableSwapRedeemer::Operate { entries } => {
+            // Spend redeemer indices refer to the canonical (sorted) input set.
+            let mut inputs: Vec<(Vec<u8>, u64)> =
+                tx.inputs().iter().map(|i| (i.hash().to_vec(), i.index())).collect();
+            inputs.sort();
+            let mut out = Vec::with_capacity(entries.len() * 2);
+            for entry in entries {
+                out.push(entry.config.clone());
+                let key = (
+                    entry.pool_oref.transaction_id.clone(),
+                    entry.pool_oref.output_index,
+                );
+                let Some(spend_index) = inputs.iter().position(|k| *k == key) else {
+                    continue;
+                };
+                let Some(spend) = redeemers
+                    .iter()
+                    .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)
+                else {
+                    continue;
+                };
+                let Ok(PoolRedeemer::Action { transcript, .. }) =
+                    PoolRedeemer::from_plutus(spend.data().clone())
+                else {
+                    continue;
+                };
+                let Some(first) = transcript.first() else {
+                    continue;
+                };
+                if first.operation_tag != crate::bigint::BigInt::from(TAG_UPDATE_RATES) {
+                    continue;
+                }
+                let Ok(update) = RateUpdate::from_plutus(first.operation_data.clone()) else {
+                    continue;
+                };
+                out.push(StableSwapConfig {
+                    rates: update.rates,
+                    ..entry.config
+                });
+            }
+            out
+        }
+        StableSwapRedeemer::Destroy { .. } => vec![],
+    }
+}
+
+/// The stableswap config for `pool_datum`: the first of `candidates`, else
+/// `cached`, whose hash the datum's `module_state` slot for the stableswap
+/// module names. `None` when the pool has no stableswap slot or nothing
+/// matches — a cached config that no longer matches is stale (a rate update
+/// this scooper did not index) and is reported, not returned.
+pub fn resolve_ss_config(
+    pool_datum: &PoolDatum,
+    ss_module_hash: &[u8],
+    candidates: &[crate::sundaev4::types::StableSwapConfig],
+    cached: Option<&crate::sundaev4::types::StableSwapConfig>,
+) -> Option<crate::sundaev4::types::StableSwapConfig> {
+    use crate::sundaev4::ss_math::{check_config, config_matches_datum};
+    // A config the module's Create bounds reject cannot have come from a
+    // real pool; treat such a candidate as no match.
+    let accepted = |c: &crate::sundaev4::types::StableSwapConfig| -> bool {
+        config_matches_datum(c, pool_datum, ss_module_hash)
+            && match check_config(c) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "v4: stableswap config hashes to module_state but fails the module's bounds: {e}"
+                    );
+                    false
+                }
+            }
+    };
+    if let Some(c) = candidates.iter().find(|c| accepted(c)) {
+        return Some(c.clone());
+    }
+    let cached = cached?;
+    if accepted(cached) {
+        return Some(cached.clone());
+    }
+    warn!(
+        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+        "v4: cached stableswap config does not hash to the pool's module_state — a rate update \
+         was not indexed; scoops against this pool are refused until the config is recovered \
+         (a restart recovers it from the pool's tx history)",
+    );
+    None
 }
 
 /// Like `extract_fee_split_config_from_tx`, but for an Operate redeemer with
@@ -986,6 +1151,17 @@ impl ChainIndex for SundaeV4Indexer {
             self.protocol.execution.as_ref().and_then(|e| {
                 extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
             });
+        // Stableswap: every config this tx vouches for (Create initial_state,
+        // Operate entry configs, and the post-rate-update form of each).
+        // Which one applies to a given pool output is decided by its datum's
+        // module_state hash below.
+        let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.stableswap.as_ref())
+            .map(|ss| extract_ss_config_candidates(&tx, &ss.hash))
+            .unwrap_or_default();
         let swap_order_hash: Vec<u8> = self
             .protocol
             .execution
@@ -1025,6 +1201,12 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
             .map(|cl| cl.hash.as_ref().to_vec());
+        let ss_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.stableswap.as_ref())
+            .map(|ss| ss.hash.as_ref().to_vec());
         let fs_module_hash_bytes: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -1064,13 +1246,47 @@ impl ChainIndex for SundaeV4Indexer {
                         cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
                     let resolved_cl =
                         cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
+                    // Stableswap: the datum's module_state hash selects among
+                    // this tx's candidates and the cache. A cached config a
+                    // rate update has superseded is not used.
+                    let resolved_ss = ss_module_hash_bytes.as_ref().and_then(|h| {
+                        resolve_ss_config(
+                            &pd,
+                            h,
+                            &ss_candidates_from_tx,
+                            module_cache.ss.get(&pool_id),
+                        )
+                    });
                     let pool_type = detect_pool_type(
                         &pd,
                         self.protocol.execution.as_ref(),
                         resolved_cs,
                         resolved_cp,
                         resolved_cl,
+                        resolved_ss.as_ref(),
                     );
+
+                    // Stableswap: persist on first sight AND on change (a
+                    // tag-7 rate update rewrites `rates`; the row is upserted).
+                    if let (Some(cfg), Some(ss_hash)) =
+                        (resolved_ss.as_ref(), ss_module_hash_bytes.as_ref())
+                        && module_cache.ss.get(&pool_id) != Some(cfg)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode StableSwapConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: ss_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.ss.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            rates = ?cfg.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                            "v4: persisted stableswap pool config from redeemer"
+                        );
+                    }
 
                     // If we just learned this pool's CS config from a Create
                     // redeemer, persist it and remember it for future blocks.
@@ -1814,6 +2030,7 @@ pub fn detect_pool_type(
     cs_config_from_tx: Option<&crate::sundaev4::types::ConstantSumConfig>,
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
     cl_config_from_tx: Option<&crate::sundaev4::types::ConcentratedLiquidityConfig>,
+    ss_config: Option<&crate::sundaev4::types::StableSwapConfig>,
 ) -> crate::sundaev4::types::PoolType {
     use crate::bigint::BigInt;
     use crate::sundaev4::types::{PoolType, Rational};
@@ -1835,6 +2052,7 @@ pub fn detect_pool_type(
     let cl_hash =
         exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
@@ -1863,6 +2081,13 @@ pub fn detect_pool_type(
         {
             matched_action = Some(action);
             matched_kind = Some("cl");
+            break;
+        }
+        if let Some(h) = &ss_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("ss");
             break;
         }
     }
@@ -1950,6 +2175,38 @@ pub fn detect_pool_type(
             balance_fee: Rational {
                 num: BigInt::from(exec.fee.0),
                 den: BigInt::from(exec.fee.1),
+            },
+        };
+    }
+
+    if matched_kind == Some("ss") {
+        if let Some(cfg) = ss_config {
+            return PoolType::StableSwap {
+                config: cfg.clone(),
+            };
+        }
+        // No preimage that hashes to the datum's module_state slot. There is
+        // no operator override for stableswap: a static override goes stale
+        // on the first rate update, and the datum hash is authoritative. The
+        // placeholder below cannot pass the tx builder's hash check, so the
+        // pool is skipped loudly rather than mispriced.
+        warn!(
+            pool = %ident_hex,
+            "stableswap pool has no config preimage matching its module_state (not yet indexed \
+             from a Create/Operate redeemer, or a rate update was missed); scoops against it \
+             are refused until it is recovered — a restart recovers from the pool's tx history"
+        );
+        return PoolType::StableSwap {
+            config: crate::sundaev4::types::StableSwapConfig {
+                linear_amplification: BigInt::from(1),
+                fee: Rational {
+                    num: BigInt::from(exec.fee.0),
+                    den: BigInt::from(exec.fee.1),
+                },
+                rates: vec![BigInt::from(1); pool_datum.assets.len()],
+                rate_manager: None,
+                monotone_rates: false,
+                max_rate_step: None,
             },
         };
     }
@@ -2120,6 +2377,7 @@ mod mainnet_create_tx_tests {
             pool_mint: next(CS_HASH),
             settings: next(CS_HASH),
             constant_sum: Some(next(CS_HASH)),
+            stableswap: None,
             concentrated_liquidity: Some(next(CS_HASH)),
             swap_order: Some(next(CS_HASH)),
             basic_order: Some(next(CS_HASH)),

@@ -49,6 +49,7 @@ pub enum PoolFamily {
     ConstantProduct,
     ConstantSum,
     ConcentratedLiquidity,
+    StableSwap,
 }
 
 impl PoolFamily {
@@ -57,6 +58,7 @@ impl PoolFamily {
             Self::ConstantProduct => "cp",
             Self::ConstantSum => "cs",
             Self::ConcentratedLiquidity => "cl",
+            Self::StableSwap => "ss",
         }
     }
 }
@@ -145,6 +147,7 @@ pub struct Metrics {
     scooped_cp: AtomicU64,
     scooped_cs: AtomicU64,
     scooped_cl: AtomicU64,
+    scooped_ss: AtomicU64,
     /// Submit latency histogram in seconds. Buckets are tuned for
     /// Blockfrost: most submits land in 100ms-2s, tail past 5s is a
     /// sign of upstream trouble.
@@ -239,6 +242,7 @@ impl Metrics {
             scooped_cp: AtomicU64::new(0),
             scooped_cs: AtomicU64::new(0),
             scooped_cl: AtomicU64::new(0),
+            scooped_ss: AtomicU64::new(0),
             submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
             mempool_txs_seen: AtomicU64::new(0),
             mempool_order_creates: AtomicU64::new(0),
@@ -278,6 +282,7 @@ impl Metrics {
             PoolFamily::ConstantProduct => &self.scooped_cp,
             PoolFamily::ConstantSum => &self.scooped_cs,
             PoolFamily::ConcentratedLiquidity => &self.scooped_cl,
+            PoolFamily::StableSwap => &self.scooped_ss,
         };
         counter.fetch_add(n, Ordering::Relaxed);
     }
@@ -627,6 +632,10 @@ pub async fn render_metrics(
         (
             PoolFamily::ConcentratedLiquidity.label(),
             metrics.scooped_cl.load(Ordering::Relaxed),
+        ),
+        (
+            PoolFamily::StableSwap.label(),
+            metrics.scooped_ss.load(Ordering::Relaxed),
         ),
     ] {
         let _ = writeln!(
