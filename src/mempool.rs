@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pallas_traverse::MultiEraTx;
+use pallas_traverse::{Era, MultiEraTx};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -534,10 +534,23 @@ pub async fn submit_via_node(
 ) -> Result<(), NodeSubmitError> {
     use pallas_network::miniprotocols::localtxsubmission::{EraTx, Response};
     const CONWAY_ERA: u16 = 6;
+    // SUN-musashi: Musashi's node runs the Dijkstra ledger era, one past
+    // Conway. LocalTxSubmission's SubmitTx envelope numbers eras sequentially
+    // (the same convention ShelleyBasedEra uses for tx-error reporting), so
+    // Dijkstra is 7. Tagging a Dijkstra-shaped tx as Conway (6) gets it
+    // rejected, and the reject reason's Dijkstra-shaped ApplyTxError payload
+    // isn't fully decodable yet (see MUSASHI_MIGRATION.md §3) — so instead of
+    // a clean Rejected(reason), the decode itself fails, surfacing as a
+    // generic transport/channel error. Musashi's magic (164) is unique among
+    // this codebase's configured networks, so branch on it here rather than
+    // threading an era parameter through every caller.
+    const MUSASHI_MAGIC: u64 = 164;
+    const DIJKSTRA_ERA: u16 = 7;
+    let era = if network_magic == MUSASHI_MAGIC { DIJKSTRA_ERA } else { CONWAY_ERA };
     let mut client = pallas_network::facades::NodeClient::connect(socket_path, network_magic)
         .await
         .map_err(|e| NodeSubmitError::Transport(e.to_string()))?;
-    let result = client.submission().submit_tx(EraTx(CONWAY_ERA, cbor.to_vec())).await;
+    let result = client.submission().submit_tx(EraTx(era, cbor.to_vec())).await;
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
@@ -699,7 +712,25 @@ async fn watch_mempool(
         let mut current: BTreeSet<Vec<u8>> = BTreeSet::new();
         while let Some((era, body)) = monitor.query_next_tx().await? {
             let raw: &[u8] = body.0.as_ref();
-            let tx = match MultiEraTx::decode(raw) {
+            // `MultiEraTx::decode` sniffs the era from the CBOR shape alone,
+            // and Dijkstra's 3-element mempool-tx shape is indistinguishable
+            // from Shelley/Allegra/Mary's — it never resolves to Dijkstra,
+            // so every genuine Dijkstra mempool tx failed to decode here
+            // (observed live on Musashi as "era=7" in this log line).
+            // `decode_for_era` disambiguates correctly given the era, which
+            // LocalTxMonitor's wire already tells us; we just weren't using
+            // it. The `+ 1` corrects for `pallas_traverse::Era`'s tag
+            // numbering (Byron accepts both 0 and 1, Shelley=2, ...,
+            // Conway=7, Dijkstra=8), one off from LocalTxMonitor's raw
+            // 0-indexed-from-Byron era tag (Byron=0, ..., Conway=6,
+            // Dijkstra=7 — confirmed against the "era=7" Dijkstra
+            // observation above and pallas-network's own captured-fixture
+            // test, era=5, which is Babbage under this same +1 mapping).
+            let tx = match Era::try_from(era as u16 + 1)
+                .map_err(|e| e.to_string())
+                .and_then(|want_era| {
+                    MultiEraTx::decode_for_era(want_era, raw).map_err(|e| e.to_string())
+                }) {
                 Ok(tx) => tx,
                 Err(e) => {
                     debug!(era, error = %e, "mempool tx failed to decode; skipping");
