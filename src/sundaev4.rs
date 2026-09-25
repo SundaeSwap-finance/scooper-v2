@@ -20,6 +20,8 @@ pub use indexer::*;
 pub use types::*;
 
 #[cfg(test)]
+mod router_route_quality;
+#[cfg(test)]
 mod scoop_tests;
 #[cfg(test)]
 pub(crate) mod test_harness;
