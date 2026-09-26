@@ -37,13 +37,40 @@ use std::collections::BTreeMap;
 // bound. The order validator's contract check is `each order's budget * n
 // >= fee`, evaluated against THIS placeholder during first-pass eval. If
 // the placeholder is too pessimistic, orders whose `budget * n` could
-// satisfy the real fee fail the eval and abort the cycle. The minimum
-// realistic scoop fee is ~1.5 ADA (1 pool, 1 order, current tracing-on
-// contracts). Setting placeholder = 1.5 ADA means every order with budget
-// >= 1.5 ADA passes any first-pass eval; the rebuild's higher fee_override
-// is still checked against `budget * n` in the on-chain re-eval, which
-// scales with n so it stays satisfied.
+// satisfy the real fee fail the eval and abort the cycle.
+//
+// This is a CEILING now, not the value used: `first_pass_fee` prefers the
+// settings node's base_fee, which is what the orders actually pay. Two
+// reasons the constant alone was wrong:
+//
+//   1. It is stale. The comment used to claim ~1.5 ADA was the minimum
+//      realistic scoop fee for 1 pool / 1 order. Mainnet tx
+//      cd7e06cc832f522dcf4ab063dcb3f9e40f531b8555440a6dd4215288adce6624
+//      is exactly that shape and paid 1.007553 ADA. The contracts got
+//      cheaper; the constant did not move.
+//
+//   2. A placeholder ABOVE what the orders pay forces a funding input on
+//      every scoop that cannot cover it. `designated_required` is
+//      `total_fee_deducted.saturating_sub(tx_fee)`, so a placeholder of
+//      1.5 against a 1.28 pot saturates to 0, the identity
+//      `total_fee_deducted == tx_fee + designated_required` fails, and the
+//      build reports FundingRequired. The retry adds a wallet UTxO that
+//      the rebuild then returns untouched, because the real fee lands
+//      below the pot. Only n=1 tripped it: at n=2 the pot is 2.56 and
+//      clears 1.5 on its own.
 pub const TX_FEE: u64 = 1_500_000;
+
+/// The fee to stamp into a first-pass build.
+///
+/// The settings node's `base_fee` is what every order deducts, so using it
+/// makes the first pass balance by construction: `designated_required`
+/// becomes the real surplus rather than saturating to zero. Clamped to
+/// [`TX_FEE`] so this can only ever be LESS pessimistic than before — a
+/// base_fee above the ceiling would re-create the eval risk the note above
+/// warns about.
+pub fn first_pass_fee(fee_settings: Option<&crate::sundaev4::types::SundaeV4FeeSettings>) -> u64 {
+    fee_settings.map(|fs| fs.base_fee).unwrap_or(TX_FEE).min(TX_FEE)
+}
 
 /// Encode an order's input UTxO ref as `OutputReference { transaction_id,
 /// output_index }` = `Constr 0 [Bytes, Int]` — the Aiken `OutputReference`
@@ -368,9 +395,9 @@ pub fn build_multi_pool_scoop_tx(
     // offer edges the builder can't compose; this is the backstop).
     butane: Option<&crate::sundaev4::butane::ButaneRuntime>,
 ) -> Result<MultiPoolBuildResult> {
-    // First-pass builds use the TX_FEE upper bound; the rebuild passes the
-    // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
-    let tx_fee = fee_override.unwrap_or(TX_FEE);
+    // First-pass builds use the settings base_fee (see `first_pass_fee`);
+    // the rebuild passes the exact fee from `compute_tx_fee(size, mem, cpu)`.
+    let tx_fee = fee_override.unwrap_or_else(|| first_pass_fee(fee_settings));
     let batches: &[Batch] = &plan.batches;
     let routes = &plan.routes;
     let m_pools = batches.len();
@@ -4043,5 +4070,68 @@ mod reward_account_tests {
         assert_eq!(testnet[0], 0xf0, "testnet script reward account");
         assert_eq!(&mainnet[1..], hash.as_ref());
         assert_eq!(mainnet.len(), 29);
+    }
+}
+
+#[cfg(test)]
+mod first_pass_fee_tests {
+    use super::*;
+    use crate::sundaev4::types::SundaeV4FeeSettings;
+
+    fn settings(base_fee: u64) -> SundaeV4FeeSettings {
+        SundaeV4FeeSettings {
+            input: crate::cardano_types::TransactionInput::new([0u8; 32].into(), 0),
+            token: vec![],
+            base_fee,
+            slot: 0,
+        }
+    }
+
+    /// The invariant the funding input depended on.
+    ///
+    /// `designated_required` is `total_fee_deducted.saturating_sub(tx_fee)`,
+    /// and the build demands a funding UTxO unless
+    /// `total_fee_deducted == tx_fee + designated_required`. That identity
+    /// holds for every `tx_fee <= total_fee_deducted` and fails for every
+    /// `tx_fee > total_fee_deducted`, because the subtraction saturates.
+    fn identity_holds(total_fee_deducted: u64, tx_fee: u64) -> bool {
+        let designated_required = total_fee_deducted.saturating_sub(tx_fee);
+        total_fee_deducted == tx_fee + designated_required
+    }
+
+    #[test]
+    fn a_single_order_at_the_base_fee_needs_no_funding_input() {
+        // The case that forced a funding input on every 1-order scoop: the
+        // 1.5 ADA constant against a 1.28 ADA pot.
+        assert!(!identity_holds(1_280_000, TX_FEE), "1.5 > 1.28 saturates");
+        // Derived from settings, the first pass balances.
+        let fee = first_pass_fee(Some(&settings(1_280_000)));
+        assert_eq!(fee, 1_280_000);
+        assert!(identity_holds(1_280_000, fee));
+    }
+
+    #[test]
+    fn holds_for_any_order_count() {
+        let base = 1_280_000;
+        let fee = first_pass_fee(Some(&settings(base)));
+        for n in 1..=10u64 {
+            assert!(
+                identity_holds(base * n, fee),
+                "n={n} orders should not need a funding input"
+            );
+        }
+    }
+
+    #[test]
+    fn never_more_pessimistic_than_the_ceiling() {
+        // A base_fee above the ceiling would re-create the eval risk the
+        // note on TX_FEE warns about, so it is clamped.
+        assert_eq!(first_pass_fee(Some(&settings(9_000_000))), TX_FEE);
+        assert_eq!(first_pass_fee(Some(&settings(1_280_000))), 1_280_000);
+    }
+
+    #[test]
+    fn falls_back_to_the_constant_without_settings() {
+        assert_eq!(first_pass_fee(None), TX_FEE);
     }
 }
