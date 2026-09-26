@@ -68,9 +68,7 @@ pub const TX_FEE: u64 = 1_500_000;
 /// [`TX_FEE`] so this can only ever be LESS pessimistic than before — a
 /// base_fee above the ceiling would re-create the eval risk the note above
 /// warns about.
-pub fn first_pass_fee(
-    fee_settings: Option<&crate::sundaev4::types::SundaeV4FeeSettings>,
-) -> u64 {
+pub fn first_pass_fee(fee_settings: Option<&crate::sundaev4::types::SundaeV4FeeSettings>) -> u64 {
     fee_settings.map(|fs| fs.base_fee).unwrap_or(TX_FEE).min(TX_FEE)
 }
 

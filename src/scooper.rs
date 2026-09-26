@@ -2318,10 +2318,7 @@ impl Scooper {
             // to absorb min-ada support and any gap between the fee pot and the
             // tx fee. Logging which way this went is what tells an operator
             // whether the wallet UTxO a scoop consumed was actually needed.
-            info!(
-                funding_input = funding_owned.is_some(),
-                "scoop built"
-            );
+            info!(funding_input = funding_owned.is_some(), "scoop built");
             break (padded_budgets, final_tx);
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
