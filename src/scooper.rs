@@ -2131,7 +2131,7 @@ impl Scooper {
                         && funding_owned.is_none()
                         && funding_available.is_some() =>
                 {
-                    debug!(reason = %e, "scoop needs a funding input; rebuilding with one");
+                    info!(reason = %e, "scoop needs a funding input; rebuilding with one");
                     funding_owned = funding_available.clone();
                     continue;
                 }
@@ -2314,6 +2314,14 @@ impl Scooper {
                 self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                 return false;
             }
+            // Funding is an input the scoop returns untouched: it exists only
+            // to absorb min-ada support and any gap between the fee pot and the
+            // tx fee. Logging which way this went is what tells an operator
+            // whether the wallet UTxO a scoop consumed was actually needed.
+            info!(
+                funding_input = funding_owned.is_some(),
+                "scoop built"
+            );
             break (padded_budgets, final_tx);
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
