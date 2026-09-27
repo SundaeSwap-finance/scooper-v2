@@ -100,6 +100,7 @@ mod tests {
         for file in [
             "config/preview-v4.json",
             "config/preprod-v4.json",
+            "config/mainnet-v4.json",
             "config/mainnet.json",
         ] {
             let config = load_config([file]).expect("config loads");

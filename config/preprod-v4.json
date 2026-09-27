@@ -411,6 +411,10 @@
       "hash": "b22b5293a1d6265a5a02564436bf35f6f3cef85654f565c2759cce4b",
       "ref-utxo": "e4ebd18f0f884c0f74854c2b91d3e58952075c1a174c378070057c506a8f605f#0"
      },
+     "stableswap": {
+      "hash": "031b29852b494e33ab3b66a4df53d28dd8d00af15b59d3c5a6529db0",
+      "ref-utxo": "5d8891affb8e84f755e683317415408fc06a72be4c8b455ebc1b0c9f5e6aad0f#0"
+     },
      "basic-order": {
       "hash": "e6d77b2d7cca04e2c9b8af99ed0a798cbd69e702fa1c2d8fde989dae",
       "ref-utxo": "85f1c6a17afa243629ef066816137e02b66c8af03e5a0cb3b8d50eadcfee7a5d#0"
