@@ -155,6 +155,28 @@ trait BootstrapProvider {
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_tip(&self) -> Result<(u64, String)>;
 
+    /// Whether this provider can enumerate a script's UTxOs by PAYMENT
+    /// CREDENTIAL, i.e. find them at addresses carrying any staking part.
+    ///
+    /// Blockfrost cannot. Every one of its `/addresses/...` endpoints matches
+    /// a single full bech32 address, and its OpenAPI spec has no credential,
+    /// pattern or prefix query. `script_address` therefore only ever builds
+    /// the enterprise form (`addr1w...`). Users attach their own stake
+    /// credential to an order, so real orders sit at `addr1z...` and the
+    /// lookup returns nothing - reported as a healthy "0 order UTxOs".
+    ///
+    /// This matters because bootstrap does two things: it seeds state, and it
+    /// then tells the indexer to start at the bootstrap tip. The second part
+    /// discards all history before that tip. A provider that cannot enumerate
+    /// by credential has not seen the orders, so skipping the history that
+    /// contains them loses every pending order, with no error anywhere.
+    /// `run_bootstrap` refuses rather than do that. The caller already falls
+    /// back to a full replay from the configured starting point, which reads
+    /// orders from the ledger and needs no provider at all.
+    fn enumerates_by_credential(&self) -> bool {
+        true
+    }
+
     /// Fetch pool UTxOs by discovering addresses that hold NFTs under the given policy.
     /// Pools often sit at addresses with staking credentials, so a simple script-hash-to-address
     /// lookup (with null staking) misses them. This method enumerates NFT holders instead.
@@ -748,6 +770,18 @@ fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for BlockfrostProvider {
+    /// Blockfrost has no payment-credential query. See the trait method's
+    /// documentation; `fetch_script_utxos` below can only ever return the
+    /// enterprise address's UTxOs, so this provider must not be used to seed
+    /// state and skip history.
+    fn enumerates_by_credential(&self) -> bool {
+        false
+    }
+
+    /// NOTE: this sees ONLY the enterprise address (`addr1w...`). Any UTxO at
+    /// the same payment credential with a staking part is invisible here.
+    /// Pools work around it with `fetch_pool_utxos_by_nft`; orders carry no
+    /// NFT, so there is no equivalent trick for them.
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
         let bech32 = self.script_address(script_hash);
         self.fetch_address_utxos(&bech32).await
@@ -1261,6 +1295,22 @@ pub async fn run_bootstrap(
     persistence: &Arc<dyn crate::persistence::Persistence>,
 ) -> Result<BootstrapResult> {
     let provider = make_provider(config);
+
+    // Refuse to seed-and-skip with a provider that cannot see staked order
+    // addresses. Returning Err here is deliberate: the caller logs it and
+    // falls through to a chain replay from the configured starting point,
+    // which reconstructs orders, pools, module configs and reference scripts
+    // straight from the ledger. That replay is the bedrock recovery path and
+    // it is strictly more complete than any bootstrap - bootstrap only ever
+    // buys the time the replay would take.
+    anyhow::ensure!(
+        provider.enumerates_by_credential(),
+        "this bootstrap source cannot enumerate UTxOs by payment credential, so it cannot \
+         see orders at user-staked addresses (addr1z...). Seeding from it and then starting \
+         the indexer at the bootstrap tip would silently discard every pending order. \
+         Falling back to a full chain replay from the configured starting-point. \
+         To keep the bootstrap fast path, bootstrap from a Kupo source instead."
+    );
 
     let (tip_slot, tip_hash) = provider.fetch_tip().await?;
     info!(tip_slot, tip_hash = %tip_hash, "bootstrap: fetched chain tip");
@@ -2551,6 +2601,54 @@ async fn bootstrap_v4(
         "V4 bootstrap complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod credential_enumeration_tests {
+    //! Bootstrap seeds state and then starts the indexer at the bootstrap
+    //! tip, discarding every block before it. That is only safe when the
+    //! provider could actually see everything worth keeping.
+    //!
+    //! On 2026-09-26 a mainnet bootstrap reported "0 V4 order UTxOs" and a
+    //! clean start while a live user order sat unspent on chain. Blockfrost
+    //! had been asked for `addr1w...` (the enterprise form of the order
+    //! script) while the order sat at `addr1z...`, because users attach their
+    //! own stake credential. The order became invisible: bootstrap had not
+    //! seen it, and the history containing it was skipped.
+    use super::*;
+
+    #[test]
+    fn blockfrost_does_not_claim_credential_enumeration() {
+        let p = BlockfrostProvider::new("https://example.invalid/api/v0", "tok");
+        assert!(
+            !p.enumerates_by_credential(),
+            "Blockfrost has no payment-credential query; claiming otherwise lets \
+             run_bootstrap seed-and-skip and silently drop staked orders"
+        );
+    }
+
+    #[test]
+    fn kupo_enumerates_by_credential() {
+        // Kupo matches `{credential}/*`, so any staking part is covered.
+        let p = KupoProvider::new("https://example.invalid");
+        assert!(p.enumerates_by_credential());
+    }
+
+    /// The guard has to reject the *config the operator actually writes*, not
+    /// just a provider object, or a Blockfrost bootstrap still runs.
+    #[test]
+    fn a_blockfrost_bootstrap_config_is_rejected() {
+        let cfg = BootstrapConfig::Blockfrost {
+            url: "https://example.invalid/api/v0".to_string(),
+            project_id: "tok".to_string(),
+        };
+        assert!(!make_provider(&cfg).enumerates_by_credential());
+
+        let cfg = BootstrapConfig::Kupo {
+            url: "https://example.invalid".to_string(),
+        };
+        assert!(make_provider(&cfg).enumerates_by_credential());
+    }
 }
 
 #[cfg(test)]
