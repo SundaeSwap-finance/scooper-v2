@@ -144,9 +144,18 @@
 
   .stats {
     display: flex;
+    flex-wrap: wrap;
     gap: 16px;
     margin-bottom: 16px;
   }
+  .stat-card .sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+  .stat-card[title] { cursor: help; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.num { text-align: right; }
   .stat-card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -323,6 +332,7 @@
 <div class="tabs">
   <div class="tab" data-tab="v3">V3</div>
   <div class="tab active" data-tab="v4">V4</div>
+  <div class="tab" data-tab="protocol">Protocol</div>
   <div class="tab" data-tab="health">Health</div>
   <div class="tab" data-tab="events">Event Log</div>
 </div>
@@ -377,6 +387,36 @@
     <table id="v4-spent-orders-table">
       <thead><tr><th>Order Ref</th><th>Pool(s)</th><th>Reason</th><th>Tx</th><th>Time</th></tr></thead>
       <tbody id="v4-spent-orders-body"></tbody>
+    </table>
+  </div>
+
+  <!-- Protocol Tab -->
+  <div class="tab-panel" id="panel-protocol">
+    <div class="stats" id="protocol-cards"><div class="not-configured">Loading...</div></div>
+    <div class="section-title">Pools by Type</div>
+    <div class="stats" id="protocol-pool-cards"></div>
+    <div class="section-title">Open Orders</div>
+    <div class="stats" id="protocol-order-cards"></div>
+    <div class="section-title">Activity</div>
+    <table id="protocol-activity-table">
+      <thead><tr><th>Window</th><th class="num">Scoop Txs</th><th class="num">Orders Executed</th><th class="num">Pools Touched</th><th class="num">Active Scoopers</th></tr></thead>
+      <tbody id="protocol-activity-body"></tbody>
+    </table>
+    <div class="section-title">LP Fee Equity by Asset</div>
+    <table id="protocol-earnings-table">
+      <thead><tr><th>Asset</th><th class="num">Accrued</th><th class="num">USD</th></tr></thead>
+      <tbody id="protocol-earnings-body"></tbody>
+    </table>
+    <div class="section-title">Liquidity by Asset</div>
+    <table id="protocol-tvl-table">
+      <thead><tr><th>Asset</th><th class="num">In Pools</th><th class="num">USD</th></tr></thead>
+      <tbody id="protocol-tvl-body"></tbody>
+    </table>
+    <div class="section-title">Pools</div>
+    <div class="search-bar"><input type="text" data-filter="protocol-pools-body" placeholder="Filter pools..."></div>
+    <table id="protocol-pools-table">
+      <thead><tr><th>Pool ID</th><th>Type</th><th>Reserves</th><th class="num">TVL (USD)</th><th class="num">LP Equity (USD)</th><th class="num">Surplus (ADA)</th><th class="num">Protocol Share</th></tr></thead>
+      <tbody id="protocol-pools-body"></tbody>
     </table>
   </div>
 
@@ -543,16 +583,29 @@
   var assetNamePending = new Set();
   var assetNameCallbacks = [];
 
+  // The SundaeSwap API for the network this scooper indexes. /status names
+  // the network; the hostname is only a hint for before /status has loaded
+  // (the mainnet box has no public hostname, so it would otherwise fall
+  // through to preview). Mainnet's API is api.sundae.fi, unprefixed.
   function getGraphQLUrl() {
-    var host = window.location.hostname;
-    var m = host.match(/scooper\.(\w+)\.sundae\.fi/);
-    if (m) return 'https://api.' + m[1] + '.sundae.fi/graphql';
-    return 'https://api.preview.sundae.fi/graphql';
+    var net = status.network;
+    if (!net) {
+      var m = window.location.hostname.match(/scooper\.(\w+)\.sundae\.fi/);
+      net = m ? m[1] : 'preview';
+    }
+    if (net === 'mainnet') return 'https://api.sundae.fi/graphql';
+    return 'https://api.' + net + '.sundae.fi/graphql';
+  }
+
+  // Metadata lookups need the network from /status; wait for it once.
+  async function ensureNetwork() {
+    if (!status.network) await fetchStatus();
   }
 
   async function resolveAssetNames(assetIds) {
     var toFetch = assetIds.filter(function(id) { return id && !assetNameCache[id] && !assetNamePending.has(id); });
     if (toFetch.length === 0) return;
+    await ensureNetwork();
     toFetch.forEach(function(id) { assetNamePending.add(id); });
 
     // Batch into groups of 20 to avoid query size limits
@@ -592,6 +645,297 @@
     var fullId = ac.policy_id + '.' + (ac.asset_name || '');
     if (assetNameCache[fullId]) return assetNameCache[fullId];
     return truncate(ac.policy_id, 8) + '.' + truncate(ac.asset_name || '', 8);
+  }
+
+  // --- Asset metadata + USD prices (Protocol tab) ---
+  // Prices come from the Float API (api.float.sundae.fi), which quotes
+  // every asset with a priced pool in USD (stablecoin-implied) and
+  // carries the asset's decimals in the same response. Amounts on chain
+  // are raw integer units, so a USD figure needs those decimals.
+  // Cache: id -> { ticker, decimals, usd } where usd is the price of one
+  // whole unit, or null when there is no quote. Float covers mainnet
+  // only; on other networks only ADA gets a price.
+  var FLOAT_API = 'https://api.float.sundae.fi/v1';
+  // USDM: the stablecoin Float's USD quote is implied from. Its ADA price
+  // is the ADA/USD rate, since ADA is Float's quote asset and has no
+  // entry of its own.
+  var FLOAT_USDM = 'c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d';
+  var assetMetaCache = {};
+  var assetMetaPending = new Set();
+
+  function assetGqlId(id) {
+    return (id === 'lovelace' || id === '' || id == null) ? 'ada.lovelace' : id;
+  }
+
+  async function gql(query) {
+    var res = await fetch(getGraphQLUrl(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: query }),
+    });
+    return res.json();
+  }
+
+  // Float's price.value is quote base units (micro-USD, or lovelace when
+  // quote=ada) per one base unit of the asset. Price per whole unit =
+  // value × 10^decimals / 10^quote_decimals. `decimals: null` means Float
+  // can't derive it yet; the caller falls back to registry decimals.
+  async function floatAsset(id, quote) {
+    var res = await fetch(FLOAT_API + '/assets/' + id + '?quote=' + quote);
+    if (!res.ok) return null;
+    var d = await res.json();
+    if (!d || !d.price || d.price.value == null) return null;
+    return {
+      ticker: d.ticker || d.name || null,
+      decimals: (d.decimals == null) ? null : d.decimals,
+      value: Number(d.price.value),
+      quoteDecimals: (d.meta && d.meta.quote_decimals != null) ? d.meta.quote_decimals : 6,
+    };
+  }
+
+  async function resolveAssetMeta(assetIds) {
+    var toFetch = [];
+    assetIds.forEach(function(id) {
+      var g = assetGqlId(id);
+      if (!assetMetaCache[g] && !assetMetaPending.has(g) && toFetch.indexOf(g) < 0) toFetch.push(g);
+    });
+    if (toFetch.length === 0) return;
+    await ensureNetwork();
+    toFetch.forEach(function(id) { assetMetaPending.add(id); });
+
+    // Registry metadata (ticker, decimals) from the SundaeSwap API, batched.
+    // This also covers networks Float does not index.
+    for (var i = 0; i < toFetch.length; i += 20) {
+      var batch = toFetch.slice(i, i + 20);
+      var fragments = batch.map(function(id, j) {
+        return 'a' + j + ': assets { byId(id: "' + id + '") { id ticker name decimals } }';
+      });
+      try {
+        var data = await gql('{ ' + fragments.join(' ') + ' }');
+        if (data && data.data) {
+          for (var key in data.data) {
+            var a = data.data[key] && data.data[key].byId;
+            if (!a || !a.id) continue;
+            assetMetaCache[a.id] = { ticker: a.ticker || a.name || a.id, decimals: a.decimals == null ? null : a.decimals, usd: null };
+            if (a.id !== 'ada.lovelace' && !assetNameCache[a.id]) assetNameCache[a.id] = assetMetaCache[a.id].ticker;
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // Prices from Float, one request per asset (each is small and CDN-cached).
+    await Promise.all(toFetch.map(async function(id) {
+      if (!assetMetaCache[id]) assetMetaCache[id] = { ticker: id, decimals: id === 'ada.lovelace' ? 6 : null, usd: null };
+      var m = assetMetaCache[id];
+      try {
+        if (id === 'ada.lovelace') {
+          // ADA per USDM, inverted. USDM is Float's dollar by definition.
+          var u = await floatAsset(FLOAT_USDM, 'ada');
+          if (u && u.decimals != null && u.value > 0) {
+            var adaPerUsdm = u.value * Math.pow(10, u.decimals - u.quoteDecimals);
+            m.usd = 1 / adaPerUsdm;
+          }
+        } else {
+          var f = await floatAsset(id, 'usd');
+          if (f) {
+            if (f.ticker && (!m.ticker || m.ticker === id)) { m.ticker = f.ticker; assetNameCache[id] = f.ticker; }
+            if (f.decimals != null) m.decimals = f.decimals;
+            if (m.decimals != null) m.usd = f.value * Math.pow(10, m.decimals - f.quoteDecimals);
+          }
+        }
+      } catch (e) { /* ignore */ }
+      assetMetaPending.delete(id);
+    }));
+  }
+
+  // Whole-unit quantity of a raw amount, using the asset's decimals.
+  function wholeUnits(id, raw) {
+    var m = assetMetaCache[assetGqlId(id)];
+    var dec = (m && m.decimals != null) ? m.decimals : (assetGqlId(id) === 'ada.lovelace' ? 6 : 0);
+    return Number(raw) / Math.pow(10, dec);
+  }
+
+  // Sum a [{asset, amount}] list in USD. Returns { usd, priced, unpriced }.
+  function usdOf(list) {
+    var usd = 0, priced = 0, unpriced = [];
+    (list || []).forEach(function(e) {
+      var m = assetMetaCache[assetGqlId(e.asset)];
+      if (m && m.usd != null) { usd += wholeUnits(e.asset, e.amount) * m.usd; priced++; }
+      else unpriced.push(e.asset);
+    });
+    return { usd: usd, priced: priced, unpriced: unpriced };
+  }
+
+  function fmtUsd(n) {
+    if (n == null || isNaN(n)) return '—';
+    var opts = { style: 'currency', currency: 'USD', maximumFractionDigits: n >= 1000 ? 0 : 2 };
+    return n.toLocaleString('en-US', opts);
+  }
+
+  function fmtQty(n) {
+    if (n == null || isNaN(n)) return '?';
+    return n.toLocaleString('en-US', { maximumFractionDigits: n >= 1000 ? 0 : 4 });
+  }
+
+  // Hover text for a USD figure: one line per asset with the whole-unit
+  // quantity and the raw on-chain integer.
+  function rawTitle(list) {
+    return (list || []).map(function(e) {
+      var m = assetMetaCache[assetGqlId(e.asset)];
+      var line = formatAssetClass(e.asset) + ': ' + fmtQty(wholeUnits(e.asset, e.amount)) + ' (raw ' + Number(e.amount).toLocaleString() + ')';
+      if (m && m.usd != null) line += ' ≈ ' + fmtUsd(wholeUnits(e.asset, e.amount) * m.usd);
+      else line += ' — no USD quote';
+      return line;
+    }).join('\n');
+  }
+
+  // A USD stat card whose hover lists the raw token amounts behind it.
+  function usdCard(label, list) {
+    var v = usdOf(list);
+    var value = v.priced > 0 ? fmtUsd(v.usd) : (list && list.length ? 'unpriced' : '—');
+    var sub = v.unpriced.length ? '+' + v.unpriced.length + ' unpriced asset' + (v.unpriced.length > 1 ? 's' : '') : '';
+    return '<div class="stat-card" title="' + escapeHtml(rawTitle(list)) + '"><div class="label">' + label +
+      '</div><div class="value">' + value + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>';
+  }
+
+  function usdCell(list) {
+    var v = usdOf(list);
+    var text = v.priced > 0 ? fmtUsd(v.usd) : '—';
+    if (v.unpriced.length && v.priced > 0) text += '*';
+    return '<td class="num" title="' + escapeHtml(rawTitle(list)) + '">' + text + '</td>';
+  }
+
+  var protocolData = null;
+
+  async function loadProtocol() {
+    try {
+      var res = await fetch('/v4/protocol');
+      var data = await res.json();
+      if (data.error) {
+        document.getElementById('protocol-cards').innerHTML = '<div class="not-configured">' + escapeHtml(data.error) + '</div>';
+        return;
+      }
+      protocolData = data;
+      // ADA always: the base-fee surplus is lovelace even when no pool
+      // holds ADA in its reserves.
+      var ids = ['lovelace'];
+      (data.pools.tvl || []).forEach(function(e) { ids.push(e.asset); });
+      await resolveAssetMeta(ids);
+      renderProtocol(data);
+    } catch (e) { /* ignore */ }
+  }
+
+  function renderProtocol(d) {
+    var pools = d.pools || {}, orders = d.orders || {}, swaps = orders.swaps || {};
+    var act = d.activity || {}, windows = act.windows || [];
+    var eq = d.protocol_equity || {};
+    var w24 = windows.filter(function(w) { return w.label === '24h'; })[0] || {};
+    var fees = d.fees || {};
+
+    var oldest = '—', oldestTitle = '';
+    if (orders.oldest_slot) {
+      var od = slotToDate(orders.oldest_slot);
+      oldest = od ? durStr((Date.now() - od) / 1000) : 'slot ' + orders.oldest_slot;
+      oldestTitle = slotTitle(orders.oldest_slot);
+    }
+    var shareText = fees.protocol_share ? fees.protocol_share[0] + '/' + fees.protocol_share[1] : '—';
+    var baseFee = fees.scooper_base_fee_lovelace != null ? (fees.scooper_base_fee_lovelace / 1e6).toFixed(2) + ' ADA' : '—';
+
+    document.getElementById('protocol-cards').innerHTML =
+      statCard('Pools', pools.total || 0) +
+      statCard('Open Orders', orders.open || 0) +
+      statCard('Executable Now', (swaps.executable || 0) + ' <span class="sub">of ' + (swaps.matched || 0) + ' swaps</span>') +
+      statCard('Executed 24h', (w24.orders != null ? w24.orders : '—') + ' <span class="sub">in ' + (w24.scoop_txs != null ? w24.scoop_txs : '—') + ' scoops</span>') +
+      usdCard('Liquidity (TVL)', pools.tvl) +
+      usdCard('LP Fee Equity', eq.total) +
+      usdCard('Base-Fee Surplus', eq.surplus_lovelace != null ? [{ asset: 'lovelace', amount: eq.surplus_lovelace }] : []) +
+      usdCard('Executable Volume', swaps.executable_volume) +
+      '<div class="stat-card"' + (oldestTitle ? ' title="' + escapeHtml(oldestTitle) + '"' : '') + '><div class="label">Oldest Order</div><div class="value">' + oldest + '</div></div>' +
+      statCard('Protocol Share', shareText) +
+      statCard('Base Scoop Fee', baseFee);
+
+    var bt = pools.by_type || {};
+    document.getElementById('protocol-pool-cards').innerHTML =
+      statCard('Constant Product', bt.cp || 0) +
+      statCard('Constant Sum', bt.cs || 0) +
+      statCard('Concentrated', bt.cl || 0) +
+      statCard('StableSwap', bt.ss || 0) +
+      statCard('Empty Reserve', pools.empty || 0) +
+      statCard('Allowlisted', pools.restricted || 0);
+
+    var bk = orders.by_kind || {}, bl = swaps.blocked || {};
+    document.getElementById('protocol-order-cards').innerHTML =
+      statCard('Swaps', bk.swap || 0) +
+      statCard('Deposits', bk.deposit || 0) +
+      statCard('Withdrawals', bk.withdraw || 0) +
+      statCard('Claims', bk.claim || 0) +
+      statCard('Strategies', bk.strategy || 0) +
+      statCard('No Pool', swaps.unmatched || 0) +
+      statCard('Below Min', bl.below_min_received || 0) +
+      statCard('Zero Output', bl.zero_output || 0) +
+      statCard('Asset Mismatch', bl.asset_mismatch || 0) +
+      statCard('Config Missing', bl.config_missing || 0) +
+      statCard('Route Budget', bl.route_budget || 0) +
+      statCard('Restricted', bl.restricted || 0) +
+      statCard('Other Blocked', bl.other || 0) +
+      statCard('Invalid Datum', orders.invalid || 0);
+
+    var ab = document.getElementById('protocol-activity-body');
+    ab.innerHTML = '';
+    if (!act.records_available) {
+      ab.innerHTML = '<tr><td colspan="5" class="empty-state">Scoop records unavailable (no persistence)</td></tr>';
+    } else {
+      windows.forEach(function(w) {
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>Last ' + w.label + '</td><td class="num">' + w.scoop_txs + '</td><td class="num">' + w.orders +
+          '</td><td class="num">' + w.pools + '</td><td class="num">' + w.scoopers + '</td>';
+        ab.appendChild(tr);
+      });
+      var at = act.all_time || {};
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>All time</td><td class="num">' + (at.scoop_txs || 0) + '</td><td class="num">' + (at.orders || 0) +
+        '</td><td class="num">—</td><td class="num">' + (at.scoopers || 0) + '</td>';
+      ab.appendChild(tr);
+    }
+
+    function assetRows(tbodyId, list) {
+      var tb = document.getElementById(tbodyId);
+      tb.innerHTML = '';
+      if (!list || !list.length) { tb.innerHTML = '<tr><td colspan="3" class="empty-state">Nothing yet</td></tr>'; return; }
+      var rows = list.map(function(e) {
+        var m = assetMetaCache[assetGqlId(e.asset)];
+        var usd = (m && m.usd != null) ? wholeUnits(e.asset, e.amount) * m.usd : null;
+        return { e: e, usd: usd };
+      });
+      rows.sort(function(a, b) { return (b.usd || 0) - (a.usd || 0); });
+      rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + copyable(formatAssetClass(r.e.asset), assetGqlId(r.e.asset)) + '</td>' +
+          '<td class="num" title="raw ' + Number(r.e.amount).toLocaleString() + '">' + fmtQty(wholeUnits(r.e.asset, r.e.amount)) + '</td>' +
+          '<td class="num">' + (r.usd != null ? fmtUsd(r.usd) : '<span style="color:var(--text-dim)">no quote</span>') + '</td>';
+        tb.appendChild(tr);
+      });
+    }
+    assetRows('protocol-earnings-body', eq.total);
+    assetRows('protocol-tvl-body', pools.tvl);
+
+    var typeBadge = { cp: '<span class="badge badge-blue">CP</span>', cs: '<span class="badge badge-green">CS</span>',
+                      cl: '<span class="badge badge-accent">CL</span>', ss: '<span class="badge badge-green">SS</span>' };
+    var prow = (eq.pools || []).slice();
+    prow.forEach(function(p) { p._tvl = usdOf(p.reserves).usd; p._eq = usdOf(p.protocol_equity).usd; });
+    prow.sort(function(a, b) { return b._tvl - a._tvl; });
+    var rows = prow.map(function(p) {
+      var tr = document.createElement('tr');
+      var share = p.protocol_share ? parseBigint(p.protocol_share.num) + '/' + parseBigint(p.protocol_share.den) : shareText;
+      var reserves = (p.reserves || []).map(function(e) { return formatAssetClass(e.asset) + ': ' + fmtQty(wholeUnits(e.asset, e.amount)); }).join(' / ');
+      tr.innerHTML = '<td>' + copyable(truncate(p.pool_id, 16), p.pool_id) + (p.restricted ? ' <span class="badge badge-yellow">allowlist</span>' : '') + '</td>' +
+        '<td>' + (typeBadge[p.pool_type] || p.pool_type) + '</td>' +
+        '<td>' + reserves + '</td>' + usdCell(p.reserves) + usdCell(p.protocol_equity) +
+        '<td class="num" title="' + escapeHtml('raw ' + Number(p.surplus_lovelace || 0).toLocaleString() + ' lovelace · min_surplus floor ' + fmtQty(Number(p.min_surplus || 0) / 1e6) + ' ADA') + '">' + fmtQty(Number(p.surplus_lovelace || 0) / 1e6) + '</td>' +
+        '<td class="num">' + share + '</td>';
+      return tr;
+    });
+    renderLimited('protocol-pools-body', rows);
   }
 
   // --- In-flight tracking ---
@@ -880,6 +1224,7 @@
         'v3-spent-orders-body': loadV3SpentOrders,
         'v4-pools-body': loadV4Pools, 'v4-orders-body': loadV4Orders,
         'v4-spent-orders-body': loadV4SpentOrders,
+        'protocol-pools-body': function() { if (protocolData) renderProtocol(protocolData); },
       };
       if (loaders[tbodyId]) loaders[tbodyId]();
     };
@@ -1349,6 +1694,7 @@
     loadV4Pools(); loadV4Orders(); loadV4SpentOrders();
     loadHealthStats();
     loadFailures();
+    loadProtocol();
   }
 
   setInterval(function() {
@@ -1416,9 +1762,9 @@
             refreshTimer = null;
             fetchStatus();
             if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
-            if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); }
+            if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadProtocol(); }
             if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); loadFailures(); }
-            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); }
+            if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); loadProtocol(); }
           }, 500);
         }
       });
