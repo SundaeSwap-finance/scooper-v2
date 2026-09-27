@@ -1535,6 +1535,13 @@ impl AdminServer {
         let mut tvl: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
         let mut equity_total: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
         let mut pool_rows = Vec::new();
+        // Lovelace on each pool UTxO above its ADA reserve. Base fees are
+        // delivered as an exact surplus on the designated pool (ADR-0010),
+        // outside the datum's reserve accounting, so this is where base-fee
+        // income accumulates. It also holds each pool's create-time ADA
+        // buffer, which the datum does not record (only the min_surplus
+        // floor), so it overstates fees collected by that deposit.
+        let mut surplus_total = crate::bigint::BigInt::zero();
         let mut empty_pools = 0u64;
         let mut restricted_pools = 0u64;
         for (ident, pool) in &state.pools {
@@ -1566,6 +1573,14 @@ impl AdminServer {
                     add_to(&mut equity, asset, share);
                 }
             }
+            let reserve_ada = pd
+                .assets
+                .iter()
+                .find(|(a, _)| *a == crate::cardano_types::ADA_ASSET_CLASS)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(crate::bigint::BigInt::zero);
+            let surplus = pool.value.get(&crate::cardano_types::ADA_ASSET_CLASS) - &reserve_ada;
+            surplus_total += &surplus;
             let protocol_share = pool
                 .fee_split_config
                 .as_ref()
@@ -1577,6 +1592,8 @@ impl AdminServer {
                 "total_lp": pd.total_lp.to_string(),
                 "protocol_lp": protocol_lp.to_string(),
                 "protocol_equity": asset_list(equity),
+                "surplus_lovelace": surplus.to_string(),
+                "min_surplus": pd.min_surplus.to_string(),
                 "protocol_share": protocol_share,
                 "restricted": self.v4_pool_allowlists.is_restricted(ident),
             }));
@@ -1701,6 +1718,7 @@ impl AdminServer {
             },
             "protocol_equity": {
                 "total": asset_list(equity_total),
+                "surplus_lovelace": surplus_total.to_string(),
                 "pools": pool_rows,
             },
             "orders": {
@@ -1950,6 +1968,8 @@ mod protocol_stats_tests {
         let mut pool = (*pool).clone();
         pool.pool_datum.total_lp = 400.into();
         pool.pool_datum.circulating_lp = 300.into();
+        // 7 ADA on the UTxO with no ADA reserve: all of it is surplus.
+        pool.value.insert(&ada(), 7_000_000.into());
         let pool = Arc::new(pool);
 
         let mut state = crate::sundaev4::SundaeV4State::default();
@@ -1980,6 +2000,11 @@ mod protocol_stats_tests {
         assert!(eq.iter().any(|e| e["amount"] == "250000"), "{eq:?}");
         assert!(eq.iter().any(|e| e["amount"] == "500000"), "{eq:?}");
         assert_eq!(v["protocol_equity"]["pools"][0]["protocol_lp"], "100");
+        assert_eq!(
+            v["protocol_equity"]["pools"][0]["surplus_lovelace"],
+            "7000000"
+        );
+        assert_eq!(v["protocol_equity"]["surplus_lovelace"], "7000000");
 
         assert_eq!(v["orders"]["open"], 3);
         assert_eq!(v["orders"]["by_kind"]["swap"], 3);
