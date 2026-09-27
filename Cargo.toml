@@ -15,6 +15,7 @@ acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://gith
 acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
 acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
 anyhow = "1"
+bech32 = "0.11"
 async-trait = "0.1"
 caryatid_sdk = { version = "0.14.1", git = "https://github.com/input-output-hk/caryatid.git", rev = "538c3f8" }
 caryatid_process = { version = "0.14.3", git = "https://github.com/input-output-hk/caryatid.git", rev = "538c3f8" }

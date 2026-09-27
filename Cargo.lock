@@ -4981,6 +4981,7 @@ dependencies = [
  "acropolis_module_peer_network_interface",
  "anyhow",
  "async-trait",
+ "bech32 0.11.1",
  "caryatid_process",
  "caryatid_sdk",
  "chrono",
