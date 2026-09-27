@@ -802,7 +802,9 @@
         return;
       }
       protocolData = data;
-      var ids = [];
+      // ADA always: the base-fee surplus is lovelace even when no pool
+      // holds ADA in its reserves.
+      var ids = ['lovelace'];
       (data.pools.tvl || []).forEach(function(e) { ids.push(e.asset); });
       await resolveAssetMeta(ids);
       renderProtocol(data);
