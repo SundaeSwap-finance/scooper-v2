@@ -635,10 +635,18 @@
   }
 
   // --- Asset metadata + USD prices (Protocol tab) ---
-  // The SundaeSwap API prices each asset against USD. Amounts on chain are
-  // raw integer units, so a USD figure needs the asset's decimals too.
+  // Prices come from the Float API (api.float.sundae.fi), which quotes
+  // every asset with a priced pool in USD (stablecoin-implied) and
+  // carries the asset's decimals in the same response. Amounts on chain
+  // are raw integer units, so a USD figure needs those decimals.
   // Cache: id -> { ticker, decimals, usd } where usd is the price of one
-  // whole unit, or null when the API has no USD quote.
+  // whole unit, or null when there is no quote. Float covers mainnet
+  // only; on other networks only ADA gets a price.
+  var FLOAT_API = 'https://api.float.sundae.fi/v1';
+  // USDM: the stablecoin Float's USD quote is implied from. Its ADA price
+  // is the ADA/USD rate, since ADA is Float's quote asset and has no
+  // entry of its own.
+  var FLOAT_USDM = 'c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d';
   var assetMetaCache = {};
   var assetMetaPending = new Set();
 
@@ -655,6 +663,23 @@
     return res.json();
   }
 
+  // Float's price.value is quote base units (micro-USD, or lovelace when
+  // quote=ada) per one base unit of the asset. Price per whole unit =
+  // value × 10^decimals / 10^quote_decimals. `decimals: null` means Float
+  // can't derive it yet; the caller falls back to registry decimals.
+  async function floatAsset(id, quote) {
+    var res = await fetch(FLOAT_API + '/assets/' + id + '?quote=' + quote);
+    if (!res.ok) return null;
+    var d = await res.json();
+    if (!d || !d.price || d.price.value == null) return null;
+    return {
+      ticker: d.ticker || d.name || null,
+      decimals: (d.decimals == null) ? null : d.decimals,
+      value: Number(d.price.value),
+      quoteDecimals: (d.meta && d.meta.quote_decimals != null) ? d.meta.quote_decimals : 6,
+    };
+  }
+
   async function resolveAssetMeta(assetIds) {
     var toFetch = [];
     assetIds.forEach(function(id) {
@@ -664,10 +689,8 @@
     if (toFetch.length === 0) return;
     toFetch.forEach(function(id) { assetMetaPending.add(id); });
 
-    // Metadata batches fine. The price field is non-nullable and the API
-    // errors on assets it has no quote for, which nulls the whole response,
-    // so prices are fetched one asset per request and a failure only costs
-    // that asset its quote.
+    // Registry metadata (ticker, decimals) from the SundaeSwap API, batched.
+    // This also covers networks Float does not index.
     for (var i = 0; i < toFetch.length; i += 20) {
       var batch = toFetch.slice(i, i + 20);
       var fragments = batch.map(function(id, j) {
@@ -679,19 +702,33 @@
           for (var key in data.data) {
             var a = data.data[key] && data.data[key].byId;
             if (!a || !a.id) continue;
-            assetMetaCache[a.id] = { ticker: a.ticker || a.name || a.id, decimals: a.decimals || 0, usd: null };
+            assetMetaCache[a.id] = { ticker: a.ticker || a.name || a.id, decimals: a.decimals == null ? null : a.decimals, usd: null };
             if (a.id !== 'ada.lovelace' && !assetNameCache[a.id]) assetNameCache[a.id] = assetMetaCache[a.id].ticker;
           }
         }
       } catch (e) { /* ignore */ }
     }
+
+    // Prices from Float, one request per asset (each is small and CDN-cached).
     await Promise.all(toFetch.map(async function(id) {
-      if (!assetMetaCache[id]) assetMetaCache[id] = { ticker: id, decimals: id === 'ada.lovelace' ? 6 : 0, usd: null };
+      if (!assetMetaCache[id]) assetMetaCache[id] = { ticker: id, decimals: id === 'ada.lovelace' ? 6 : null, usd: null };
+      var m = assetMetaCache[id];
       try {
-        var data = await gql('{ assets { byId(id: "' + id + '") { price { ratio denominator { asset { id } } } } } }');
-        var price = data && data.data && data.data.assets && data.data.assets.byId && data.data.assets.byId.price;
-        var denom = price && price.denominator && price.denominator.asset && price.denominator.asset.id;
-        if (price && denom === 'USD' && typeof price.ratio === 'number') assetMetaCache[id].usd = price.ratio;
+        if (id === 'ada.lovelace') {
+          // ADA per USDM, inverted. USDM is Float's dollar by definition.
+          var u = await floatAsset(FLOAT_USDM, 'ada');
+          if (u && u.decimals != null && u.value > 0) {
+            var adaPerUsdm = u.value * Math.pow(10, u.decimals - u.quoteDecimals);
+            m.usd = 1 / adaPerUsdm;
+          }
+        } else {
+          var f = await floatAsset(id, 'usd');
+          if (f) {
+            if (f.ticker && (!m.ticker || m.ticker === id)) { m.ticker = f.ticker; assetNameCache[id] = f.ticker; }
+            if (f.decimals != null) m.decimals = f.decimals;
+            if (m.decimals != null) m.usd = f.value * Math.pow(10, m.decimals - f.quoteDecimals);
+          }
+        }
       } catch (e) { /* ignore */ }
       assetMetaPending.delete(id);
     }));
@@ -700,7 +737,7 @@
   // Whole-unit quantity of a raw amount, using the asset's decimals.
   function wholeUnits(id, raw) {
     var m = assetMetaCache[assetGqlId(id)];
-    var dec = m ? m.decimals : (assetGqlId(id) === 'ada.lovelace' ? 6 : 0);
+    var dec = (m && m.decimals != null) ? m.decimals : (assetGqlId(id) === 'ada.lovelace' ? 6 : 0);
     return Number(raw) / Math.pow(10, dec);
   }
 
