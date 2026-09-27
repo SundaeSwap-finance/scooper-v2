@@ -583,16 +583,29 @@
   var assetNamePending = new Set();
   var assetNameCallbacks = [];
 
+  // The SundaeSwap API for the network this scooper indexes. /status names
+  // the network; the hostname is only a hint for before /status has loaded
+  // (the mainnet box has no public hostname, so it would otherwise fall
+  // through to preview). Mainnet's API is api.sundae.fi, unprefixed.
   function getGraphQLUrl() {
-    var host = window.location.hostname;
-    var m = host.match(/scooper\.(\w+)\.sundae\.fi/);
-    if (m) return 'https://api.' + m[1] + '.sundae.fi/graphql';
-    return 'https://api.preview.sundae.fi/graphql';
+    var net = status.network;
+    if (!net) {
+      var m = window.location.hostname.match(/scooper\.(\w+)\.sundae\.fi/);
+      net = m ? m[1] : 'preview';
+    }
+    if (net === 'mainnet') return 'https://api.sundae.fi/graphql';
+    return 'https://api.' + net + '.sundae.fi/graphql';
+  }
+
+  // Metadata lookups need the network from /status; wait for it once.
+  async function ensureNetwork() {
+    if (!status.network) await fetchStatus();
   }
 
   async function resolveAssetNames(assetIds) {
     var toFetch = assetIds.filter(function(id) { return id && !assetNameCache[id] && !assetNamePending.has(id); });
     if (toFetch.length === 0) return;
+    await ensureNetwork();
     toFetch.forEach(function(id) { assetNamePending.add(id); });
 
     // Batch into groups of 20 to avoid query size limits
@@ -687,6 +700,7 @@
       if (!assetMetaCache[g] && !assetMetaPending.has(g) && toFetch.indexOf(g) < 0) toFetch.push(g);
     });
     if (toFetch.length === 0) return;
+    await ensureNetwork();
     toFetch.forEach(function(id) { assetMetaPending.add(id); });
 
     // Registry metadata (ticker, decimals) from the SundaeSwap API, batched.
