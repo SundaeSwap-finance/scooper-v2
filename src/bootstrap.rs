@@ -3,9 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use num_traits::Signed;
-use pallas_addresses::{
-    Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
-};
+use pallas_addresses::{ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway;
 use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
@@ -154,6 +152,31 @@ trait BootstrapProvider {
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_tip(&self) -> Result<(u64, String)>;
+
+    /// Whether this provider can enumerate a script's UTxOs by PAYMENT
+    /// CREDENTIAL, i.e. find them at addresses carrying any staking part.
+    ///
+    /// Users attach their own stake credential to an order, so real orders
+    /// sit at `addr1z...`, not at the enterprise form `addr1w...`. A provider
+    /// that only matches one full address sees none of them and reports a
+    /// healthy "0 order UTxOs".
+    ///
+    /// This matters because bootstrap does two things: it seeds state, and it
+    /// then tells the indexer to start at the bootstrap tip. The second part
+    /// discards all history before that tip. A provider that cannot enumerate
+    /// by credential has not seen the orders, so skipping the history that
+    /// contains them loses every pending order, with no error anywhere.
+    /// `run_bootstrap` refuses rather than do that. The caller already falls
+    /// back to a full replay from the configured starting point, which reads
+    /// orders from the ledger and needs no provider at all.
+    ///
+    /// Kupo matches `{credential}/*`. Blockfrost accepts a bare payment
+    /// credential (CIP-5 `script1...` / `addr_vkh1...`) wherever it accepts
+    /// an address, and `/addresses/{credential}/utxos` returns the UTxOs at
+    /// every address with that payment part. Both answer true.
+    fn enumerates_by_credential(&self) -> bool {
+        true
+    }
 
     /// Fetch pool UTxOs by discovering addresses that hold NFTs under the given policy.
     /// Pools often sit at addresses with staking credentials, so a simple script-hash-to-address
@@ -530,7 +553,6 @@ struct BlockfrostProvider {
     client: reqwest::Client,
     url: String,
     project_id: String,
-    network: Network,
     bucket: Mutex<RateBucket>,
     /// Block hash → slot, so a page of UTxOs from the same block costs one call.
     block_slots: Mutex<std::collections::HashMap<String, u64>>,
@@ -538,16 +560,10 @@ struct BlockfrostProvider {
 
 impl BlockfrostProvider {
     fn new(url: &str, project_id: &str) -> Self {
-        let network = if url.contains("mainnet") {
-            Network::Mainnet
-        } else {
-            Network::Testnet
-        };
         Self {
             client: reqwest::Client::new(),
             url: url.trim_end_matches('/').to_string(),
             project_id: project_id.to_string(),
-            network,
             bucket: Mutex::new(RateBucket::full(tokio::time::Instant::now())),
             block_slots: Mutex::new(std::collections::HashMap::new()),
         }
@@ -647,19 +663,28 @@ impl BlockfrostProvider {
         Ok(slot)
     }
 
-    fn script_address(&self, script_hash: &ScriptHash) -> String {
-        let shelley = ShelleyAddress::new(
-            self.network,
-            ShelleyPaymentPart::Script(*script_hash),
-            ShelleyDelegationPart::Null,
-        );
-        let addr = Address::from(shelley);
-        addr.to_bech32().unwrap_or_default()
+    /// The CIP-5 bech32 form of a script payment credential (`script1...`).
+    ///
+    /// Blockfrost accepts this wherever it accepts a full address, and the
+    /// UTxO query then covers every address with this payment part, whatever
+    /// staking part the user attached. Querying the enterprise address
+    /// (`addr1w...`) instead would match only outputs with no staking part,
+    /// which is none of the UI's orders.
+    fn script_credential(script_hash: &ScriptHash) -> String {
+        bech32::encode::<bech32::Bech32>(
+            bech32::Hrp::parse_unchecked("script"),
+            script_hash.as_ref(),
+        )
+        .expect("28-byte script hash is well within the bech32 limit")
     }
 }
 
 #[derive(Deserialize)]
 struct BlockfrostUtxo {
+    /// The full address holding the output. Present on current Blockfrost;
+    /// only there does a credential query learn the address the order was
+    /// actually paid to.
+    address: Option<String>,
     tx_hash: String,
     tx_index: u64,
     amount: Vec<BlockfrostAmount>,
@@ -748,9 +773,11 @@ fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for BlockfrostProvider {
+    /// Queries by payment credential, so UTxOs at every staking variant of
+    /// the script address are returned. Each row's own `address` field says
+    /// which variant.
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
-        let bech32 = self.script_address(script_hash);
-        self.fetch_address_utxos(&bech32).await
+        self.fetch_address_utxos(&Self::script_credential(script_hash)).await
     }
 
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>> {
@@ -813,7 +840,9 @@ impl BootstrapProvider for BlockfrostProvider {
                 all_utxos.push(FetchedUtxo {
                     tx_hash,
                     output_index: utxo.tx_index,
-                    address: address.to_string(),
+                    // `address` may be a bare credential; the row carries the
+                    // real address, which downstream parses as bech32.
+                    address: utxo.address.unwrap_or_else(|| address.to_string()),
                     value,
                     datum_cbor,
                     slot,
@@ -1261,6 +1290,21 @@ pub async fn run_bootstrap(
     persistence: &Arc<dyn crate::persistence::Persistence>,
 ) -> Result<BootstrapResult> {
     let provider = make_provider(config);
+
+    // Refuse to seed-and-skip with a provider that cannot see staked order
+    // addresses. Returning Err here is deliberate: the caller logs it and
+    // falls through to a chain replay from the configured starting point,
+    // which reconstructs orders, pools, module configs and reference scripts
+    // straight from the ledger. That replay is the bedrock recovery path and
+    // it is strictly more complete than any bootstrap - bootstrap only ever
+    // buys the time the replay would take.
+    anyhow::ensure!(
+        provider.enumerates_by_credential(),
+        "this bootstrap source cannot enumerate UTxOs by payment credential, so it cannot \
+         see orders at user-staked addresses (addr1z...). Seeding from it and then starting \
+         the indexer at the bootstrap tip would silently discard every pending order. \
+         Falling back to a full chain replay from the configured starting-point."
+    );
 
     let (tip_slot, tip_hash) = provider.fetch_tip().await?;
     info!(tip_slot, tip_hash = %tip_hash, "bootstrap: fetched chain tip");
@@ -2554,6 +2598,81 @@ async fn bootstrap_v4(
 }
 
 #[cfg(test)]
+mod credential_enumeration_tests {
+    //! Bootstrap seeds state and then starts the indexer at the bootstrap
+    //! tip, discarding every block before it. That is only safe when the
+    //! provider could actually see everything worth keeping.
+    //!
+    //! On 2026-09-26 a mainnet bootstrap reported "0 V4 order UTxOs" and a
+    //! clean start while a live user order sat unspent on chain. Blockfrost
+    //! had been asked for `addr1w...` (the enterprise form of the order
+    //! script) while the order sat at `addr1z...`, because users attach their
+    //! own stake credential. The order became invisible: bootstrap had not
+    //! seen it, and the history containing it was skipped.
+    //!
+    //! The fix is to ask Blockfrost for the bare payment credential
+    //! (`script1...`), which its `/addresses` endpoints accept and which
+    //! matches every staking variant.
+    use super::*;
+
+    /// Preview V4 order script; the bech32 was checked against a live
+    /// `/addresses/{credential}/utxos` call that returned an order at
+    /// `addr_test1z...` where the enterprise address returned nothing.
+    #[test]
+    fn script_credential_is_cip5_bech32() {
+        let hash: ScriptHash =
+            "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b".parse().unwrap();
+        assert_eq!(
+            BlockfrostProvider::script_credential(&hash),
+            "script13flvmtanvpwa7ash2xeerssys2m77sk2q9t46y6afpxzknmwa3q"
+        );
+    }
+
+    #[test]
+    fn blockfrost_enumerates_by_credential() {
+        let p = BlockfrostProvider::new("https://example.invalid/api/v0", "tok");
+        assert!(p.enumerates_by_credential());
+    }
+
+    /// The row's own address must win over the queried string: the queried
+    /// string is a credential, and `bootstrap_v4` parses the address as bech32.
+    #[test]
+    fn utxo_row_carries_its_full_address() {
+        let row: BlockfrostUtxo = serde_json::from_str(
+            r#"{"address":"addr_test1zz98and0kds9mhmkzagm8ywzqjpt0m6zegq4whgnt4yyc2cpjqw6nx3y36p6r8z825sahmmdkdn7mq9md9qnqu3l8fnqlmqq02",
+                "tx_hash":"2595ce1b13ab0000000000000000000000000000000000000000000000000000",
+                "tx_index":0,"output_index":0,"amount":[],"block":null,
+                "data_hash":null,"inline_datum":null,"reference_script_hash":null}"#,
+        )
+        .unwrap();
+        assert!(row.address.unwrap().starts_with("addr_test1z"));
+    }
+
+    #[test]
+    fn kupo_enumerates_by_credential() {
+        // Kupo matches `{credential}/*`, so any staking part is covered.
+        let p = KupoProvider::new("https://example.invalid");
+        assert!(p.enumerates_by_credential());
+    }
+
+    /// The guard judges the *config the operator actually writes*, not just
+    /// a provider object.
+    #[test]
+    fn both_bootstrap_configs_pass_the_guard() {
+        let cfg = BootstrapConfig::Blockfrost {
+            url: "https://example.invalid/api/v0".to_string(),
+            project_id: "tok".to_string(),
+        };
+        assert!(make_provider(&cfg).enumerates_by_credential());
+
+        let cfg = BootstrapConfig::Kupo {
+            url: "https://example.invalid".to_string(),
+        };
+        assert!(make_provider(&cfg).enumerates_by_credential());
+    }
+}
+
+#[cfg(test)]
 mod blockfrost_pacing_tests {
     //! A fresh free-tier Blockfrost key answers >10 req/s with 429. Before
     //! these guards, a mainnet bootstrap with v3 enabled hit that within
@@ -2676,6 +2795,37 @@ mod live_smoke_tests {
         "9a30124e1071263f8f1b5da9f39436c3e80fab3a7bf7260af7682ad1";
     const PREVIEW_CS_MODULE_HASH_HEX: &str =
         "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da";
+
+    /// The credential query must surface orders at user-staked addresses.
+    /// At the time of writing preview holds one V4 order at `addr_test1z...`
+    /// and none at the enterprise address.
+    #[tokio::test]
+    #[ignore]
+    async fn live_order_query_by_credential_sees_staked_addresses() -> Result<()> {
+        let provider = BlockfrostProvider::new(PREVIEW_BLOCKFROST, PREVIEW_PROJECT_ID);
+        let order_hash: ScriptHash =
+            "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b".parse()?;
+        let utxos = provider.fetch_script_utxos(&order_hash).await?;
+        assert!(
+            !utxos.is_empty(),
+            "preview should hold at least one V4 order"
+        );
+        for u in &utxos {
+            let addr = pallas_addresses::Address::from_bech32(&u.address)
+                .with_context(|| format!("row address {}", u.address))?;
+            let pallas_addresses::Address::Shelley(sh) = addr else {
+                anyhow::bail!("order at non-Shelley address {}", u.address);
+            };
+            assert_eq!(sh.payment().as_hash(), &order_hash);
+            eprintln!(
+                "{}#{} at {}",
+                hex::encode(u.tx_hash),
+                u.output_index,
+                u.address
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore]

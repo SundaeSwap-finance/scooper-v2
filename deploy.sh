@@ -29,9 +29,16 @@ set -euo pipefail
 #   ./deploy.sh [--wipe-db] [--keep-config] [host]
 #
 # Flags:
-#   --wipe-db      Delete the remote scooper-v2.db before starting. Use after
-#                  a contract cutover or when the protocol config gained new
-#                  module ref-utxos that need to be fetched at bootstrap.
+#   --wipe-db      Delete the remote DB before starting, so bootstrap re-runs.
+#                  Use after a contract cutover or when the protocol config
+#                  gained new module ref-utxos: the ScriptStore is built only
+#                  from what bootstrap fetched, and bootstrap only runs when
+#                  tip_slot == 0.
+#                  The path is read from persistence.sqlite.filename, so it
+#                  works on hosts whose DB is not named scooper-v2.db.
+#                  REQUIRES protocol.bootstrap in the remote config. Without
+#                  it there is nothing to re-seed from and the wipe leaves the
+#                  scooper with no pools, orders or reference scripts.
 #   --keep-config  Ship the binary and unit only; leave the remote config.json
 #                  untouched. Required for any host this repo has no config
 #                  for - mainnet's v4 config lives on its box, not here.
@@ -141,9 +148,31 @@ fi
 
 # Optional: wipe DB so bootstrap re-runs (needed after contract cutover or
 # when new module ref-utxos are added to the config).
+#
+# The filename comes from the config's persistence.sqlite.filename, NOT a
+# constant. Mainnet uses scooper-v2-mainnet.db, so a hardcoded
+# `rm -f scooper-v2.db` deleted nothing there and --wipe-db silently did
+# nothing: the scooper restarted on its old DB, skipped bootstrap (which
+# only runs at tip_slot == 0), and never fetched the newly configured
+# module ref-utxos. The deploy looked clean and the scoops kept failing
+# with "script <hash> not found in store".
 if [ "${WIPE_DB:-0}" = "1" ]; then
-  echo "    wiping scooper-v2.db (fresh bootstrap)"
-  rm -f scooper-v2.db scooper-v2.db-journal
+  DB_PATH="$(python3 -c '
+import json, sys
+cfg = json.load(open("config.json"))
+name = (cfg.get("persistence") or {}).get("sqlite", {}).get("filename")
+print(name or "", end="")
+' 2>/dev/null || true)"
+  if [ -z "$DB_PATH" ]; then
+    echo "    ERROR: could not read persistence.sqlite.filename from config.json;" >&2
+    echo "    refusing to guess which DB to wipe. Wipe it by hand and re-run." >&2
+    exit 1
+  fi
+  if [ ! -f "$DB_PATH" ]; then
+    echo "    WARNING: --wipe-db given but $DB_PATH does not exist (nothing to wipe)" >&2
+  fi
+  echo "    wiping $DB_PATH (fresh bootstrap)"
+  rm -f "$DB_PATH" "$DB_PATH-journal" "$DB_PATH-wal" "$DB_PATH-shm"
 fi
 
 # Start and confirm.
