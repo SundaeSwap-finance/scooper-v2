@@ -816,6 +816,12 @@ mod tests {
         async fn load_scoop_records(&self) -> Result<Vec<crate::persistence::ScoopRecord>> {
             Ok(vec![])
         }
+        async fn load_scoop_records_since(
+            &self,
+            _since_slot: u64,
+        ) -> Result<Vec<crate::persistence::ScoopRecord>> {
+            Ok(vec![])
+        }
         async fn load_module_configs(
             &self,
         ) -> Result<Vec<crate::persistence::PersistedModuleConfig>> {

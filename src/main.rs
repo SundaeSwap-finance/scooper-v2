@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
         shutdown.child_token(),
     ));
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
+    let v4_protocol_share = v4_execution.as_ref().map(|e| e.protocol_share);
     let v4_routing_costs =
         v4_execution.as_ref().map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
     let v4_pool_allowlists = std::sync::Arc::new(
@@ -275,6 +276,8 @@ async fn main() -> Result<()> {
         v4_routing_costs,
         v4_pool_allowlists,
         v4_module_preimages,
+        v4_protocol_share,
+        v4_state.as_ref().map(|_| Arc::from(persistence.indexer_dao("sundae_v4"))),
         resync_tx,
         event_tx.clone(),
         paused.clone(),

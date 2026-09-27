@@ -121,6 +121,9 @@ pub trait IndexerDao: Send + Sync + 'static {
     async fn load_datums(&self) -> Result<Vec<PersistedDatum>>;
     async fn prune_txos(&self, min_height: u64) -> Result<()>;
     async fn load_scoop_records(&self) -> Result<Vec<ScoopRecord>>;
+    /// Scoop records at or after `since_slot`, oldest first. Backs the
+    /// dashboard's activity windows without loading the whole table.
+    async fn load_scoop_records_since(&self, since_slot: u64) -> Result<Vec<ScoopRecord>>;
     async fn load_module_configs(&self) -> Result<Vec<PersistedModuleConfig>>;
 }
 

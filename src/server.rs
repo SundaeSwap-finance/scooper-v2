@@ -41,6 +41,50 @@ type V4State = Option<Arc<Mutex<SundaeV4HistoricalState>>>;
 /// Computed at startup from the scooper's execution config.
 pub type ModuleStatePreimages = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// A reason dispatch skips a swap before pricing it. One variant per gate
+/// the scooper applies; `reason()` is the operator-facing text and
+/// `bucket()` the stable key the Protocol tab counts by.
+enum SwapGate {
+    ConfigMissing(String),
+    Restricted,
+    RouteBudget {
+        per_exec: u64,
+        cost_per_pool: u64,
+        cost_per_step: u64,
+    },
+}
+
+impl SwapGate {
+    fn bucket(&self) -> &'static str {
+        match self {
+            SwapGate::ConfigMissing(_) => "config_missing",
+            SwapGate::Restricted => "restricted",
+            SwapGate::RouteBudget { .. } => "route_budget",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            SwapGate::ConfigMissing(token) => format!(
+                "references OrderConfig token {token} which is not on chain; \
+                 the order cannot execute until that config is published"
+            ),
+            SwapGate::Restricted => "this pool is allowlist-restricted and this scooper does not \
+                                     serve the order's credentials on it"
+                .to_string(),
+            SwapGate::RouteBudget {
+                per_exec,
+                cost_per_pool,
+                cost_per_step,
+            } => format!(
+                "max_per_execution {per_exec} lovelace cannot fund any route \
+                 (scooper prices {cost_per_pool} per pool / {cost_per_step} per step); \
+                 cancel and re-place with a higher per-execution cap"
+            ),
+        }
+    }
+}
+
 /// Build the preimage map from an execution config's fee and protocol_share.
 pub fn compute_module_state_preimages(
     fee: (u64, u64),
@@ -158,6 +202,8 @@ pub async fn admin_server(
     v4_routing_costs: Option<(u64, u64)>,
     v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: ModuleStatePreimages,
+    v4_protocol_share: Option<(u64, u64)>,
+    v4_dao: Option<Arc<dyn crate::persistence::IndexerDao>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
@@ -174,6 +220,8 @@ pub async fn admin_server(
         v4_routing_costs,
         v4_pool_allowlists,
         v4_module_preimages: Arc::new(v4_module_preimages),
+        v4_protocol_share,
+        v4_dao,
         resync_tx,
         event_tx,
         paused,
@@ -300,6 +348,12 @@ struct AdminServer {
     /// listings and intent probes agree with what dispatch will do.
     v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: Arc<ModuleStatePreimages>,
+    /// The scooper's configured protocol share of pool fees, reported on the
+    /// dashboard's Protocol tab. Pools may override it per pool on chain.
+    v4_protocol_share: Option<(u64, u64)>,
+    /// V4 indexer DAO, for scoop-record windows on the Protocol tab. The
+    /// in-memory `ScoopStats` keep only the 50 most recent scoops.
+    v4_dao: Option<Arc<dyn crate::persistence::IndexerDao>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
@@ -1173,6 +1227,7 @@ impl AdminServer {
             "/orders" => self.v4_list_orders().await,
             "/spent-orders" => self.v4_list_spent_orders().await,
             "/spent-pools" => self.v4_list_spent_pools().await,
+            "/protocol" => self.v4_protocol_stats().await,
             _ => "unknown".into(),
         }
     }
@@ -1363,53 +1418,12 @@ impl AdminServer {
         let mut non_executable = Vec::new();
 
         for order in &candidates {
-            // Mirror the scooper's dispatch gate: an order naming an
-            // unindexed OrderConfig can never validate on chain.
-            if !state.order_configs.contains_key(&order.datum.config_token) {
+            if let Err(gate) = self.v4_swap_gate(&state, &ident, order) {
                 non_executable.push(serde_json::json!({
                     "order": order.input.to_string(),
-                    "reason": format!(
-                        "references OrderConfig token {} which is not on chain; \
-                         the order cannot execute until that config is published",
-                        hex::encode(&order.datum.config_token),
-                    ),
+                    "reason": gate.reason(),
                 }));
                 continue;
-            }
-            if !self.v4_pool_allowlists.permits(&ident, order, order.constraint.strategy()) {
-                non_executable.push(serde_json::json!({
-                    "order": order.input.to_string(),
-                    "reason": "this pool is allowlist-restricted and this scooper does not \
-                               serve the order's credentials on it",
-                }));
-                continue;
-            }
-            // Mirror the router's fan-out gate: an order's max_per_execution
-            // buys its route budget, and one that can't afford a single pool
-            // touch will never dispatch, no matter how in-range the swap is.
-            // Without this check the dashboard calls such orders executable
-            // while dispatch logs "no route" every cycle (seen live with a
-            // max_per_execution of 10,000 lovelace against a 1 ADA/pool
-            // routing cost).
-            if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
-                use num_traits::ToPrimitive;
-                let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
-                let limits = crate::sundaev4::router::RoutingLimits::from_budget(
-                    per_exec,
-                    cost_per_pool,
-                    cost_per_step,
-                );
-                if limits.max_pools < 1 || limits.max_steps < 1 {
-                    non_executable.push(serde_json::json!({
-                        "order": order.input.to_string(),
-                        "reason": format!(
-                            "max_per_execution {per_exec} lovelace cannot fund any route \
-                             (scooper prices {cost_per_pool} per pool / {cost_per_step} per step); \
-                             cancel and re-place with a higher per-execution cap"
-                        ),
-                    }));
-                    continue;
-                }
             }
             match batch::check_order_executability(
                 order,
@@ -1438,6 +1452,277 @@ impl AdminServer {
             "non_executable": non_executable,
         });
         serde_json::to_string_pretty(&response).unwrap()
+    }
+
+    /// Why dispatch would skip a swap before even pricing it. Mirrors the
+    /// scooper's own gates so the dashboard agrees with what dispatch does.
+    fn v4_swap_gate(
+        &self,
+        state: &crate::sundaev4::SundaeV4State,
+        ident: &Ident,
+        order: &crate::sundaev4::SundaeV4Order,
+    ) -> Result<(), SwapGate> {
+        // An order naming an unindexed OrderConfig can never validate on chain.
+        if !state.order_configs.contains_key(&order.datum.config_token) {
+            return Err(SwapGate::ConfigMissing(hex::encode(
+                &order.datum.config_token,
+            )));
+        }
+        if !self.v4_pool_allowlists.permits(ident, order, order.constraint.strategy()) {
+            return Err(SwapGate::Restricted);
+        }
+        // The router's fan-out gate: an order's max_per_execution buys its
+        // route budget, and one that can't afford a single pool touch will
+        // never dispatch, no matter how in-range the swap is. Without this
+        // check the dashboard calls such orders executable while dispatch
+        // logs "no route" every cycle (seen live with a max_per_execution of
+        // 10,000 lovelace against a 1 ADA/pool routing cost).
+        if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
+            use num_traits::ToPrimitive;
+            let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
+            let limits = crate::sundaev4::router::RoutingLimits::from_budget(
+                per_exec,
+                cost_per_pool,
+                cost_per_step,
+            );
+            if limits.max_pools < 1 || limits.max_steps < 1 {
+                return Err(SwapGate::RouteBudget {
+                    per_exec,
+                    cost_per_pool,
+                    cost_per_step,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Protocol-wide aggregates for the dashboard's Protocol tab: pools by
+    /// type, reserves, accrued protocol equity, open orders and their
+    /// executability, and scoop activity over recent windows. Everything
+    /// here is derived from indexed state plus the scoop-record table; no
+    /// prices are involved, the client prices assets itself.
+    async fn v4_protocol_stats(&self) -> String {
+        use crate::cardano_types::AssetClass;
+        use crate::sundaev4::{Constraint, PoolType};
+        use num_traits::{Signed, Zero};
+
+        let Some(v4) = &self.v4_state else {
+            return serde_json::to_string(&serde_json::json!({
+                "error": "v4 indexer not configured"
+            }))
+            .unwrap();
+        };
+        let state = v4.lock().await.latest().into_owned();
+
+        fn asset_list(map: BTreeMap<AssetClass, crate::bigint::BigInt>) -> Vec<serde_json::Value> {
+            map.into_iter()
+                .filter(|(_, amount)| amount.is_positive())
+                .map(|(asset, amount)| {
+                    serde_json::json!({ "asset": asset, "amount": amount.to_string() })
+                })
+                .collect()
+        }
+        fn add_to(
+            map: &mut BTreeMap<AssetClass, crate::bigint::BigInt>,
+            asset: &AssetClass,
+            amount: crate::bigint::BigInt,
+        ) {
+            *map.entry(asset.clone()).or_insert_with(crate::bigint::BigInt::zero) += amount;
+        }
+
+        // ── Pools: counts by type, reserves, accrued protocol equity ──
+        let mut by_type: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut tvl: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut equity_total: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut pool_rows = Vec::new();
+        let mut empty_pools = 0u64;
+        let mut restricted_pools = 0u64;
+        for (ident, pool) in &state.pools {
+            let kind = match &pool.pool_type {
+                PoolType::ConstantProduct { .. } => "cp",
+                PoolType::ConstantSum { .. } => "cs",
+                PoolType::ConcentratedLiquidity { .. } => "cl",
+                PoolType::StableSwap { .. } => "ss",
+            };
+            *by_type.entry(kind).or_default() += 1;
+            if self.v4_pool_allowlists.is_restricted(ident) {
+                restricted_pools += 1;
+            }
+            let pd = &pool.pool_datum;
+            if pd.assets.iter().any(|(_, r)| !r.is_positive()) {
+                empty_pools += 1;
+            }
+            // The protocol's fee accrues as LP minted into total_lp but not
+            // into circulation. Its share of every reserve is the accrued,
+            // unclaimed protocol equity — the same figure the V4 pool table
+            // shows per pool.
+            let protocol_lp = pd.total_lp.clone() - &pd.circulating_lp;
+            let mut equity: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+            for (asset, reserve) in &pd.assets {
+                add_to(&mut tvl, asset, reserve.clone());
+                if pd.total_lp.is_positive() && protocol_lp.is_positive() {
+                    let share = reserve.clone() * &protocol_lp / &pd.total_lp;
+                    add_to(&mut equity_total, asset, share.clone());
+                    add_to(&mut equity, asset, share);
+                }
+            }
+            let protocol_share = pool
+                .fee_split_config
+                .as_ref()
+                .map(|c| serde_json::to_value(&c.protocol_share).unwrap_or_default());
+            pool_rows.push(serde_json::json!({
+                "pool_id": hex::encode(ident.to_bytes()),
+                "pool_type": kind,
+                "reserves": asset_list(pd.assets.iter().cloned().collect()),
+                "total_lp": pd.total_lp.to_string(),
+                "protocol_lp": protocol_lp.to_string(),
+                "protocol_equity": asset_list(equity),
+                "protocol_share": protocol_share,
+                "restricted": self.v4_pool_allowlists.is_restricted(ident),
+            }));
+        }
+
+        // ── Orders: by kind, and swap executability against current pools ──
+        let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut oldest_slot: Option<u64> = None;
+        for order in &state.orders {
+            let kind = match &order.constraint {
+                Constraint::Swap { .. } => "swap",
+                Constraint::Deposit { .. } => "deposit",
+                Constraint::Withdraw { .. } => "withdraw",
+                Constraint::Claim { .. } => "claim",
+                Constraint::Strategy { .. } => "strategy",
+            };
+            *by_kind.entry(kind).or_default() += 1;
+            oldest_slot = Some(oldest_slot.map_or(order.slot, |s| s.min(order.slot)));
+        }
+        let groups = batch::group_orders_by_pool(&state.orders, &state.pools);
+        let matched_swaps: u64 = groups.values().map(|v| v.len() as u64).sum();
+        let unmatched_swaps =
+            by_kind.get("swap").copied().unwrap_or(0).saturating_sub(matched_swaps);
+        let mut executable = 0u64;
+        let mut blocked: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut executable_volume: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut executable_output: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        for (ident, candidates) in &groups {
+            let Some(pool) = state.pools.get(ident) else {
+                continue;
+            };
+            for order in candidates {
+                if let Err(gate) = self.v4_swap_gate(&state, ident, order) {
+                    *blocked.entry(gate.bucket()).or_default() += 1;
+                    continue;
+                }
+                match batch::check_order_executability(
+                    order,
+                    &pool.pool_datum.assets,
+                    &pool.pool_datum.total_lp,
+                    &pool.pool_type,
+                ) {
+                    Ok(swap) => {
+                        executable += 1;
+                        let (offered, dx) = order.swap_offered();
+                        add_to(&mut executable_volume, offered, dx.clone());
+                        add_to(
+                            &mut executable_output,
+                            &pool.pool_datum.assets[swap.output_idx].0,
+                            swap.dy.clone(),
+                        );
+                    }
+                    Err(reason) => {
+                        let bucket = if reason.starts_with("below min_received") {
+                            "below_min_received"
+                        } else {
+                            "other"
+                        };
+                        *blocked.entry(bucket).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Activity: scoop records over recent windows, from the DB ──
+        // Slots are seconds on every post-Byron network, so a window in
+        // seconds is a window in slots off the indexed tip.
+        const WINDOWS: [(&str, u64); 3] = [("1h", 3_600), ("24h", 86_400), ("7d", 604_800)];
+        let horizon = state.tip_slot.saturating_sub(WINDOWS[WINDOWS.len() - 1].1);
+        let records = match &self.v4_dao {
+            Some(dao) => dao.load_scoop_records_since(horizon).await.unwrap_or_else(|e| {
+                tracing::warn!("protocol stats: scoop record window query failed: {e:#}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        let windows: Vec<serde_json::Value> = WINDOWS
+            .iter()
+            .map(|(label, secs)| {
+                let since = state.tip_slot.saturating_sub(*secs);
+                let mut txs = std::collections::BTreeSet::new();
+                let mut pools = std::collections::BTreeSet::new();
+                let mut scoopers = std::collections::BTreeSet::new();
+                let mut orders = 0u64;
+                for r in records.iter().filter(|r| r.slot >= since) {
+                    txs.insert(&r.tx_id);
+                    pools.insert(&r.pool_id);
+                    scoopers.insert(&r.scooper);
+                    orders += r.n_orders as u64;
+                }
+                serde_json::json!({
+                    "label": label,
+                    "seconds": secs,
+                    "scoop_txs": txs.len(),
+                    "orders": orders,
+                    "pools": pools.len(),
+                    "scoopers": scoopers.len(),
+                })
+            })
+            .collect();
+        let stats = &state.scoop_stats;
+        let all_time = serde_json::json!({
+            "scoop_txs": stats.scooper_totals.iter().map(|t| t.scoop_txs).sum::<u64>(),
+            "orders": stats.scooper_totals.iter().map(|t| t.orders_processed).sum::<u64>(),
+            "scoopers": stats.scooper_totals.len(),
+        });
+
+        serde_json::to_string(&serde_json::json!({
+            "tip_slot": state.tip_slot,
+            "network_tip_slot": state.network_tip_slot,
+            "pools": {
+                "total": state.pools.len(),
+                "by_type": by_type,
+                "empty": empty_pools,
+                "restricted": restricted_pools,
+                "tvl": asset_list(tvl),
+            },
+            "protocol_equity": {
+                "total": asset_list(equity_total),
+                "pools": pool_rows,
+            },
+            "orders": {
+                "open": state.orders.len(),
+                "by_kind": by_kind,
+                "invalid": state.invalid_orders.len(),
+                "oldest_slot": oldest_slot,
+                "swaps": {
+                    "matched": matched_swaps,
+                    "unmatched": unmatched_swaps,
+                    "executable": executable,
+                    "blocked": blocked,
+                    "executable_volume": asset_list(executable_volume),
+                    "executable_output": asset_list(executable_output),
+                },
+            },
+            "activity": {
+                "windows": windows,
+                "all_time": all_time,
+                "records_available": self.v4_dao.is_some(),
+            },
+            "fees": {
+                "scooper_base_fee_lovelace": state.fee_settings.as_ref().map(|f| f.base_fee),
+                "protocol_share": self.v4_protocol_share,
+            },
+        }))
+        .unwrap()
     }
 
     async fn v4_list_pools(&self) -> String {
@@ -1614,5 +1899,108 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "rollback",
             serde_json::json!({ "to_slot": to_slot }).to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod protocol_stats_tests {
+    //! The Protocol tab's numbers come from one aggregate endpoint. This
+    //! exercises it against a real pool and order from the test harness so
+    //! the counts, reserves, equity and executability buckets line up with
+    //! the state they were derived from.
+    use super::*;
+    use crate::sundaev4::test_harness::*;
+
+    fn server_over(state: crate::sundaev4::SundaeV4State) -> AdminServer {
+        let mut hist = SundaeV4HistoricalState::new();
+        let slot = state.tip_slot;
+        *hist.update_slot(slot).unwrap() = state;
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+        AdminServer {
+            visibility: Visibility::Private,
+            network: "devnet".into(),
+            v3_state: None,
+            v4_state: Some(Arc::new(Mutex::new(hist))),
+            v4_fee: Some((1, 1)),
+            v4_routing_costs: None,
+            v4_pool_allowlists: Arc::default(),
+            v4_module_preimages: Arc::default(),
+            v4_protocol_share: Some((1, 2)),
+            v4_dao: None,
+            resync_tx,
+            event_tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+            intents: None,
+            remote_addr: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregates_pools_orders_and_equity() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        // 1000 A / 2000 B, with a quarter of the LP held by the protocol.
+        let pool = make_pool(&env, 0xA1, token_a(), 1_000_000, token_b(), 2_000_000);
+        let mut pool = (*pool).clone();
+        pool.pool_datum.total_lp = 400.into();
+        pool.pool_datum.circulating_lp = 300.into();
+        let pool = Arc::new(pool);
+
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.tip_slot = 5_000;
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool.clone());
+        // One swap that fits, one that asks for more than the pool can pay,
+        // one whose assets match no pool.
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1, 100));
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1_000_000_000, 200));
+        state.orders.push(make_order(token_e(), 10_000, token_f(), 1, 300));
+        // Index the harness's OrderConfigs so the config gate passes and the
+        // pricing check is what decides.
+        state.order_configs = env.order_configs.clone();
+
+        let body = server_over(state).v4_protocol_stats().await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(v["pools"]["total"], 1);
+        assert_eq!(v["pools"]["by_type"]["cp"], 1);
+        assert_eq!(v["pools"]["empty"], 0);
+        let tvl = v["pools"]["tvl"].as_array().unwrap();
+        assert_eq!(tvl.len(), 2);
+        assert!(tvl.iter().any(|e| e["amount"] == "1000000"));
+        assert!(tvl.iter().any(|e| e["amount"] == "2000000"));
+
+        // Protocol equity = reserve × (400 − 300) / 400 = a quarter of each.
+        let eq = v["protocol_equity"]["total"].as_array().unwrap();
+        assert!(eq.iter().any(|e| e["amount"] == "250000"), "{eq:?}");
+        assert!(eq.iter().any(|e| e["amount"] == "500000"), "{eq:?}");
+        assert_eq!(v["protocol_equity"]["pools"][0]["protocol_lp"], "100");
+
+        assert_eq!(v["orders"]["open"], 3);
+        assert_eq!(v["orders"]["by_kind"]["swap"], 3);
+        assert_eq!(v["orders"]["oldest_slot"], 100);
+        let swaps = &v["orders"]["swaps"];
+        assert_eq!(swaps["matched"], 2);
+        assert_eq!(swaps["unmatched"], 1);
+        assert_eq!(swaps["executable"], 1);
+        assert_eq!(swaps["blocked"]["below_min_received"], 1);
+        assert_eq!(swaps["executable_volume"][0]["amount"], "10000");
+
+        assert_eq!(v["activity"]["records_available"], false);
+        assert_eq!(v["fees"]["protocol_share"], serde_json::json!([1, 2]));
+    }
+
+    #[tokio::test]
+    async fn unindexed_order_config_is_counted_not_priced() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        let pool = make_pool(&env, 0xA2, token_a(), 1_000_000, token_b(), 2_000_000);
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool);
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1, 100));
+
+        let body = server_over(state).v4_protocol_stats().await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["orders"]["swaps"]["executable"], 0);
+        assert_eq!(v["orders"]["swaps"]["blocked"]["config_missing"], 1);
     }
 }
