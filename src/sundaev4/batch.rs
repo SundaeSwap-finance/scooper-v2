@@ -1375,9 +1375,28 @@ pub fn resolve_proportional_withdraw(
             let p = swap_math::ss_params(config);
             let reserves: Vec<BigInt> =
                 pool.pool_datum.assets.iter().map(|(_, q)| q.clone()).collect();
-            let t =
-                super::ss_math::withdraw_target_for_lp(&p, &reserves, total_lp, &lp_burned, None)?;
-            let step = super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, None)?;
+            let d_before = p.d_of(&reserves)?;
+            let t = super::ss_math::withdraw_target_for_lp(
+                &p,
+                &reserves,
+                total_lp,
+                &lp_burned,
+                Some(&d_before),
+            )?;
+            let step =
+                super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, Some(&d_before))?;
+            tracing::info!(
+                order = %order.input,
+                reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                total_lp = %total_lp,
+                lp_burned = %lp_burned,
+                amp = %p.amp,
+                rates = ?p.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                d_before = %d_before,
+                target_delta_d = %t,
+                lp_delta = %step.lp_delta,
+                "stableswap withdraw resolved",
+            );
             let actual_burn = -&step.lp_delta;
             if !actual_burn.is_positive() || actual_burn > lp_burned {
                 return Err("withdraw pin does not burn the offered LP".into());

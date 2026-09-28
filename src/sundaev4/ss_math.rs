@@ -646,6 +646,31 @@ mod tests {
         BigInt::from(i)
     }
 
+    /// Mainnet USDrf/sUSDrf, 2026-09-28: withdraw order 567785e9…#0 burning
+    /// 7346987527052 LP against reserves (50362747, 42149345), total_lp
+    /// 92503618509277, D 92511724873961179510592042. The CLI's target
+    /// −7347631365219459674054077 passed on chain; the scooper submitted
+    /// −7347631365219459674054078 twelve times and the module refused each
+    /// with `(D + t) · before_lp >= D · after_lp` false.
+    #[test]
+    fn mainnet_withdraw_target_matches_the_cli() {
+        let p = SsParams {
+            amp: bi(500),
+            fee: Rational { num: bi(15), den: bi(10000) },
+            rates: vec![bi(1_000_000), bi(1_000_000)],
+        };
+        let reserves = vec![bi(50_362_747), bi(42_149_345)];
+        let total_lp = big("92503618509277");
+        let burn = big("7346987527052");
+        let d = p.d_of(&reserves).unwrap();
+        assert_eq!(d, big("92511724873961179510592042"), "D_before");
+        let t = withdraw_target_for_lp(&p, &reserves, &total_lp, &burn, None).unwrap();
+        assert_eq!(t, big("-7347631365219459674054077"), "target_delta_d");
+        let step = liquidity_step(&p, &reserves, &total_lp, &t, None).unwrap();
+        assert_eq!(-&step.lp_delta, burn, "burns exactly the offered LP");
+        assert_eq!(step.deltas, vec![bi(-3_999_999), bi(-3_347_660)]);
+    }
+
     fn unit_params(amp: i64, fee: (i64, i64)) -> SsParams {
         SsParams {
             amp: bi(amp),

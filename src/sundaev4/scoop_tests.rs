@@ -1802,6 +1802,81 @@ mod tests {
         );
     }
 
+    /// Mainnet USDrf/sUSDrf on 2026-09-28: withdraw order 567785e9…#0 burning
+    /// 7346987527052 LP. The scooper declared target_delta_d
+    /// −7347631365219459674054078 while the CLI's −…077 passed on chain, and
+    /// the module refused twelve submissions with
+    /// `(D + t) · before_lp >= D · after_lp` false. Everything else in the two
+    /// transactions was byte-identical, so this pins the resolved target and
+    /// the module's own inequality against the real validators.
+    #[test]
+    fn ss_withdraw_mainnet_20260928_target_is_pinned() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        // Mainnet's pool takes a 1/5 protocol share, and its module_state
+        // pins the matching fee_split config hash. Set it on the env before
+        // building the pool so both agree, as they do on chain.
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.exec.protocol_share = (1, 5);
+        let env = env;
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            &env,
+            0x61,
+            vec![(token_a(), 50_362_747), (token_e(), 42_149_345)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x61);
+        // Mainnet's LP book, which is NOT make_ss_pool's D / calc_precision:
+        // the pool has traded, so D / total_lp has drifted above precision.
+        let total_lp = BigInt::from(92_503_618_509_277i64);
+        let circulating_lp = BigInt::from(92_501_818_293_556i64);
+        let preminted_lp = BigInt::from(907_498_181_706_444i64);
+        let pool = {
+            let mut p = (*pool).clone();
+            p.pool_datum.total_lp = total_lp.clone();
+            p.pool_datum.circulating_lp = circulating_lp;
+            p.pool_datum.preminted_lp = preminted_lp.clone();
+            p.value.insert(&lp_asset, preminted_lp);
+            std::sync::Arc::new(p)
+        };
+
+        let burn = 7_346_987_527_052i64;
+        let order = make_basic_withdraw_order(
+            lp_asset.clone(),
+            burn,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("mainnet SS withdraw should resolve");
+        let plan = accum.into_plan();
+        let wd = &plan.batches[0].withdraws[0];
+        assert_eq!(wd.lp_burned, BigInt::from(burn), "burns exactly the offered LP");
+        assert_eq!(
+            wd.dy,
+            vec![BigInt::from(3_999_999), BigInt::from(3_347_660)],
+            "pays out what the on-chain withdraw paid",
+        );
+        assert_eq!(
+            wd.target_delta_v.clone().expect("a declared target"),
+            BigInt::from(-7_347_631_365_219_459_674_054_077i128),
+            "the target the module accepts for this D",
+        );
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("mainnet SS withdraw should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+    }
+
     #[test]
     fn ss_withdraw_pinned_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;

@@ -912,6 +912,13 @@ pub fn build_multi_pool_scoop_tx(
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
                 // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
                 // from asset deltas, so any sentinel tag works.
+                tracing::info!(
+                    order = %w.order.input,
+                    lp_burned = %w.lp_burned,
+                    target_delta_v = ?w.target_delta_v.as_ref().map(|t| t.to_string()),
+                    total_lp_before = %running_total_lp,
+                    "stableswap withdraw entry",
+                );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
@@ -1379,6 +1386,14 @@ pub fn build_multi_pool_scoop_tx(
                 let sum_invariant = swap_math::ss_params(config).d_of(&reserves).map_err(|e| {
                     anyhow::anyhow!("pool {}: {e}", batch.pool.pool_datum.identifier)
                 })?;
+                tracing::info!(
+                    pool = %batch.pool.pool_datum.identifier,
+                    reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                    amp = %config.linear_amplification,
+                    rates = ?config.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                    sum_invariant = %sum_invariant,
+                    "stableswap redeemer sum_invariant",
+                );
                 ss_entries.push(crate::sundaev4::types::SSOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
                     config: config.clone(),
