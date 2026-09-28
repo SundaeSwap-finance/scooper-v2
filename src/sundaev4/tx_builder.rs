@@ -912,7 +912,7 @@ pub fn build_multi_pool_scoop_tx(
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
                 // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
                 // from asset deltas, so any sentinel tag works.
-                tracing::info!(
+                tracing::debug!(
                     order = %w.order.input,
                     lp_burned = %w.lp_burned,
                     target_delta_v = ?w.target_delta_v.as_ref().map(|t| t.to_string()),
@@ -1386,7 +1386,7 @@ pub fn build_multi_pool_scoop_tx(
                 let sum_invariant = swap_math::ss_params(config).d_of(&reserves).map_err(|e| {
                     anyhow::anyhow!("pool {}: {e}", batch.pool.pool_datum.identifier)
                 })?;
-                tracing::info!(
+                tracing::debug!(
                     pool = %batch.pool.pool_datum.identifier,
                     reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                     amp = %config.linear_amplification,

@@ -1385,7 +1385,7 @@ pub fn resolve_proportional_withdraw(
             )?;
             let step =
                 super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, Some(&d_before))?;
-            tracing::info!(
+            tracing::debug!(
                 order = %order.input,
                 reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                 total_lp = %total_lp,
