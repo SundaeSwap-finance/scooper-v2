@@ -1814,10 +1814,22 @@ mod tests {
     /// deposit asks for more LP than the ledger's signed 64-bit quantity
     /// holds. Admission must refuse it and leave the batch usable, rather
     /// than building a transaction the node cannot take.
-    fn near_cap_ss_pool(env: &TestEnv, ident: u8, total_lp: i64) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
+    fn near_cap_ss_pool(
+        env: &TestEnv,
+        ident: u8,
+        total_lp: i64,
+    ) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
         let r = 1_000_000_000i64;
-        let fee = crate::sundaev4::types::Rational { num: BigInt::from(15), den: BigInt::from(10_000) };
-        let pool = make_ss_pool(env, ident, vec![(token_a(), r), (token_e(), r)], ss_config(500, fee, [1_000_000, 1_000_000]));
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            env,
+            ident,
+            vec![(token_a(), r), (token_e(), r)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
         let mut p = (*pool).clone();
         let escrow = BigInt::from(1_000_000i64);
         p.pool_datum.total_lp = BigInt::from(total_lp);
@@ -1837,7 +1849,12 @@ mod tests {
         let r = 1_000_000_000i64;
 
         // Doubling the reserves asks for ~total_lp more LP: over the cap.
-        let big = make_basic_deposit_order(vec![(token_a(), 2 * r), (token_e(), 2 * r)], lp_asset.clone(), 1, 1);
+        let big = make_basic_deposit_order(
+            vec![(token_a(), 2 * r), (token_e(), 2 * r)],
+            lp_asset.clone(),
+            1,
+            1,
+        );
         let mut accum = Accumulator::new(env.exec.protocol_share);
         let err = accum
             .try_add_deposit(&big, &pool.pool_datum.identifier.clone(), &pool)
@@ -1848,12 +1865,21 @@ mod tests {
         );
 
         // The accumulator is still usable: a deposit that fits still goes in.
-        let small = make_basic_deposit_order(vec![(token_a(), r / 1000), (token_e(), r / 1000)], lp_asset, 1, 2);
+        let small = make_basic_deposit_order(
+            vec![(token_a(), r / 1000), (token_e(), r / 1000)],
+            lp_asset,
+            1,
+            2,
+        );
         accum
             .try_add_deposit(&small, &pool.pool_datum.identifier.clone(), &pool)
             .expect("a deposit within the cap still resolves");
         let plan = accum.into_plan();
-        assert_eq!(plan.batches[0].deposits.len(), 1, "only the small deposit was admitted");
+        assert_eq!(
+            plan.batches[0].deposits.len(),
+            1,
+            "only the small deposit was admitted"
+        );
     }
 
     /// Two deposits that each fit but together exceed one transaction's mint
@@ -1869,16 +1895,20 @@ mod tests {
 
         // Each doubles the pool it sees, so each mints 6e18: under the cap
         // alone, 1.2e19 together.
-        let a = make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset.clone(), 1, 1);
+        let a =
+            make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset.clone(), 1, 1);
         let b = make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset, 1, 2);
         let mut accum = Accumulator::new(env.exec.protocol_share);
         let ident = pool.pool_datum.identifier.clone();
         accum.try_add_deposit(&a, &ident, &pool).expect("the first fits on its own");
-        let err = accum
-            .try_add_deposit(&b, &ident, &pool)
-            .expect_err("the pair exceeds one mint field");
+        let err =
+            accum.try_add_deposit(&b, &ident, &pool).expect_err("the pair exceeds one mint field");
         assert!(err.contains("mint field"), "got: {err}");
-        assert_eq!(accum.into_plan().batches[0].deposits.len(), 1, "the batch keeps only the first");
+        assert_eq!(
+            accum.into_plan().batches[0].deposits.len(),
+            1,
+            "the batch keeps only the first"
+        );
     }
 
     /// Withdrawals return LP to the pool's escrow rather than burning it, and
@@ -1888,8 +1918,16 @@ mod tests {
         use crate::sundaev4::accumulator::Accumulator;
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let r = 1_000_000_000i64;
-        let fee = crate::sundaev4::types::Rational { num: BigInt::from(15), den: BigInt::from(10_000) };
-        let pool = make_ss_pool(&env, 0x66, vec![(token_a(), r), (token_e(), r)], ss_config(500, fee, [1_000_000, 1_000_000]));
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            &env,
+            0x66,
+            vec![(token_a(), r), (token_e(), r)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
         let lp_asset = lp_asset_for(&env, 0x66);
         let burn = 4_000_000_000_000_000_000i64;
         let pool = {
@@ -1903,7 +1941,8 @@ mod tests {
             p.value.insert(&lp_asset, escrow);
             std::sync::Arc::new(p)
         };
-        let order = make_basic_withdraw_order(lp_asset, burn, vec![(token_a(), 1), (token_e(), 1)], 1);
+        let order =
+            make_basic_withdraw_order(lp_asset, burn, vec![(token_a(), 1), (token_e(), 1)], 1);
         let mut accum = Accumulator::new(env.exec.protocol_share);
         let err = accum
             .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
@@ -1960,7 +1999,11 @@ mod tests {
             .expect("mainnet SS withdraw should resolve");
         let plan = accum.into_plan();
         let wd = &plan.batches[0].withdraws[0];
-        assert_eq!(wd.lp_burned, BigInt::from(burn), "burns exactly the offered LP");
+        assert_eq!(
+            wd.lp_burned,
+            BigInt::from(burn),
+            "burns exactly the offered LP"
+        );
         assert_eq!(
             wd.dy,
             vec![BigInt::from(3_999_999), BigInt::from(3_347_660)],

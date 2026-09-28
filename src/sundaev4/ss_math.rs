@@ -656,7 +656,10 @@ mod tests {
     fn mainnet_withdraw_target_matches_the_cli() {
         let p = SsParams {
             amp: bi(500),
-            fee: Rational { num: bi(15), den: bi(10000) },
+            fee: Rational {
+                num: bi(15),
+                den: bi(10000),
+            },
             rates: vec![bi(1_000_000), bi(1_000_000)],
         };
         let reserves = vec![bi(50_362_747), bi(42_149_345)];

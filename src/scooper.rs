@@ -3194,8 +3194,10 @@ mod reject_dump_tests {
             std::fs::write(format!("{prefix}{i:02}.cbor"), [i as u8]).unwrap();
             std::fs::write(format!("{prefix}{i:02}.reason.hex"), "ab").unwrap();
             // Distinct mtimes, oldest first.
-            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i as u64 * 10);
-            let f = std::fs::File::options().write(true).open(format!("{prefix}{i:02}.cbor")).unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + i as u64 * 10);
+            let f =
+                std::fs::File::options().write(true).open(format!("{prefix}{i:02}.cbor")).unwrap();
             f.set_modified(t).unwrap();
         }
         let bystander = dir.join("keep-me.cbor");
@@ -3204,14 +3206,26 @@ mod reject_dump_tests {
         prune_dumps(&prefix, 2);
 
         for i in 0..3u32 {
-            assert!(!std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(), "{i} should be pruned");
-            assert!(!std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists(), "{i}'s reason should go too");
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be pruned"
+            );
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists(),
+                "{i}'s reason should go too"
+            );
         }
         for i in 3..5u32 {
-            assert!(std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(), "{i} should be kept");
+            assert!(
+                std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be kept"
+            );
             assert!(std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists());
         }
-        assert!(bystander.exists(), "a file outside the dump set must be left alone");
+        assert!(
+            bystander.exists(),
+            "a file outside the dump set must be left alone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
