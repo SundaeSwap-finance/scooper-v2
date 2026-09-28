@@ -546,7 +546,14 @@
 
   function copyable(display, fullValue) {
     if (!fullValue) return display || '';
-    var escaped = fullValue.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    // `&` first, or the entities below get double-escaped. getAttribute
+    // decodes these again, so data-copy still yields the original text.
+    var escaped = String(fullValue)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
     return '<span title="' + escaped + '">' + display +
       '<span class="copy-btn" data-copy="' + escaped + '">' + copySvg + '</span></span>';
   }
@@ -1006,7 +1013,7 @@
     var red = { 'pool-not-found': 1, 'pool-not-claimable': 1, 'no-route': 1, 'shape-unsupported': 1 };
     var cls = green[state] ? 'badge-green' : (red[state] ? 'badge-red' : 'badge-yellow');
     var badge = '<span class="badge ' + cls + '" title="' + escapeHtml(detail) + '">' + escapeHtml(state) + '</span>';
-    return badge + (detail ? ' <span title="' + escapeHtml(detail) + '" style="opacity:.7">' + escapeHtml(truncate(detail, 60)) + '</span>' : '');
+    return badge + (detail ? ' <span style="opacity:.7">' + copyable(escapeHtml(truncate(detail, 60)), detail) + '</span>' : '');
   }
 
   async function loadIntentDispatch(intentId) {
@@ -1323,7 +1330,7 @@
           '<td>' + copyable(truncate(ref, 20), ref) + '</td>' +
           '<td>' + (datum.action ? Object.keys(datum.action)[0] : (datum.direction || '?')) + '</td>' +
           '<td>' + statusBadge + '</td>' +
-          '<td>' + truncate(detail, 60) + '</td>';
+          '<td>' + copyable(escapeHtml(truncate(detail, 60)), detail) + '</td>';
         return row;
       });
       renderLimited('v3-orders-body', rows);
@@ -1416,7 +1423,7 @@
           // Malformed / unparseable order (the `invalid` array from /v4/orders):
           // its datum didn't decode into a supported constraint. Show why.
           statusBadge = '<span class="badge badge-malformed" title="Order datum could not be decoded into a supported constraint">\u26a0 malformed</span>';
-          detailHtml = '<span title="' + escapeHtml(e.order.reason) + '">' + escapeHtml(truncate(e.order.reason, 72)) + '</span>';
+          detailHtml = copyable(escapeHtml(truncate(e.order.reason, 72)), e.order.reason);
         } else if (isInFlight) {
           statusBadge = '<span class="badge badge-in-flight" title="Transaction in mempool">\u23f3 in-flight</span>';
           detail = 'awaiting settlement';
@@ -1443,7 +1450,7 @@
         row.innerHTML = '<td>' + poolCell + '</td>' +
           '<td>' + copyable(truncate(orderRef, 24), orderRef) + '</td>' +
           '<td>' + statusBadge + '</td>' +
-          '<td>' + (detailHtml !== null ? detailHtml : escapeHtml(truncate(detail, 50))) + '</td>';
+          '<td>' + (detailHtml !== null ? detailHtml : copyable(escapeHtml(truncate(detail, 50)), detail)) + '</td>';
         return row;
       });
       renderLimited('v4-orders-body', rows);
