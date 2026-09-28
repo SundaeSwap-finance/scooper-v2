@@ -38,6 +38,33 @@ Pool families: constant product, constant sum, concentrated liquidity, and stabl
 
 The server listens on `server.address` (`0.0.0.0:9999` by default) and serves `/dashboard`, `/status`, `/health`, `/metrics`, `/failures`, `/events` (SSE), `/pause`, `/resync-from-acropolis`, and per-protocol `/v3/…` and `/v4/…` listings of `pools`, `orders`, `spent-orders`, and `spent-pools`. Setting `server.public_address` opens a second listener carrying only the strategy-intent endpoints and `/health`.
 
+### First sync
+
+`config/mainnet-v4.json` ships no `protocol.bootstrap` block, deliberately. On an
+empty database the scooper replays the chain from `protocol.v4.starting-point`,
+which reconstructs pools, orders, module configs and reference scripts straight
+from the ledger. That replay is slower than a bootstrap and strictly more
+complete, and it is the recovery path to reach for when a scooper's state is
+wrong.
+
+If you do configure a bootstrap source, the scooper checks it can enumerate
+UTxOs by payment credential and refuses it otherwise:
+
+> this bootstrap source cannot enumerate UTxOs by payment credential, so it
+> cannot see orders at user-staked addresses (addr1z...). Seeding from it and
+> then starting the indexer at the bootstrap tip would silently discard every
+> pending order.
+
+That is not hypothetical. A bootstrap blind to staked addresses seeds an
+order book that looks healthy and is missing live orders, and the indexer then
+starts at the bootstrap tip and never revisits them — the orders sit unfilled
+with nothing in the logs to say why. Kupo (`/matches/{credential}/*`) and
+Blockfrost (`/addresses/{credential}/utxos`) both qualify.
+
+`--wipe-db` on a deploy therefore only makes sense with a bootstrap configured.
+Without one it leaves the scooper to replay from the starting point, which is
+correct but takes as long as the replay takes.
+
 ### Pool allowlists
 
 `protocol.v4.execution.pool-allowlists` closes named pools to everyone except listed credentials. Keys are pool idents and values list 28-byte key or script hashes, all in hex:
