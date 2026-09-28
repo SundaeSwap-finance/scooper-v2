@@ -1480,8 +1480,10 @@ impl AdminServer {
         if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
             use num_traits::ToPrimitive;
             let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
+            let base_fee = state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
             let limits = crate::sundaev4::router::RoutingLimits::from_budget(
                 per_exec,
+                base_fee,
                 cost_per_pool,
                 cost_per_step,
             );

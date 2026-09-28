@@ -1479,8 +1479,13 @@ impl Scooper {
                         // execution can spend, so it buys the route fan-out.
                         order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0)
                     };
+                    // base_fee already bought one pool and one step; the rest
+                    // of the budget buys the extras (RoutingLimits::from_budget).
+                    let base_fee_lov =
+                        v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
                     let limits = router::RoutingLimits::from_budget(
                         order_budget_lov,
+                        base_fee_lov,
                         exec.cost_per_pool_lovelace,
                         exec.cost_per_step_lovelace,
                     );
