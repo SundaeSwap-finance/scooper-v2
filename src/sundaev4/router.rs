@@ -1402,7 +1402,7 @@ pub fn find_blended_route(
         output_token,
         amount,
         limits,
-    )?;
+    );
     let single_plan = |plan: RoutingPlan| -> BlendedRoute {
         BlendedRoute {
             total_input: plan.total_input.clone(),
@@ -1415,7 +1415,7 @@ pub fn find_blended_route(
     let max_depth = 4.min(limits.max_pools.max(1)).min(limits.max_steps.max(1));
     let paths = find_paths(&graph, input_token, output_token, max_depth);
     if paths.len() < 2 {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     // Rank paths by standalone output at the full amount, then greedily keep
@@ -1426,7 +1426,12 @@ pub fn find_blended_route(
         .iter()
         .enumerate()
         .filter_map(|(i, path)| {
-            let hops = evaluate_path(path, amount, &limits);
+            let mut hops = evaluate_path(path, amount, &limits);
+            if hops.is_empty() {
+                // Too capped for the full amount: still a candidate partial
+                // branch, ranked (below full-amount paths) by one chunk's output.
+                hops = evaluate_path(path, &(amount / &BigInt::from(CHUNKS)), &limits);
+            }
             let out = hops.last().map(|h| h.total_output.clone())?;
             out.is_positive().then_some((i, out))
         })
@@ -1446,13 +1451,13 @@ pub fn find_blended_route(
         }
     }
     if chosen.len() < 2 {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     // Water-fill `amount` across the chosen paths chunk by chunk.
     let chunk = amount / &BigInt::from(CHUNKS);
     if !chunk.is_positive() {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
     let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
         if !alloc.is_positive() {
@@ -1502,7 +1507,7 @@ pub fn find_blended_route(
         let Some(out) = hops.last().map(|h| h.total_output.clone()) else {
             // A branch that evaluated fine during allocation must still
             // evaluate at its final size; if not, play it safe.
-            return Some(single_plan(single));
+            return single.map(single_plan);
         };
         branches.push(RoutingPlan {
             hops,
@@ -1551,19 +1556,19 @@ pub fn find_blended_route(
                 output_token,
                 amount,
                 limits,
-            ) && pruned.total_output > single.total_output
+            ) && single.as_ref().is_none_or(|s| pruned.total_output > s.total_output)
             {
                 return Some(pruned);
             }
         }
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     let total_output: BigInt = branches.iter().fold(BigInt::from(0), |a, b| &a + &b.total_output);
     // Paranoia: integer flooring at chunk boundaries could in principle land
     // a hair under the all-in answer; never return a worse blend.
-    if branches.len() < 2 || total_output <= single.total_output {
-        return Some(single_plan(single));
+    if branches.len() < 2 || single.as_ref().is_some_and(|s| total_output <= s.total_output) {
+        return single.map(single_plan);
     }
 
     Some(BlendedRoute {
