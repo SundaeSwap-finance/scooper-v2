@@ -10,7 +10,7 @@
   "protocol": {
     "bootstrap": {
       "source": "blockfrost",
-      "url": "http://blockfrost-api:3000",
+      "url": "http://sundae-bf-proxy:3009",
       "project-id": "musashi"
     }
   },
