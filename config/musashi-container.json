@@ -1,4 +1,7 @@
 {
+  "log": {
+    "level": "info"
+  },
   "persistence": {
     "sqlite": {
       "filename": "/app/data/scooper-musashi.db"
