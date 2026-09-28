@@ -566,6 +566,10 @@ pub fn try_execute_order(
 /// used by `ConcentratedLiquidity` (CP/CS swap math doesn't depend on LP);
 /// callers should pass the pool's current `total_lp` so CL math can derive
 /// virtual reserves.
+///
+/// A swap that cannot fill folds to `0` here. Callers that only price a
+/// step want that; `check_order_executability` wants the reason, and takes
+/// it from `explain_swap_result` instead.
 pub fn compute_swap_result(
     pool_type: &PoolType,
     assets: &[(AssetClass, BigInt)],
@@ -574,18 +578,45 @@ pub fn compute_swap_result(
     output_idx: usize,
     dx: &BigInt,
 ) -> BigInt {
+    explain_swap_result(pool_type, assets, total_lp, input_idx, output_idx, dx)
+        .unwrap_or_else(|_| BigInt::from(0))
+}
+
+/// `compute_swap_result`, but a swap that cannot fill says why, with the
+/// amounts: what it would take against what the pool holds, or that the
+/// curve yields nothing for this `dx`. The dashboard shows these strings
+/// per order, so an operator can tell an order that overshoots the reserve
+/// from one that is merely dust without re-running the math.
+pub fn explain_swap_result(
+    pool_type: &PoolType,
+    assets: &[(AssetClass, BigInt)],
+    total_lp: &BigInt,
+    input_idx: usize,
+    output_idx: usize,
+    dx: &BigInt,
+) -> Result<BigInt, String> {
+    let no_output = |dy: &BigInt| {
+        format!(
+            "swap of {dx} {} yields no output (dy={dy}; reserves in={}, out={} {})",
+            assets[input_idx].0, assets[input_idx].1, assets[output_idx].1, assets[output_idx].0,
+        )
+    };
     match pool_type {
         PoolType::ConstantProduct { fee } => {
             use num_traits::ToPrimitive;
             let fee_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
             let fee_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
-            swap_math::cp_swap_result(
+            let dy = swap_math::cp_swap_result(
                 &assets[input_idx].1,
                 &assets[output_idx].1,
                 dx,
                 fee_num,
                 fee_den,
-            )
+            );
+            if !dy.is_positive() {
+                return Err(no_output(&dy));
+            }
+            Ok(dy)
         }
         PoolType::ConstantSum { prices, fee, .. } => {
             let dy =
@@ -593,27 +624,38 @@ pub fn compute_swap_result(
             // A fill can never draw more of the output asset than the pool holds;
             // otherwise the on-chain constant_sum check fails `amt_after >= 0`
             // (reserve goes negative) and wedges the whole batch. Treat an
-            // over-draining fill as unfillable (dy = 0) so the order is skipped
-            // rather than baked into an invalid tx. (`amt_after == 0` is allowed,
-            // so only a strict overshoot is rejected.)
-            if dy > assets[output_idx].1 {
-                return BigInt::from(0);
+            // over-draining fill as unfillable so the order is skipped rather
+            // than baked into an invalid tx. (`amt_after == 0` is allowed, so
+            // only a strict overshoot is rejected.)
+            let held = &assets[output_idx].1;
+            if &dy > held {
+                return Err(format!(
+                    "swap would take {dy} {} but the pool holds only {held} (short by {})",
+                    assets[output_idx].0,
+                    &dy - held,
+                ));
             }
-            dy
+            if !dy.is_positive() {
+                return Err(no_output(&dy));
+            }
+            Ok(dy)
         }
         PoolType::StableSwap { config } => {
             // ss_check.check_swap: the gross output is the smallest scaled
             // y-solution of the curve at D_before, floored to token units;
             // the fee is ceil'd off it and stays in the out reserve. A step
-            // the module's own two-sided checks refuse is unfillable (dy = 0).
+            // the module's own two-sided checks refuse is unfillable.
             if assets.len() != 2 || input_idx > 1 || output_idx > 1 || input_idx == output_idx {
-                return BigInt::from(0);
+                return Err(format!(
+                    "stableswap pool has {} assets; swap {input_idx} -> {output_idx} is not a pair",
+                    assets.len()
+                ));
             }
             let p = swap_math::ss_params(config);
             let reserves: Vec<BigInt> = assets.iter().map(|(_, q)| q.clone()).collect();
             match super::ss_math::swap_step(&p, &reserves, total_lp, input_idx, dx, None) {
-                Ok(s) => s.dy,
-                Err(_) => BigInt::from(0),
+                Ok(s) => Ok(s.dy),
+                Err(e) => Err(format!("stableswap: {e}")),
             }
         }
         PoolType::ConcentratedLiquidity {
@@ -627,7 +669,7 @@ pub fn compute_swap_result(
             // dx_eff multiplier and the denominator's sqrt-price differ.
             let (a, b) = (&assets[0].1, &assets[1].1);
             let is_a_input = input_idx == 0;
-            swap_math::cl_swap_result(
+            let dy = swap_math::cl_swap_result(
                 a,
                 b,
                 total_lp,
@@ -639,7 +681,11 @@ pub fn compute_swap_result(
                 &sqrt_price_b.den,
                 &fee.num,
                 &fee.den,
-            )
+            );
+            if !dy.is_positive() {
+                return Err(no_output(&dy));
+            }
+            Ok(dy)
         }
     }
 }
@@ -662,10 +708,10 @@ pub fn check_order_executability(
         return Err("offered amount not positive".to_string());
     }
 
-    let dy = compute_swap_result(pool_type, pool_assets, total_lp, input_idx, output_idx, &dx);
-    if !dy.is_positive() {
-        return Err("swap output not positive".to_string());
-    }
+    // The reason carries the amounts (what the swap would take against what
+    // the pool holds, or that the curve yields nothing for this dx); the
+    // dashboard shows it per order.
+    let dy = explain_swap_result(pool_type, pool_assets, total_lp, input_idx, output_idx, &dx)?;
 
     // Check min_received
     let output_asset = &pool_assets[output_idx].0;

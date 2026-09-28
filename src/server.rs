@@ -1650,7 +1650,10 @@ impl AdminServer {
                         // Stable keys for check_order_executability's messages.
                         let bucket = if reason.starts_with("below min_received") {
                             "below_min_received"
-                        } else if reason.starts_with("swap output not positive") {
+                        } else if reason.starts_with("swap would take")
+                            || reason.starts_with("swap of")
+                            || reason.starts_with("stableswap")
+                        {
                             "zero_output"
                         } else if reason.starts_with("no matching pool asset") {
                             "asset_mismatch"

@@ -320,7 +320,10 @@ pub fn swap_step(
     }
     let out_after = out_before - &dy;
     if out_after.is_negative() {
-        return Err("swap drains the out reserve".into());
+        return Err(format!(
+            "swap would take {dy} but the out reserve holds only {out_before} (short by {})",
+            &dy - out_before
+        ));
     }
     let reserves_after = if in_idx == 0 {
         vec![in_after.clone(), out_after]
