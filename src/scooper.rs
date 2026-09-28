@@ -2520,8 +2520,21 @@ impl Scooper {
                 // quarantined — an order whose input is fine must not sit
                 // out minutes for a wallet-UTxO conflict.
                 let node_reject_hex: Option<&str> = msg.strip_prefix("node rejected tx: ");
-                if node_reject_hex.is_some() {
+                if let Some(hex_reason) = node_reject_hex {
                     self.metrics.node_rejects.fetch_add(1, Ordering::Relaxed);
+                    // Keep what the node refused. A reject is not always a
+                    // race: on 2026-09-28 mainnet refused a stableswap
+                    // withdraw scoop twelve times running with a script
+                    // failure our own evaluator did not reproduce, and
+                    // nothing had the tx bytes to re-evaluate with traced
+                    // scripts. The reason from pallas is cut at one mux
+                    // segment (12288 bytes), before the node's trace, so the
+                    // bytes are the only way to get one.
+                    let base = format!("/tmp/scoop-reject-{}", final_tx.tx_hash_hex);
+                    if let Err(e) = std::fs::write(format!("{base}.cbor"), &final_tx.cbor) {
+                        warn!(%e, "couldn't write rejected tx dump");
+                    }
+                    let _ = std::fs::write(format!("{base}.reason.hex"), hex_reason);
                 }
                 let is_race_lost = msg.contains("BadInputsUTxO")
                     || msg.contains("ConwayMempoolFailure")
