@@ -803,8 +803,11 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         // Sum allocations
         let mut total_alloc: BigInt = allocs.iter().fold(BigInt::from(0), |a, b| &a + b);
 
-        // Cap proportionally if exceeds total_input
-        if &total_alloc > total_input {
+        // Cap proportionally if exceeds total_input. Remember it: the rescale
+        // brings total_alloc back under total_input, but the bisection must
+        // still raise λ.
+        let over = &total_alloc > total_input;
+        if over {
             for a in allocs.iter_mut() {
                 *a = &*a * total_input / &total_alloc;
             }
@@ -824,11 +827,11 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
             best_allocs = allocs;
         }
 
-        if &total_alloc == total_input || &lambda_hi - &lambda_lo <= BigInt::from(1) {
+        if (!over && &total_alloc == total_input) || &lambda_hi - &lambda_lo <= BigInt::from(1) {
             break;
         }
 
-        if &total_alloc > total_input {
+        if over {
             lambda_lo = lambda_mid;
         } else {
             lambda_hi = lambda_mid;
@@ -2398,5 +2401,122 @@ mod tests {
         // short-input pool positive (the swap rebalances it).
         assert!(tiebreak_score(&balanced, &dx).is_negative());
         assert!(tiebreak_score(&imbalanced, &dx).is_positive());
+    }
+
+    /// Adjacent concentrated-liquidity bands, each capped by its own reserve,
+    /// must be filled in price order: the best band first, the next one only
+    /// once the first is exhausted. Each band `k` covers √p ∈ [0.99^(k+1),
+    /// 0.99^k] (≈2 % in price) and sits just above spot, so it holds only the
+    /// output token. The order needs about three bands; the far ones must get
+    /// nothing, and adding them must never lower the output.
+    #[test]
+    fn test_split_fills_adjacent_cl_bands_in_price_order() {
+        let den: i64 = 1_000_000_000;
+        let sqrt_p = |k: i32| (den as f64 * 0.99f64.powi(k)).round() as i64;
+        let lp: i64 = 1_000_000_000_000;
+        let band = |k: i32| {
+            let (spb, spa) = (sqrt_p(k), sqrt_p(k + 1));
+            PoolView {
+                ident: Ident::new(&[k as u8 + 1]),
+                // Selling A: real A reserve 0, real B = L·(√pb − √pa).
+                reserve_in: BigInt::from(0),
+                reserve_out: BigInt::from(lp / den * (spb - spa)),
+                fee_num: 3,
+                fee_den: 1000,
+                view_type: PoolViewType::ConcentratedLiquidity {
+                    is_a_input: true,
+                    spa_num: BigInt::from(spa),
+                    spa_den: BigInt::from(den),
+                    spb_num: BigInt::from(spb),
+                    spb_den: BigInt::from(den),
+                    lp: BigInt::from(lp),
+                },
+            }
+        };
+        let bands: Vec<PoolView> = (0..14).map(band).collect();
+        let cap = |p: &PoolView| pool_absorb_cap(p).expect("CL bands are capped");
+        // Two full bands plus half of the third.
+        let dx = &(&cap(&bands[0]) + &cap(&bands[1])) + &(&cap(&bands[2]) / &BigInt::from(2));
+
+        // Reference: greedy fill in price order.
+        let mut left = dx.clone();
+        let mut greedy = BigInt::from(0);
+        for b in &bands {
+            let take = if left > cap(b) { cap(b) } else { left.clone() };
+            greedy = &greedy + &pool_output(b, &take);
+            left = &left - &take;
+        }
+        assert!(!left.is_positive());
+
+        let total = |splits: &[SplitEntry]| {
+            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.output_amount)
+        };
+        let routed = |splits: &[SplitEntry]| {
+            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.input_amount)
+        };
+
+        let near = optimize_split(&bands[..3], &dx);
+        let all = optimize_split(&bands, &dx);
+        assert_eq!(routed(&near), dx);
+        assert_eq!(routed(&all), dx);
+
+        // Within 1e-6 of the greedy optimum.
+        let tol = &greedy / &BigInt::from(1_000_000);
+        assert!(
+            &total(&all) + &tol >= greedy,
+            "14 bands: {} vs greedy {}",
+            total(&all),
+            greedy,
+        );
+        assert!(
+            &total(&near) + &tol >= greedy,
+            "3 bands: {} vs greedy {}",
+            total(&near),
+            greedy,
+        );
+        for s in &all {
+            let k = bands.iter().position(|b| b.ident == s.pool.ident).unwrap();
+            assert!(
+                k < 3,
+                "band {} gets {} but should be untouched",
+                k,
+                s.input_amount
+            );
+        }
+    }
+
+    /// The proportional rescale of an over-allocation can land exactly on
+    /// `total_input`; the bisection must not take that for convergence. Three
+    /// constant-sum pools of 1M capacity each, priced 1.2, 1.1 and 1.0, sell
+    /// 1.5M (no pool can take it alone). The first λ is below every marginal:
+    /// all three absorb their cap, 3M, and halving it gives exactly 1.5M. The
+    /// worst pool must still end up with nothing.
+    #[test]
+    fn test_split_exact_rescale_keeps_raising_lambda() {
+        let cs = |byte: u8, price_in: i64, reserve_out: i64| PoolView {
+            ident: Ident::new(&[byte]),
+            reserve_in: BigInt::from(0),
+            reserve_out: BigInt::from(reserve_out),
+            fee_num: 0,
+            fee_den: 1000,
+            view_type: PoolViewType::ConstantSum {
+                price_in: BigInt::from(price_in),
+                price_out: BigInt::from(10),
+            },
+        };
+        let best = cs(0x01, 12, 1_200_000);
+        let mid = cs(0x02, 11, 1_100_000);
+        let worst = cs(0x03, 10, 1_000_000);
+        let dx = BigInt::from(1_500_000);
+
+        let splits = optimize_split(&[best, mid, worst.clone()], &dx);
+
+        let routed = splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.input_amount);
+        assert_eq!(routed, dx);
+        assert!(
+            splits.iter().all(|s| s.pool.ident != worst.ident),
+            "the worst pool must get nothing: {:?}",
+            splits.iter().map(|s| (&s.pool.ident, &s.input_amount)).collect::<Vec<_>>(),
+        );
     }
 }
