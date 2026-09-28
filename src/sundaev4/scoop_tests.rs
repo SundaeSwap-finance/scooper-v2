@@ -140,7 +140,13 @@ mod tests {
 
         let order = make_order(token_b(), 400_000_000_000, token_a(), 1, 1);
         // Order budget: 5 ADA → max_pools=5, max_steps=10 (cost 1/0.5 ADA).
-        let limits = router::RoutingLimits::from_budget(5_000_000, 1_000_000, 500_000);
+        // The fan-out allowance this case is about, stated directly: deriving it
+        // from a budget makes the test depend on fee arithmetic it is not
+        // testing (and silently changed meaning when from_budget was inverted).
+        let limits = router::RoutingLimits {
+            max_pools: 5,
+            max_steps: 10,
+        };
 
         let blend = router::find_blended_route(
             &pool_map,
@@ -197,7 +203,10 @@ mod tests {
         // TIGHT budget (3 pools): the full 5-pool blend now exceeds the budget.
         // Budget-aware pruning must find the best route that FITS 3 pools (direct
         // + ONE multi-hop leg) rather than collapsing to the single-hop fallback.
-        let tight = router::RoutingLimits::from_budget(3_000_000, 1_000_000, 500_000);
+        let tight = router::RoutingLimits {
+            max_pools: 3,
+            max_steps: 6,
+        };
         let tight_single = router::find_optimal_route(
             &pool_map,
             &[],

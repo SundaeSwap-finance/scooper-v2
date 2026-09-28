@@ -144,14 +144,52 @@ impl RoutingLimits {
     /// Compute limits from an order's lovelace budget and per-unit costs.
     /// `cost_per_pool == 0` or `cost_per_step == 0` means that axis is
     /// unlimited.
-    pub fn from_budget(budget_lovelace: u64, cost_per_pool: u64, cost_per_step: u64) -> Self {
-        let max_pools =
-            (budget_lovelace as usize).checked_div(cost_per_pool as usize).unwrap_or(usize::MAX);
-        let max_steps =
-            (budget_lovelace as usize).checked_div(cost_per_step as usize).unwrap_or(usize::MAX);
+    ///
+    /// This is the INVERSE of how the budget was built. A client sizes an
+    /// order from the quote it was given:
+    ///
+    ///   budget = base_fee + (pools - 1)·cost_per_pool + (steps - 1)·cost_per_step
+    ///
+    /// because `base_fee` is what one pool and one step already costs, so the
+    /// marginal terms pay only for fan-out ABOVE a direct swap. Inverting it
+    /// means spending `base_fee` on that first pool and step, and letting what
+    /// remains buy the extras.
+    ///
+    /// Dividing the whole budget by `cost_per_pool` instead — as this did —
+    /// charges the first pool twice and silently caps what any order can
+    /// reach. It imposed a ceiling that was an artifact rather than a policy:
+    /// a two-pool plan was only routable while
+    /// `cost_per_pool <= base_fee + cost_per_step`, so raising the per-pool
+    /// cost past 1.78 ADA (at a 1.28 base fee) made two-pool routes
+    /// unroutable at ANY budget, including budgets sized for them. With the
+    /// inverse there is no such ceiling and the per-pool cost is free to be
+    /// whatever policy wants.
+    ///
+    /// `base_fee` unknown (the fee-settings node is not indexed yet) falls
+    /// back to 0, which is the old, conservative reading: the order is treated
+    /// as if it had paid for no minimal route, so it buys strictly fewer
+    /// pools, never more.
+    pub fn from_budget(
+        budget_lovelace: u64,
+        base_fee: u64,
+        cost_per_pool: u64,
+        cost_per_step: u64,
+    ) -> Self {
+        // What is left after the minimal one-pool, one-step route the base fee
+        // already bought. Saturating: an order budgeted below the base fee has
+        // nothing to spend on fan-out, and still gets its one pool.
+        let extra = budget_lovelace.saturating_sub(base_fee) as usize;
+        let axis = |unit: u64| -> usize {
+            match extra.checked_div(unit as usize) {
+                // The one pool and one step the base fee covers, plus what the
+                // remainder buys.
+                Some(n) => n.saturating_add(1),
+                None => usize::MAX,
+            }
+        };
         Self {
-            max_pools,
-            max_steps,
+            max_pools: axis(cost_per_pool),
+            max_steps: axis(cost_per_step),
         }
     }
 }
@@ -2406,6 +2444,81 @@ mod tests {
         // short-input pool positive (the swap rebalances it).
         assert!(tiebreak_score(&balanced, &dx).is_negative());
         assert!(tiebreak_score(&imbalanced, &dx).is_positive());
+    }
+
+    /// A budget sized from a quote must buy back the plan it was sized for.
+    ///
+    /// The client computes `base_fee + (p-1)*cpp + (s-1)*cps` from the quote and
+    /// locks it into the order; this inverts it. Before the inverse, dividing
+    /// the whole budget by `cost_per_pool` charged the first pool twice, and a
+    /// two-pool plan was routable only while `cpp <= base_fee + cps`.
+    #[test]
+    fn a_budget_buys_back_the_plan_it_was_sized_for() {
+        const BASE_FEE: u64 = 1_280_000;
+        for (cpp, cps) in [
+            (1_000_000u64, 500_000u64),
+            // Past the old ceiling of base_fee + cps = 1.78 ADA: these used to
+            // make two-pool routes unroutable at any budget.
+            (2_000_000, 500_000),
+            (5_000_000, 1_000_000),
+        ] {
+            for pools in 1u64..=4 {
+                for steps in pools..=6 {
+                    let budget = BASE_FEE + (pools - 1) * cpp + (steps - 1) * cps;
+                    let limits = RoutingLimits::from_budget(budget, BASE_FEE, cpp, cps);
+                    assert!(
+                        limits.max_pools >= pools as usize,
+                        "cpp {cpp}: a {pools}-pool/{steps}-step plan budgets {budget}, \
+                         which buys only {} pools",
+                        limits.max_pools,
+                    );
+                    assert!(
+                        limits.max_steps >= steps as usize,
+                        "cps {cps}: a {pools}-pool/{steps}-step plan budgets {budget}, \
+                         which buys only {} steps",
+                        limits.max_steps,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mainnet order that went unexecutable: quoted as two pools, budgeted
+    /// at 1_655_000 against the API's stale 250k/125k costs, then sized by a
+    /// scooper charging 1_000_000 per pool. The budget is genuinely short, so
+    /// one pool is the right answer even with the inverse - the fix for that
+    /// order was the API's constants, not this. Corrected, it buys two.
+    #[test]
+    fn mainnet_20260928_underbudgeted_order_still_buys_one_pool() {
+        const BASE_FEE: u64 = 1_280_000;
+        let stale = RoutingLimits::from_budget(1_655_000, BASE_FEE, 1_000_000, 500_000);
+        assert_eq!(
+            stale.max_pools, 1,
+            "1_655_000 really only pays for one pool"
+        );
+
+        let corrected = RoutingLimits::from_budget(2_780_000, BASE_FEE, 1_000_000, 500_000);
+        assert!(
+            corrected.max_pools >= 2,
+            "a correctly-sized two-pool budget buys two"
+        );
+    }
+
+    /// An order below the base fee still gets the one pool it needs to fill at
+    /// all, rather than zero.
+    #[test]
+    fn a_budget_under_the_base_fee_still_buys_one_pool() {
+        let limits = RoutingLimits::from_budget(10_000, 1_280_000, 1_000_000, 500_000);
+        assert_eq!(limits.max_pools, 1);
+        assert_eq!(limits.max_steps, 1);
+    }
+
+    /// A zero cost means that axis is unbounded, unchanged.
+    #[test]
+    fn zero_cost_leaves_an_axis_unlimited() {
+        let limits = RoutingLimits::from_budget(2_000_000, 1_280_000, 0, 0);
+        assert_eq!(limits.max_pools, usize::MAX);
+        assert_eq!(limits.max_steps, usize::MAX);
     }
 
     /// Adjacent concentrated-liquidity bands, each capped by its own reserve,
