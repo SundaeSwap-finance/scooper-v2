@@ -558,6 +558,182 @@ mod tests {
         );
     }
 
+    /// An on-curve CL pool (total_lp == the liquidity its reserves support)
+    /// with a band sqrt-price in [0.95, 1/0.95] — price 1 at equal reserves.
+    /// Selling the FIRST asset (A-input) drains the second, so the pool's
+    /// capacity is roughly its second-asset reserve.
+    fn on_curve_cl_pool(
+        env: &TestEnv,
+        id: u8,
+        tok_a: crate::cardano_types::AssetClass,
+        a: i64,
+        tok_b: crate::cardano_types::AssetClass,
+        b: i64,
+    ) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
+        use num_traits::ToPrimitive;
+        let big = BigInt::from;
+        let (spa_n, spa_d, spb_n, spb_d) = (95i64, 100i64, 100i64, 95i64);
+        let supported = crate::sundaev4::swap_math::cl_fee_budget(
+            &big(a),
+            &big(b),
+            &big(0),
+            &big(spa_n),
+            &big(spa_d),
+            &big(spb_n),
+            &big(spb_d),
+        );
+        let lp = supported.unwrap().to_i64().expect("L fits i64");
+        make_cl_pool(
+            env, id, tok_a, a, tok_b, b, lp, spa_n, spa_d, spb_n, spb_d, 30, 10000,
+        )
+    }
+
+    /// Two pool-disjoint A→Z paths (direct A/Z band, and A→E→Z through two
+    /// bands), all A-input. Returns (pool_map, direct ident byte, via ident bytes).
+    fn two_capped_cl_paths(
+        env: &TestEnv,
+        direct_reserve: i64,
+        via_reserve: i64,
+    ) -> std::collections::BTreeMap<
+        crate::sundaev3::Ident,
+        std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+    > {
+        let mut pool_map = std::collections::BTreeMap::new();
+        for p in [
+            on_curve_cl_pool(
+                env,
+                0x21,
+                token_a(),
+                direct_reserve,
+                token_b(),
+                direct_reserve,
+            ),
+            on_curve_cl_pool(env, 0x22, token_a(), via_reserve, token_e(), via_reserve),
+            on_curve_cl_pool(env, 0x23, token_e(), via_reserve, token_b(), via_reserve),
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+        pool_map
+    }
+
+    fn branch_first_pool_bytes(blend: &crate::sundaev4::router::BlendedRoute) -> Vec<u8> {
+        blend.branches.iter().map(|b| b.hops[0].splits[0].pool.ident.to_bytes()[0]).collect()
+    }
+
+    fn assert_blend_fills(
+        env: &TestEnv,
+        pool_map: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        order: &std::sync::Arc<crate::sundaev4::types::SundaeV4Order>,
+        blend: &crate::sundaev4::router::BlendedRoute,
+    ) {
+        use crate::sundaev4::accumulator::Accumulator;
+        let routed: BigInt =
+            blend.branches.iter().fold(BigInt::from(0), |acc, b| &acc + &b.total_input);
+        assert_eq!(
+            &routed,
+            order.swap_offered().1,
+            "blend must route exactly the order amount"
+        );
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let result = match blend.as_single() {
+            Some(single) => accum.try_add_routed_order(order, single, pool_map),
+            None => accum.try_add_blended_order(order, blend, pool_map),
+        };
+        assert!(
+            result.is_ok(),
+            "blend must be fillable, got {:?}",
+            result.err()
+        );
+    }
+
+    /// Neither capped CL path (~60G of Z each) can absorb a 100G order alone,
+    /// but together they can: the router must blend them instead of giving up.
+    #[test]
+    fn capped_cl_paths_blend_when_none_can_fill_alone() {
+        use crate::sundaev4::router;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool_map = two_capped_cl_paths(&env, 60_000_000_000, 60_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+        let limits = router::RoutingLimits::unlimited();
+
+        assert!(
+            router::find_optimal_route(
+                &pool_map,
+                &[],
+                &token_a(),
+                &token_b(),
+                order.swap_offered().1,
+                limits
+            )
+            .is_none(),
+            "fixture: no single path may absorb the whole order"
+        );
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("the two capped paths together can fill the order");
+        let mut firsts = branch_first_pool_bytes(&blend);
+        firsts.sort();
+        assert_eq!(firsts, vec![0x21, 0x22], "must use both paths");
+        assert_blend_fills(&env, &pool_map, &order, &blend);
+    }
+
+    /// The direct band can take the whole order, the A→E→Z path (~30G of Z)
+    /// can't — but it is still worth a partial branch, since the direct band's
+    /// price slides far over a 100G sale. The blend must use it and never do
+    /// worse than the single-path answer.
+    #[test]
+    fn capped_cl_path_joins_blend_as_partial_branch() {
+        use crate::sundaev4::router;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool_map = two_capped_cl_paths(&env, 200_000_000_000, 30_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+        let limits = router::RoutingLimits::unlimited();
+
+        let single = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("the direct band can absorb the order alone");
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("route exists");
+        assert!(
+            blend.total_output >= single.total_output,
+            "blend never worse than single"
+        );
+        let mut firsts = branch_first_pool_bytes(&blend);
+        firsts.sort();
+        assert_eq!(
+            firsts,
+            vec![0x21, 0x22],
+            "capped path must join as a partial branch"
+        );
+        assert!(
+            blend.total_output > single.total_output,
+            "partial branch must improve output"
+        );
+        assert_blend_fills(&env, &pool_map, &order, &blend);
+    }
+
     use proptest::prelude::*;
 
     proptest! {
