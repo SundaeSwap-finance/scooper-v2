@@ -402,7 +402,7 @@ mod tests {
         // The mainnet stableswap withdraw target that was refused on chain.
         let v = num_bigint::BigInt::from_str_radix("-7347631365219459674054077", 10).unwrap();
         let mut buf = vec![];
-        minicbor::encode(&AsPlutus::to_plutus(BigInt(v.clone())), &mut buf).unwrap();
+        minicbor::encode(AsPlutus::to_plutus(BigInt(v.clone())), &mut buf).unwrap();
         let hex = hex::encode(&buf);
         // tag 3, 11-byte payload = |v| - 1, exactly what blaze produced.
         assert!(
@@ -427,7 +427,7 @@ mod tests {
         ] {
             let v = BigInt(num_bigint::BigInt::from_str_radix(s, 10).unwrap());
             let mut buf = vec![];
-            minicbor::encode(&AsPlutus::to_plutus(v.clone()), &mut buf).unwrap();
+            minicbor::encode(AsPlutus::to_plutus(v.clone()), &mut buf).unwrap();
             let back: BigInt = AsPlutus::from_plutus(minicbor::decode(&buf).unwrap()).unwrap();
             assert_eq!(v, back, "round trip for {s}");
         }

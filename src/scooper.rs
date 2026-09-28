@@ -134,7 +134,7 @@ fn prune_dumps(dump_prefix: &str, keep: usize) {
     if dumps.len() <= keep {
         return;
     }
-    dumps.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    dumps.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
     for (_, path) in dumps.drain(keep..) {
         let _ = std::fs::remove_file(path.with_extension("reason.hex"));
         let _ = std::fs::remove_file(path);
