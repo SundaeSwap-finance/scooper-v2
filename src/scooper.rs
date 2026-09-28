@@ -95,6 +95,52 @@ pub struct Scooper {
     last_node_reject: Option<(String, u32)>,
 }
 
+/// Where a node-rejected tx is kept for offline re-evaluation, and how many
+/// to keep.
+///
+/// A rejected scoop is retried, so one stuck order writes a dump per attempt
+/// — a mainnet stableswap withdrawal produced 77 in under an hour. Only the
+/// newest few are ever wanted (they differ by collateral and fee, not by the
+/// defect), so cap the set rather than filling /tmp.
+const REJECT_DUMP_PREFIX: &str = "/tmp/scoop-reject-";
+const REJECT_DUMP_KEEP: usize = 20;
+
+/// Delete all but the newest `REJECT_DUMP_KEEP` rejected-tx dumps. Best
+/// effort: losing a dump must never fail a scoop, so every error is ignored.
+fn prune_reject_dumps() {
+    prune_dumps(REJECT_DUMP_PREFIX, REJECT_DUMP_KEEP);
+}
+
+fn prune_dumps(dump_prefix: &str, keep: usize) {
+    let Some((dir, prefix)) = dump_prefix.rsplit_once('/') else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dumps: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?;
+            // Match the .cbor of each pair; its .reason.hex goes with it.
+            if !name.starts_with(prefix) || !name.ends_with(".cbor") {
+                return None;
+            }
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if dumps.len() <= keep {
+        return;
+    }
+    dumps.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
+    for (_, path) in dumps.drain(keep..) {
+        let _ = std::fs::remove_file(path.with_extension("reason.hex"));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 impl Scooper {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -2520,8 +2566,22 @@ impl Scooper {
                 // quarantined — an order whose input is fine must not sit
                 // out minutes for a wallet-UTxO conflict.
                 let node_reject_hex: Option<&str> = msg.strip_prefix("node rejected tx: ");
-                if node_reject_hex.is_some() {
+                if let Some(hex_reason) = node_reject_hex {
                     self.metrics.node_rejects.fetch_add(1, Ordering::Relaxed);
+                    // Keep what the node refused. A reject is not always a
+                    // race: on 2026-09-28 mainnet refused a stableswap
+                    // withdraw scoop twelve times running with a script
+                    // failure our own evaluator did not reproduce, and
+                    // nothing had the tx bytes to re-evaluate with traced
+                    // scripts. The reason from pallas is cut at one mux
+                    // segment (12288 bytes), before the node's trace, so the
+                    // bytes are the only way to get one.
+                    let base = format!("{REJECT_DUMP_PREFIX}{}", final_tx.tx_hash_hex);
+                    if let Err(e) = std::fs::write(format!("{base}.cbor"), &final_tx.cbor) {
+                        warn!(%e, "couldn't write rejected tx dump");
+                    }
+                    let _ = std::fs::write(format!("{base}.reason.hex"), hex_reason);
+                    prune_reject_dumps();
                 }
                 let is_race_lost = msg.contains("BadInputsUTxO")
                     || msg.contains("ConwayMempoolFailure")
@@ -3115,4 +3175,70 @@ enum OrderInvalidReason {
     NoPools,
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
+}
+
+#[cfg(test)]
+mod reject_dump_tests {
+    use super::prune_dumps;
+
+    /// Keeps the newest `keep` pairs, removes the rest, and leaves files that
+    /// do not belong to the dump set alone.
+    #[test]
+    fn prunes_to_the_newest_and_touches_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("scooper-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/scoop-reject-", dir.display());
+
+        for i in 0..5u32 {
+            std::fs::write(format!("{prefix}{i:02}.cbor"), [i as u8]).unwrap();
+            std::fs::write(format!("{prefix}{i:02}.reason.hex"), "ab").unwrap();
+            // Distinct mtimes, oldest first.
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + i as u64 * 10);
+            let f =
+                std::fs::File::options().write(true).open(format!("{prefix}{i:02}.cbor")).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        let bystander = dir.join("keep-me.cbor");
+        std::fs::write(&bystander, "x").unwrap();
+
+        prune_dumps(&prefix, 2);
+
+        for i in 0..3u32 {
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be pruned"
+            );
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists(),
+                "{i}'s reason should go too"
+            );
+        }
+        for i in 3..5u32 {
+            assert!(
+                std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be kept"
+            );
+            assert!(std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists());
+        }
+        assert!(
+            bystander.exists(),
+            "a file outside the dump set must be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under the cap nothing is removed.
+    #[test]
+    fn keeps_everything_under_the_cap() {
+        let dir = std::env::temp_dir().join(format!("scooper-prune-small-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/scoop-reject-", dir.display());
+        std::fs::write(format!("{prefix}aa.cbor"), "x").unwrap();
+        prune_dumps(&prefix, 20);
+        assert!(std::path::Path::new(&format!("{prefix}aa.cbor")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

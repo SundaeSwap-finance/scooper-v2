@@ -40,6 +40,14 @@ pub struct PoolAccum {
     /// effects. Mirrors tx_builder's running_total_lp at this point in the walk.
     pub running_total_lp: BigInt,
     pub running_circ_lp: BigInt,
+    /// The pool's LP escrow as this batch leaves it. Deposits draw from it,
+    /// withdrawals return to it, and it rides on the pool output as a Value
+    /// entry — so it is bounded by `MAX_VALUE_QUANTITY`. Mirrors tx_builder's
+    /// per_pool_running_preminted.
+    running_preminted: BigInt,
+    /// LP this batch mints under pool_mint for this pool, i.e. what the
+    /// escrow could not cover. The tx's mint field is bounded too.
+    running_minted: BigInt,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<crate::sundaev4::batch::ResolvedDeposit>,
@@ -106,6 +114,58 @@ pub struct Accumulator {
     protocol_share: (u64, u64),
 }
 
+impl PoolAccum {
+    /// The escrow and mint totals after issuing `lp_minted`, or why the batch
+    /// cannot carry it.
+    ///
+    /// Deposits take LP from the pool's preminted escrow and mint only the
+    /// shortfall — the same rule tx_builder walks. Each of the three results
+    /// lands in a Cardano `Value`, which is signed 64-bit: the depositor's own
+    /// LP output, the escrow left on the pool output, and the transaction's
+    /// mint field. A batch that would exceed any of them cannot be submitted,
+    /// so refuse the order here and let it scoop in a batch of its own rather
+    /// than building a transaction the ledger will not take.
+    fn lp_issue_after(&self, lp_minted: &BigInt) -> Result<(BigInt, BigInt), String> {
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        // The order's own LP output.
+        if lp_minted > &cap {
+            return Err(format!(
+                "deposit mints {lp_minted} LP, more than a Value entry can hold ({cap}); \
+                 it cannot be paid out in one output"
+            ));
+        }
+        let (next_preminted, minted_now) = if &self.running_preminted >= lp_minted {
+            (&self.running_preminted - lp_minted, BigInt::from(0))
+        } else {
+            (BigInt::from(0), lp_minted - &self.running_preminted)
+        };
+        let next_minted = &self.running_minted + &minted_now;
+        if next_minted > cap {
+            return Err(format!(
+                "this batch would mint {next_minted} LP for the pool, over the {cap} a \
+                 transaction's mint field can hold; leaving the order for the next batch"
+            ));
+        }
+        Ok((next_preminted, next_minted))
+    }
+
+    /// The escrow after a withdrawal returns `lp_burned` to it.
+    ///
+    /// Withdrawals do not burn: the LP goes back to the pool's escrow, which
+    /// rides on the pool output and is bounded like any other Value entry.
+    fn lp_return_after(&self, lp_burned: &BigInt) -> Result<BigInt, String> {
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        let next = &self.running_preminted + lp_burned;
+        if next > cap {
+            return Err(format!(
+                "returning {lp_burned} LP would leave the pool holding {next}, over the {cap} \
+                 a Value entry can hold; leaving the order for the next batch"
+            ));
+        }
+        Ok(next)
+    }
+}
+
 impl Accumulator {
     pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
@@ -143,6 +203,8 @@ impl Accumulator {
             running_assets: effective_pool.pool_datum.assets.clone(),
             running_total_lp: effective_pool.pool_datum.total_lp.clone(),
             running_circ_lp: effective_pool.pool_datum.circulating_lp.clone(),
+            running_preminted: effective_pool.pool_datum.preminted_lp.clone(),
+            running_minted: BigInt::from(0),
             swaps: Vec::new(),
             continuations: Vec::new(),
             deposits: Vec::new(),
@@ -263,6 +325,7 @@ impl Accumulator {
         transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let deposit = batch::resolve_proportional_deposit(&transient, order)?;
+        let (next_preminted, next_minted) = accum.lp_issue_after(&deposit.lp_minted)?;
 
         // Update running reserves: each asset i grows by dx[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
@@ -270,6 +333,8 @@ impl Accumulator {
         }
         accum.running_total_lp = &accum.running_total_lp + &deposit.lp_minted;
         accum.running_circ_lp = &accum.running_circ_lp + &deposit.lp_minted;
+        accum.running_preminted = next_preminted;
+        accum.running_minted = next_minted;
 
         let dep_idx = accum.deposits.len();
         accum.deposits.push(deposit);
@@ -370,6 +435,7 @@ impl Accumulator {
 
         let accum = self.pools.get_mut(pool_ident).expect("pool accum was inserted above");
         accum.check_canonical_append(&order.input)?;
+        let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
         accum.cum_gross_fb = cum_gross_fb;
         accum.cum_protocol_lp = new_cum_protocol_lp;
         accum.running_assets = after_swap;
@@ -378,6 +444,8 @@ impl Accumulator {
         }
         accum.running_total_lp = &lp_at_deposit + &lp_minted;
         accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
+        accum.running_preminted = next_preminted;
+        accum.running_minted = next_minted;
 
         let zap_idx = accum.zaps.len();
         accum.zaps.push(batch::ResolvedZap {
@@ -414,6 +482,7 @@ impl Accumulator {
         transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let withdraw = batch::resolve_proportional_withdraw(&transient, order)?;
+        let next_preminted = accum.lp_return_after(&withdraw.lp_burned)?;
 
         // Update running reserves: each asset i shrinks by dy[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
@@ -421,6 +490,7 @@ impl Accumulator {
         }
         accum.running_total_lp = &accum.running_total_lp - &withdraw.lp_burned;
         accum.running_circ_lp = &accum.running_circ_lp - &withdraw.lp_burned;
+        accum.running_preminted = next_preminted;
 
         let w_idx = accum.withdraws.len();
         accum.withdraws.push(withdraw);
