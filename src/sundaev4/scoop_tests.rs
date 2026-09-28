@@ -1809,6 +1809,108 @@ mod tests {
     /// `(D + t) · before_lp >= D · after_lp` false. Everything else in the two
     /// transactions was byte-identical, so this pins the resolved target and
     /// the module's own inequality against the real validators.
+    /// A pool whose LP supply already sits near what a Cardano Value can
+    /// carry: LP is minted at `reserves x rate_scale`, so a large enough
+    /// deposit asks for more LP than the ledger's signed 64-bit quantity
+    /// holds. Admission must refuse it and leave the batch usable, rather
+    /// than building a transaction the node cannot take.
+    fn near_cap_ss_pool(env: &TestEnv, ident: u8, total_lp: i64) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
+        let r = 1_000_000_000i64;
+        let fee = crate::sundaev4::types::Rational { num: BigInt::from(15), den: BigInt::from(10_000) };
+        let pool = make_ss_pool(env, ident, vec![(token_a(), r), (token_e(), r)], ss_config(500, fee, [1_000_000, 1_000_000]));
+        let mut p = (*pool).clone();
+        let escrow = BigInt::from(1_000_000i64);
+        p.pool_datum.total_lp = BigInt::from(total_lp);
+        p.pool_datum.preminted_lp = escrow.clone();
+        p.pool_datum.circulating_lp = BigInt::from(total_lp) - &escrow;
+        p.value.insert(&lp_asset_for(env, ident), escrow);
+        std::sync::Arc::new(p)
+    }
+
+    #[test]
+    fn deposit_over_the_value_cap_is_refused_not_built() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        // total_lp just under the cap, so doubling the pool doubles the LP.
+        let pool = near_cap_ss_pool(&env, 0x64, 9_000_000_000_000_000_000);
+        let lp_asset = lp_asset_for(&env, 0x64);
+        let r = 1_000_000_000i64;
+
+        // Doubling the reserves asks for ~total_lp more LP: over the cap.
+        let big = make_basic_deposit_order(vec![(token_a(), 2 * r), (token_e(), 2 * r)], lp_asset.clone(), 1, 1);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let err = accum
+            .try_add_deposit(&big, &pool.pool_datum.identifier.clone(), &pool)
+            .expect_err("a deposit over the Value cap must be refused");
+        assert!(
+            err.contains("Value entry can hold") || err.contains("mint field"),
+            "the refusal should name the ledger limit, got: {err}",
+        );
+
+        // The accumulator is still usable: a deposit that fits still goes in.
+        let small = make_basic_deposit_order(vec![(token_a(), r / 1000), (token_e(), r / 1000)], lp_asset, 1, 2);
+        accum
+            .try_add_deposit(&small, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("a deposit within the cap still resolves");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches[0].deposits.len(), 1, "only the small deposit was admitted");
+    }
+
+    /// Two deposits that each fit but together exceed one transaction's mint
+    /// field. The second is refused, so the batch splits instead of building
+    /// an unsubmittable transaction.
+    #[test]
+    fn deposits_that_only_overflow_together_split_the_batch() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = near_cap_ss_pool(&env, 0x65, 6_000_000_000_000_000_000);
+        let lp_asset = lp_asset_for(&env, 0x65);
+        let r = 1_000_000_000i64;
+
+        // Each doubles the pool it sees, so each mints 6e18: under the cap
+        // alone, 1.2e19 together.
+        let a = make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset.clone(), 1, 1);
+        let b = make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset, 1, 2);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let ident = pool.pool_datum.identifier.clone();
+        accum.try_add_deposit(&a, &ident, &pool).expect("the first fits on its own");
+        let err = accum
+            .try_add_deposit(&b, &ident, &pool)
+            .expect_err("the pair exceeds one mint field");
+        assert!(err.contains("mint field"), "got: {err}");
+        assert_eq!(accum.into_plan().batches[0].deposits.len(), 1, "the batch keeps only the first");
+    }
+
+    /// Withdrawals return LP to the pool's escrow rather than burning it, and
+    /// the escrow rides on the pool output as a Value entry.
+    #[test]
+    fn withdraw_that_overfills_the_escrow_is_refused() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let r = 1_000_000_000i64;
+        let fee = crate::sundaev4::types::Rational { num: BigInt::from(15), den: BigInt::from(10_000) };
+        let pool = make_ss_pool(&env, 0x66, vec![(token_a(), r), (token_e(), r)], ss_config(500, fee, [1_000_000, 1_000_000]));
+        let lp_asset = lp_asset_for(&env, 0x66);
+        let burn = 4_000_000_000_000_000_000i64;
+        let pool = {
+            let mut p = (*pool).clone();
+            // An escrow already close to the cap, and enough LP outstanding
+            // to withdraw against.
+            let escrow = BigInt::from(6_000_000_000_000_000_000i64);
+            p.pool_datum.total_lp = BigInt::from(9_000_000_000_000_000_000i64);
+            p.pool_datum.circulating_lp = BigInt::from(burn * 2);
+            p.pool_datum.preminted_lp = escrow.clone();
+            p.value.insert(&lp_asset, escrow);
+            std::sync::Arc::new(p)
+        };
+        let order = make_basic_withdraw_order(lp_asset, burn, vec![(token_a(), 1), (token_e(), 1)], 1);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let err = accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect_err("6e18 + 4e18 returned LP does not fit a Value entry");
+        assert!(err.contains("Value entry can hold"), "got: {err}");
+    }
+
     #[test]
     fn ss_withdraw_mainnet_20260928_target_is_pinned() {
         use crate::sundaev4::accumulator::Accumulator;

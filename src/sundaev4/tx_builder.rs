@@ -1062,6 +1062,26 @@ pub fn build_multi_pool_scoop_tx(
     let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
     for (i, batch) in batches.iter().enumerate() {
         let pool = &batch.pool;
+        // Backstop. Admission already refuses an order that would take a
+        // Value entry past what the ledger carries (signed 64-bit), so
+        // reaching this means the two have drifted apart. Fail the build
+        // rather than hand the node a transaction it cannot accept.
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        if per_pool_lp_minted[i] > cap {
+            bail!(
+                "pool {}: batch mints {} LP, over the {cap} a transaction's mint field holds",
+                pool.pool_datum.identifier,
+                per_pool_lp_minted[i],
+            );
+        }
+        if per_pool_running_preminted[i] > cap {
+            bail!(
+                "pool {}: batch leaves {} LP in the pool's escrow, over the {cap} a Value \
+                 entry holds",
+                pool.pool_datum.identifier,
+                per_pool_running_preminted[i],
+            );
+        }
         let final_total_lp = per_pool_running_total_lp[i].clone();
         let final_circ_lp = per_pool_running_circ_lp[i].clone();
         let final_assets_actual = per_pool_running_assets[i].clone();

@@ -828,6 +828,15 @@ pub struct BountyClaim {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Constant-sum swap step.
+/// The largest quantity a Cardano `Value` entry can carry. Token amounts and
+/// the mint field are both signed 64-bit on the ledger, so anything above
+/// this cannot be put on chain no matter what the datum says.
+///
+/// `total_lp` in the datum is a Plutus integer and may exceed it — a pool's
+/// TVL is not capped. What is capped is any single LP holding, a deposit's
+/// minted output, and one transaction's total mint.
+pub const MAX_VALUE_QUANTITY: i64 = i64::MAX;
+
 pub const TAG_SWAP: u64 = 3;
 /// Constant-sum LP-redemption step (SUN-202).
 pub const TAG_WITHDRAW: u64 = 4;
