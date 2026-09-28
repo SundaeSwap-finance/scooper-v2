@@ -342,11 +342,12 @@ impl AsPlutus for BigInt {
                 )))
             }
             pallas_primitives::BigInt::BigNInt(bytes) => {
+                // CBOR tag 3 (RFC 8949 s3.4.3): the payload `n` encodes the
+                // value `-1 - n`, NOT `-n`. Reading it as `-n` makes every
+                // large negative integer one too high.
                 let n = num_bigint::BigUint::from_bytes_be(&bytes);
-                Ok(BigInt(num_bigint::BigInt::from_biguint(
-                    num_bigint::Sign::Minus,
-                    n,
-                )))
+                let n = num_bigint::BigInt::from(n) + num_bigint::BigInt::from(1u8);
+                Ok(BigInt(-n))
             }
         }
     }
@@ -370,7 +371,16 @@ impl AsPlutus for BigInt {
                 unreachable!()
             }
             num_bigint::Sign::Minus => {
-                let bytes = big_uint.to_bytes_be();
+                // The payload is `-1 - v`, i.e. `|v| - 1`. Writing `|v|` put
+                // a value one MORE negative than intended on chain for every
+                // negative integer too big for the 64-bit form. It cost a
+                // mainnet stableswap withdrawal: the scooper resolved
+                // target_delta_d = -7347631365219459674054077, serialised it
+                // as -...078, and the module refused every submission with
+                // `(D + t) * before_lp >= D * after_lp` false. The scooper
+                // decoded its own output symmetrically, so the error was
+                // invisible to a round trip.
+                let bytes = (big_uint - 1u32).to_bytes_be();
                 PlutusData::BigInt(pallas_primitives::BigInt::BigNInt(bytes.into()))
             }
         }
@@ -381,6 +391,59 @@ impl AsPlutus for BigInt {
 mod tests {
     use super::BigInt;
     use plutus_parser::AsPlutus;
+
+    /// CBOR tag 3 carries `-1 - n`, so the ledger and every other codec read
+    /// the payload one lower than the magnitude. Pin the bytes, not just a
+    /// round trip: the encoder and decoder were wrong in the same direction,
+    /// so a round trip agreed with itself and disagreed with the chain.
+    #[test]
+    fn large_negative_matches_cbor_tag3_semantics() {
+        use num_traits::Num;
+        // The mainnet stableswap withdraw target that was refused on chain.
+        let v = num_bigint::BigInt::from_str_radix("-7347631365219459674054077", 10).unwrap();
+        let mut buf = vec![];
+        minicbor::encode(&AsPlutus::to_plutus(BigInt(v.clone())), &mut buf).unwrap();
+        let hex = hex::encode(&buf);
+        // tag 3, 11-byte payload = |v| - 1, exactly what blaze produced.
+        assert!(
+            hex.contains("c34b0613ebe4f9ffafa04a9dbc"),
+            "expected tag-3 payload |v|-1, got {hex}",
+        );
+        assert!(
+            !hex.contains("c34b0613ebe4f9ffafa04a9dbd"),
+            "payload must not be |v|: {hex}",
+        );
+    }
+
+    #[test]
+    fn large_negative_roundtrips() {
+        use num_traits::Num;
+        for s in [
+            "-7347631365219459674054077",
+            "-18446744073709551616",
+            "-18446744073709551617",
+            "-1",
+            "-340282366920938463463374607431768211456",
+        ] {
+            let v = BigInt(num_bigint::BigInt::from_str_radix(s, 10).unwrap());
+            let mut buf = vec![];
+            minicbor::encode(&AsPlutus::to_plutus(v.clone()), &mut buf).unwrap();
+            let back: BigInt = AsPlutus::from_plutus(minicbor::decode(&buf).unwrap()).unwrap();
+            assert_eq!(v, back, "round trip for {s}");
+        }
+    }
+
+    /// Decoding alone, against a payload written by a correct encoder.
+    #[test]
+    fn decodes_tag3_payload_as_minus_one_minus_n() {
+        use num_traits::Num;
+        let bytes = hex::decode("c34b0613ebe4f9ffafa04a9dbc").unwrap();
+        let got: BigInt = AsPlutus::from_plutus(minicbor::decode(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            got,
+            BigInt(num_bigint::BigInt::from_str_radix("-7347631365219459674054077", 10).unwrap()),
+        );
+    }
 
     #[test]
     fn bigint_roundtrip_small() {
