@@ -21,8 +21,35 @@ pub const ROLLBACK_LIMIT: u64 = 2160;
 /// malformed?" for anything recent.
 pub const INVALID_ORDER_CAP: usize = 10_000;
 
+/// What an instance is for.
+///
+/// The public-facing box must not be able to sign. Making that a role the
+/// binary enforces, rather than only the absence of a key file, means a key
+/// that arrives on that box by accident stops it starting instead of
+/// quietly arming it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeRole {
+    /// Indexes, executes orders and signs transactions. The default, so an
+    /// existing config keeps the behaviour it had.
+    #[default]
+    Scooper,
+    /// Indexes, accepts strategy intents, gossips them to peers, and does
+    /// nothing else. Holds no key, builds no transaction, and does not serve
+    /// the controls that stop or restart the indexer.
+    Observer,
+}
+
+impl NodeRole {
+    pub fn is_observer(self) -> bool {
+        matches!(self, Self::Observer)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub role: NodeRole,
     pub log: LogConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
@@ -146,5 +173,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let exec = config.expect("config loads").protocol.v4.and_then(|v4| v4.execution);
         assert!(exec.expect("v4 execution config").blacklisted_pools.contains(&pool));
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::NodeRole;
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        #[serde(default)]
+        role: NodeRole,
+    }
+
+    fn role_of(json: &str) -> NodeRole {
+        serde_json::from_str::<Holder>(json).unwrap().role
+    }
+
+    #[test]
+    fn the_default_is_the_scooper_it_has_always_been() {
+        assert_eq!(role_of("{}"), NodeRole::Scooper);
+        assert!(!role_of("{}").is_observer());
+    }
+
+    #[test]
+    fn observer_is_spelled_in_kebab_case() {
+        assert_eq!(role_of(r#"{"role":"observer"}"#), NodeRole::Observer);
+        assert!(role_of(r#"{"role":"observer"}"#).is_observer());
+    }
+
+    #[test]
+    fn an_unrecognised_role_is_refused_rather_than_defaulted() {
+        // A typo must not quietly produce a scooper. It would then demand a
+        // signing key and fail to start, which is the safe direction, but
+        // the error should name the role rather than the missing key.
+        for bad in [
+            r#"{"role":"Observer"}"#,
+            r#"{"role":"observe"}"#,
+            r#"{"role":""}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Holder>(bad).is_err(),
+                "{bad} must not parse"
+            );
+        }
     }
 }

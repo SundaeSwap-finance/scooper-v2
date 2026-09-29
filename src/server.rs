@@ -235,6 +235,7 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
 #[allow(clippy::too_many_arguments)]
 pub async fn admin_server(
     config: ServerConfig,
+    role: crate::config::NodeRole,
     network: String,
     v3_state: V3State,
     v4_state: V4State,
@@ -253,6 +254,7 @@ pub async fn admin_server(
 ) {
     let base = AdminServer {
         visibility: Visibility::Private,
+        role,
         network,
         v3_state,
         v4_state,
@@ -444,6 +446,9 @@ enum Visibility {
 #[derive(Clone)]
 struct AdminServer {
     visibility: Visibility,
+    /// Set from the config. An observer serves no control that changes what
+    /// the process is doing, because the public box runs as one.
+    role: crate::config::NodeRole,
     /// Network name from config, e.g. "preview". Reported in `/status` so
     /// the dashboard can convert slots to wall-clock times.
     network: String,
@@ -1113,6 +1118,9 @@ impl AdminServer {
             ),
             "/status" => Self::json_response(self.serve_status().await),
             "/resync-from-acropolis" => {
+                if self.role.is_observer() {
+                    return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
+                }
                 // This restarts the indexer. It answered any method,
                 // including GET, so a link, an image tag or a prefetch was
                 // enough to trigger it, and the response carried an open
@@ -1137,6 +1145,11 @@ impl AdminServer {
             // any stray request (scanner, browser prefetch, curl typo)
             // silently stop all scooping — which once went unnoticed for
             // days because the toggle also didn't log.
+            "/pause" if self.role.is_observer() => {
+                // There is no scooping to pause, and the control is one more
+                // way to stop a box that anyone can reach.
+                Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path")
+            }
             "/pause" => match *req.method() {
                 hyper::Method::POST => {
                     // Halting scooping is a state change, and a plain POST
@@ -2142,6 +2155,7 @@ mod protocol_stats_tests {
         let (resync_tx, _) = tokio::sync::broadcast::channel(1);
         AdminServer {
             visibility: Visibility::Private,
+            role: crate::config::NodeRole::Scooper,
             network: "devnet".into(),
             v3_state: None,
             v4_state: Some(Arc::new(Mutex::new(hist))),

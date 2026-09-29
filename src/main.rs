@@ -84,10 +84,25 @@ async fn main() -> Result<()> {
         v4.set_network(sundaev4::AddressNetwork::from_network_name(&network_name));
         info!(network_name, network = ?v4.network, "v4 address network");
     }
+    let observer = config.role.is_observer();
     if let Some(ref mut v4) = protocol.v4
         && let Some(ref mut exec) = v4.execution
     {
-        exec.resolve_secret_key().expect("failed to resolve scooper secret key");
+        if observer {
+            // The point of the observer role is that this instance cannot
+            // sign. Refuse to start if a key is present rather than run with
+            // one loaded and merely unused: a key on a public box is the
+            // thing the split exists to prevent, and it should be loud.
+            if !exec.scooper_secret_key.is_empty() || exec.scooper_secret_key_file.is_some() {
+                panic!(
+                    "role is observer but a scooper key is configured; \
+                     remove scooper-secret-key and scooper-secret-key-file"
+                );
+            }
+            info!("role observer: indexing and gossiping intents, no key, no execution");
+        } else {
+            exec.resolve_secret_key().expect("failed to resolve scooper secret key");
+        }
     }
     let v4_execution = protocol.v4.as_ref().and_then(|v4| v4.execution.clone());
 
@@ -253,23 +268,31 @@ async fn main() -> Result<()> {
             shutdown.child_token(),
         ));
     }
-    let scooper_handle = tokio::spawn(
-        Scooper::new(
-            config.log.trace_directory.clone(),
-            event_tx.subscribe(),
-            v3_state.clone(),
-            v4_state.clone(),
-            v4_execution,
-            paused.clone(),
-            metrics.clone(),
-            intents.clone(),
-            scooper_provisional,
-            scooper_node_submit,
-        )?
-        .run(shutdown.child_token()),
-    );
+    // An observer never builds a transaction, so the scooper loop is not
+    // started at all. Leaving it running and gating each action would give
+    // every future action a new chance to forget the gate.
+    let scooper_handle = if observer {
+        tokio::spawn(async move {})
+    } else {
+        tokio::spawn(
+            Scooper::new(
+                config.log.trace_directory.clone(),
+                event_tx.subscribe(),
+                v3_state.clone(),
+                v4_state.clone(),
+                v4_execution,
+                paused.clone(),
+                metrics.clone(),
+                intents.clone(),
+                scooper_provisional,
+                scooper_node_submit,
+            )?
+            .run(shutdown.child_token()),
+        )
+    };
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
+        config.role,
         config.network_name(),
         v3_state.clone(),
         v4_state.clone(),
