@@ -100,6 +100,24 @@ async fn main() -> Result<()> {
                 );
             }
             info!("role observer: indexing and gossiping intents, no key, no execution");
+            // Gossip is the entire job of an observer: it accepts intents on
+            // a public endpoint and forwards them to the instance that can
+            // execute them. With no peers it accepts intents and drops them
+            // on the floor.
+            //
+            // Worth saying loudly because the field is easy to get wrong and
+            // impossible to notice. ScooperExecution is kebab-case and does
+            // not deny unknown fields, so `strategy_peers` instead of
+            // `strategy-peers` parses cleanly, sets nothing, and reports
+            // nothing.
+            if exec.strategy_peers.is_empty() {
+                warn!(
+                    "role is observer but strategy-peers is empty: accepted intents will be \
+                     stored and never forwarded. Check the spelling; the key is kebab-case."
+                );
+            } else {
+                info!(peers = ?exec.strategy_peers, "observer will gossip accepted intents");
+            }
         } else {
             exec.resolve_secret_key().expect("failed to resolve scooper secret key");
         }
