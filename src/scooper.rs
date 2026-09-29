@@ -1291,6 +1291,12 @@ impl Scooper {
         let mut skip_add_failed = 0u32;
         let mut skip_no_route = 0u32;
         let mut skip_not_allowlisted = 0u32;
+        // A pool the allowlist withheld leaves the router with nothing to
+        // route through, which counts as skip_no_route and reads in the
+        // summary as though no pool existed. Counted apart so the summary
+        // distinguishes "nobody made this pool" from "this owner may not use
+        // it", which are the operator's problem and the user's respectively.
+        let mut skip_no_route_allowlisted = 0u32;
         let mut skip_route_failed = 0u32;
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
@@ -1465,11 +1471,12 @@ impl Scooper {
                     }
                     // Filtered after the overlay, never before — see
                     // `PoolAllowlists::retain_visible`.
-                    let pool_view = exec.pool_allowlists.retain_visible(
-                        candidate.current_pool_view(&pools_filtered),
-                        order,
-                        order_strategy,
-                    );
+                    let (pool_view, withheld_by_allowlist) =
+                        exec.pool_allowlists.retain_visible_reporting(
+                            candidate.current_pool_view(&pools_filtered),
+                            order,
+                            order_strategy,
+                        );
                     // Per-order fan-out limits: the order's tx-fee budget
                     // buys it a number of pools and routing steps. Orders
                     // paying more get more elaborate routes.
@@ -1550,7 +1557,44 @@ impl Scooper {
                         offer_amount,
                         limits,
                     ) else {
-                        tracing::info!(order = %order.input, "order dispatch: swap, no route");
+                        // "No route" covers three situations that need three
+                        // different answers, and the operator cannot tell
+                        // them apart from the words alone:
+                        //
+                        //   the allowlist withheld every pool for the pair
+                        //     -> add the owner's credential, or drop the list
+                        //   the fee budget bought too few pools or steps
+                        //     -> the client under-budgeted the order
+                        //   neither
+                        //     -> no pool for the pair, or not enough depth
+                        //
+                        // Only the first is something an operator fixes, and
+                        // an allowlist makes it routine, so name the pools
+                        // that were withheld.
+                        if withheld_by_allowlist.is_empty() {
+                            tracing::info!(
+                                order = %order.input,
+                                pools_considered = pool_view.len(),
+                                max_pools = limits.max_pools,
+                                max_steps = limits.max_steps,
+                                budget_lovelace = order_budget_lov,
+                                "order dispatch: swap, no route",
+                            );
+                        } else {
+                            let withheld = withheld_by_allowlist
+                                .iter()
+                                .map(|i| i.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            tracing::info!(
+                                order = %order.input,
+                                pools_considered = pool_view.len(),
+                                withheld_pools = %withheld,
+                                withheld_count = withheld_by_allowlist.len(),
+                                "order dispatch: swap, no route; the allowlist withheld pools this order could otherwise have used",
+                            );
+                            skip_no_route_allowlisted += 1;
+                        }
                         skip_no_route += 1;
                         continue;
                     };
@@ -1715,6 +1759,7 @@ impl Scooper {
                 skip_no_pool,
                 skip_add_failed,
                 skip_no_route,
+                skip_no_route_allowlisted,
                 skip_not_allowlisted,
                 skip_route_failed,
                 "no orders could be added to batch"

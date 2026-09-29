@@ -139,15 +139,39 @@ impl PoolAllowlists {
     /// back the moment one permitted order has used it.
     pub fn retain_visible<P>(
         &self,
-        mut pools: BTreeMap<Ident, P>,
+        pools: BTreeMap<Ident, P>,
         order: &SundaeV4Order,
         strategy: Option<&StrategyConstraints>,
     ) -> BTreeMap<Ident, P> {
+        self.retain_visible_reporting(pools, order, strategy).0
+    }
+
+    /// As `retain_visible`, and also the pools it withheld.
+    ///
+    /// The withheld list exists for the log. A pool dropped here is invisible
+    /// to the router, which then reports "no route" in exactly the words it
+    /// uses for a pair nobody has ever made a pool for, and for an order
+    /// whose fee budget is too small to reach one. Those three need different
+    /// answers from an operator, and only this one is fixed by adding a
+    /// credential to a list, so the caller has to be able to tell them apart.
+    pub fn retain_visible_reporting<P>(
+        &self,
+        mut pools: BTreeMap<Ident, P>,
+        order: &SundaeV4Order,
+        strategy: Option<&StrategyConstraints>,
+    ) -> (BTreeMap<Ident, P>, Vec<Ident>) {
         if self.is_empty() {
-            return pools;
+            return (pools, Vec::new());
         }
-        pools.retain(|ident, _| self.permits(ident, order, strategy));
-        pools
+        let mut withheld = Vec::new();
+        pools.retain(|ident, _| {
+            let ok = self.permits(ident, order, strategy);
+            if !ok {
+                withheld.push(ident.clone());
+            }
+            ok
+        });
+        (pools, withheld)
     }
 }
 
@@ -584,6 +608,41 @@ mod tests {
         let permitted = order(sig(ALICE), fixed_to(BOB));
         let kept = allowlists().retain_visible(map.clone(), &permitted, None);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn retain_visible_reporting_names_what_it_withheld() {
+        // The reason a restricted order reaches the router with nothing to
+        // route through. Without this list the log says "no route", which is
+        // also what it says when nobody has ever made a pool for the pair.
+        // One of those is fixed by adding a credential and the other is not.
+        let other = Ident::new(&[0x99; 28]);
+        let map = pool_map(&[pool(), other.clone()]);
+
+        let denied = order(sig(STRANGER), fixed_to(STRANGER));
+        let (kept, withheld) = allowlists().retain_visible_reporting(map.clone(), &denied, None);
+        assert_eq!(kept.keys().collect::<Vec<_>>(), vec![&other]);
+        assert_eq!(withheld, vec![pool()]);
+
+        let permitted = order(sig(ALICE), fixed_to(BOB));
+        let (kept, withheld) = allowlists().retain_visible_reporting(map, &permitted, None);
+        assert_eq!(kept.len(), 2);
+        assert!(
+            withheld.is_empty(),
+            "nothing was withheld, so the log must not claim otherwise"
+        );
+    }
+
+    #[test]
+    fn nothing_is_withheld_when_no_pool_is_restricted() {
+        // An unrestricted deployment must never produce the allowlist
+        // wording, whoever the order belongs to.
+        let map = pool_map(&[pool()]);
+        let stranger = order(sig(STRANGER), fixed_to(STRANGER));
+        let (kept, withheld) =
+            PoolAllowlists::default().retain_visible_reporting(map, &stranger, None);
+        assert_eq!(kept.len(), 1);
+        assert!(withheld.is_empty());
     }
 
     #[test]
