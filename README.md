@@ -36,7 +36,47 @@ A v4 execution config needs these additional settings
 
 Pool families: constant product, constant sum, concentrated liquidity, and stableswap. Stableswap pools need `module-scripts.stableswap` and carry a config that changes on chain; see [docs/stableswap.md](./docs/stableswap.md) for how they are recognised, priced, and what to do when the module is deployed.
 
-The server listens on `server.address` (`0.0.0.0:9999` by default) and serves `/dashboard`, `/status`, `/health`, `/metrics`, `/failures`, `/events` (SSE), `/pause`, `/resync-from-acropolis`, and per-protocol `/v3/…` and `/v4/…` listings of `pools`, `orders`, `spent-orders`, and `spent-pools`. Setting `server.public_address` opens a second listener carrying only the strategy-intent endpoints and `/health`.
+The server listens on `server.address` (`127.0.0.1:9999` by default) and serves `/dashboard`, `/status`, `/health`, `/metrics`, `/failures`, `/events` (SSE), `/pause`, `/resync-from-acropolis`, and per-protocol `/v3/…` and `/v4/…` listings of `pools`, `orders`, `spent-orders`, and `spent-pools`. Setting `server.public_address` opens a second listener carrying only the strategy-intent endpoints and `/health`.
+
+`server.address` takes one address or a list, so a box can serve the
+operational surface on loopback and on its tailnet address without serving it
+anywhere else:
+
+```json
+"server": { "address": ["127.0.0.1:9999", "100.100.132.62:9999"] }
+```
+
+Addresses are listed, not discovered by interface name. A control surface that
+finds where to listen can begin listening somewhere new when an interface
+appears; one that is told cannot. A wildcard bind still works and now logs a
+warning naming what it exposes.
+
+### Public and private instances
+
+The operational surface is unauthenticated. `/pause` stops scooping and
+`/resync-from-acropolis` restarts the indexer, so anything that can reach
+`server.address` can stop the scooper. It belongs on loopback and the tailnet,
+never on a public interface.
+
+When the strategy-intent endpoint is published, run two instances:
+
+| | private | public |
+| --- | --- | --- |
+| `role` | `scooper` (default) | `observer` |
+| signing key | yes | **refuses to start with one** |
+| `server.address` | loopback + tailnet | loopback + tailnet |
+| `server.public_address` | unset | `0.0.0.0:9998` |
+| builds transactions | yes | no |
+| `/pause`, `/resync-from-acropolis` | yes | 404 |
+
+An observer indexes the chain, accepts strategy intents, validates them,
+stores them and gossips them to `strategy_peers`. It holds no key and starts
+no scooper loop. If a key is configured it refuses to start rather than run
+with one loaded: a key on the public box is the thing the split exists to
+prevent, and it should be loud.
+
+Point the private instance at the public one with `strategy_peers` so intents
+posted publicly reach the instance that can execute them.
 
 ### First sync
 
