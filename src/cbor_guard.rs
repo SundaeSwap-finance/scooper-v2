@@ -196,7 +196,7 @@ mod tests {
     /// aborts the process when it reaches the decoder.
     fn nested_indefinite(depth: usize) -> Vec<u8> {
         let mut v = vec![0x9f; depth];
-        v.extend(std::iter::repeat(0xff).take(depth));
+        v.extend(std::iter::repeat_n(0xff, depth));
         v
     }
 
@@ -217,7 +217,7 @@ mod tests {
         // 1000 integers in one array. Width must not read as depth: a real
         // transcript is wide, and a limit that counted items would refuse it.
         let mut v = vec![0x99, 0x03, 0xe8];
-        v.extend(std::iter::repeat(0x00).take(1000));
+        v.extend(std::iter::repeat_n(0x00, 1000));
         assert_eq!(check_depth(&v, MAX_CBOR_DEPTH), Ok(1));
     }
 
