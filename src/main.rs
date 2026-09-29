@@ -23,6 +23,7 @@ mod bigint;
 mod blueprint;
 mod bootstrap;
 mod cardano_types;
+mod cbor_guard;
 mod config;
 mod datum_lookup;
 mod events;

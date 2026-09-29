@@ -226,6 +226,14 @@ impl IntentStore {
         describe_invalid: impl Fn(&OrderKey) -> Option<String>,
         now_ms: u64,
     ) -> Result<(SubmitOutcome, Option<StoredIntent>)> {
+        // Bound the nesting BEFORE decoding. PlutusData's decoder recurses
+        // once per level with no limit of its own, and a stack overflow in
+        // Rust aborts the process rather than failing the request, so a
+        // single unauthenticated post would take the scooper down. The guard
+        // does not recurse and stops as soon as the limit is passed.
+        crate::cbor_guard::check_depth(&sse_cbor, crate::cbor_guard::MAX_CBOR_DEPTH)
+            .map_err(|e| anyhow::anyhow!("signed_execution rejected: {e}"))?;
+
         let pd: PlutusData = minicbor::decode(&sse_cbor)
             .map_err(|e| anyhow::anyhow!("signed_execution is not valid CBOR PlutusData: {e}"))?;
 

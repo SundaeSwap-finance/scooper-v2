@@ -445,20 +445,28 @@ impl AdminServer {
             );
         };
 
-        // Bound the body read: an SSE is small; 64KB is generous.
+        // Bound the body read: a signed execution is small; 64KB is generous.
+        //
+        // The limit has to be enforced by the reader, not checked after it.
+        // Collecting first and measuring afterwards buffers the whole body
+        // whatever its size, so an unauthenticated post of a few gigabytes
+        // was an out-of-memory kill rather than a 413. `Limited` stops at the
+        // cap and returns an error instead.
         const MAX_BODY: usize = 64 * 1024;
-        let body = match req.into_body().collect().await {
+        let limited = http_body_util::Limited::new(req.into_body(), MAX_BODY);
+        let body = match limited.collect().await {
             Ok(b) => b.to_bytes(),
+            // `Limited` reports the cap as a boxed error and gives no way to
+            // tell it apart from a read failure, so both answer 413. A client
+            // that lost its connection gets a slightly wrong code; a client
+            // sending too much gets the right one.
             Err(e) => {
                 return Self::error_response(
-                    hyper::StatusCode::BAD_REQUEST,
-                    format!("failed to read body: {e}"),
+                    hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("body rejected (limit {MAX_BODY} bytes): {e}"),
                 );
             }
         };
-        if body.len() > MAX_BODY {
-            return Self::error_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, "body too large");
-        }
 
         #[derive(Deserialize)]
         struct PostIntentBody {
