@@ -78,6 +78,48 @@ prevent, and it should be loud.
 Point the private instance at the public one with `strategy_peers` so intents
 posted publicly reach the instance that can execute them.
 
+### Provisioning the public observer
+
+The CloudFormation template in `sundae-scooper-server` creates the instance,
+its security group, the load balancer and the DNS name. It installs nothing.
+These are the steps that turn a bare instance into the observer.
+
+1. **Join the tailnet.** SSH in on the public address, install Tailscale and
+   bring it up with `--advertise-tags=tag:scooper-public`. Then note the
+   address it gets: `tailscale ip -4`.
+
+2. **Install the binary.** Take the release matching the signer's version, so
+   the two agree about everything they both parse. Put it at
+   `~/scooper-v2/scooper-v2` with the unit from `deploy/scooper-v2.service`.
+
+3. **Write the config.** Run the generator ON THE SIGNER, which is where the
+   authoritative mainnet config lives, then copy the result across:
+
+   ```
+   python3 deploy/mk-observer-config.py --tailnet-ip <the address from step 1> \
+     > observer-config.json
+   ```
+
+   It derives from the live file rather than from the example in this repo,
+   because mainnet deploys with `--keep-config` and the two have drifted
+   before. The six things it changes, and nothing else, are listed at the top
+   of that script.
+
+4. **Point the signer back.** The observer forwards accepted intents to the
+   signer's tailnet address on 9998, so the signer needs
+   `server.public_address` set to its own tailnet address. Not `0.0.0.0`:
+   that surface should be reachable from the observer and from nowhere else.
+   This is a config edit and a restart on the signer.
+
+5. **Check it is actually gossiping.** Startup logs the peer list, and warns
+   if an observer has none. An observer with no peers accepts intents and
+   drops them, which nothing else would tell you.
+
+Once it is up, the public address from the template can be removed. Because
+it is declared in a `NetworkInterfaces` block that replaces the instance on
+change, removing it means rebuilding the box. That is cheap here: an observer
+holds no key and re-seeds from Blockfrost in minutes.
+
 ### First sync
 
 `config/mainnet-v4.json` ships no `protocol.bootstrap` block, deliberately. On an
