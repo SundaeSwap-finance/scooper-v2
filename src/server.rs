@@ -432,11 +432,54 @@ async fn serve_connection(
 
 /// Paths the public listener answers. Everything else is 404 there.
 ///
-/// Matched exactly rather than by prefix. A prefix test also admits any path
-/// that merely begins with it, so a route added later whose name starts the
-/// same way would be published without anyone choosing to publish it.
+/// An allowlist, not a denylist, and every entry is a deliberate decision to
+/// publish. A route added later is private until someone adds it here.
+///
+/// What is published: the operator dashboard and the reads it needs to draw
+/// a health picture. Pools, orders and sync state are chain data that anyone
+/// can derive from the ledger, so serving them costs nothing and saves
+/// everyone else the indexing.
+///
+/// What is NOT, and why:
+///
+///   /pause, /resync-from-acropolis  controls. They change what the process
+///                                   is doing. The observer 404s them by
+///                                   role as well, so this is the second of
+///                                   two locks.
+///   /failures                       a ring buffer of internal error
+///                                   strings. Useful to an operator,
+///                                   and it describes our failures rather
+///                                   than the chain's state.
+///   /metrics                        operational internals, scraped over the
+///                                   tailnet. Nothing here needs it.
 fn public_path_allowed(path: &str) -> bool {
-    path == "/v4/strategy-intents" || path.starts_with("/v4/strategy-intents/") || path == "/health"
+    // Exact reads.
+    if matches!(
+        path,
+        "/health" | "/dashboard" | "/status" | "/events" | "/v4/strategy-intents"
+    ) {
+        return true;
+    }
+    // One intent by id.
+    if path.starts_with("/v4/strategy-intents/") {
+        return true;
+    }
+    // Per-protocol listings, and one pool by ident. Spelled out rather than
+    // matched on a "/v3/" or "/v4/" prefix, because that prefix is also where
+    // any future route lands.
+    matches!(
+        path,
+        "/v3/pools"
+            | "/v3/orders"
+            | "/v3/spent-orders"
+            | "/v3/spent-pools"
+            | "/v4/pools"
+            | "/v4/orders"
+            | "/v4/spent-orders"
+            | "/v4/spent-pools"
+            | "/v4/protocol"
+    ) || path.starts_with("/v3/pool/")
+        || path.starts_with("/v4/pool/")
 }
 
 /// Which route surface a listener serves.
@@ -2269,23 +2312,56 @@ mod surface_tests {
     }
 
     #[test]
-    fn the_public_surface_answers_only_intents_and_health() {
-        assert!(public_path_allowed("/v4/strategy-intents"));
-        assert!(public_path_allowed("/v4/strategy-intents/abcd"));
-        assert!(public_path_allowed("/health"));
-
-        for denied in [
-            "/pause",
-            "/resync-from-acropolis",
+    fn the_public_surface_serves_the_dashboard_and_the_chain_reads() {
+        for allowed in [
+            "/health",
             "/dashboard",
             "/status",
-            "/metrics",
             "/events",
+            "/v4/strategy-intents",
+            "/v4/strategy-intents/abcd",
+            "/v3/pools",
+            "/v3/orders",
+            "/v3/spent-orders",
+            "/v3/spent-pools",
             "/v4/pools",
             "/v4/orders",
-            "/v3/pools",
+            "/v4/spent-orders",
+            "/v4/spent-pools",
+            "/v4/protocol",
+            "/v4/pool/abcd",
+            "/v3/pool/abcd",
         ] {
+            assert!(public_path_allowed(allowed), "{allowed} should be public");
+        }
+    }
+
+    #[test]
+    fn the_public_surface_withholds_the_controls_and_our_own_internals() {
+        // The controls change what the process is doing. /failures is a log
+        // of our errors rather than the chain's state, and /metrics is
+        // operational internals scraped over the tailnet.
+        for denied in ["/pause", "/resync-from-acropolis", "/failures", "/metrics"] {
             assert!(!public_path_allowed(denied), "{denied} must not be public");
+        }
+    }
+
+    #[test]
+    fn a_new_route_under_a_published_prefix_is_private_until_it_is_listed() {
+        // The listings are named one by one rather than matched on "/v4/",
+        // because that prefix is also where the next route lands.
+        for unlisted in [
+            "/v4/admin",
+            "/v4/keys",
+            "/v3/secrets",
+            "/v4/strategy-intents-admin",
+            "/dashboard-admin",
+            "/statuses",
+        ] {
+            assert!(
+                !public_path_allowed(unlisted),
+                "{unlisted} must not be public"
+            );
         }
     }
 
@@ -2414,13 +2490,17 @@ mod listener_tests {
     }
 
     #[tokio::test]
-    async fn the_public_listener_refuses_the_operational_surface() {
+    async fn the_public_listener_serves_the_dashboard_and_refuses_the_controls() {
         let (addr, shutdown) = start(Visibility::Public).await;
-        for denied in ["/status", "/metrics", "/dashboard", "/v4/pools"] {
+        for denied in ["/metrics", "/failures", "/pause", "/resync-from-acropolis"] {
             let (status, _) = get(addr, denied).await;
             assert_eq!(status, 404, "{denied} must not be served publicly");
         }
+        let (status, body) = get(addr, "/dashboard").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("<html") || body.contains("<!DOCTYPE") || body.contains("<body"));
         assert_eq!(get(addr, "/health").await.0, 200);
+        assert_eq!(get(addr, "/status").await.0, 200);
         shutdown.cancel();
     }
 

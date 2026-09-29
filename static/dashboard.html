@@ -425,7 +425,7 @@
     <div class="stats" id="health-cards"></div>
     <div class="section-title">Operator</div>
     <div class="stats" id="ops-cards"></div>
-    <div class="section-title">Recent Failures</div>
+    <div class="section-title" id="ops-failures-title">Recent Failures</div>
     <table id="ops-failures-table">
       <thead><tr><th>Time</th><th>Stage</th><th>Tx</th><th>Orders</th><th>Detail</th></tr></thead>
       <tbody id="ops-failures-body"><tr><td colspan="5" class="empty-state">No recent failures</td></tr></tbody>
@@ -1059,6 +1059,7 @@
   }
 
   async function togglePause() {
+    if (readOnly) return;
     try {
       var res = await fetch('/pause', { method: 'POST' });
       var data = await res.json();
@@ -1695,12 +1696,35 @@
   // catch up on whatever the dead stream missed.
   let lastSseActivity = Date.now();
 
+  // The same page is served on the private listener and on the public one.
+  // The public surface publishes the reads that describe the chain and
+  // withholds the two that describe us: the controls, and the internal
+  // failure log. Probe once and hide what is not there, so a shared
+  // dashboard shows a smaller view rather than broken panels.
+  var readOnly = false;
+  async function detectSurface() {
+    try {
+      var res = await fetch('/pause');
+      readOnly = res.status === 404;
+    } catch (e) {
+      readOnly = true;
+    }
+    if (readOnly) {
+      var btn = document.getElementById('pauseBtn');
+      if (btn) btn.style.display = 'none';
+      var title = document.getElementById('ops-failures-title');
+      var table = document.getElementById('ops-failures-table');
+      if (title) title.style.display = 'none';
+      if (table) table.style.display = 'none';
+    }
+  }
+
   function fullReload() {
     fetchStatus();
     loadV3Pools(); loadV3Orders(); loadV3SpentOrders();
     loadV4Pools(); loadV4Orders(); loadV4SpentOrders();
     loadHealthStats();
-    loadFailures();
+    if (!readOnly) loadFailures();
     loadProtocol();
   }
 
@@ -1770,7 +1794,7 @@
             fetchStatus();
             if (evtType.startsWith('v3')) { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); }
             if (evtType.startsWith('v4')) { loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadProtocol(); }
-            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); loadFailures(); }
+            if (evtType === 'v4_order_scooped' || evtType === 'v3_order_scooped') { loadHealthStats(); if (!readOnly) loadFailures(); }
             if (evtType === 'rollback') { loadV3Pools(); loadV3Orders(); loadV3SpentOrders(); loadV4Pools(); loadV4Orders(); loadV4SpentOrders(); loadHealthStats(); loadProtocol(); }
           }, 500);
         }
@@ -1837,8 +1861,12 @@
   // connectSSE's onopen runs fullReload (which covers everything the old
   // init loaded, plus the failures panel), but load once eagerly anyway so
   // the page isn't blank if the SSE connection is slow to establish.
-  fullReload();
-  connectSSE();
+  // Probe first, so the first paint already omits what this surface does
+  // not serve rather than flashing controls that then vanish.
+  detectSurface().then(function() {
+    fullReload();
+    connectSSE();
+  });
 })();
 </script>
 </body>
