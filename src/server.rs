@@ -417,6 +417,11 @@ async fn serve_connection(
 ) {
     let io = TokioIo::new(stream);
     if let Err(err) = http1::Builder::new()
+        // hyper panics at request time if a timeout is configured without a
+        // timer to drive it: "header_read_timeout set, but no timer set".
+        // The panic is per connection, so the process stays up and looks
+        // healthy while every request is answered with a reset.
+        .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(io, server)
         .await
@@ -2332,5 +2337,103 @@ mod surface_tests {
             Some("null"),
             "localhost:9999"
         )));
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    //! Exercises the real listener: bind a port, speak HTTP to it, read the
+    //! response.
+    //!
+    //! The predicate tests above cover routing decisions and say nothing
+    //! about how a connection is served. That gap shipped a panic: hyper
+    //! aborts the connection task at request time when a timeout is set
+    //! without a timer to drive it, so every request came back as a reset
+    //! while the process stayed up and looked healthy.
+    use super::*;
+
+    fn bare_server(visibility: Visibility) -> AdminServer {
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+        AdminServer {
+            visibility,
+            role: crate::config::NodeRole::Scooper,
+            network: "devnet".into(),
+            v3_state: None,
+            v4_state: None,
+            v4_fee: None,
+            v4_routing_costs: None,
+            v4_pool_allowlists: Arc::default(),
+            v4_module_preimages: Arc::default(),
+            v4_protocol_share: None,
+            v4_dao: None,
+            resync_tx,
+            event_tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+            intents: None,
+            remote_addr: None,
+        }
+    }
+
+    async fn start(visibility: Visibility) -> (SocketAddr, CancellationToken) {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let server = bare_server(visibility);
+        tokio::spawn(async move { run_listener(addr, None, server, token).await });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (addr, shutdown)
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let res = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("request should get a response, not a connection reset");
+        let status = res.status().as_u16();
+        (status, res.text().await.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_request_gets_a_response_rather_than_a_reset() {
+        let (addr, shutdown) = start(Visibility::Private).await;
+        let (status, body) = get(addr, "/health").await;
+        assert_eq!(status, 200);
+        assert!(!body.is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_public_listener_refuses_the_operational_surface() {
+        let (addr, shutdown) = start(Visibility::Public).await;
+        for denied in ["/status", "/metrics", "/dashboard", "/v4/pools"] {
+            let (status, _) = get(addr, denied).await;
+            assert_eq!(status, 404, "{denied} must not be served publicly");
+        }
+        assert_eq!(get(addr, "/health").await.0, 200);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_private_listener_sends_no_cross_origin_header() {
+        let (addr, shutdown) = start(Visibility::Private).await;
+        let res = reqwest::Client::new()
+            .get(format!("http://{addr}/health"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+        shutdown.cancel();
     }
 }
