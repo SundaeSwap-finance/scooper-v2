@@ -105,6 +105,11 @@ These are the steps that turn a bare instance into the observer.
    before. The six things it changes, and nothing else, are listed at the top
    of that script.
 
+   The observer follows the chain from public Cardano relays. Peering it with
+   the dolos relays on the sync boxes was the original plan and does not
+   work: acropolis connects over TCP and is dropped immediately, logging
+   `disconnected from pre-configured peer`, and no block arrives.
+
 4. **Point the signer back.** The observer forwards accepted intents to the
    signer's tailnet address on 9998, so the signer needs
    `server.public_address` set to its own tailnet address. Not `0.0.0.0`:
@@ -113,7 +118,15 @@ These are the steps that turn a bare instance into the observer.
 
 5. **Check it is actually gossiping.** Startup logs the peer list, and warns
    if an observer has none. An observer with no peers accepts intents and
-   drops them, which nothing else would tell you.
+   drops them, which nothing else would tell you. A peer it cannot reach is
+   the same silence with a different cause, so the tailnet policy has to
+   grant `tag:scooper-public` to `tag:scooper` on 9998.
+
+6. **Check the tip is moving**, not just that the service is active. On a
+   rebuild, a sync that starts behind the database's own position has every
+   block discarded and never advances: the process looks healthy, the
+   network tip climbs, and the indexer's own tip sits still. Start from an
+   empty database rather than restarting in place.
 
 Once it is up, the public address from the template can be removed. Because
 it is declared in a `NetworkInterfaces` block that replaces the instance on

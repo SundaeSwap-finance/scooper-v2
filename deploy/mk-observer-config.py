@@ -14,10 +14,12 @@ The observer differs from the signer in six ways and no others:
   role            observer, so the binary refuses to start with a key
   no key          both key fields removed
   no mempool      there is no local cardano-node on that box
-  peers           our own dolos relays, not localhost
+  peers           public Cardano relays, not localhost
   bootstrap       seeds from Blockfrost instead of replaying from the v4
-                  starting point, which is older than the window the relays
-                  retain
+                  starting point. This also matters on a rebuild: a sync
+                  that starts behind the database's own position has every
+                  block discarded and never advances, so a box being rebuilt
+                  wants an empty database, not a restart in place.
   listeners       operational surface on loopback and the tailnet only,
                   intents public, and gossip pointed at the signer
 """
@@ -29,10 +31,20 @@ import sys
 # over the tailnet, to the instance that can actually execute them.
 SIGNER_TAILNET = "100.100.132.62"
 
-# Dolos relays on the two sundae-sync-v2 boxes. The observer follows the tip
-# from these rather than running a cardano-node of its own, which is what
-# keeps it a small instance.
-DOLOS_RELAYS = ["10.0.101.82:30031", "10.0.107.92:30031"]
+# Public Cardano relays. The observer follows the tip from these rather than
+# running a cardano-node of its own, which is what keeps it a small instance.
+#
+# NOT the dolos relays on the sundae-sync-v2 boxes, which was the original
+# plan. Tried on 2026-09-29: acropolis connects to 30031 over TCP and is
+# dropped again immediately, logging "disconnected from pre-configured peer"
+# against both, and no block ever arrives. Its node-to-node relay is not
+# compatible with this chain-sync client. Public relays worked first time,
+# which is unsurprising: it is the same protocol the signer already speaks to
+# its own local node.
+RELAYS = [
+    "backbone.cardano.iog.io:3001",
+    "backbone.mainnet.cardanofoundation.org:3001",
+]
 
 
 def main() -> int:
@@ -55,7 +67,7 @@ def main() -> int:
         ex.pop(k, None)
 
     d["protocol"]["v4"].pop("mempool", None)
-    d["acropolis"]["module"]["peer-network-interface"]["node-addresses"] = list(DOLOS_RELAYS)
+    d["acropolis"]["module"]["peer-network-interface"]["node-addresses"] = list(RELAYS)
 
     # The signer disables bootstrap by renaming the key, and the block sits
     # under `protocol`, not at the root. The observer wants it on. Reuse
