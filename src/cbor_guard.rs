@@ -231,7 +231,10 @@ mod tests {
     fn the_stack_killing_input_is_refused() {
         // 4000 levels aborted the process when measured against the decoder.
         let v = nested_indefinite(4000);
-        assert!(matches!(check_depth(&v, MAX_CBOR_DEPTH), Err(DepthError::TooDeep(_))));
+        assert!(matches!(
+            check_depth(&v, MAX_CBOR_DEPTH),
+            Err(DepthError::TooDeep(_))
+        ));
     }
 
     #[test]
@@ -271,7 +274,10 @@ mod tests {
 
     #[test]
     fn a_truncated_item_is_reported_as_truncated() {
-        assert_eq!(check_depth(&[0x44, 0x01], MAX_CBOR_DEPTH), Err(DepthError::Truncated));
+        assert_eq!(
+            check_depth(&[0x44, 0x01], MAX_CBOR_DEPTH),
+            Err(DepthError::Truncated)
+        );
         assert_eq!(check_depth(&[], MAX_CBOR_DEPTH), Err(DepthError::Truncated));
     }
 
@@ -290,7 +296,8 @@ mod tests {
         for b in 0u16..=255 {
             let _ = check_depth(&[b as u8], MAX_CBOR_DEPTH);
         }
-        let noise: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let noise: Vec<u8> =
+            (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
         let _ = check_depth(&noise, MAX_CBOR_DEPTH);
     }
 }

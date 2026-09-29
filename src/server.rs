@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use http_body_util::{Either, Full};
@@ -152,9 +153,48 @@ impl hyper::body::Body for SseBody {
 
 type ResponseBody = Either<Full<Bytes>, SseBody>;
 
+/// Where the private admin surface listens.
+///
+/// A list, because the operational surface has to be reachable from an
+/// operator's machine over the tailnet AND from the box itself, and those are
+/// different addresses. Accepts a bare string for the single-address case so
+/// existing configs keep working.
+///
+/// Addresses are listed explicitly rather than matched by interface name or
+/// by subnet. A control surface that discovers where to listen can start
+/// listening somewhere new when a network interface appears; one that is
+/// told cannot. Tailscale addresses are stable per node, so naming them
+/// costs a line of config once.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AdminAddresses {
+    One(SocketAddr),
+    Many(Vec<SocketAddr>),
+}
+
+impl AdminAddresses {
+    pub fn to_vec(&self) -> Vec<SocketAddr> {
+        match self {
+            Self::One(a) => vec![*a],
+            Self::Many(a) => a.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for AdminAddresses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = self.to_vec();
+        write!(
+            f,
+            "{}",
+            all.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
-    pub address: SocketAddr,
+    pub address: AdminAddresses,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     /// Optional second listener exposing only the PUBLIC surface: the
@@ -241,7 +281,24 @@ pub async fn admin_server(
         (None, None) => None,
         _ => panic!("tls_cert and tls_key must both be set or both be absent"),
     };
-    listeners.push((config.address, private_tls, base.clone()));
+    let admin_addrs = config.address.to_vec();
+    if admin_addrs.is_empty() {
+        panic!("server.address lists no addresses; the admin surface would be unreachable");
+    }
+    for addr in &admin_addrs {
+        if addr.ip().is_unspecified() {
+            // 0.0.0.0 puts /pause, /resync-from-acropolis and the whole state
+            // dump on every interface the box has, including any public one.
+            // It is still allowed, because a devnet in a container needs it,
+            // but it is never what a deployed box wants and it should be
+            // visible in the log when it happens.
+            tracing::warn!(
+                address = %addr,
+                "admin surface bound to a wildcard address; it is reachable on every interface"
+            );
+        }
+        listeners.push((*addr, private_tls.clone(), base.clone()));
+    }
 
     if let Some(public_addr) = config.public_address {
         let public_tls = match (&config.public_tls_cert, &config.public_tls_key) {
@@ -270,6 +327,25 @@ pub async fn admin_server(
     }
 }
 
+/// Concurrent connections one listener will hold open.
+///
+/// The accept loop spawned a task per connection with no ceiling, so a client
+/// that opens sockets and never speaks costs memory without bound. The cap is
+/// generous next to the handful of operators and health checks a scooper
+/// actually serves, and a refused connection is a far better failure than an
+/// exhausted host.
+const MAX_CONNECTIONS: usize = 512;
+
+/// How long a connection may take to send its request headers.
+///
+/// Without this a peer can hold a connection by sending one byte at a time.
+/// SSE streams are unaffected: the limit covers the headers, not the life of
+/// the response.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a TLS handshake may take, for the same reason.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn run_listener(
     addr: SocketAddr,
     tls_acceptor: Option<TlsAcceptor>,
@@ -277,7 +353,18 @@ async fn run_listener(
     shutdown: CancellationToken,
 ) {
     let listener = TcpListener::bind(addr).await.unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // Take the permit BEFORE accepting. Accepting first and then waiting
+        // would drain the kernel backlog into memory, which is the thing the
+        // cap exists to stop.
+        let permit = select! {
+            p = permits.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+            _ = shutdown.cancelled() => { break; }
+        };
         let (stream, peer) = select! {
             res = listener.accept() => match res {
                 Ok(pair) => pair,
@@ -290,11 +377,21 @@ async fn run_listener(
         let tls_acceptor = tls_acceptor.clone();
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
+            let _permit = permit;
             if let Some(acceptor) = tls_acceptor {
-                let tls_stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                let tls_stream = match tokio::time::timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         debug!("TLS handshake failed: {:?}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("TLS handshake timed out");
                         return;
                     }
                 };
@@ -317,9 +414,22 @@ async fn serve_connection(
     server: AdminServer,
 ) {
     let io = TokioIo::new(stream);
-    if let Err(err) = http1::Builder::new().serve_connection(io, server).await {
+    if let Err(err) = http1::Builder::new()
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(io, server)
+        .await
+    {
         debug!("Failed to serve connection: {:?}", err);
     }
+}
+
+/// Paths the public listener answers. Everything else is 404 there.
+///
+/// Matched exactly rather than by prefix. A prefix test also admits any path
+/// that merely begins with it, so a route added later whose name starts the
+/// same way would be published without anyone choosing to publish it.
+fn public_path_allowed(path: &str) -> bool {
+    path == "/v4/strategy-intents" || path.starts_with("/v4/strategy-intents/") || path == "/health"
 }
 
 /// Which route surface a listener serves.
@@ -935,12 +1045,51 @@ impl AdminServer {
         body
     }
 
+    /// Route a request, then apply the header policy the surface requires.
+    ///
+    /// The cross-origin header is set by the response helpers, which are
+    /// associated functions and cannot see which listener they answer on.
+    /// Deciding it here keeps one rule in one place instead of adding a
+    /// visibility argument to every helper.
     async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
+        let visibility = self.visibility;
+        let mut res = self.route(req).await;
+        if visibility == Visibility::Private {
+            // The operational surface is for operators, not for pages. Left
+            // open, any site an operator visits could read the whole pool and
+            // order state out of a box their machine can reach.
+            res.headers_mut().remove("Access-Control-Allow-Origin");
+        }
+        res
+    }
+
+    /// Whether a browser is sending this from a different origin.
+    ///
+    /// Browsers attach `Origin` to every POST, same-origin ones included, so
+    /// the signal is a mismatch against `Host`, not the presence of the
+    /// header. A request with no `Origin` did not come from a page: curl, the
+    /// deploy script and the health checker all land there.
+    fn is_cross_origin<B>(req: &Request<B>) -> bool {
+        let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        if origin.eq_ignore_ascii_case("null") {
+            return true;
+        }
+        let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        // Compare authorities only. The scheme differs whenever TLS
+        // terminates in front, and that is not what this check is about.
+        let origin_authority = origin.split("://").nth(1).unwrap_or(origin);
+        !origin_authority.eq_ignore_ascii_case(host)
+    }
+
+    async fn route(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
         let path = req.uri().path().to_string();
 
-        if self.visibility == Visibility::Public
-            && !(path.starts_with("/v4/strategy-intents") || path == "/health")
-        {
+        // Allowlist the public surface by exact path. A prefix test also
+        // admits anything that merely begins with it, so a route added later
+        // whose name starts the same way would be published by accident.
+        if self.visibility == Visibility::Public && !public_path_allowed(&path) {
             return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
         }
 
@@ -964,6 +1113,21 @@ impl AdminServer {
             ),
             "/status" => Self::json_response(self.serve_status().await),
             "/resync-from-acropolis" => {
+                // This restarts the indexer. It answered any method,
+                // including GET, so a link, an image tag or a prefetch was
+                // enough to trigger it, and the response carried an open
+                // cross-origin header. POST alone does not fix that, because
+                // a form post is still reachable from another page; the
+                // origin check is what closes it.
+                if *req.method() != hyper::Method::POST {
+                    return Self::error_response(hyper::StatusCode::METHOD_NOT_ALLOWED, "use POST");
+                }
+                if Self::is_cross_origin(&req) {
+                    return Self::error_response(
+                        hyper::StatusCode::FORBIDDEN,
+                        "cross-origin request refused",
+                    );
+                }
                 let _ = self.resync_tx.send(());
                 Self::text_response("resync")
             }
@@ -975,6 +1139,16 @@ impl AdminServer {
             // days because the toggle also didn't log.
             "/pause" => match *req.method() {
                 hyper::Method::POST => {
+                    // Halting scooping is a state change, and a plain POST
+                    // with a simple content type needs no preflight, so the
+                    // effect lands from another page even though the reply
+                    // cannot be read. Refuse the cross-origin case outright.
+                    if Self::is_cross_origin(&req) {
+                        return Self::error_response(
+                            hyper::StatusCode::FORBIDDEN,
+                            "cross-origin request refused",
+                        );
+                    }
                     let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
                     let now_paused = !was_paused;
                     let remote =
@@ -1086,7 +1260,15 @@ impl AdminServer {
         .unwrap()
     }
 
+    /// Liveness for the public surface and full operational detail for the
+    /// private one.
+    ///
+    /// The wallet balance, the UTxO count and our key hash say how much the
+    /// scooper holds and which key signs. None of it is needed to answer
+    /// whether the service is up, and all of it is useful to someone sizing
+    /// an attack, so the public answer stops at sync and pool counts.
     async fn serve_health_stats(&self) -> String {
+        let full = self.visibility == Visibility::Private;
         let Some(v4) = &self.v4_state else {
             return serde_json::to_string(&serde_json::json!({
                 "error": "v4 indexer not configured"
@@ -1125,13 +1307,13 @@ impl AdminServer {
                 "count": state.pools.len(),
                 "orders_pending": orders_pending,
             },
-            "wallet": {
+            "wallet": full.then(|| serde_json::json!({
                 "ada_balance": ada_balance,
                 "utxo_count": state.wallet_utxos.len(),
-            },
-            "our_keyhash": stats.our_keyhash,
-            "scooper_totals": stats.scooper_totals,
-            "recent_scoops": stats.recent_scoops,
+            })),
+            "our_keyhash": full.then(|| stats.our_keyhash.clone()),
+            "scooper_totals": full.then(|| stats.scooper_totals.clone()),
+            "recent_scoops": full.then(|| stats.recent_scoops.clone()),
         }))
         .unwrap()
     }
@@ -1245,7 +1427,12 @@ impl AdminServer {
             return "v3 indexer not configured".into();
         };
         let state = v3.lock().await.latest().into_owned();
-        let id_bytes = hex::decode(pool_id).unwrap();
+        // A path segment is caller-supplied. Unwrapping here panicked the
+        // connection task on any non-hex request and answered a reset
+        // instead of a status. The v4 twin already handled this.
+        let Ok(id_bytes) = hex::decode(pool_id) else {
+            return format!("pool id {pool_id} is not hex");
+        };
         let ident = Ident::new(&id_bytes);
         let pool = match state.pools.get(&ident).cloned() {
             Some(p) => p,
@@ -2045,5 +2232,91 @@ mod protocol_stats_tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["orders"]["swaps"]["executable"], 0);
         assert_eq!(v["orders"]["swaps"]["blocked"]["config_missing"], 1);
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    //! What each listener is allowed to answer, and what a page on another
+    //! site is allowed to make it do.
+    use super::*;
+
+    fn req_with(origin: Option<&str>, host: &str) -> Request<()> {
+        let mut b = Request::builder().header("host", host);
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn the_public_surface_answers_only_intents_and_health() {
+        assert!(public_path_allowed("/v4/strategy-intents"));
+        assert!(public_path_allowed("/v4/strategy-intents/abcd"));
+        assert!(public_path_allowed("/health"));
+
+        for denied in [
+            "/pause",
+            "/resync-from-acropolis",
+            "/dashboard",
+            "/status",
+            "/metrics",
+            "/events",
+            "/v4/pools",
+            "/v4/orders",
+            "/v3/pools",
+        ] {
+            assert!(!public_path_allowed(denied), "{denied} must not be public");
+        }
+    }
+
+    #[test]
+    fn a_path_that_merely_starts_with_the_public_prefix_is_not_public() {
+        // The gate used to be a prefix test, so a route named like this one
+        // would have been served publicly the day it was added.
+        assert!(!public_path_allowed("/v4/strategy-intents-admin"));
+        assert!(!public_path_allowed("/v4/strategy-intentsX"));
+    }
+
+    #[test]
+    fn a_request_with_no_origin_is_not_cross_origin() {
+        // curl, the deploy script and the health checker send no Origin.
+        // Treating that as cross-origin would lock operators out of /pause.
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            None,
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn the_dashboard_posting_to_its_own_host_is_allowed() {
+        // Browsers attach Origin to same-origin POSTs too, so the check has
+        // to compare it against Host rather than test for its presence.
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            Some("http://localhost:9999"),
+            "localhost:9999"
+        )));
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            Some("https://localhost:9999"),
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn another_site_is_cross_origin() {
+        assert!(AdminServer::is_cross_origin(&req_with(
+            Some("https://evil.example"),
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn an_opaque_origin_is_cross_origin() {
+        // A sandboxed iframe or a data: document sends "null". It is not the
+        // dashboard, so it does not get to pause scooping.
+        assert!(AdminServer::is_cross_origin(&req_with(
+            Some("null"),
+            "localhost:9999"
+        )));
     }
 }
