@@ -805,10 +805,18 @@ impl IntentService {
                     .await;
                 match result {
                     Ok(resp) if resp.status().is_success() => {}
+                    // Warn, not debug. Delivery is the whole job of an
+                    // observer, and the service runs at info, so a peer that
+                    // is unreachable meant every intent was accepted and
+                    // silently dropped with nothing in the journal.
+                    //
+                    // The case that prompted this: the tailnet policy has to
+                    // grant tag:scooper-public -> tag:scooper on 9998, and
+                    // until it does the connection is refused.
                     Ok(resp) => {
-                        tracing::debug!(url, status = %resp.status(), "intent gossip rejected")
+                        tracing::warn!(url, status = %resp.status(), "intent gossip rejected")
                     }
-                    Err(e) => tracing::debug!(url, "intent gossip failed: {e}"),
+                    Err(e) => tracing::warn!(url, "intent gossip failed: {e}"),
                 }
             });
         }
