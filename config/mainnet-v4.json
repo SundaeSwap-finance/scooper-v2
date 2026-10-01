@@ -774,51 +774,7 @@
           2
         ],
         "scooper-secret-key-file": "/path/to/your/scooper.skey",
-        "pool-allowlists": {
-          "062ed639ee7ac7e9d3727ab52c605e88bcab80dd32dd3ab4c9617bc0": {
-            "credentials": [
-              "e0b68e229f9c043ab610067ed7f3c6d662b8f3c6bb4ec452c11f6411",
-              "f0e17b51bc18962397450eb625222bce9c510cb82b213bd9cf17ea82",
-              "def3ae76d194a05fc6fc4e29e281d628ab84ee5a466e81e41e465e88",
-              "e9ede0c1b25054d79d34b4c0fb62c501b922ae1f47001668c2a3a34c",
-              "b93a63a5dc4fea0cabf703fcc40f6f5f593c5f9a804d5b9d6d974f4f",
-              "703aa7b6de4e6c0d42e7586752a6e5c8c93ad4cdfb3a27eee39345e3",
-              "47cb097b1393e749fb509632acd4bb795059cdf16038231003bc17d7",
-              "2203f944dc79f104cab8da0ac0c7b863f09f4b1eb67e0504e201f606",
-              "c4ce114e6a9942910015fccb63ef0c0a66d7e644fd16b3ad757b197c",
-              "b90a5cb483b2df7467fe967f794a1ebf9c94e5b4d09762419938e5ce",
-              "c50a4d9659c2c1f9c6f7efa95498775a88669766d8d114e8bd03c07a",
-              "164908dc4ac572ade719c1f58cc81fdb4ee3610be0bbd4046d5ab733",
-              "259eae5fb3e8d6ac7a56718acc92e06e8f1cb4f1199625d705657cff",
-              "373f8b55a204faebd4e2c11b821591ffce47b91d6777b9bc68b85744",
-              "63b90c49214f4ead7caa36e890e47eedb1ab3dc6752e64a6209cef53",
-              "6f87bab3039edb823dae659c42a5313c0c8e807384b0c03edf93fadb",
-              "cc7b6750a8f6bd1720038afbff0edf2fd449c726a066a952319e9cad",
-              "6e4aa1513881865184fdd7768b840955cb7cc479b2582d72335c27d0",
-              "482a7fb46fd32846f07b301378d738e902dd2d9d6e39cf2bff162847",
-              "2357b45739a650ba79b5048917c1538907f01612a7a5aa2ee72eae35",
-              "7c14dd3e8db4c27e10f8256e8477aaa0669f05cb5079a86a3b0ac488",
-              "1172d467a0e78a9a89a89c6b209e0805617c43cc4aad7e31726b86b1",
-              "b4827ffb1a5f7a8aefb5c6f76cbd1d1db1975e24c478115a083749cb",
-              "fa5e11b4390128b6b376ed7bab4b0ffa43afe7871408aab26bd7d67c",
-              "bdd8e5f8db86d80670fc094be34f53bc261a99938aaaf58e3aef9d9f",
-              "72a002baaf3977687d494f05f4903575f1a703d17d52af61c54b7756",
-              "676d13d25d9bce2d35d630124d625d215a6b15cd3500b783d69ecc6a",
-              "2ed2fcaad9524744f98c697d9b2f73b706db1f20407ab582ed4f7890",
-              "e779309afc6cf6345fecc53df400b8c4a75e11f4cae6c60d2d36d660",
-              "8927ad730560c8eaa15573d802b48bf1f73ee093664f14b938e6486e",
-              "396de337de5c2470e1ac552e25f94edf2987146dda4fd40e7f303659",
-              "9b7d4d98b49d4bd64bc17cfcf59543d1d5e7e6da46cbae9f6cf19fc3",
-              "91675e873e53f71c22d8d4db72b7754275ea7edd14ac40c05366fc0e",
-              "cfacb712dab53e3c729ec1443b8003a89b6e1e78f34a75d057dcb027",
-              "3494321bc8684305ab226049ab4d6b60e9c0aa0010f2418784ed88ca",
-              "999785d3c0e162536934bbac93670f1d9e66db1c0c1c8277e04f393c",
-              "14a71194862a74a765150d10a1240992fea2c5959ad388fc3cee974d",
-              "8b90c5061cfcc27a8fa2be4bd044ee71784cf1b750e9096ebacd5e48",
-              "d77c0bea8bf5a2f8b3b401329ba22e77b2cd8fe88f2b8e2fc3781223"
-            ]
-          }
-        }
+        "pool-allowlists": {}
       },
       "fee-settings-token": "0019b58b8d626ebe1f2ad80fbc01f9125f54b6c6a4d2b45d31178bc72c337f35"
     }
