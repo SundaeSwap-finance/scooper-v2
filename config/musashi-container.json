@@ -26,7 +26,8 @@
       },
       "local-chain-follower": {
         "socket-path": "/data/node.socket",
-        "network-magic": 164
+        "network-magic": 164,
+        "block-topic": "cardano.block.proposed"
       }
     }
   }
