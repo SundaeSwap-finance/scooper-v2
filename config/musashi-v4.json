@@ -17,7 +17,7 @@
       "execution": {
         "scooper-secret-key-file": "config/musashi/scooper2.skey",
         "submit-url": "http://unused.local/no-http-submit-on-musashi",
-        "budget-padding": [6, 5],
+        "budget-padding": [107, 100],
         "fee": [
           3,
           1000
