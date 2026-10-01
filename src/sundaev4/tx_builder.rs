@@ -987,7 +987,10 @@ pub fn build_multi_pool_scoop_tx(
         )
     };
 
-    let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
+    // CP entries grouped by the CP module revision each pool binds (the first
+    // module of its enabled action): a pool created before a module revision
+    // keeps the old one, so one scoop can need several CP withdrawals.
+    let mut cp_entries: Vec<(&ScriptRefInfo, Vec<CPOperateEntry>)> = Vec::new();
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
@@ -1042,10 +1045,23 @@ pub fn build_multi_pool_scoop_tx(
         match &batch.pool.pool_type {
             PoolType::ConstantProduct { fee } => {
                 let config = ConstantProductConfig { fee: fee.clone() };
-                cp_entries.push(CPOperateEntry {
+                let cp_script = exec
+                    .module_scripts
+                    .constant_product_for_pool(&batch.pool.pool_datum)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pool {} binds no configured constant-product module revision",
+                            batch.pool_ident
+                        )
+                    })?;
+                let entry = CPOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
                     config,
-                });
+                };
+                match cp_entries.iter_mut().find(|(s, _)| s.hash == cp_script.hash) {
+                    Some((_, entries)) => entries.push(entry),
+                    None => cp_entries.push((cp_script, vec![entry])),
+                }
             }
             PoolType::ConstantSum {
                 prices,
@@ -1266,7 +1282,6 @@ pub fn build_multi_pool_scoop_tx(
         entries: order_validator_entries,
     };
 
-    let has_cp = !cp_entries.is_empty();
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
 
@@ -1304,7 +1319,7 @@ pub fn build_multi_pool_scoop_tx(
     if has_lp_mint_or_burn {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
-    if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
+    for (cp, _) in &cp_entries {
         all_ref_inputs.push(cp.ref_utxo.0.clone());
     }
     if has_cs && let Some(cs) = &exec.module_scripts.constant_sum {
@@ -1500,11 +1515,10 @@ pub fn build_multi_pool_scoop_tx(
         ));
     }
 
-    // Conditionally add CP withdrawal
-    if has_cp && let Some(cp_script) = &exec.module_scripts.constant_product {
-        let cp_redeemer = ConstantProductRedeemer::Operate {
-            entries: cp_entries,
-        };
+    // One CP withdrawal per CP module revision in this scoop, each carrying
+    // only the entries for the pools that bind it.
+    for (cp_script, entries) in cp_entries {
+        let cp_redeemer = ConstantProductRedeemer::Operate { entries };
         withdrawals.push((reward_account(&cp_script.hash), cp_redeemer.to_plutus()));
     }
 
