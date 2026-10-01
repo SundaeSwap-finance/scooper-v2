@@ -1225,6 +1225,14 @@ pub struct ModuleScripts {
     /// audit-final cs-launch deployment does not publish CP).
     #[serde(default)]
     pub constant_product: Option<ScriptRefInfo>,
+    /// Earlier revisions of the constant-product module that existing pools
+    /// still bind. A revised module is published under a new hash
+    /// (`deploy-scripts --supersede`), but a pool keeps the modules it was
+    /// created with, so the scooper must still be able to run the old ones.
+    /// Each pool is matched to its revision by the first module hash of its
+    /// enabled action (see `constant_product_by_hash`).
+    #[serde(default)]
+    pub constant_product_legacy: Vec<ScriptRefInfo>,
     pub fee_split: ScriptRefInfo,
     pub fairness: ScriptRefInfo,
     pub pool: ScriptRefInfo,
@@ -1265,6 +1273,35 @@ pub struct ModuleScripts {
     /// can't be scooped.
     #[serde(default)]
     pub fee_constraint: Option<ScriptRefInfo>,
+}
+
+impl ModuleScripts {
+    /// Every configured constant-product module revision: the current one
+    /// first, then the legacy ones.
+    pub fn constant_product_scripts(&self) -> impl Iterator<Item = &ScriptRefInfo> {
+        self.constant_product.iter().chain(self.constant_product_legacy.iter())
+    }
+
+    /// The constant-product revision with this script hash, if configured.
+    pub fn constant_product_by_hash(&self, hash: &[u8]) -> Option<&ScriptRefInfo> {
+        self.constant_product_scripts().find(|s| s.hash.as_ref() == hash)
+    }
+
+    /// True if `hash` is any configured constant-product revision.
+    pub fn is_constant_product_hash(&self, hash: &[u8]) -> bool {
+        self.constant_product_by_hash(hash).is_some()
+    }
+
+    /// The constant-product revision a pool binds: the first module of its
+    /// first enabled action, when that module is a known CP revision.
+    pub fn constant_product_for_pool(&self, pool_datum: &PoolDatum) -> Option<&ScriptRefInfo> {
+        pool_datum
+            .actions
+            .iter()
+            .filter(|a| a.enabled)
+            .filter_map(|a| a.modules.first())
+            .find_map(|h| self.constant_product_by_hash(h.as_slice()))
+    }
 }
 
 #[serde_with::serde_as]
@@ -1558,6 +1595,56 @@ mod secret_key_tests {
 
 #[cfg(test)]
 mod tests {
+    fn module_scripts_json(with_legacy: bool) -> serde_json::Value {
+        let script = |b: u8| {
+            serde_json::json!({
+                "hash": hex::encode([b; 28]),
+                "ref-utxo": format!("{}#0", hex::encode([b; 32])),
+            })
+        };
+        let mut v = serde_json::json!({
+            "constant-product": script(1),
+            "fee-split": script(10),
+            "fairness": script(11),
+            "pool": script(12),
+            "order": script(13),
+            "pool-mint": script(14),
+            "settings": script(15),
+        });
+        if with_legacy {
+            v["constant-product-legacy"] = serde_json::json!([script(2)]);
+        }
+        v
+    }
+
+    #[test]
+    fn module_scripts_resolve_constant_product_revisions() {
+        let scripts: super::ModuleScripts =
+            serde_json::from_value(module_scripts_json(true)).unwrap();
+        assert_eq!(scripts.constant_product_scripts().count(), 2);
+        // The current revision is listed first.
+        let first: &[u8] = scripts.constant_product_scripts().next().unwrap().hash.as_ref();
+        assert_eq!(first, &[1u8; 28][..]);
+        assert!(scripts.is_constant_product_hash(&[1u8; 28]));
+        let legacy = scripts.constant_product_by_hash(&[2u8; 28]).expect("legacy revision");
+        assert_eq!(
+            legacy.ref_utxo.to_string(),
+            format!("{}#0", hex::encode([2u8; 32]))
+        );
+        assert!(!scripts.is_constant_product_hash(&[3u8; 28]));
+        // fee_split is not a CP revision.
+        assert!(!scripts.is_constant_product_hash(&[10u8; 28]));
+    }
+
+    #[test]
+    fn module_scripts_without_legacy_constant_product() {
+        let scripts: super::ModuleScripts =
+            serde_json::from_value(module_scripts_json(false)).unwrap();
+        assert!(scripts.constant_product_legacy.is_empty());
+        assert_eq!(scripts.constant_product_scripts().count(), 1);
+        assert!(scripts.constant_product_by_hash(&[2u8; 28]).is_none());
+    }
+
     /// Preview's real anchor: slot 0 at 2022-10-25T00:00:00Z, 1s slots.
     fn preview_slots() -> super::SlotConfig {
         super::SlotConfig {

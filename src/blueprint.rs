@@ -290,6 +290,8 @@ impl Blueprint {
 
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
+            // A blueprint holds one revision of each module; earlier ones come from config.
+            constant_product_legacy: Vec::new(),
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
             fairness: make_info(self, mappings[2].0, mappings[2].1, mappings[2].2)?,
             pool: make_info(self, mappings[3].0, mappings[3].1, mappings[3].2)?,

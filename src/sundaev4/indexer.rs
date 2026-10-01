@@ -153,7 +153,7 @@ impl SundaeV4Indexer {
                 .iter()
                 .map(|s| s.ref_utxo.clone())
                 .collect::<BTreeSet<_>>();
-                if let Some(cp) = &scripts.constant_product {
+                for cp in scripts.constant_product_scripts() {
                     set.insert(cp.ref_utxo.clone());
                 }
                 if let Some(cs) = &scripts.constant_sum {
@@ -219,12 +219,14 @@ impl SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
+        // Any CP revision: pools keep the module they were created with, and
+        // their configs were persisted under that module's hash.
+        let is_cp_module = |hash: &[u8]| {
+            self.protocol
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.module_scripts.is_constant_product_hash(hash))
+        };
         let cl_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -244,7 +246,7 @@ impl SundaeV4Indexer {
                 let parsed = ConstantSumConfig::from_plutus(pd)
                     .context("could not parse persisted ConstantSumConfig")?;
                 cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+            } else if is_cp_module(&cfg.module_hash) {
                 let parsed = ConstantProductConfig::from_plutus(pd)
                     .context("could not parse persisted ConstantProductConfig")?;
                 cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
@@ -927,12 +929,13 @@ impl ChainIndex for SundaeV4Indexer {
         // given module, these return None — harmless. We use the result to
         // populate per-pool config caches.
         let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
-        let cp_config_from_tx = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
-            .and_then(|h| extract_cp_config_from_tx(&tx, &h));
+        // A CP Create redeemer may come from any configured CP revision; keep
+        // the revision's hash alongside the config.
+        let cp_config_from_tx = self.protocol.execution.as_ref().and_then(|e| {
+            e.module_scripts.constant_product_scripts().find_map(|cp| {
+                extract_cp_config_from_tx(&tx, &cp.hash).map(|cfg| (cp.hash.as_ref().to_vec(), cfg))
+            })
+        });
         let cl_config_from_tx = self
             .protocol
             .execution
@@ -970,12 +973,6 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_sum.as_ref())
             .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
         let cl_module_hash_bytes: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -1017,8 +1014,10 @@ impl ChainIndex for SundaeV4Indexer {
                     //   4. defaults
                     let resolved_cs =
                         cs_config_from_tx.as_ref().or_else(|| module_cache.cs.get(&pool_id));
-                    let resolved_cp =
-                        cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
+                    let resolved_cp = cp_config_from_tx
+                        .as_ref()
+                        .map(|(_, cfg)| cfg)
+                        .or_else(|| module_cache.cp.get(&pool_id));
                     let resolved_cl =
                         cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
                     let pool_type = detect_pool_type(
@@ -1052,17 +1051,25 @@ impl ChainIndex for SundaeV4Indexer {
                         );
                     }
                     // Same for CP: persist on first sighting (Create or Operate).
-                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
-                        (cp_config_from_tx.as_ref(), &pool_type)
+                    if let (
+                        Some((matched_hash, cfg)),
+                        crate::sundaev4::types::PoolType::ConstantProduct { .. },
+                    ) = (cp_config_from_tx.as_ref(), &pool_type)
                         && !module_cache.cp.contains_key(&pool_id)
                     {
                         let cbor = minicbor::to_vec(cfg.clone().to_plutus())
                             .context("encode ConstantProductConfig CBOR")?;
+                        // Persist under the CP revision this pool binds.
+                        let module_hash = self
+                            .protocol
+                            .execution
+                            .as_ref()
+                            .and_then(|e| e.module_scripts.constant_product_for_pool(&pd))
+                            .map(|cp| cp.hash.as_ref().to_vec())
+                            .unwrap_or_else(|| matched_hash.clone());
                         changes.module_configs.push(PersistedModuleConfig {
                             pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: cp_module_hash_bytes
-                                .clone()
-                                .expect("cp_module_hash present when CP pool detected"),
+                            module_hash,
                             config_cbor: cbor,
                             created_slot: slot,
                         });
@@ -1791,7 +1798,6 @@ pub fn detect_pool_type(
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cl_hash =
         exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
@@ -1801,9 +1807,8 @@ pub fn detect_pool_type(
         let Some(first) = action.modules.first() else {
             continue;
         };
-        if let Some(h) = &cp_hash
-            && first.as_slice() == h.as_slice()
-        {
+        // Any configured CP revision (pools keep the module they were created with).
+        if exec.module_scripts.is_constant_product_hash(first.as_slice()) {
             matched_action = Some(action);
             matched_kind = Some("cp");
             break;

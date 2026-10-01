@@ -1137,14 +1137,8 @@ fn needs_cp_lookup(
     let Some(exec) = execution else {
         return false;
     };
-    let Some(cp) = exec.module_scripts.constant_product.as_ref() else {
-        return false;
-    };
-    let cp_hash = cp.hash;
-    let is_cp = pool_datum
-        .actions
-        .iter()
-        .any(|a| a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cp_hash.as_ref()));
+    // Any configured CP revision (pools keep the module they were created with).
+    let is_cp = exec.module_scripts.constant_product_for_pool(pool_datum).is_some();
     if !is_cp {
         return false;
     }
@@ -1216,7 +1210,12 @@ async fn lookup_pool_module_configs(
         .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
     let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash);
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
+    // Every configured CP revision: a pool's Create redeemer is under the
+    // revision it was created with.
+    let cp_hashes: Vec<_> = exec.module_scripts.constant_product_scripts().map(|s| s.hash).collect();
+    let extract_cp = |tx: &pallas_traverse::MultiEraTx| {
+        cp_hashes.iter().find_map(|h| sundaev4::extract_cp_config_from_tx(tx, h))
+    };
     let fs_hash = exec.module_scripts.fee_split.hash;
 
     let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
@@ -1242,8 +1241,8 @@ async fn lookup_pool_module_configs(
     if want_cs && let Some(h) = cs_hash.as_ref() {
         out.cs = sundaev4::extract_cs_config_from_tx(&first_tx, h);
     }
-    if want_cp && let Some(h) = cp_hash.as_ref() {
-        out.cp = sundaev4::extract_cp_config_from_tx(&first_tx, h);
+    if want_cp {
+        out.cp = extract_cp(&first_tx);
     }
     if want_cl && let Some(h) = cl_hash.as_ref() {
         out.cl = sundaev4::extract_cl_config_from_tx(&first_tx, h);
@@ -1284,11 +1283,8 @@ async fn lookup_pool_module_configs(
             {
                 out.cs = sundaev4::extract_cs_config_from_tx(&tx, h);
             }
-            if want_cp
-                && out.cp.is_none()
-                && let Some(h) = cp_hash.as_ref()
-            {
-                out.cp = sundaev4::extract_cp_config_from_tx(&tx, h);
+            if want_cp && out.cp.is_none() {
+                out.cp = extract_cp(&tx);
             }
             if want_cl
                 && out.cl.is_none()
@@ -1333,11 +1329,13 @@ async fn bootstrap_v4(
         .as_ref()
         .and_then(|e| e.module_scripts.constant_sum.as_ref())
         .map(|cs| cs.hash.as_ref().to_vec());
-    let cp_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.constant_product.as_ref())
-        .map(|cp| cp.hash.as_ref().to_vec());
+    // Any CP revision: configs are persisted under the revision a pool binds.
+    let is_cp_module = |hash: &[u8]| {
+        protocol
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.module_scripts.is_constant_product_hash(hash))
+    };
     let cl_module_hash: Option<Vec<u8>> = protocol
         .execution
         .as_ref()
@@ -1363,7 +1361,7 @@ async fn bootstrap_v4(
             let parsed = sundaev4::ConstantSumConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted CS config decode failed")?;
             cs_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+        } else if is_cp_module(&cfg.module_hash) {
             let parsed = sundaev4::ConstantProductConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted CP config decode failed")?;
             cp_configs.insert(Ident::new(&cfg.pool_id), parsed);
@@ -1476,9 +1474,13 @@ async fn bootstrap_v4(
                         .context("bootstrap v4: encode ConstantProductConfig CBOR")?;
                     new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
-                        module_hash: cp_module_hash
-                            .clone()
-                            .expect("cp_module_hash known when need_cp"),
+                        // need_cp implies the pool binds a configured CP revision.
+                        module_hash: protocol
+                            .execution
+                            .as_ref()
+                            .and_then(|e| e.module_scripts.constant_product_for_pool(&pool_datum))
+                            .map(|cp| cp.hash.as_ref().to_vec())
+                            .expect("need_cp implies a configured CP revision"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -1814,9 +1816,7 @@ async fn bootstrap_v4(
             &scripts.pool_mint,
             &scripts.settings,
         ];
-        if let Some(ref cp) = scripts.constant_product {
-            all_refs.push(cp);
-        }
+        all_refs.extend(scripts.constant_product_scripts());
         if let Some(ref cs) = scripts.constant_sum {
             all_refs.push(cs);
         }
