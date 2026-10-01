@@ -339,7 +339,7 @@ async fn manager_loop(
         let broadcaster = broadcaster.clone();
         let event_tx = event_tx.clone();
 
-        let mut process = Process::<Message>::create(config).await;
+        let mut process = Process::<Message>::create(config.clone()).await;
         GenesisBootstrapper::register(&mut process);
         MithrilSnapshotFetcher::register(&mut process);
         BlockUnpacker::register(&mut process);
