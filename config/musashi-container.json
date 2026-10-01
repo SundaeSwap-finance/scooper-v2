@@ -23,6 +23,10 @@
         "peer-sharing-enabled": false,
         "min-hot-peers": 1,
         "target-peer-count": 1
+      },
+      "local-chain-follower": {
+        "socket-path": "/data/node.socket",
+        "network-magic": 164
       }
     }
   }
