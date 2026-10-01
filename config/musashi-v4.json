@@ -55,9 +55,15 @@
             "ref-utxo": "a870562d8d8301984d8be1b7301649ae0d339ddb2f44552d255b873d85dc0699#0"
           },
           "constant-product": {
-            "hash": "2dc6358f5f005039ebbad658601d6e1f44c4626f45de614f822b9dae",
-            "ref-utxo": "cce92c3548dce46d9451823cf6298bc037b90a20c9bb0f201b9a9e6fff62ed48#0"
+            "hash": "554063a81d0f10136b0e7e2e3deacb854b8341484d2b3a36417b7453",
+            "ref-utxo": "aaafe4483e016ac02d26ceaf41bb650ee060e7dcfbb306073bffb09cd6cad299#0"
           },
+          "constant-product-legacy": [
+            {
+              "hash": "2dc6358f5f005039ebbad658601d6e1f44c4626f45de614f822b9dae",
+              "ref-utxo": "cce92c3548dce46d9451823cf6298bc037b90a20c9bb0f201b9a9e6fff62ed48#0"
+            }
+          ],
           "concentrated-liquidity": {
             "hash": "cafdf20b428dedc10d107dafe3fc999a6fa073eb621b0778337b9500",
             "ref-utxo": "6e550699bd4ad2eb440b58a9dac1f856bf2a01d1a5f635758d48030ea6ee31e8#0"
