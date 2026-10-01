@@ -28,6 +28,7 @@ mod datum_lookup;
 mod events;
 mod historical_state;
 mod instrumentation;
+mod local_chain_follower;
 mod mempool;
 mod metrics;
 mod multisig;
@@ -342,7 +343,17 @@ async fn manager_loop(
         GenesisBootstrapper::register(&mut process);
         MithrilSnapshotFetcher::register(&mut process);
         BlockUnpacker::register(&mut process);
-        PeerNetworkInterface::register(&mut process);
+        // Exactly one chain source. A `local-chain-follower` section (N2C over the
+        // node socket) replaces peer-network-interface (N2N): on a Leios chain
+        // only N2C delivers ranking blocks with their endorsed transactions.
+        // Config layers can't delete the base config's peer-network-interface
+        // section, so the choice is made here.
+        if config.get_table("module.local-chain-follower").is_ok() {
+            info!("chain source: local-chain-follower (N2C, resolves Leios endorser blocks)");
+            local_chain_follower::LocalChainFollower::register(&mut process);
+        } else {
+            PeerNetworkInterface::register(&mut process);
+        }
 
         let indexer = Arc::new(CustomIndexer::new(persistence.cursor_store()));
         process.register(indexer.clone());
