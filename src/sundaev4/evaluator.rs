@@ -77,7 +77,11 @@ impl ScriptStore {
     /// computes the PlutusV3 hash, and CBOR-unwraps to FLAT bytes.
     /// This bypasses the need to index reference UTxOs from the chain.
     /// Build from blueprint compiled code. Used by test harness.
-    #[cfg(test)]
+    // Not actually dead: feature `route-bench` uses it. But features are
+    // crate-wide, so the scooper binary compiles it too, never calls it,
+    // and would trip `clippy --all-features -D warnings` in CI.
+    #[cfg(any(test, feature = "route-bench"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_blueprint(blueprint: &crate::blueprint::Blueprint) -> Result<Self> {
         let mut store = BTreeMap::new();
         for validator in &blueprint.validators {

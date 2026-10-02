@@ -55,6 +55,16 @@ tracing-subscriber = { version = "0.3", features = [
   "json",
 ] }
 
+[features]
+# Route-quality benchmark (bench/route-quality/README.md). Not part of the
+# scooper: only builds the `route-bench` example.
+route-bench = []
+
+[[example]]
+name = "route-bench"
+path = "src/route_bench.rs"
+required-features = ["route-bench"]
+
 [dev-dependencies]
 proptest = "1"
 tokio = { version = "1.46.1", features = ["full", "test-util"] }

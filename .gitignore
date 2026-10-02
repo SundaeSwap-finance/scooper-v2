@@ -5,3 +5,6 @@
 *.db
 logs.txt
 config/*.bak
+
+/bench/route-quality/data/cache/
+/bench/route-quality/results/
