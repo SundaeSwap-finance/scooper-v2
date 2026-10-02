@@ -5,7 +5,7 @@
 //! immutable data.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use num_traits::Signed;
 
@@ -91,6 +91,10 @@ fn ss_view_swap(pool: &PoolView, dx: &BigInt) -> Option<crate::sundaev4::ss_math
 }
 
 /// Lightweight pool view for the router (direction-aware).
+///
+/// Never modified once built: the view caches its absorb cap, which a field
+/// changed in place would leave stale. For the same reason a
+/// `PoolView { .., ..view }` update must reset `absorb_cap`.
 #[derive(Clone, Debug)]
 pub struct PoolView {
     pub ident: Ident,
@@ -99,6 +103,12 @@ pub struct PoolView {
     pub fee_num: u64,
     pub fee_den: u64,
     pub view_type: PoolViewType,
+    /// `pool_absorb_cap`, computed on first use (`OnceLock::new()` when
+    /// building a view). Cheap for most pool types, but a search of ~65
+    /// fee-budget evaluations for a CL pool, and the router asks for it many
+    /// times per view (every split it tries); clones made after the first use
+    /// share the value.
+    absorb_cap: OnceLock<Option<BigInt>>,
 }
 
 /// A single pool's contribution to a split.
@@ -231,6 +241,11 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 /// A bounded pool whose solver can't produce a cap returns `Some(0)` so callers
 /// treat it as unable to absorb anything, never as unbounded.
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
+    pool.absorb_cap.get_or_init(|| compute_absorb_cap(pool)).clone()
+}
+
+/// `pool_absorb_cap`, uncached.
+fn compute_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
         // The curve is asymptotic in the out reserve: the pinned output is
@@ -1052,6 +1067,7 @@ fn build_graph(
                         fee_num,
                         fee_den,
                         view_type: view_type_fn(i, j),
+                        absorb_cap: OnceLock::new(),
                     });
             }
         }
@@ -1082,6 +1098,7 @@ fn build_graph(
                     rate_den: edge.rate_den.clone(),
                     key: edge.key.clone(),
                 },
+                absorb_cap: OnceLock::new(),
             },
         );
     }
@@ -2222,6 +2239,7 @@ mod tests {
                 rate_den: BigInt::from(1),
                 key: "x".into(),
             },
+            absorb_cap: OnceLock::new(),
         };
         assert_eq!(
             pool_output(&view, &BigInt::from(123_456_789)),
@@ -2230,6 +2248,7 @@ mod tests {
         // 1% input fee
         let feed = PoolView {
             fee_num: 100,
+            absorb_cap: OnceLock::new(),
             ..view.clone()
         };
         assert_eq!(
@@ -2243,6 +2262,7 @@ mod tests {
                 rate_den: BigInt::from(1),
                 key: "x".into(),
             },
+            absorb_cap: OnceLock::new(),
             ..view
         };
         assert_eq!(pool_output(&two, &BigInt::from(5)), BigInt::from(10));
@@ -2423,6 +2443,7 @@ mod tests {
                 price_in: BigInt::from(1),
                 price_out: BigInt::from(1),
             },
+            absorb_cap: OnceLock::new(),
         };
         // Both trade 1:1 at the same fee, so they quote the same output. The
         // first is balanced; the second is short the input asset (200k vs 1.8M),
@@ -2549,6 +2570,7 @@ mod tests {
                     spb_den: BigInt::from(den),
                     lp: BigInt::from(lp),
                 },
+                absorb_cap: OnceLock::new(),
             }
         };
         let bands: Vec<PoolView> = (0..14).map(band).collect();
@@ -2621,6 +2643,7 @@ mod tests {
                 price_in: BigInt::from(price_in),
                 price_out: BigInt::from(10),
             },
+            absorb_cap: OnceLock::new(),
         };
         let best = cs(0x01, 12, 1_200_000);
         let mid = cs(0x02, 11, 1_100_000);
