@@ -56,7 +56,14 @@ tracing-subscriber = { version = "0.3", features = [
   "json",
 ] }
 
+# Router benchmark (benches/router/): `cargo bench --bench router`.
+[[bench]]
+name = "router"
+path = "src/router_bench.rs"
+harness = false
+
 [dev-dependencies]
+criterion = "0.8"
 proptest = "1"
 tokio = { version = "1.46.1", features = ["full", "test-util"] }
 
