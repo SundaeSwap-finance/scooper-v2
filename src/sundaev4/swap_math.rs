@@ -488,6 +488,29 @@ pub fn compute_fee_budget(
                 }
             }
         }
+        super::types::PoolType::BandedConcentratedLiquidity { config } => {
+            // banded_cl_check.banded_swap step 9: `bp * X0 <= lp_before * X1
+            // < (bp + 1) * X0` with `bp = lp_after + fee_budget`, on the two
+            // ladder counters. A non-swap step must declare 0.
+            if assets_before.len() != 2 || assets_after.len() != 2 {
+                warn!("banded fee_budget: pool does not hold two assets");
+                return BigInt::from(0);
+            }
+            let (a0, b0) = (&assets_before[0].1, &assets_before[1].1);
+            let (a1, b1) = (&assets_after[0].1, &assets_after[1].1);
+            let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
+            if !is_swap {
+                return BigInt::from(0);
+            }
+            let (Some(before), Some(after)) = (
+                super::banded_math::find_witness(config, a0, b0),
+                super::banded_math::find_witness(config, a1, b1),
+            ) else {
+                warn!("banded fee_budget: no ladder witness for the step's reserves");
+                return BigInt::from(0);
+            };
+            super::banded_math::fee_budget(lp_before, &before.x, &after.x, lp_before)
+        }
         super::types::PoolType::ConcentratedLiquidity {
             sqrt_price_a,
             sqrt_price_b,

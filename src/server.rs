@@ -1613,17 +1613,20 @@ impl AdminServer {
         // A stableswap pool's config is per pool (and its rates move on
         // chain), so its preimage comes from the pool record, not the
         // startup map.
-        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> =
-            if let crate::sundaev4::PoolType::StableSwap { config } = &pool.pool_type {
-                use plutus_parser::AsPlutus;
-                let cbor = minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default();
-                Some((
-                    pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(),
-                    cbor,
-                ))
-            } else {
-                None
+        // The same holds for a banded ladder, whose config is per pool.
+        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> = {
+            use plutus_parser::AsPlutus;
+            let cbor = match &pool.pool_type {
+                crate::sundaev4::PoolType::StableSwap { config } => {
+                    Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
+                }
+                crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } => {
+                    Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
+                }
+                _ => None,
             };
+            cbor.map(|cbor| (pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(), cbor))
+        };
         if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
             let mut enriched = serde_json::Map::new();
             for (module_hash, state_bytes) in &pool.pool_datum.module_state {
@@ -1808,6 +1811,7 @@ impl AdminServer {
                 PoolType::ConstantSum { .. } => "cs",
                 PoolType::ConcentratedLiquidity { .. } => "cl",
                 PoolType::StableSwap { .. } => "ss",
+                PoolType::BandedConcentratedLiquidity { .. } => "bcl",
             };
             *by_type.entry(kind).or_default() += 1;
             if self.v4_pool_allowlists.is_restricted(ident) {

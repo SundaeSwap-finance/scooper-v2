@@ -1740,6 +1740,93 @@ mod tests {
         }
     }
 
+    /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
+    /// whole pipeline against the real validators: on the eight-band ladder
+    /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_478 in
+    /// band 0; 624 B in pays 616 A out, the counter moves to 999_999_641 and
+    /// the step's fee budget is 163 LP.
+    #[test]
+    fn bcl_single_order() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool(
+            &env,
+            0x6B,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        assert_eq!(pool.pool_datum.total_lp, BigInt::from(999_999_478i64));
+        let orders = vec![make_order(token_b(), 624, token_a(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("banded batch assembly should succeed");
+        assert_eq!(batch.swaps.len(), 1);
+        assert_eq!(batch.swaps[0].dy, BigInt::from(616));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("banded build_and_eval should succeed");
+        let rewards = eval
+            .budgets
+            .iter()
+            .filter(|(k, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
+            .count();
+        assert!(
+            rewards >= 3,
+            "expected banded + fee_split + fairness withdrawals, got {rewards}"
+        );
+        // The entry's operation_data opens with the after witness pair.
+        let step = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) => {
+                        Some(transcript)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pool spend redeemer")
+            .remove(0);
+        let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(step.operation_data)
+            .expect("banded entry carries a list");
+        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(999_999_641i64));
+        assert_eq!(BigInt::from_plutus(pair[1].clone()).unwrap(), BigInt::from(0));
+        // The module entry names the INPUT witness.
+        let entry = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::BandedCLRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::BandedCLRedeemer::Operate { entries }) => {
+                        Some(entries)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("banded withdrawal redeemer")
+            .remove(0);
+        assert_eq!(entry.counter, BigInt::from(999_999_478i64));
+        assert_eq!(entry.active_band, BigInt::from(0));
+        assert_eq!(entry.config, cfg);
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_752i64));
+        assert_eq!(after.pool_datum.assets[1].1, BigInt::from(625_623i64));
+        // fee_budget 163 at the default protocol share grows total_lp, not
+        // circulating_lp.
+        assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
+        assert_eq!(after.pool_datum.circulating_lp, pool.pool_datum.circulating_lp);
+    }
+
     /// The Aiken fixture vector (`lib/tests/unit/ss_swap.ak`): 1e7 of A into
     /// a (1e9, 1e9) pool at A=200, fee 0.3% pays 9_969_750 of B.
     #[test]

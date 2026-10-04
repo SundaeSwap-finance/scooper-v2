@@ -1,5 +1,6 @@
 pub mod access;
 pub mod accumulator;
+pub mod banded_math;
 pub mod batch;
 pub mod butane;
 pub mod chain_tracker;

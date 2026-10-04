@@ -439,6 +439,14 @@
      "stableswap": {
       "hash": "9db7ce54fb25f4390a89bb715a022fe79a86b9a043aa22c31c27380a",
       "ref-utxo": "849ff000d1b17e974f8024bf962e82d9317cbc28fc8be7010e52462f28ada689#0"
+     },
+     "banded-concentrated-liquidity": {
+      "hash": "0977898c126442fdab79057b5b677932b55d4373d93b87dcee3e7d9a",
+      "ref-utxo": "1eba92d97cbf246fde4c88764122d9c868b0af2e4f62cd209deffdc57c7639c1#0"
+     },
+     "oracle": {
+      "hash": "144f4c996e3e85a10f2c3bd3d01b32fc4bdee1d237167fc7dd678d59",
+      "ref-utxo": "ea332c77bf7ec5bdf6cb328c78cc4c6000c31ac367e9ca7f5631ca2e57fd7312#0"
      }
     },
     "plutus-v2-cost-model": [

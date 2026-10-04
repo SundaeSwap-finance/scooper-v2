@@ -302,6 +302,28 @@ impl Blueprint {
         )
         .ok();
 
+        // Banded concentrated liquidity (optional — only present once deployed).
+        let banded_concentrated_liquidity = make_info(
+            self,
+            &[
+                "banded_concentrated_liquidity.withdraw",
+                "banded_concentrated_liquidity_module",
+                "banded_concentrated_liquidity",
+                "bandedConcentratedLiquidity",
+            ],
+            "banded_concentrated_liquidity.withdraw",
+            "banded_concentrated_liquidity",
+        )
+        .ok();
+        // The general price oracle module (optional).
+        let oracle = make_info(
+            self,
+            &["oracle.withdraw", "oracle_module", "oracle"],
+            "oracle.withdraw",
+            "oracle",
+        )
+        .ok();
+
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
@@ -314,6 +336,8 @@ impl Blueprint {
             fee_constraint,
             concentrated_liquidity,
             stableswap,
+            banded_concentrated_liquidity,
+            oracle,
             swap_order,
             basic_order,
             route_order,

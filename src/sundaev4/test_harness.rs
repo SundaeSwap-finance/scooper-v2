@@ -622,6 +622,48 @@ impl TestEnv {
         ]
     }
 
+    /// `module_state` entries for a banded concentrated-liquidity pool: the
+    /// ladder's hash under the banded module credential, plus fee_split and
+    /// fairness as for every pool.
+    pub fn bcl_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let script = self
+            .exec
+            .module_scripts
+            .banded_concentrated_liquidity
+            .as_ref()
+            .expect("blueprint must include the banded validator for banded tests");
+        let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
+        let fs_config = FeeSplitConfig {
+            protocol_share: Rational {
+                num: BigInt::from(self.exec.protocol_share.0),
+                den: BigInt::from(self.exec.protocol_share.1),
+            },
+        };
+        let fs_cbor = minicbor::to_vec(fs_config.to_plutus()).unwrap();
+        let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
+        vec![
+            (script.hash.to_vec(), bcl_hash),
+            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+            (self.exec.module_scripts.fairness.hash.to_vec(), vec![0x80]),
+        ]
+    }
+
+    /// The action entry modules list for banded pools:
+    /// `[bcl_hash, fs_hash, fairness_hash]`.
+    pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
+        let script = self
+            .exec
+            .module_scripts
+            .banded_concentrated_liquidity
+            .as_ref()
+            .expect("blueprint must include the banded validator for banded tests");
+        vec![
+            script.hash.to_vec(),
+            self.exec.module_scripts.fee_split.hash.to_vec(),
+            self.exec.module_scripts.fairness.hash.to_vec(),
+        ]
+    }
+
     /// The action entry modules list for stableswap pools:
     /// `[ss_hash, fs_hash, fairness_hash]`.
     pub fn ss_action_modules(&self) -> Vec<Vec<u8>> {
@@ -1028,6 +1070,105 @@ pub fn make_ss_pool(
             extension: crate::sundaev4::types::plutus_void(),
         },
         pool_type: PoolType::StableSwap { config },
+        slot: 100,
+        fee_split_config: None,
+    })
+}
+
+/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/banded_cl_check.ak`:
+/// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee.
+pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
+    let r = |n: i64, d: i64| Rational {
+        num: BigInt::from(n),
+        den: BigInt::from(d),
+    };
+    BandedCLConfig {
+        bands: (0..8)
+            .map(|i| BandSpec {
+                start: r(1_000_000 + 10_000 * i, 1_000_000),
+                weight: BigInt::from(1),
+                curve: BigInt::from(0),
+                fee_buy: fee.clone(),
+                fee_sell: fee.clone(),
+            })
+            .collect(),
+        closing: r(1_080_000, 1_000_000),
+        weight_total: BigInt::from(8),
+    }
+}
+
+/// Create a banded concentrated-liquidity pool with the proper module
+/// pipeline (banded + FS + fairness). `total_lp` is the ladder counter the
+/// reserves witness (spec V12), found with `find_witness`; the reserves
+/// must therefore sit on a point of the ladder.
+pub fn make_bcl_pool(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: BandedCLConfig,
+) -> Arc<SundaeV4Pool> {
+    assert_eq!(assets.len(), 2, "banded pools hold exactly two assets");
+    let ident_bytes = vec![ident_byte; 28];
+
+    let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+    nft_name.extend_from_slice(&ident_bytes);
+    let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+    lp_name.extend_from_slice(&ident_bytes);
+
+    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let nft_asset = AssetClass {
+        policy: pool_mint_policy.clone(),
+        token: nft_name,
+    };
+    let lp_asset = AssetClass {
+        policy: pool_mint_policy,
+        token: lp_name,
+    };
+
+    let w = crate::sundaev4::banded_math::find_witness(
+        &config,
+        &BigInt::from(assets[0].1),
+        &BigInt::from(assets[1].1),
+    )
+    .expect("the test reserves sit on the ladder");
+    let total_lp = w.x;
+    let circulating_lp = BigInt::from(0);
+    let preminted_lp = total_lp.clone();
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(50_000_000i64));
+    for (asset, reserve) in &assets {
+        value.insert(asset, BigInt::from(*reserve));
+    }
+    value.insert(&nft_asset, BigInt::from(1i64));
+    value.insert(&lp_asset, preminted_lp.clone());
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = ident_byte;
+
+    let datum_assets: Vec<(AssetClass, BigInt)> =
+        assets.iter().map(|(a, r)| (a.clone(), BigInt::from(*r))).collect();
+
+    Arc::new(SundaeV4Pool {
+        input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
+        value,
+        pool_datum: PoolDatum {
+            assets: datum_assets,
+            total_lp,
+            circulating_lp,
+            preminted_lp,
+            identifier: Ident::new(&ident_bytes),
+            actions: vec![ActionEntry {
+                tag: BigInt::from(100),
+                enabled: true,
+                modules: env.bcl_action_modules(),
+            }],
+            module_state: env.bcl_module_state(&config),
+            min_surplus: BigInt::from(0),
+            extension: crate::sundaev4::types::plutus_void(),
+        },
+        pool_type: PoolType::BandedConcentratedLiquidity { config },
         slot: 100,
         fee_split_config: None,
     })

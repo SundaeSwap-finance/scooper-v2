@@ -142,6 +142,34 @@ fn ss_swap_op_data(
     .to_plutus())
 }
 
+/// `[X, k, attribution]` for a banded ladder entry: the witness pair of the
+/// reserves the entry leaves (`banded_cl_check.decode_entry` reads the first
+/// two positionally), plus the serving order's reference for the indexer.
+/// A state with no witness cannot be the after state of a valid step, so
+/// the tx is refused rather than built.
+fn banded_op_data(
+    config: &crate::sundaev4::types::BandedCLConfig,
+    after: &[(AssetClass, BigInt)],
+    attribution: Option<pallas_primitives::PlutusData>,
+) -> Result<pallas_primitives::PlutusData> {
+    if after.len() != 2 {
+        bail!("banded pool must hold exactly two assets");
+    }
+    let w = crate::sundaev4::banded_math::find_witness(config, &after[0].1, &after[1].1)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "banded entry leaves reserves ({}, {}) that sit on no point of the ladder",
+                after[0].1,
+                after[1].1
+            )
+        })?;
+    let mut items = vec![w.x.to_plutus(), BigInt::from(w.k as u64).to_plutus()];
+    if let Some(a) = attribution {
+        items.push(a);
+    }
+    Ok(pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items)))
+}
+
 /// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
 /// a stableswap deposit or withdraw entry: the declared delta plus `D` for
 /// the reserves the entry leaves, and the serving order's reference.
@@ -579,6 +607,7 @@ pub fn build_multi_pool_scoop_tx(
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
         })
         .collect();
 
@@ -592,6 +621,7 @@ pub fn build_multi_pool_scoop_tx(
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
         })
         .collect();
 
@@ -922,6 +952,7 @@ pub fn build_multi_pool_scoop_tx(
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+                    PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
@@ -994,6 +1025,31 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             });
+        }
+
+        // Banded entries carry the AFTER state's witness pair `[X, k]` in
+        // operation_data: the ladder walk decodes it positionally from every
+        // entry, swap or not (banded_cl_check.decode_entry), and threads it
+        // into the next step's before pair. A third element, the serving
+        // order's reference, rides along for the indexer; the walk reads
+        // only the first two.
+        if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+            use crate::sundaev4::batch::BatchOp;
+            let served_order = match op {
+                BatchOp::Swap(i) => Some(&batch.swaps[*i].order.input),
+                BatchOp::Continuation(i) => {
+                    Some(&routes[batch.continuations[*i].route.route_idx].order.input)
+                }
+                BatchOp::ZapSwap(i) | BatchOp::ZapDeposit(i) => Some(&batch.zaps[*i].order.input),
+                BatchOp::Deposit(i) => Some(&batch.deposits[*i].order.input),
+                BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
+                BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
+            };
+            op_data_override = Some(banded_op_data(
+                config,
+                running_assets,
+                served_order.map(order_ref_to_plutus),
+            )?);
         }
 
         // Per-entry protocol_lp share. fee_split.Operate's check is
@@ -1242,6 +1298,7 @@ pub fn build_multi_pool_scoop_tx(
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
     let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
+    let mut bcl_entries: Vec<crate::sundaev4::types::BandedOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -1290,6 +1347,24 @@ pub fn build_multi_pool_scoop_tx(
             transaction_id: pool_oref.transaction_id.to_vec(),
             output_index: pool_oref.index,
         };
+
+        // A pool whose enabled action lists the oracle module needs an
+        // oracle Operate entry, its reference input and a fresh accumulator
+        // slot in the output datum on every scoop. None of that is built
+        // yet, so such a pool is refused here with its reason rather than
+        // failing on chain.
+        if let Some(oracle) = exec.module_scripts.oracle.as_ref() {
+            let needs_oracle = batch.pool.pool_datum.actions.iter().any(|a| {
+                a.enabled && a.modules.iter().any(|m| m.as_slice() == oracle.hash.as_ref())
+            });
+            if needs_oracle {
+                bail!(
+                    "pool {} lists the oracle module in its trade action; this scooper does not \
+                     build oracle entries yet",
+                    batch.pool.pool_datum.identifier
+                );
+            }
+        }
 
         match &batch.pool.pool_type {
             PoolType::ConstantProduct { fee } => {
@@ -1418,6 +1493,67 @@ pub fn build_multi_pool_scoop_tx(
                     pool_oref: pool_oref_plutus.clone(),
                     config: config.clone(),
                     sum_invariant,
+                });
+            }
+            PoolType::BandedConcentratedLiquidity { config } => {
+                // The entry re-sends the ladder and the witness pair for the
+                // pool INPUT's reserves. The module checks the preimage
+                // against both datums' module_state and re-derives the pair
+                // in the walk's first step, so refuse to build on a stale or
+                // unknown config rather than fail on chain.
+                let bcl_script =
+                    exec.module_scripts.banded_concentrated_liquidity.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pool {} is banded but no banded_concentrated_liquidity module \
+                             script is configured",
+                            batch.pool.pool_datum.identifier
+                        )
+                    })?;
+                let bcl_cred = bcl_script.hash.as_ref();
+                let stored = batch
+                    .pool
+                    .pool_datum
+                    .module_state
+                    .iter()
+                    .find(|(cred, _)| cred.as_slice() == bcl_cred)
+                    .map(|(_, h)| h.clone());
+                let expected = crate::sundaev4::banded_math::config_hash(config);
+                if stored.as_deref() != Some(expected.as_slice()) {
+                    bail!(
+                        "pool {}: banded config preimage hash {} does not match the pool's \
+                         module_state {:?}; the config is unknown or stale",
+                        batch.pool.pool_datum.identifier,
+                        hex::encode(&expected),
+                        stored.map(hex::encode),
+                    );
+                }
+                let assets = &batch.pool.pool_datum.assets;
+                if assets.len() != 2 {
+                    bail!(
+                        "pool {}: banded pool must hold exactly two assets",
+                        batch.pool.pool_datum.identifier
+                    );
+                }
+                let w = crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pool {}: no ladder witness for reserves ({}, {})",
+                            batch.pool.pool_datum.identifier,
+                            assets[0].1,
+                            assets[1].1
+                        )
+                    })?;
+                tracing::debug!(
+                    pool = %batch.pool.pool_datum.identifier,
+                    counter = %w.x,
+                    active_band = w.k,
+                    "banded redeemer witness",
+                );
+                bcl_entries.push(crate::sundaev4::types::BandedOperateEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                    config: config.clone(),
+                    counter: w.x,
+                    active_band: BigInt::from(w.k as u64),
                 });
             }
         }
@@ -1578,6 +1714,7 @@ pub fn build_multi_pool_scoop_tx(
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
     let has_ss = !ss_entries.is_empty();
+    let has_bcl = !bcl_entries.is_empty();
 
     // pool_mint is only needed when the preminted reserve couldn't cover a
     // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
@@ -1620,6 +1757,9 @@ pub fn build_multi_pool_scoop_tx(
     }
     if has_ss && let Some(ss) = &exec.module_scripts.stableswap {
         all_ref_inputs.push(ss.ref_utxo.0.clone());
+    }
+    if has_bcl && let Some(bcl) = &exec.module_scripts.banded_concentrated_liquidity {
+        all_ref_inputs.push(bcl.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -1834,6 +1974,14 @@ pub fn build_multi_pool_scoop_tx(
             entries: ss_entries,
         };
         withdrawals.push((reward_account(&ss_script.hash), ss_redeemer.to_plutus()));
+    }
+
+    // Conditionally add banded concentrated-liquidity withdrawal
+    if has_bcl && let Some(bcl_script) = &exec.module_scripts.banded_concentrated_liquidity {
+        let bcl_redeemer = crate::sundaev4::types::BandedCLRedeemer::Operate {
+            entries: bcl_entries,
+        };
+        withdrawals.push((reward_account(&bcl_script.hash), bcl_redeemer.to_plutus()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in

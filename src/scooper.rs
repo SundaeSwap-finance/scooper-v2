@@ -2537,6 +2537,9 @@ impl Scooper {
                             crate::metrics::PoolFamily::ConcentratedLiquidity
                         }
                         PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
+                        PoolType::BandedConcentratedLiquidity { .. } => {
+                            crate::metrics::PoolFamily::BandedConcentratedLiquidity
+                        }
                     };
                     let n = (batch.swaps.len()
                         + batch.deposits.len()

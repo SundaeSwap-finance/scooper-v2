@@ -647,6 +647,16 @@ pub enum PoolType {
     StableSwap {
         config: StableSwapConfig,
     },
+    /// Banded concentrated liquidity
+    /// (`validators/modules/banded_concentrated_liquidity.ak`): a ladder of
+    /// price bands, each a CL arc or a constant-sum bin, sharing one
+    /// liquidity counter that IS the pool's `total_lp`. Like stableswap the
+    /// whole config preimage rides along: every Operate entry re-sends it and
+    /// the datum's `module_state` slot is its hash. Unlike stableswap it never
+    /// changes after Create.
+    BandedConcentratedLiquidity {
+        config: BandedCLConfig,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -674,6 +684,31 @@ pub struct StableSwapConfig {
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantProductConfig {
     pub fee: Rational,
+}
+
+/// One band of a ladder (`types/banded_cl.BandSpec`). `start` is the band's
+/// LOWER sqrt-price edge; its upper edge is the next band's `start`, or the
+/// config's `closing` for the last band. `curve` is 0 for a CL arc and 1 for
+/// a constant-sum bin. `fee_buy` applies when the trade buys asset A (pays
+/// B), `fee_sell` when it sells A.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BandSpec {
+    pub start: Rational,
+    pub weight: BigInt,
+    pub curve: BigInt,
+    pub fee_buy: Rational,
+    pub fee_sell: Rational,
+}
+
+/// `BandedCLConfig` (`types/banded_cl.ak`). Stored in the pool datum's
+/// `module_state` as `blake2b_256(serialise_data(config))`; the preimage
+/// travels in every `BandedCLRedeemer::Operate` entry. `weight_total` is
+/// exactly the sum of the band weights (the module checks equality).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BandedCLConfig {
+    pub bands: Vec<BandSpec>,
+    pub closing: Rational,
+    pub weight_total: BigInt,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -997,6 +1032,39 @@ pub struct SSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: StableSwapConfig,
     pub sum_invariant: BigInt,
+}
+
+// `Create` carries the whole ladder; see the note on `StableSwapRedeemer`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum BandedCLRedeemer {
+    /// `initial_state` stays field 0 (pool_mint hashes it for module_state).
+    /// `initial_band` is the band holding the launch price; the counter is
+    /// the pool's `total_lp` and has no field.
+    Create {
+        initial_state: BandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<BandedOperateEntry>,
+    },
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `BandedCLRedeemer::Operate`. `config` is the ladder
+/// as stored in the pool INPUT's `module_state`; `counter` / `active_band`
+/// are the witness pair for the pool input's reserves, which the walk's
+/// first step re-derives and checks (`banded_cl_check.band_proof`).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct BandedOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: BandedCLConfig,
+    pub counter: BigInt,
+    pub active_band: BigInt,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1361,6 +1429,16 @@ pub struct ModuleScripts {
     /// `detect_pool_type`).
     #[serde(default)]
     pub stableswap: Option<ScriptRefInfo>,
+    /// Optional: only required when scooping banded concentrated-liquidity
+    /// pools (`banded_concentrated_liquidity.withdraw`).
+    #[serde(default)]
+    pub banded_concentrated_liquidity: Option<ScriptRefInfo>,
+    /// Optional: the general price oracle module (`oracle.withdraw`). A pool
+    /// that lists it as a fourth trade-action module needs it to run on every
+    /// scoop. Parsed so the config can name it; the scooper does not build
+    /// its entries yet, and refuses pools that require it.
+    #[serde(default)]
+    pub oracle: Option<ScriptRefInfo>,
     /// Per-class constraint validators (modular order constraints, PR #11).
     /// Every order's OrderConfig lists which constraint hashes it requires;
     /// the order_validator's withdraw handler requires each listed constraint

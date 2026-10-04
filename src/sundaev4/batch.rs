@@ -658,6 +658,30 @@ pub fn explain_swap_result(
                 Err(e) => Err(format!("stableswap: {e}")),
             }
         }
+        PoolType::BandedConcentratedLiquidity { config } => {
+            // One ladder step inside the active band. A step the band cannot
+            // hold (the output would exceed the band's residual) is
+            // unfillable here: crossing into the next band is a second
+            // transcript step, which this scooper does not build yet. The
+            // message names the largest input the band does fill.
+            if assets.len() != 2 || input_idx > 1 || output_idx > 1 || input_idx == output_idx {
+                return Err(format!(
+                    "banded pool has {} assets; swap {input_idx} -> {output_idx} is not a pair",
+                    assets.len()
+                ));
+            }
+            match super::banded_math::swap_step(
+                config,
+                &assets[0].1,
+                &assets[1].1,
+                total_lp,
+                input_idx == 0,
+                dx,
+            ) {
+                Ok(s) => Ok(s.dy),
+                Err(e) => Err(format!("banded: {e}")),
+            }
+        }
         PoolType::ConcentratedLiquidity {
             sqrt_price_a,
             sqrt_price_b,
@@ -952,6 +976,7 @@ pub fn plan_zap_swap(
         }
         PoolType::ConstantProduct { .. }
         | PoolType::ConcentratedLiquidity { .. }
+        | PoolType::BandedConcentratedLiquidity { .. }
         | PoolType::StableSwap { .. } => {
             // Stableswap's deposit pin mints floor(lp · t / D) with
             // t = min_i floor(have_i · D / r_i), so the LP minted after a
@@ -1163,8 +1188,13 @@ pub fn resolve_deposit_basket(
         //   delta_i = ceil(r_i·minted/L0)
         // (L0 = total_lp = the CL virtual liquidity). A CL-specific
         // property test asserts the product invariant on the generated fill.
+        // A banded ladder's non-swap step is `check_proportional` too
+        // (banded_cl_check.banded_step_raw): every reserve must move at
+        // least in proportion to total_lp, and `X` follows because the
+        // prefix sums and `L_i` are degree-1 homogeneous in it.
         crate::sundaev4::types::PoolType::ConstantProduct { .. }
-        | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
+        | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. }
+        | crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { .. } => {
             let mut minted: Option<BigInt> = None;
             for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
                 if r.is_zero() {

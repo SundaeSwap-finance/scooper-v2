@@ -120,6 +120,8 @@ pub struct PoolModuleConfigCache {
     /// Stableswap configs carry the pool's current `rates`; a tag-7 update
     /// replaces the entry (the persisted row is upserted).
     pub ss: BTreeMap<Ident, crate::sundaev4::types::StableSwapConfig>,
+    /// Banded ladders: hash-pinned like stableswap, but fixed after Create.
+    pub bcl: BTreeMap<Ident, crate::sundaev4::types::BandedCLConfig>,
     pub fee_split: BTreeMap<Ident, crate::sundaev4::types::FeeSplitConfig>,
 }
 
@@ -185,6 +187,12 @@ impl SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.stableswap.as_ref())
             .map(|ss| ss.hash.as_ref().to_vec());
+        let bcl_module_hash: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
+            .map(|m| m.hash.as_ref().to_vec());
         let cs_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -232,6 +240,10 @@ impl SundaeV4Indexer {
                 let parsed = StableSwapConfig::from_plutus(pd)
                     .context("could not parse persisted StableSwapConfig")?;
                 cache.ss.insert(Ident::new(&cfg.pool_id), parsed);
+            } else if Some(&cfg.module_hash) == bcl_module_hash.as_ref() {
+                let parsed = crate::sundaev4::types::BandedCLConfig::from_plutus(pd)
+                    .context("could not parse persisted BandedCLConfig")?;
+                cache.bcl.insert(Ident::new(&cfg.pool_id), parsed);
             }
         }
         info!(
@@ -239,6 +251,7 @@ impl SundaeV4Indexer {
             cp = cache.cp.len(),
             cl = cache.cl.len(),
             ss = cache.ss.len(),
+            bcl = cache.bcl.len(),
             fs = cache.fee_split.len(),
             "v4: hydrated per-module pool configs from DB",
         );
@@ -269,6 +282,7 @@ impl SundaeV4Indexer {
             };
             let mut pool = (**existing).clone();
             let ss = self.cached_ss_config(&pool.pool_datum, &cache);
+            let bcl = self.cached_bcl_config(&pool.pool_datum, &cache);
             pool.pool_type = detect_pool_type(
                 &pool.pool_datum,
                 self.protocol.execution.as_ref(),
@@ -276,6 +290,7 @@ impl SundaeV4Indexer {
                 cache.cp.get(ident),
                 cache.cl.get(ident),
                 ss.as_ref(),
+                bcl.as_ref(),
             );
             pool.fee_split_config = cache.fee_split.get(ident).cloned();
             s.pools.insert(ident.clone(), Arc::new(pool));
@@ -613,6 +628,7 @@ impl SundaeV4Indexer {
         let cp = cache.cp.get(&pool_datum.identifier);
         let cl = cache.cl.get(&pool_datum.identifier);
         let ss = self.cached_ss_config(pool_datum, cache);
+        let bcl = self.cached_bcl_config(pool_datum, cache);
         detect_pool_type(
             pool_datum,
             self.protocol.execution.as_ref(),
@@ -620,7 +636,26 @@ impl SundaeV4Indexer {
             cp,
             cl,
             ss.as_ref(),
+            bcl.as_ref(),
         )
+    }
+
+    /// The cached banded ladder for a pool, only when its hash is the one
+    /// the datum's `module_state` names.
+    fn cached_bcl_config(
+        &self,
+        pool_datum: &PoolDatum,
+        cache: &PoolModuleConfigCache,
+    ) -> Option<crate::sundaev4::types::BandedCLConfig> {
+        let h = self
+            .protocol
+            .execution
+            .as_ref()?
+            .module_scripts
+            .banded_concentrated_liquidity
+            .as_ref()?
+            .hash;
+        resolve_bcl_config(pool_datum, h.as_ref(), &[], cache.bcl.get(&pool_datum.identifier))
     }
 
     /// The cached stableswap config for a pool, only when its hash is the
@@ -973,6 +1008,63 @@ pub fn extract_ss_config_candidates(
     }
 }
 
+/// Every banded ladder a transaction vouches for: a `Create`'s
+/// `initial_state`, and each `Operate` entry's `config`. The ladder never
+/// changes after Create, so there is no post-update form to add.
+pub fn extract_bcl_config_candidates(
+    tx: &MultiEraTx,
+    bcl_script_hash: &ScriptHash,
+) -> Vec<crate::sundaev4::types::BandedCLConfig> {
+    use crate::sundaev4::types::BandedCLRedeemer;
+    let Some(wd_index) = withdrawal_index_of_script(tx, bcl_script_hash) else {
+        return vec![];
+    };
+    let redeemers = tx.redeemers();
+    let Some(redeemer) =
+        redeemers.iter().find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)
+    else {
+        return vec![];
+    };
+    let Ok(parsed) = BandedCLRedeemer::from_plutus(redeemer.data().clone()) else {
+        return vec![];
+    };
+    match parsed {
+        BandedCLRedeemer::Create { initial_state, .. } => vec![initial_state],
+        BandedCLRedeemer::Operate { entries } => entries.into_iter().map(|e| e.config).collect(),
+        BandedCLRedeemer::Destroy { .. } => vec![],
+    }
+}
+
+/// The banded ladder for `pool_datum`: the first of `candidates`, else
+/// `cached`, whose hash the datum's banded `module_state` slot names, and
+/// which passes the module's Create-time shape checks. `None` when nothing
+/// matches; the tx builder then refuses the pool.
+pub fn resolve_bcl_config(
+    pool_datum: &PoolDatum,
+    bcl_module_hash: &[u8],
+    candidates: &[crate::sundaev4::types::BandedCLConfig],
+    cached: Option<&crate::sundaev4::types::BandedCLConfig>,
+) -> Option<crate::sundaev4::types::BandedCLConfig> {
+    use crate::sundaev4::banded_math::{check_shape, config_matches_datum};
+    let accepted = |c: &crate::sundaev4::types::BandedCLConfig| -> bool {
+        config_matches_datum(c, pool_datum, bcl_module_hash)
+            && match check_shape(c) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "v4: banded config hashes to module_state but fails the module's shape checks: {e}"
+                    );
+                    false
+                }
+            }
+    };
+    if let Some(c) = candidates.iter().find(|c| accepted(c)) {
+        return Some(c.clone());
+    }
+    cached.filter(|c| accepted(c)).cloned()
+}
+
 /// The stableswap config for `pool_datum`: the first of `candidates`, else
 /// `cached`, whose hash the datum's `module_state` slot for the stableswap
 /// module names. `None` when the pool has no stableswap slot or nothing
@@ -1162,6 +1254,14 @@ impl ChainIndex for SundaeV4Indexer {
             .and_then(|e| e.module_scripts.stableswap.as_ref())
             .map(|ss| extract_ss_config_candidates(&tx, &ss.hash))
             .unwrap_or_default();
+        // Banded: the ladder a Create pins or an Operate entry re-sends.
+        let bcl_candidates_from_tx: Vec<crate::sundaev4::types::BandedCLConfig> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
+            .map(|m| extract_bcl_config_candidates(&tx, &m.hash))
+            .unwrap_or_default();
         let swap_order_hash: Vec<u8> = self
             .protocol
             .execution
@@ -1207,6 +1307,12 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.stableswap.as_ref())
             .map(|ss| ss.hash.as_ref().to_vec());
+        let bcl_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
+            .map(|m| m.hash.as_ref().to_vec());
         let fs_module_hash_bytes: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -1257,6 +1363,14 @@ impl ChainIndex for SundaeV4Indexer {
                             module_cache.ss.get(&pool_id),
                         )
                     });
+                    let resolved_bcl = bcl_module_hash_bytes.as_ref().and_then(|h| {
+                        resolve_bcl_config(
+                            &pd,
+                            h,
+                            &bcl_candidates_from_tx,
+                            module_cache.bcl.get(&pool_id),
+                        )
+                    });
                     let pool_type = detect_pool_type(
                         &pd,
                         self.protocol.execution.as_ref(),
@@ -1264,7 +1378,30 @@ impl ChainIndex for SundaeV4Indexer {
                         resolved_cp,
                         resolved_cl,
                         resolved_ss.as_ref(),
+                        resolved_bcl.as_ref(),
                     );
+
+                    // Banded: persist on first sight. The ladder is fixed
+                    // after Create, so a row never changes.
+                    if let (Some(cfg), Some(bcl_hash)) =
+                        (resolved_bcl.as_ref(), bcl_module_hash_bytes.as_ref())
+                        && module_cache.bcl.get(&pool_id) != Some(cfg)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode BandedCLConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: bcl_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.bcl.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            bands = cfg.bands.len(),
+                            "v4: persisted banded pool config from redeemer"
+                        );
+                    }
 
                     // Stableswap: persist on first sight AND on change (a
                     // tag-7 rate update rewrites `rates`; the row is upserted).
@@ -2031,6 +2168,7 @@ pub fn detect_pool_type(
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
     cl_config_from_tx: Option<&crate::sundaev4::types::ConcentratedLiquidityConfig>,
     ss_config: Option<&crate::sundaev4::types::StableSwapConfig>,
+    bcl_config: Option<&crate::sundaev4::types::BandedCLConfig>,
 ) -> crate::sundaev4::types::PoolType {
     use crate::bigint::BigInt;
     use crate::sundaev4::types::{PoolType, Rational};
@@ -2053,6 +2191,11 @@ pub fn detect_pool_type(
         exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash.as_ref().to_vec());
+    let bcl_hash = exec
+        .module_scripts
+        .banded_concentrated_liquidity
+        .as_ref()
+        .map(|s| s.hash.as_ref().to_vec());
     let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
     let mut matched_kind: Option<&'static str> = None;
     for action in &pool_datum.actions {
@@ -2088,6 +2231,13 @@ pub fn detect_pool_type(
         {
             matched_action = Some(action);
             matched_kind = Some("ss");
+            break;
+        }
+        if let Some(h) = &bcl_hash
+            && first.as_slice() == h.as_slice()
+        {
+            matched_action = Some(action);
+            matched_kind = Some("bcl");
             break;
         }
     }
@@ -2207,6 +2357,34 @@ pub fn detect_pool_type(
                 rate_manager: None,
                 monotone_rates: false,
                 max_rate_step: None,
+            },
+        };
+    }
+
+    if matched_kind == Some("bcl") {
+        if let Some(cfg) = bcl_config {
+            return PoolType::BandedConcentratedLiquidity {
+                config: cfg.clone(),
+            };
+        }
+        // No preimage that hashes to the datum's module_state slot, and no
+        // operator override: the ladder is hash-pinned and the module reads
+        // it on every spend. The empty placeholder cannot pass the tx
+        // builder's hash check, so the pool is skipped loudly.
+        warn!(
+            pool = %ident_hex,
+            "banded pool has no config preimage matching its module_state (not yet indexed from \
+             a Create/Operate redeemer); scoops against it are refused until it is recovered — \
+             a restart recovers from the pool's tx history"
+        );
+        return PoolType::BandedConcentratedLiquidity {
+            config: crate::sundaev4::types::BandedCLConfig {
+                bands: vec![],
+                closing: Rational {
+                    num: BigInt::from(1),
+                    den: BigInt::from(1),
+                },
+                weight_total: BigInt::from(0),
             },
         };
     }
@@ -2378,6 +2556,8 @@ mod mainnet_create_tx_tests {
             settings: next(CS_HASH),
             constant_sum: Some(next(CS_HASH)),
             stableswap: None,
+            banded_concentrated_liquidity: None,
+            oracle: None,
             concentrated_liquidity: Some(next(CS_HASH)),
             swap_order: Some(next(CS_HASH)),
             basic_order: Some(next(CS_HASH)),

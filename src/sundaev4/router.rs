@@ -62,6 +62,18 @@ pub enum PoolViewType {
         rate_out: BigInt,
         d: BigInt,
     },
+    /// One band of a banded concentrated-liquidity ladder, direction-
+    /// oriented. The view's `reserve_in` / `reserve_out` are the band's
+    /// RESIDUAL reserves (what the active band itself holds), its
+    /// `fee_num/fee_den` the band's fee for this direction, and `band`
+    /// carries the band's edges, liquidity and curve. A step that would pay
+    /// out more than the residual leaves the band, which is a second
+    /// transcript step this scooper does not build, so `reserve_out` is the
+    /// edge's hard capacity.
+    Banded {
+        is_a_input: bool,
+        band: crate::sundaev4::banded_math::BandView,
+    },
 }
 
 /// The stableswap swap for a view: `dx` of the in asset against the out
@@ -233,6 +245,9 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
+        PoolViewType::Banded { is_a_input, band } => {
+            Some(crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input))
+        }
         // The curve is asymptotic in the out reserve: the pinned output is
         // always below it, and a fee-bearing step never lowers D.
         PoolViewType::StableSwap { .. } => None,
@@ -336,6 +351,9 @@ fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
 /// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
     let raw = match &pool.view_type {
+        PoolViewType::Banded { is_a_input, band } => {
+            crate::sundaev4::banded_math::band_output(band, *is_a_input, dx)
+        }
         PoolViewType::ConstantProduct => swap_math::cp_swap_result(
             &pool.reserve_in,
             &pool.reserve_out,
@@ -439,6 +457,46 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             }
             &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
                 / &(&fee_den * &denom * &denom)
+        }
+        PoolViewType::Banded { is_a_input, band } => {
+            // The band's arc is the CL curve on the residuals at liquidity
+            // L_k, with the module's B-input scale (`dvb_eff = dx_eff *
+            // spa_den`):
+            //   A→B: dy = vb0·dva_eff / ((va0+dva_eff)·spa_den),
+            //        dva_eff = (fm/fd)·dx·spb_num
+            //        d(dy)/dx = fm·vb0·va0·spb_num / (fd·spa_den·va²)
+            //   B→A: dy = va0·dvb_eff / ((vb0+dvb_eff)·spb_num),
+            //        dvb_eff = (fm/fd)·dx·spa_den
+            //        d(dy)/dx = fm·va0·vb0·spa_den / (fd·spb_num·vb²)
+            // A constant-sum bin has a constant marginal at its price.
+            let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
+            let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
+            if band.curve != 0 {
+                let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
+                return if *is_a_input {
+                    &fee_mult * &pn * &scale() / &(&fee_den * &pd)
+                } else {
+                    &fee_mult * &pd * &scale() / &(&fee_den * &pn)
+                };
+            }
+            let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
+            let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
+            let dx_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
+            if *is_a_input {
+                let va = &va0 + &(&dx_eff * spb_num);
+                let denom = &fee_den * spa_den * &va * &va;
+                if !denom.is_positive() {
+                    return BigInt::from(0);
+                }
+                &fee_mult * &vb0 * &va0 * spb_num * &scale() / &denom
+            } else {
+                let vb = &vb0 + &(&dx_eff * spa_den);
+                let denom = &fee_den * spb_num * &vb * &vb;
+                if !denom.is_positive() {
+                    return BigInt::from(0);
+                }
+                &fee_mult * &va0 * &vb0 * spa_den * &scale() / &denom
+            }
         }
         PoolViewType::ConstantSum {
             price_in,
@@ -562,6 +620,58 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
             let fee_mult = &fee_den - &fee_num;
 
             match &pool.view_type {
+                PoolViewType::Banded { is_a_input, band } => {
+                    let cap = crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input);
+                    let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
+                    let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
+                    if band.curve != 0 {
+                        // Constant marginal: take the whole bin when the
+                        // price beats lambda, nothing otherwise.
+                        let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
+                        let marginal = if *is_a_input {
+                            &fee_mult * &pn * &sc / &(&fee_den * &pd)
+                        } else {
+                            &fee_mult * &pd * &sc / &(&fee_den * &pn)
+                        };
+                        return if lambda <= &marginal { cap } else { BigInt::from(0) };
+                    }
+                    // Invert the arc's marginal = λ (see marginal_at_allocation):
+                    //   A→B: va² = fm·vb0·va0·spb_num·SCALE / (λ·fd·spa_den),
+                    //        dx_eff = (isqrt(va²) − va0) / spb_num
+                    //   B→A: vb² = fm·va0·vb0·spa_den·SCALE / (λ·fd·spb_num),
+                    //        dx_eff = (isqrt(vb²) − vb0) / spa_den
+                    let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
+                    let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
+                    let (numerator, denom, v0, sp_input) = if *is_a_input {
+                        (
+                            &fee_mult * &vb0 * &va0 * spb_num * &sc,
+                            &fee_den * spa_den * lambda,
+                            &va0,
+                            spb_num,
+                        )
+                    } else {
+                        (
+                            &fee_mult * &va0 * &vb0 * spa_den * &sc,
+                            &fee_den * spb_num * lambda,
+                            &vb0,
+                            spa_den,
+                        )
+                    };
+                    if !denom.is_positive() || !sp_input.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    let v_target = swap_math::isqrt(&(&numerator / &denom));
+                    let dv_eff = &v_target - v0;
+                    if !dv_eff.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    let dx_eff = &dv_eff / sp_input;
+                    if !dx_eff.is_positive() {
+                        return BigInt::from(0);
+                    }
+                    let raw = &dx_eff * &fee_den / &fee_mult;
+                    if raw > cap { cap } else { raw }
+                }
                 PoolViewType::ConstantProduct => {
                     // x_eff = isqrt(fee_mult * A * B * SCALE / (fee_den * lambda)) - A
                     let numerator = &fee_mult * &pool.reserve_in * &pool.reserve_out * &sc;
@@ -957,6 +1067,48 @@ fn build_graph(
     for (ident, pool) in pools {
         let assets = &pool.pool_datum.assets;
 
+        // A banded ladder's two edges price on the ACTIVE band's residuals
+        // with that band's direction fee, so they are built here rather than
+        // through the shared single-fee closure below.
+        if let PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type {
+            use crate::sundaev4::banded_math::{band_view, fee_for, find_witness};
+            if assets.len() != 2 {
+                tracing::warn!(pool = %ident, "banded pool skipped by the router: not two assets");
+                continue;
+            }
+            let (a, b) = (&assets[0].1, &assets[1].1);
+            let Some(w) = find_witness(config, a, b) else {
+                tracing::warn!(pool = %ident, "banded pool skipped by the router: no ladder witness");
+                continue;
+            };
+            let Ok(view) = band_view(config, a, b, &w) else {
+                continue;
+            };
+            for (i, j) in [(0usize, 1usize), (1, 0)] {
+                let is_a_input = i == 0;
+                let fee = fee_for(&view, is_a_input);
+                let (reserve_in, reserve_out) =
+                    if is_a_input { (view.ra.clone(), view.rb.clone()) } else { (view.rb.clone(), view.ra.clone()) };
+                graph
+                    .entry(assets[i].0.clone())
+                    .or_default()
+                    .entry(assets[j].0.clone())
+                    .or_default()
+                    .push(PoolView {
+                        ident: ident.clone(),
+                        reserve_in,
+                        reserve_out,
+                        fee_num: fee.num.clone().unwrap().to_u64().unwrap_or(0),
+                        fee_den: fee.den.clone().unwrap().to_u64().unwrap_or(1),
+                        view_type: PoolViewType::Banded {
+                            is_a_input,
+                            band: view.clone(),
+                        },
+                    });
+            }
+            continue;
+        }
+
         let (fee_num, fee_den, view_type_fn): (u64, u64, ViewTypeFn) = match &pool.pool_type {
             PoolType::ConstantProduct { fee } => {
                 let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
@@ -1029,6 +1181,8 @@ fn build_graph(
                     }),
                 )
             }
+            // Handled above: a banded pool builds its own two edges.
+            PoolType::BandedConcentratedLiquidity { .. } => continue,
         };
 
         // Create edges for all (i, j) pairs
