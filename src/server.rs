@@ -1647,6 +1647,47 @@ impl AdminServer {
             }
             *obj = serde_json::Value::Object(enriched);
         }
+        // Banded pools: the ladder witness (counter X, active band k) is
+        // derived from the reserves, never stored, so compute it here for
+        // the dashboard along with the active band's price edges and the
+        // input each direction can still absorb.
+        if let crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type
+            && pool.pool_datum.assets.len() == 2
+        {
+            use crate::sundaev4::banded_math as bm;
+            let (a, b) = (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1);
+            let band_state = match bm::find_witness(config, a, b) {
+                Some(w) => {
+                    let view = bm::band_view(config, a, b, &w).ok();
+                    let (ra, rb, lo, hi) = view
+                        .as_ref()
+                        .map(|v| {
+                            (
+                                v.ra.to_string(),
+                                v.rb.to_string(),
+                                format!("{}/{}", v.lo.num, v.lo.den),
+                                format!("{}/{}", v.hi.num, v.hi.den),
+                            )
+                        })
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "counter": w.x.to_string(),
+                        "active_band": w.k,
+                        "bands": config.bands.len(),
+                        "residual_a": ra,
+                        "residual_b": rb,
+                        "sqrt_price_lo": lo,
+                        "sqrt_price_hi": hi,
+                        "capacity_a_in": bm::ladder_capacity_from(config, a, b, true, Some(&w)).to_string(),
+                        "capacity_b_in": bm::ladder_capacity_from(config, a, b, false, Some(&w)).to_string(),
+                    })
+                }
+                None => serde_json::json!({ "error": "no ladder witness for the reserves" }),
+            };
+            if let Some(obj) = pool_json.as_object_mut() {
+                obj.insert("band_state".into(), band_state);
+            }
+        }
         pool_json
     }
 

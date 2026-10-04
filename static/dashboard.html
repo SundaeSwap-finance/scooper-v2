@@ -865,7 +865,7 @@
     document.getElementById('protocol-pool-cards').innerHTML =
       statCard('Constant Product', bt.cp || 0) +
       statCard('Constant Sum', bt.cs || 0) +
-      statCard('Concentrated', bt.cl || 0) +
+      statCard('Banded CL', bt.bcl || 0) +
       statCard('StableSwap', bt.ss || 0) +
       statCard('Empty Reserve', pools.empty || 0) +
       statCard('Allowlisted', pools.restricted || 0);
@@ -927,7 +927,7 @@
     assetRows('protocol-tvl-body', pools.tvl);
 
     var typeBadge = { cp: '<span class="badge badge-blue">CP</span>', cs: '<span class="badge badge-green">CS</span>',
-                      cl: '<span class="badge badge-accent">CL</span>', ss: '<span class="badge badge-green">SS</span>' };
+                      bcl: '<span class="badge badge-accent">BCL</span>', ss: '<span class="badge badge-green">SS</span>' };
     var prow = (eq.pools || []).slice();
     prow.forEach(function(p) { p._tvl = usdOf(p.reserves).usd; p._eq = usdOf(p.protocol_equity).usd; });
     prow.sort(function(a, b) { return b._tvl - a._tvl; });
@@ -1364,7 +1364,7 @@
         var id = e[0], pool = e[1];
         var row = document.createElement('tr');
         var pd = pool.pool_datum || {};
-        var pt = formatPoolType(pool.pool_type);
+        var pt = formatPoolType(pool.pool_type, pool.band_state);
         var flightBadge = inFlightPools.has(id) ? ' <span class="badge badge-in-flight" title="Transaction in mempool">\u23f3</span>' : '';
         row.innerHTML = '<td>' + copyable(truncate(id, 16), id) + flightBadge + '</td>' +
           '<td>' + pt + '</td>' +
@@ -1469,11 +1469,24 @@
     return formatAssetClass(a) + ' / ' + formatAssetClass(b);
   }
 
-  function formatPoolType(pt) {
+  function formatPoolType(pt, bandState) {
     if (!pt) return '<span class="badge badge-yellow">?</span>';
     if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
     if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
     if (pt.StableSwap) return '<span class="badge badge-green">SS</span>';
+    if (pt.BandedConcentratedLiquidity) {
+      var badge = '<span class="badge badge-accent">BCL</span>';
+      if (bandState && bandState.bands != null) {
+        var title = 'ladder counter ' + bandState.counter +
+          '; active band sqrt-price [' + bandState.sqrt_price_lo + ', ' + bandState.sqrt_price_hi + ')' +
+          '; residuals ' + bandState.residual_a + ' / ' + bandState.residual_b +
+          '; absorbs ' + bandState.capacity_a_in + ' A-in / ' + bandState.capacity_b_in + ' B-in before the ladder ends';
+        badge += ' <span style="opacity:.75;font-size:.9em" title="' + escapeHtml(title) + '">band ' + bandState.active_band + '/' + bandState.bands + '</span>';
+      } else if (bandState && bandState.error) {
+        badge += ' <span class="badge badge-yellow" title="' + escapeHtml(bandState.error) + '">no witness</span>';
+      }
+      return badge;
+    }
     var keys = Object.keys(pt);
     return '<span class="badge badge-yellow">' + (keys[0] || '?') + '</span>';
   }
