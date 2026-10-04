@@ -1391,6 +1391,7 @@ impl Scooper {
                                 effective_pool.pool_type,
                                 crate::sundaev4::PoolType::ConstantSum { .. }
                                     | crate::sundaev4::PoolType::StableSwap { .. }
+                                    | crate::sundaev4::PoolType::BandedConcentratedLiquidity { .. }
                             ) {
                                 // A two-asset deposit is rejected on chain by
                                 // cp_check, which reads both reserves rising as
@@ -1400,8 +1401,8 @@ impl Scooper {
                                 // turn a cheap skip into a build failure, and a
                                 // lone order failing to build is quarantined
                                 // for good.
-                                Err("only constant-sum and stableswap pools zap: \
-                                     the other curves reject a two-asset deposit \
+                                Err("only constant-sum, stableswap and banded pools zap: \
+                                     constant product rejects the deposit step \
                                      on chain"
                                     .to_string())
                             } else if carries_route_constraint(&exec, order) {

@@ -972,6 +972,53 @@ mod tests {
         );
     }
 
+    /// A single-asset deposit into a banded pool fills as a zap: an in-band
+    /// swap step rebalances the basket, then a proportional deposit step
+    /// mints LP. Both are ordinary transcript steps for the module.
+    #[test]
+    fn bcl_zap_single_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool(
+            &env,
+            0x6E,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg,
+        );
+        let lp_asset = lp_asset_for(&env, 0x6E);
+        let order = make_basic_deposit_order(vec![(token_b(), 2_000)], lp_asset.clone(), 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("single-asset banded deposit should fill as a zap");
+        let plan = accum.into_plan();
+        let batch = &plan.batches[0];
+        assert_eq!(batch.zaps.len(), 1);
+        assert_eq!(batch.ops_order.len(), 2);
+        let zap = &batch.zaps[0];
+        assert!(zap.lp_minted.is_positive());
+        let net_b = &zap.swap_deltas[1] + &zap.deposit_dx[1];
+        assert!(net_b <= BigInt::from(2_000), "consumes {net_b} of 2000 B offered");
+        assert!(
+            (&zap.swap_deltas[0] + &zap.deposit_dx[0]) <= BigInt::from(0),
+            "no A is taken from the order"
+        );
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("banded zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &zap.lp_minted
+        );
+    }
+
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
     /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_478 in
