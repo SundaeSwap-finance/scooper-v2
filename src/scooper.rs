@@ -1349,6 +1349,57 @@ impl Scooper {
             }
             let mut candidate = accum.clone();
             let added = match &order.constraint {
+                crate::sundaev4::Constraint::Deposit { .. }
+                | crate::sundaev4::Constraint::Withdraw { .. }
+                | crate::sundaev4::Constraint::Swap { .. }
+                    if batch::is_liquidity_op(order, &pools_filtered) =>
+                {
+                    // Multi-leg liquidity op: LP burned in some pools, LP
+                    // minted in others (movement, multi-withdrawal,
+                    // multi-deposit or a mix). Each leg is a proportional
+                    // pool op; the order is fulfilled once.
+                    let (burn_specs, mint_specs) = batch::lp_legs(order, &pools_filtered);
+                    let idents: Vec<_> = burn_specs
+                        .iter()
+                        .chain(mint_specs.iter())
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    if !idents.iter().all(|p| exec.pool_allowlists.permits(p, order, order_strategy)) {
+                        trace!(order = %order.input, "order dispatch: liquidity op, not on a pool's allowlist");
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
+                    tracing::info!(
+                        order = %order.input,
+                        kind = "liquidity-op",
+                        burns = ?burn_specs.iter().map(|(p, q)| format!("{p}:{q}")).collect::<Vec<_>>(),
+                        mints = ?mint_specs.iter().map(|(p, q)| format!("{p}:{q}")).collect::<Vec<_>>(),
+                        "order dispatch",
+                    );
+                    let resolve = |specs: &[(crate::sundaev3::Ident, crate::bigint::BigInt)]| {
+                        specs
+                            .iter()
+                            .map(|(p, q)| {
+                                pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, p)
+                                    .map(|pool| (p.clone(), q.clone(), pool))
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    };
+                    let (Some(burns), Some(mints)) = (resolve(&burn_specs), resolve(&mint_specs)) else {
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    let plain_offered = batch::plain_offered(order, &pools_filtered);
+                    let plain_floors = batch::plain_floors(order, &pools_filtered);
+                    match candidate.try_add_liquidity_op(order, &burns, &mints, &plain_offered, &plain_floors) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            skip_add_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add failed");
+                            false
+                        }
+                    }
+                }
                 crate::sundaev4::Constraint::Deposit { .. } => {
                     let Some(pool_ident) =
                         batch::find_pool_for_deposit_order(order, &pools_filtered)
@@ -1463,60 +1514,6 @@ impl Scooper {
                     };
                     match candidate.try_add_withdraw(order, &pool_ident, &effective_pool) {
                         Ok(_) => true,
-                        Err(e) => {
-                            skip_add_failed += 1;
-                            tracing::info!(error = %e, order = %order.input, "try_add failed");
-                            false
-                        }
-                    }
-                }
-                crate::sundaev4::Constraint::Swap { .. }
-                    if batch::movement_pools(order, &pools_filtered).is_some() =>
-                {
-                    // Liquidity movement: offer pool X's LP, ask pool Y's LP.
-                    // No pool edge trades LP, so the router can't serve it;
-                    // it resolves as a withdraw from X and a deposit into Y.
-                    let (from_ident, to_ident) =
-                        batch::movement_pools(order, &pools_filtered).expect("checked by guard");
-                    let permitted = [&from_ident, &to_ident]
-                        .iter()
-                        .all(|p| exec.pool_allowlists.permits(p, order, order_strategy));
-                    if !permitted {
-                        trace!(
-                            order = %order.input,
-                            from = %from_ident,
-                            to = %to_ident,
-                            "order dispatch: movement, not on a pool's allowlist",
-                        );
-                        skip_not_allowlisted += 1;
-                        continue;
-                    }
-                    tracing::info!(
-                        order = %order.input,
-                        kind = "move",
-                        from_pool = %from_ident,
-                        to_pool = %to_ident,
-                        "order dispatch",
-                    );
-                    let from_pool = pick_effective_pool(
-                        &candidate,
-                        &self.v4_chain_tracker,
-                        &v4_state,
-                        &from_ident,
-                    );
-                    let to_pool = pick_effective_pool(
-                        &candidate,
-                        &self.v4_chain_tracker,
-                        &v4_state,
-                        &to_ident,
-                    );
-                    let (Some(from_pool), Some(to_pool)) = (from_pool, to_pool) else {
-                        skip_no_pool += 1;
-                        continue;
-                    };
-                    match candidate.try_add_move(order, &from_ident, &from_pool, &to_ident, &to_pool)
-                    {
-                        Ok(()) => true,
                         Err(e) => {
                             skip_add_failed += 1;
                             tracing::info!(error = %e, order = %order.input, "try_add failed");
@@ -2239,7 +2236,7 @@ impl Scooper {
                 b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len()
             })
             .sum::<usize>()
-            - final_plan.moves.len();
+            - final_plan.moves.iter().map(|m| m.legs() - 1).sum::<usize>();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
             final_plan.batches.iter().map(|b| b.pool_ident.clone()).collect();

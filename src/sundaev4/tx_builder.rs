@@ -554,7 +554,7 @@ pub fn build_multi_pool_scoop_tx(
         + n_zap_orders
         + n_claim_orders
         + n_conversion_orders
-        - plan.moves.len();
+        - plan.moves.iter().map(|m| m.legs() - 1).sum::<usize>();
     // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
     // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
     if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
@@ -1454,8 +1454,14 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
     for (mi, m) in plan.moves.iter().enumerate() {
+        let home = m
+            .mints
+            .first()
+            .map(|l| l.batch)
+            .or_else(|| m.burns.first().map(|l| l.batch))
+            .unwrap_or(0);
         flat_orders.push(FlatOrder {
-            batch_idx: m.to_batch,
+            batch_idx: home,
             kind: FlatOrderKind::Move(mi),
             order_ref: m.order.input.0.clone(),
         });
@@ -2842,17 +2848,21 @@ pub fn build_multi_pool_scoop_tx(
                 // so they are keyed separately; pool assets shared by both
                 // pools net against each other.
                 let m = &plan.moves[*i];
-                let lp_from = pool_lp_asset(exec, &batches[m.from_batch].pool)?;
-                let lp_to = pool_lp_asset(exec, &batches[m.to_batch].pool)?;
                 let mut net: std::collections::BTreeMap<AssetClass, BigInt> =
                     std::collections::BTreeMap::new();
-                *net.entry(lp_from).or_insert_with(|| BigInt::from(0)) -= &m.lp_burned;
-                *net.entry(lp_to).or_insert_with(|| BigInt::from(0)) += &m.lp_minted;
-                for (a, q) in &m.withdrawn {
-                    *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+                for leg in &m.burns {
+                    let lp = pool_lp_asset(exec, &batches[leg.batch].pool)?;
+                    *net.entry(lp).or_insert_with(|| BigInt::from(0)) -= &leg.lp_burned;
+                    for (a, q) in &leg.withdrawn {
+                        *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+                    }
                 }
-                for (a, q) in &m.deposited {
-                    *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) -= q;
+                for leg in &m.mints {
+                    let lp = pool_lp_asset(exec, &batches[leg.batch].pool)?;
+                    *net.entry(lp).or_insert_with(|| BigInt::from(0)) += &leg.lp_minted;
+                    for (a, q) in &leg.deposited {
+                        *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) -= q;
+                    }
                 }
                 let moves: Vec<(&AssetClass, BigInt)> =
                     net.iter().map(|(a, q)| (a, q.clone())).collect();

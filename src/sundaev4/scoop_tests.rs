@@ -875,6 +875,137 @@ mod tests {
         }
     }
 
+    fn two_bcl_pools_with_circulating_lp(
+        env: &TestEnv,
+        ids: [u8; 2],
+        circulating: i64,
+    ) -> Vec<std::sync::Arc<crate::sundaev4::SundaeV4Pool>> {
+        let cfg = bcl_eq8_config(ss_fee_3());
+        ids.iter()
+            .map(|&id| {
+                let p = make_bcl_pool(env, id, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+                let lp = lp_asset_for(env, id);
+                let mut p = (*p).clone();
+                let c = BigInt::from(circulating);
+                p.pool_datum.circulating_lp = c.clone();
+                p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &c;
+                let held = p.value.get(&lp);
+                p.value.insert(&lp, &held - &c);
+                std::sync::Arc::new(p)
+            })
+            .collect()
+    }
+
+    /// One order offers the LP of two pools and asks for the pool assets:
+    /// two withdraw legs, one fulfillment carrying both payouts.
+    #[test]
+    fn bcl_multi_withdrawal_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::batch;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pools = two_bcl_pools_with_circulating_lp(&env, [0x72, 0x73], 20_000_000);
+        let lp_x = lp_asset_for(&env, 0x72);
+        let lp_y = lp_asset_for(&env, 0x73);
+        let order = make_basic_lp_order(
+            vec![(lp_x.clone(), 10_000_000), (lp_y.clone(), 5_000_000)],
+            vec![(token_a(), 1), (token_b(), 1)],
+            1,
+            1,
+        );
+        let pool_map: BTreeMap<_, _> =
+            pools.iter().map(|p| (p.pool_datum.identifier.clone(), p.clone())).collect();
+        assert!(batch::is_liquidity_op(&order, &pool_map));
+        let (burns, mints) = batch::lp_legs(&order, &pool_map);
+        assert_eq!(burns.len(), 2);
+        assert!(mints.is_empty());
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let burn_specs: Vec<_> =
+            burns.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+        accum
+            .try_add_liquidity_op(
+                &order,
+                &burn_specs,
+                &[],
+                &batch::plain_offered(&order, &pool_map),
+                &batch::plain_floors(&order, &pool_map),
+            )
+            .expect("two withdraw legs should resolve");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(plan.moves[0].burns.len(), 2);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("multi-withdrawal should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 2);
+        for leg in &plan.moves[0].burns {
+            let after = &result.predicted_pools.iter().find(|(i, _, _)| i == &leg.pool).unwrap().2;
+            assert_eq!(after.pool_datum.total_lp, &pool_map[&leg.pool].pool_datum.total_lp - &leg.lp_burned);
+        }
+    }
+
+    /// One order offers both pool assets and asks for the LP of two pools:
+    /// the basket is split equally, two deposit legs, one fulfillment.
+    #[test]
+    fn bcl_multi_deposit_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::batch;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pools = two_bcl_pools_with_circulating_lp(&env, [0x74, 0x75], 0);
+        let lp_x = lp_asset_for(&env, 0x74);
+        let lp_y = lp_asset_for(&env, 0x75);
+        let order = make_basic_lp_order(
+            vec![(token_a(), 200_000), (token_b(), 14_500)],
+            vec![(lp_x.clone(), 1), (lp_y.clone(), 1)],
+            0,
+            1,
+        );
+        let pool_map: BTreeMap<_, _> =
+            pools.iter().map(|p| (p.pool_datum.identifier.clone(), p.clone())).collect();
+        assert!(batch::is_liquidity_op(&order, &pool_map));
+        let (burns, mints) = batch::lp_legs(&order, &pool_map);
+        assert!(burns.is_empty());
+        assert_eq!(mints.len(), 2);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let mint_specs: Vec<_> =
+            mints.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+        accum
+            .try_add_liquidity_op(
+                &order,
+                &[],
+                &mint_specs,
+                &batch::plain_offered(&order, &pool_map),
+                &batch::plain_floors(&order, &pool_map),
+            )
+            .expect("two deposit legs should resolve");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2);
+        let m = &plan.moves[0];
+        assert_eq!(m.mints.len(), 2);
+        // Equal split: each leg uses about half of each offered asset.
+        for leg in &m.mints {
+            assert!(leg.deposited[0].1 <= BigInt::from(100_000));
+            assert!(leg.deposited[0].1 >= BigInt::from(90_000), "leg uses {:?}", leg.deposited);
+            assert!(leg.lp_minted.is_positive());
+        }
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("multi-deposit should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        for leg in &m.mints {
+            let after = &result.predicted_pools.iter().find(|(i, _, _)| i == &leg.pool).unwrap().2;
+            assert_eq!(after.pool_datum.total_lp, &pool_map[&leg.pool].pool_datum.total_lp + &leg.lp_minted);
+        }
+    }
+
     /// A liquidity movement between two banded pools: one basic order offers
     /// pool A's LP and asks pool B's LP. The scooper burns the offered LP in
     /// A, deposits the payout into B and pays the user B's LP plus any
@@ -925,13 +1056,16 @@ mod tests {
         assert_eq!(plan.moves.len(), 1);
         assert_eq!(plan.batches.len(), 2, "one batch per pool");
         let m = &plan.moves[0];
-        assert_eq!(m.lp_burned, BigInt::from(burn), "burns the offered LP");
-        assert!(m.lp_minted.is_positive());
+        assert_eq!(m.burns.len(), 1);
+        assert_eq!(m.mints.len(), 1);
+        let (bl, ml) = (&m.burns[0], &m.mints[0]);
+        assert_eq!(bl.lp_burned, BigInt::from(burn), "burns the offered LP");
+        assert!(ml.lp_minted.is_positive());
         // Identical pools: the payout is proportional for B too, so the
         // ceil-pinned deposit consumes it up to rounding dust. The floor on
         // each withdrawn asset and the min over assets of the mint leave at
         // most a few units behind; bound it at a tenth of a percent.
-        for ((_, out), (_, used)) in m.withdrawn.iter().zip(m.deposited.iter()) {
+        for ((_, out), (_, used)) in bl.withdrawn.iter().zip(ml.deposited.iter()) {
             assert!(used <= out, "deposit never exceeds the payout");
             assert!(
                 (out - used) * BigInt::from(1_000) <= *out,
@@ -940,11 +1074,8 @@ mod tests {
                 out
             );
         }
-        assert_eq!(
-            plan.batches[m.from_batch].pool_ident, a_ident,
-            "withdraw leg sits in pool A's batch"
-        );
-        assert_eq!(plan.batches[m.to_batch].pool_ident, b_ident, "deposit leg sits in pool B's batch");
+        assert_eq!(plan.batches[bl.batch].pool_ident, a_ident, "withdraw leg sits in pool A's batch");
+        assert_eq!(plan.batches[ml.batch].pool_ident, b_ident, "deposit leg sits in pool B's batch");
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -963,11 +1094,11 @@ mod tests {
             .find(|(i, _, _)| i == &b_ident)
             .expect("pool B predicted")
             .2;
-        assert_eq!(after_a.pool_datum.total_lp, &pool_a.pool_datum.total_lp - &m.lp_burned);
-        assert_eq!(after_b.pool_datum.total_lp, &pool_b.pool_datum.total_lp + &m.lp_minted);
+        assert_eq!(after_a.pool_datum.total_lp, &pool_a.pool_datum.total_lp - &bl.lp_burned);
+        assert_eq!(after_b.pool_datum.total_lp, &pool_b.pool_datum.total_lp + &ml.lp_minted);
         assert_eq!(
             after_b.value.get(&lp_b),
-            &pool_b.value.get(&lp_b) - &m.lp_minted,
+            &pool_b.value.get(&lp_b) - &ml.lp_minted,
             "B's LP is served from its reserve"
         );
     }

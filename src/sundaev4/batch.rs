@@ -196,23 +196,135 @@ pub struct ScoopPlan {
     pub moves: Vec<ResolvedMove>,
 }
 
-/// An "offer LP_X, ask LP_Y" order resolved into a proportional withdraw
-/// from pool X and a proportional deposit into pool Y, in one transaction.
-/// Any withdrawn asset the deposit does not consume returns to the user.
+/// One order that burns LP in any number of pools and mints LP in any
+/// number of pools, in one transaction: a movement (one of each), a
+/// multi-withdrawal (burns only, several pools), a multi-deposit (mints
+/// only, several pools) or any mix. The order's plain offered assets join
+/// the withdraw payouts as the deposit basket; whatever the ceil-pinned
+/// deposits do not use returns to the user. Every leg is an ordinary
+/// withdraw or deposit op in its pool's batch; the order is fulfilled once
+/// from this record.
 #[derive(Clone, Debug)]
 pub struct ResolvedMove {
     pub order: Arc<SundaeV4Order>,
-    pub from_pool: Ident,
-    pub to_pool: Ident,
-    /// Batch indices, filled in by `into_plan`.
-    pub from_batch: usize,
-    pub to_batch: usize,
+    pub burns: Vec<BurnLeg>,
+    pub mints: Vec<MintLeg>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnLeg {
+    pub pool: Ident,
+    /// Batch index, filled in by `into_plan`.
+    pub batch: usize,
     pub lp_burned: BigInt,
-    /// Withdraw payout, in pool X's asset order.
+    /// Withdraw payout, in the pool's asset order.
     pub withdrawn: Vec<(AssetClass, BigInt)>,
-    /// Deposit contribution, in pool Y's asset order.
+}
+
+#[derive(Clone, Debug)]
+pub struct MintLeg {
+    pub pool: Ident,
+    /// Batch index, filled in by `into_plan`.
+    pub batch: usize,
+    /// Deposit contribution, in the pool's asset order.
     pub deposited: Vec<(AssetClass, BigInt)>,
     pub lp_minted: BigInt,
+}
+
+impl ResolvedMove {
+    /// Pool ops this order occupies across all batches.
+    pub fn legs(&self) -> usize {
+        self.burns.len() + self.mints.len()
+    }
+}
+
+/// The LP legs an order asks for: `(burns, mints)` as `(pool, amount)`
+/// pairs read from the LP tokens in its offered and min_received lists.
+/// Plain assets are left to the caller. Works on any constraint tag: the
+/// tag is a dispatch hint, the chain only checks consumption and floors.
+pub fn lp_legs(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> (Vec<(Ident, BigInt)>, Vec<(Ident, BigInt)>) {
+    let (offered, min_received): (Vec<(AssetClass, BigInt)>, &[(AssetClass, BigInt)]) =
+        match &order.constraint {
+            Constraint::Deposit { offered, min_received }
+            | Constraint::Withdraw { offered, min_received }
+            | Constraint::Claim { offered, min_received } => (offered.clone(), min_received),
+            Constraint::Swap {
+                offered,
+                remaining_offered,
+                min_received,
+                ..
+            } => (vec![(offered.clone(), remaining_offered.clone())], min_received),
+            _ => return (Vec::new(), Vec::new()),
+        };
+    let classify = |list: &[(AssetClass, BigInt)]| -> Vec<(Ident, BigInt)> {
+        list.iter()
+            .filter_map(|(a, q)| {
+                let one = [(a.clone(), q.clone())];
+                find_pool_by_lp_asset(&one, pools).map(|p| (p, q.clone()))
+            })
+            .collect()
+    };
+    (classify(&offered), classify(min_received))
+}
+
+/// Whether an order needs the multi-leg liquidity path: more than one LP
+/// leg in total, or a burn and a mint together. A plain deposit (one mint),
+/// a plain withdraw (one burn) and a plain swap (no LP legs) keep their
+/// own paths.
+pub fn is_liquidity_op(order: &SundaeV4Order, pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>) -> bool {
+    let (burns, mints) = lp_legs(order, pools);
+    burns.len() + mints.len() >= 2
+}
+
+/// The order's offered assets that are not LP tokens of indexed pools, in
+/// the form the deposit basket uses.
+pub fn plain_offered(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Vec<(AssetClass, BigInt)> {
+    let offered: Vec<(AssetClass, BigInt)> = match &order.constraint {
+        Constraint::Deposit { offered, .. }
+        | Constraint::Withdraw { offered, .. }
+        | Constraint::Claim { offered, .. } => offered.clone(),
+        Constraint::Swap {
+            offered,
+            remaining_offered,
+            ..
+        } => vec![(offered.clone(), remaining_offered.clone())],
+        _ => Vec::new(),
+    };
+    offered
+        .into_iter()
+        .filter(|(a, q)| {
+            let one = [(a.clone(), q.clone())];
+            find_pool_by_lp_asset(&one, pools).is_none()
+        })
+        .collect()
+}
+
+/// The order's min_received floors on plain assets (not LP tokens of
+/// indexed pools).
+pub fn plain_floors(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Vec<(AssetClass, BigInt)> {
+    let mins: &[(AssetClass, BigInt)] = match &order.constraint {
+        Constraint::Deposit { min_received, .. }
+        | Constraint::Withdraw { min_received, .. }
+        | Constraint::Claim { min_received, .. }
+        | Constraint::Swap { min_received, .. } => min_received,
+        _ => &[],
+    };
+    mins.iter()
+        .filter(|(a, q)| {
+            let one = [(a.clone(), q.clone())];
+            find_pool_by_lp_asset(&one, pools).is_none()
+        })
+        .cloned()
+        .collect()
 }
 
 /// One planned off-protocol conversion leg: `dx` of `from` becomes `out` of
@@ -401,31 +513,17 @@ pub fn find_pool_for_withdraw_order(
     find_pool_by_lp_asset(offered, pools)
 }
 
-/// Detect a liquidity movement: a Swap-constrained order whose offered asset
-/// is one indexed pool's LP token and whose `min_received` names another
-/// indexed pool's LP token. Returns `(from_pool, to_pool)`. The basic module
-/// checks only aggregate consumption and floors on chain, so such an order
-/// is valid; the router cannot serve it because no pool edge trades LP.
+#[cfg(test)]
+/// A movement: exactly one burn leg and one mint leg in different pools.
 pub fn movement_pools(
     order: &SundaeV4Order,
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<(Ident, Ident)> {
-    let Constraint::Swap {
-        offered,
-        remaining_offered,
-        min_received,
-        ..
-    } = &order.constraint
-    else {
-        return None;
-    };
-    let offered_list = [(offered.clone(), remaining_offered.clone())];
-    let from = find_pool_by_lp_asset(&offered_list, pools)?;
-    let to = find_pool_by_lp_asset(min_received, pools)?;
-    if from == to {
-        return None;
+    let (burns, mints) = lp_legs(order, pools);
+    match (burns.as_slice(), mints.as_slice()) {
+        ([(from, _)], [(to, _)]) if from != to => Some((from.clone(), to.clone())),
+        _ => None,
     }
-    Some((from, to))
 }
 
 /// Search a `(asset, qty)` list for a CIP-67 LP token (label `0014df10`) and

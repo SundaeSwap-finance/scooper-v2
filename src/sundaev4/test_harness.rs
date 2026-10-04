@@ -1409,6 +1409,81 @@ pub fn make_basic_withdraw_order(
     Arc::new(order)
 }
 
+/// A basic-module order with arbitrary offered and min_received lists:
+/// several LP tokens on either side, plain assets, any mix. `ctor` is the
+/// basic constraint's dispatch tag (0 deposit, 1 withdraw, 2 swap); the
+/// chain ignores it. The order value carries every offered asset.
+pub fn make_basic_lp_order(
+    offered: Vec<(AssetClass, i64)>,
+    min_received: Vec<(AssetClass, i64)>,
+    ctor: u64,
+    slot: u64,
+) -> Arc<SundaeV4Order> {
+    use plutus_parser::AsPlutus;
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(5_000_000i64));
+    for (a, q) in &offered {
+        let cur = value.get(a);
+        value.insert(a, &cur + &BigInt::from(*q));
+    }
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = 0xD4;
+    tx_hash[1] = ctor as u8;
+    tx_hash[2..10].copy_from_slice(&slot.to_be_bytes());
+
+    let (seed_offer, seed_amt) = offered[0].clone();
+    let (seed_want, seed_min) = min_received[0].clone();
+    let order = SundaeV4Order::test_swap_order(
+        crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        value,
+        Multisig::Signature(vec![0xAA; 28]),
+        Destination::Fixed(
+            crate::sundaev3::PlutusAddress {
+                payment_credential: crate::sundaev3::Credential::VerificationKey([0xAA; 28].into()),
+                stake_credential: None,
+            },
+            None,
+        ),
+        (seed_offer, BigInt::from(seed_amt)),
+        (seed_want, BigInt::from(seed_min)),
+        BigInt::from(1_500_000i64),
+        slot,
+    );
+
+    let offered_bi: Vec<(AssetClass, BigInt)> =
+        offered.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
+    let min_bi: Vec<(AssetClass, BigInt)> =
+        min_received.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
+    let payload = PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121 + ctor,
+        any_constructor: None,
+        fields: pallas_primitives::MaybeIndefArray::Def(vec![
+            offered_bi.clone().to_plutus(),
+            min_bi.clone().to_plutus(),
+        ]),
+    });
+    let mut order = with_real_constraints_payload(order, CFG_BASIC, Some(payload));
+    order.constraint = match ctor {
+        0 => crate::sundaev4::types::Constraint::Deposit {
+            offered: offered_bi,
+            min_received: min_bi,
+        },
+        1 => crate::sundaev4::types::Constraint::Withdraw {
+            offered: offered_bi,
+            min_received: min_bi,
+        },
+        _ => crate::sundaev4::types::Constraint::Swap {
+            offered: offered_bi[0].0.clone(),
+            original_offered: offered_bi[0].1.clone(),
+            remaining_offered: offered_bi[0].1.clone(),
+            min_received: min_bi,
+        },
+    };
+    Arc::new(order)
+}
+
 pub fn with_real_constraints_payload(
     order: SundaeV4Order,
     cfg_token: &[u8],

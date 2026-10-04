@@ -585,13 +585,8 @@ impl Accumulator {
     ///
     /// Fee budget computed here is router-projected; tx_builder recomputes
     /// fresh per-pool fee budgets during its streaming walk.
-    /// Add a liquidity movement: burn the order's offered LP in `from` and
-    /// deposit the proportional payout into `to`, minting `to`'s LP. Both
-    /// legs are proportional steps (fee_budget 0 on every curve), so the
-    /// only curve maths is the ceil/floor pin each pool already applies to
-    /// its deposits and withdraws. The caller works on a cloned accumulator
-    /// and drops it on `Err`, so a failed deposit leg after an applied
-    /// withdraw leg leaves no partial state behind.
+#[cfg(test)]
+    /// Add a movement: one burn leg and one mint leg.
     pub fn try_add_move(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,
@@ -600,113 +595,210 @@ impl Accumulator {
         to_ident: &Ident,
         to_pool: &Arc<SundaeV4Pool>,
     ) -> Result<(), String> {
-        use num_traits::Signed;
-
-        let crate::sundaev4::types::Constraint::Swap {
-            offered,
-            remaining_offered,
-            min_received,
-            ..
-        } = &order.constraint
-        else {
-            return Err("movement order is not Swap-constrained".into());
-        };
         if from_ident == to_ident {
             return Err("movement must name two different pools".into());
         }
-        let Some(min_lp) = batch::declared_min_lp(min_received, to_ident).cloned() else {
-            return Err("movement needs the order's declared LP minimum for the target pool".into());
-        };
+        let (burns, mints) = batch::lp_legs(order, &BTreeMap::from([
+            (from_ident.clone(), from_pool.clone()),
+            (to_ident.clone(), to_pool.clone()),
+        ]));
+        self.try_add_liquidity_op(
+            order,
+            &burns.into_iter().map(|(p, q)| (p, q, from_pool.clone())).collect::<Vec<_>>(),
+            &mints.into_iter().map(|(p, q)| (p, q, to_pool.clone())).collect::<Vec<_>>(),
+            &[],
+            &[],
+        )
+    }
 
-        // Withdraw leg.
-        let fresh = self.fresh_pool_accum(from_ident, from_pool);
-        let accum = self.pools.entry(from_ident.clone()).or_insert(fresh);
-        accum.check_canonical_append(&order.input)?;
-        let mut transient = (**from_pool).clone();
-        transient.pool_datum.assets = accum.running_assets.clone();
-        transient.pool_datum.total_lp = accum.running_total_lp.clone();
-        let offered_list = [(offered.clone(), remaining_offered.clone())];
-        let (lp_burned, dy, wd_target) =
-            batch::resolve_withdraw_of_offered(&transient, &offered_list)?;
-        let next_preminted = accum.lp_return_after(&lp_burned)?;
-        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
-            *amt = &*amt - &dy[i];
-        }
-        accum.running_total_lp = &accum.running_total_lp - &lp_burned;
-        accum.running_circ_lp = &accum.running_circ_lp - &lp_burned;
-        accum.running_preminted = next_preminted;
-        let withdrawn: Vec<(AssetClass, BigInt)> = accum
-            .running_assets
-            .iter()
-            .zip(dy.iter())
-            .map(|((a, _), q)| (a.clone(), q.clone()))
-            .collect();
-        let w_idx = accum.withdraws.len();
-        accum.withdraws.push(batch::ResolvedWithdraw {
-            order: order.clone(),
-            lp_burned: lp_burned.clone(),
-            dy,
-            target_delta_v: wd_target,
-        });
-        let op_idx = accum.ops_order.len();
-        accum.ops_order.push(BatchOp::Withdraw(w_idx));
-        self.global_seq_raw.push((from_ident.clone(), op_idx));
+    /// Add a multi-leg liquidity operation. `burns` are `(pool, lp to burn,
+    /// pool state)`; `mints` are `(pool, LP floor, pool state)`. The deposit
+    /// basket is the burn payouts plus `plain_offered`; each asset of it is
+    /// split equally among the mint targets whose pool holds that asset,
+    /// the last target taking the rounding remainder. Each leg is a
+    /// proportional step (fee_budget 0 on every curve). `plain_floors` are
+    /// checked against what is left for the user. The caller works on a
+    /// cloned accumulator and drops it on `Err`.
+    pub fn try_add_liquidity_op(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        burns: &[(Ident, BigInt, Arc<SundaeV4Pool>)],
+        mints: &[(Ident, BigInt, Arc<SundaeV4Pool>)],
+        plain_offered: &[(AssetClass, BigInt)],
+        plain_floors: &[(AssetClass, BigInt)],
+    ) -> Result<(), String> {
+        use num_traits::Signed;
 
-        // Deposit leg, fed by the withdraw payout.
-        let fresh = self.fresh_pool_accum(to_ident, to_pool);
-        let accum = self.pools.entry(to_ident.clone()).or_insert(fresh);
-        accum.check_canonical_append(&order.input)?;
-        let basket = batch::align_offered_to_pool(&withdrawn, &accum.running_assets);
-        let (dx, lp_minted, dep_target) = batch::resolve_deposit_basket(
-            &to_pool.pool_type,
-            &accum.running_assets,
-            &accum.running_total_lp,
-            &basket,
-        )?;
-        if !lp_minted.is_positive() {
-            return Err("movement deposit produces zero LP".into());
+        if burns.is_empty() && mints.is_empty() {
+            return Err("liquidity op has no LP legs".into());
         }
-        if lp_minted < min_lp {
-            return Err(format!(
-                "movement mints {lp_minted} LP, below the order's minimum {min_lp}"
-            ));
+        {
+            let mut seen: Vec<&Ident> = Vec::new();
+            for (p, _, _) in burns.iter().chain(mints.iter()) {
+                if seen.contains(&p) {
+                    return Err(format!("liquidity op names pool {p} twice"));
+                }
+                seen.push(p);
+            }
         }
-        let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
-        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
-            *amt = &*amt + &dx[i];
+
+        // Basket: plain offered assets plus every withdraw payout.
+        let mut basket: BTreeMap<AssetClass, BigInt> = BTreeMap::new();
+        for (a, q) in plain_offered {
+            *basket.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
         }
-        accum.running_total_lp = &accum.running_total_lp + &lp_minted;
-        accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
-        accum.running_preminted = next_preminted;
-        accum.running_minted = next_minted;
-        let deposited: Vec<(AssetClass, BigInt)> = accum
-            .running_assets
-            .iter()
-            .zip(dx.iter())
-            .map(|((a, _), q)| (a.clone(), q.clone()))
-            .collect();
-        let dep_idx = accum.deposits.len();
-        accum.deposits.push(batch::ResolvedDeposit {
-            order: order.clone(),
-            dx,
-            lp_minted: lp_minted.clone(),
-            surplus: Vec::new(),
-            target_delta_v: dep_target,
-        });
-        let op_idx = accum.ops_order.len();
-        accum.ops_order.push(BatchOp::Deposit(dep_idx));
-        self.global_seq_raw.push((to_ident.clone(), op_idx));
+
+        let mut burn_legs: Vec<batch::BurnLeg> = Vec::new();
+        for (ident, lp_offered, pool) in burns {
+            let fresh = self.fresh_pool_accum(ident, pool);
+            let accum = self.pools.entry(ident.clone()).or_insert(fresh);
+            accum.check_canonical_append(&order.input)?;
+            let mut transient = (**pool).clone();
+            transient.pool_datum.assets = accum.running_assets.clone();
+            transient.pool_datum.total_lp = accum.running_total_lp.clone();
+            // resolve_withdraw_of_offered matches the LP by label and
+            // pool ident only; the policy is not consulted.
+            let lp_asset = AssetClass {
+                policy: Vec::new(),
+                token: {
+                    let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                    t.extend_from_slice(ident.to_bytes());
+                    t
+                },
+            };
+            let offered_list = [(lp_asset, lp_offered.clone())];
+            let (lp_burned, dy, wd_target) =
+                batch::resolve_withdraw_of_offered(&transient, &offered_list)?;
+            let next_preminted = accum.lp_return_after(&lp_burned)?;
+            for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+                *amt = &*amt - &dy[i];
+            }
+            accum.running_total_lp = &accum.running_total_lp - &lp_burned;
+            accum.running_circ_lp = &accum.running_circ_lp - &lp_burned;
+            accum.running_preminted = next_preminted;
+            let withdrawn: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .zip(dy.iter())
+                .map(|((a, _), q)| (a.clone(), q.clone()))
+                .collect();
+            for (a, q) in &withdrawn {
+                *basket.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+            }
+            let w_idx = accum.withdraws.len();
+            accum.withdraws.push(batch::ResolvedWithdraw {
+                order: order.clone(),
+                lp_burned: lp_burned.clone(),
+                dy,
+                target_delta_v: wd_target,
+            });
+            let op_idx = accum.ops_order.len();
+            accum.ops_order.push(BatchOp::Withdraw(w_idx));
+            self.global_seq_raw.push((ident.clone(), op_idx));
+            burn_legs.push(batch::BurnLeg {
+                pool: ident.clone(),
+                batch: usize::MAX,
+                lp_burned,
+                withdrawn,
+            });
+        }
+
+        // Equal split of each basket asset among the targets holding it.
+        let mut users_of: BTreeMap<AssetClass, usize> = BTreeMap::new();
+        for (_, _, pool) in mints {
+            for (a, _) in &pool.pool_datum.assets {
+                if basket.contains_key(a) {
+                    *users_of.entry(a.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut remaining_users = users_of.clone();
+        let mut mint_legs: Vec<batch::MintLeg> = Vec::new();
+        for (ident, min_lp, pool) in mints {
+            let fresh = self.fresh_pool_accum(ident, pool);
+            let accum = self.pools.entry(ident.clone()).or_insert(fresh);
+            accum.check_canonical_append(&order.input)?;
+            let share: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .map(|(a, _)| {
+                    let avail = basket.get(a).cloned().unwrap_or_else(|| BigInt::from(0));
+                    let n = remaining_users.get(a).cloned().unwrap_or(1).max(1);
+                    (a.clone(), &avail / &BigInt::from(n as i64))
+                })
+                .collect();
+            for (a, _) in &share {
+                if let Some(n) = remaining_users.get_mut(a) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            let offered_per_pool = batch::align_offered_to_pool(&share, &accum.running_assets);
+            let (dx, lp_minted, dep_target) = batch::resolve_deposit_basket(
+                &pool.pool_type,
+                &accum.running_assets,
+                &accum.running_total_lp,
+                &offered_per_pool,
+            )
+            .map_err(|e| format!("deposit leg into pool {ident}: {e}"))?;
+            if !lp_minted.is_positive() {
+                return Err(format!("deposit leg into pool {ident} produces zero LP"));
+            }
+            if &lp_minted < min_lp {
+                return Err(format!(
+                    "deposit leg into pool {ident} mints {lp_minted} LP, below the order's minimum {min_lp}"
+                ));
+            }
+            let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
+            for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+                *amt = &*amt + &dx[i];
+            }
+            accum.running_total_lp = &accum.running_total_lp + &lp_minted;
+            accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
+            accum.running_preminted = next_preminted;
+            accum.running_minted = next_minted;
+            let deposited: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .zip(dx.iter())
+                .map(|((a, _), q)| (a.clone(), q.clone()))
+                .collect();
+            for (a, q) in &deposited {
+                if let Some(b) = basket.get_mut(a) {
+                    *b = &*b - q;
+                }
+            }
+            let dep_idx = accum.deposits.len();
+            accum.deposits.push(batch::ResolvedDeposit {
+                order: order.clone(),
+                dx,
+                lp_minted: lp_minted.clone(),
+                surplus: Vec::new(),
+                target_delta_v: dep_target,
+            });
+            let op_idx = accum.ops_order.len();
+            accum.ops_order.push(BatchOp::Deposit(dep_idx));
+            self.global_seq_raw.push((ident.clone(), op_idx));
+            mint_legs.push(batch::MintLeg {
+                pool: ident.clone(),
+                batch: usize::MAX,
+                deposited,
+                lp_minted,
+            });
+        }
+
+        for (a, floor) in plain_floors {
+            let left = basket.get(a).cloned().unwrap_or_else(|| BigInt::from(0));
+            if &left < floor {
+                return Err(format!(
+                    "liquidity op leaves {left} of an asset for the user, below the order's floor {floor}"
+                ));
+            }
+        }
 
         self.moves.push(batch::ResolvedMove {
             order: order.clone(),
-            from_pool: from_ident.clone(),
-            to_pool: to_ident.clone(),
-            from_batch: usize::MAX,
-            to_batch: usize::MAX,
-            lp_burned,
-            withdrawn,
-            deposited,
-            lp_minted,
+            burns: burn_legs,
+            mints: mint_legs,
         });
         Ok(())
     }
@@ -1288,8 +1380,12 @@ impl Accumulator {
             .moves
             .into_iter()
             .map(|mut m| {
-                m.from_batch = ident_to_batch_idx[&m.from_pool];
-                m.to_batch = ident_to_batch_idx[&m.to_pool];
+                for leg in &mut m.burns {
+                    leg.batch = ident_to_batch_idx[&leg.pool];
+                }
+                for leg in &mut m.mints {
+                    leg.batch = ident_to_batch_idx[&leg.pool];
+                }
                 m
             })
             .collect();

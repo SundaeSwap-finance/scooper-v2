@@ -562,6 +562,7 @@ pub fn fee_budget(lp_before: &BigInt, x_before: &BigInt, x_after: &BigInt, lp_af
 
 /// One in-band swap, fully resolved: the output, the after reserves, the
 /// after witness and the fee budget the entry must declare.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct BandedSwapResult {
     pub dy: BigInt,
@@ -576,6 +577,7 @@ pub struct BandedSwapResult {
 /// `lp`. `Err` names why the step is unfillable: no witness for the input
 /// reserves, the step would leave the band, no output, or the after reserves
 /// have no witness.
+#[cfg(test)]
 pub fn swap_step(
     cfg: &BandedCLConfig,
     a: &BigInt,
