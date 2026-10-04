@@ -208,7 +208,23 @@ pub struct ScoopPlan {
 pub struct ResolvedMove {
     pub order: Arc<SundaeV4Order>,
     pub burns: Vec<BurnLeg>,
+    /// Swaps between the burns and the mints: basket assets no target
+    /// needs, routed into assets the targets lack. Their pool ops are
+    /// continuation swaps on routes owned by this order.
+    pub swaps: Vec<SwapLeg>,
     pub mints: Vec<MintLeg>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SwapLeg {
+    pub from: AssetClass,
+    pub dx: BigInt,
+    pub to: AssetClass,
+    /// Output predicted at accumulate time; the walk's route state is the
+    /// authority for the fulfillment.
+    pub dy: BigInt,
+    /// Indices into `ScoopPlan.routes` of the branches that carry it.
+    pub route_idxs: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]

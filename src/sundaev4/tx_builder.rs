@@ -2864,6 +2864,14 @@ pub fn build_multi_pool_scoop_tx(
                         *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) -= q;
                     }
                 }
+                for leg in &m.swaps {
+                    *net.entry(leg.from.clone()).or_insert_with(|| BigInt::from(0)) -= &leg.dx;
+                    let received = leg
+                        .route_idxs
+                        .iter()
+                        .fold(BigInt::from(0), |acc, ri| &acc + &route_states[*ri].final_output);
+                    *net.entry(leg.to.clone()).or_insert_with(|| BigInt::from(0)) += &received;
+                }
                 let moves: Vec<(&AssetClass, BigInt)> =
                     net.iter().map(|(a, q)| (a, q.clone())).collect();
                 build_fulfillment_value_with_moves(&m.order.value, &moves, actual_fee)?

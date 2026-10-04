@@ -602,12 +602,18 @@ impl Accumulator {
             (from_ident.clone(), from_pool.clone()),
             (to_ident.clone(), to_pool.clone()),
         ]));
+        let pools = BTreeMap::from([
+            (from_ident.clone(), from_pool.clone()),
+            (to_ident.clone(), to_pool.clone()),
+        ]);
         self.try_add_liquidity_op(
             order,
             &burns.into_iter().map(|(p, q)| (p, q, from_pool.clone())).collect::<Vec<_>>(),
             &mints.into_iter().map(|(p, q)| (p, q, to_pool.clone())).collect::<Vec<_>>(),
             &[],
             &[],
+            &pools,
+            crate::sundaev4::router::RoutingLimits::unlimited(),
         )
     }
 
@@ -626,6 +632,8 @@ impl Accumulator {
         mints: &[(Ident, BigInt, Arc<SundaeV4Pool>)],
         plain_offered: &[(AssetClass, BigInt)],
         plain_floors: &[(AssetClass, BigInt)],
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+        limits: crate::sundaev4::router::RoutingLimits,
     ) -> Result<(), String> {
         use num_traits::Signed;
 
@@ -701,6 +709,73 @@ impl Accumulator {
                 lp_burned,
                 withdrawn,
             });
+        }
+
+        // Cross-pair: route every basket asset no target holds into the
+        // assets the targets hold but the basket lacks. A/B -> A/C becomes
+        // withdraw(A,B), swap B->C, deposit(A,C). Several deficits share a
+        // surplus equally; several surpluses each route in full.
+        let mut swap_legs: Vec<batch::SwapLeg> = Vec::new();
+        if !mints.is_empty() {
+            let needed: std::collections::BTreeSet<AssetClass> = mints
+                .iter()
+                .flat_map(|(_, _, p)| p.pool_datum.assets.iter().map(|(a, _)| a.clone()))
+                .collect();
+            let surplus: Vec<AssetClass> = basket
+                .iter()
+                .filter(|(a, q)| q.is_positive() && !needed.contains(*a))
+                .map(|(a, _)| a.clone())
+                .collect();
+            let deficit: Vec<AssetClass> = needed
+                .iter()
+                .filter(|a| !basket.get(*a).is_some_and(|q| q.is_positive()))
+                .cloned()
+                .collect();
+            if !deficit.is_empty() {
+                for from in surplus {
+                    let total = basket.get(&from).cloned().unwrap_or_else(|| BigInt::from(0));
+                    let n = BigInt::from(deficit.len() as i64);
+                    let mut spent = BigInt::from(0);
+                    for (di, to) in deficit.iter().enumerate() {
+                        let dx = if di + 1 == deficit.len() { &total - &spent } else { &total / &n };
+                        if !dx.is_positive() {
+                            continue;
+                        }
+                        let Some(blend) = crate::sundaev4::router::find_blended_route(
+                            pools,
+                            &[],
+                            &from,
+                            to,
+                            &dx,
+                            limits,
+                        ) else {
+                            return Err(format!(
+                                "liquidity op: no route for {dx} of a withdrawn asset into a target asset"
+                            ));
+                        };
+                        let first_route = self.routes.len();
+                        let mut dy = BigInt::from(0);
+                        for branch in &blend.branches {
+                            dy = &dy + &self.add_route_branch(order, branch, pools, false, false)?;
+                        }
+                        if !dy.is_positive() {
+                            return Err("liquidity op: swap leg pays nothing".into());
+                        }
+                        spent = &spent + &dx;
+                        *basket.entry(to.clone()).or_insert_with(|| BigInt::from(0)) += &dy;
+                        swap_legs.push(batch::SwapLeg {
+                            from: from.clone(),
+                            dx,
+                            to: to.clone(),
+                            dy,
+                            route_idxs: (first_route..self.routes.len()).collect(),
+                        });
+                    }
+                    if let Some(b) = basket.get_mut(&from) {
+                        *b = &*b - &spent;
+                    }
+                }
+            }
         }
 
         // Equal split of each basket asset among the targets holding it.
@@ -798,6 +873,7 @@ impl Accumulator {
         self.moves.push(batch::ResolvedMove {
             order: order.clone(),
             burns: burn_legs,
+            swaps: swap_legs,
             mints: mint_legs,
         });
         Ok(())

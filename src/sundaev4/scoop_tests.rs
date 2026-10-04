@@ -931,6 +931,8 @@ mod tests {
                 &[],
                 &batch::plain_offered(&order, &pool_map),
                 &batch::plain_floors(&order, &pool_map),
+                &pool_map,
+                crate::sundaev4::router::RoutingLimits::unlimited(),
             )
             .expect("two withdraw legs should resolve");
         let plan = accum.into_plan();
@@ -983,6 +985,8 @@ mod tests {
                 &mint_specs,
                 &batch::plain_offered(&order, &pool_map),
                 &batch::plain_floors(&order, &pool_map),
+                &pool_map,
+                crate::sundaev4::router::RoutingLimits::unlimited(),
             )
             .expect("two deposit legs should resolve");
         let plan = accum.into_plan();
@@ -1003,6 +1007,78 @@ mod tests {
         for leg in &m.mints {
             let after = &result.predicted_pools.iter().find(|(i, _, _)| i == &leg.pool).unwrap().2;
             assert_eq!(after.pool_datum.total_lp, &pool_map[&leg.pool].pool_datum.total_lp + &leg.lp_minted);
+        }
+    }
+
+    /// A cross-pair movement: LP of an A/B pool offered, LP of an A/E pool
+    /// asked. The scooper withdraws (A, B), routes B -> E (B -> A through
+    /// the source pool, A -> E through the target), and deposits (A, E).
+    #[test]
+    fn bcl_cross_pair_movement_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::batch;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let burn = 10_000_000i64;
+        let pool_x = {
+            let p = make_bcl_pool(&env, 0x76, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+            let lp = lp_asset_for(&env, 0x76);
+            let mut p = (*p).clone();
+            let c = BigInt::from(2 * burn);
+            p.pool_datum.circulating_lp = c.clone();
+            p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &c;
+            let held = p.value.get(&lp);
+            p.value.insert(&lp, &held - &c);
+            std::sync::Arc::new(p)
+        };
+        let pool_y = make_bcl_pool(&env, 0x77, vec![(token_a(), 8_637_368), (token_e(), 624_999)], cfg);
+        let lp_x = lp_asset_for(&env, 0x76);
+        let lp_y = lp_asset_for(&env, 0x77);
+        let order = make_basic_swap_order(lp_x.clone(), burn, lp_y.clone(), 1, 1);
+        let pool_map: BTreeMap<_, _> = [pool_x.clone(), pool_y.clone()]
+            .into_iter()
+            .map(|p| (p.pool_datum.identifier.clone(), p))
+            .collect();
+        assert!(batch::is_liquidity_op(&order, &pool_map));
+        let (burns, mints) = batch::lp_legs(&order, &pool_map);
+        let burn_specs: Vec<_> = burns.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+        let mint_specs: Vec<_> = mints.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_liquidity_op(
+                &order,
+                &burn_specs,
+                &mint_specs,
+                &[],
+                &[],
+                &pool_map,
+                crate::sundaev4::router::RoutingLimits::unlimited(),
+            )
+            .expect("cross-pair movement should resolve");
+        let plan = accum.into_plan();
+        let m = &plan.moves[0];
+        assert_eq!(m.burns.len(), 1);
+        assert_eq!(m.mints.len(), 1);
+        assert_eq!(m.swaps.len(), 1, "one swap leg B -> E");
+        assert_eq!(m.swaps[0].from, token_b());
+        assert_eq!(m.swaps[0].to, token_e());
+        assert!(m.swaps[0].dy.is_positive());
+        assert!(!plan.routes.is_empty(), "the swap leg rides a route");
+        let (_, e_in) = &m.mints[0].deposited[1];
+        assert!(e_in.is_positive(), "the deposit uses the swapped-in E");
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("cross-pair movement should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        for (ident, _, after) in &result.predicted_pools {
+            let b = plan.batches.iter().find(|b| &b.pool_ident == ident).unwrap();
+            assert_eq!(b.final_assets, after.pool_datum.assets, "accumulator matches the walk for {ident}");
+            assert_eq!(b.final_total_lp, after.pool_datum.total_lp);
         }
     }
 

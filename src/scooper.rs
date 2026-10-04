@@ -1391,7 +1391,33 @@ impl Scooper {
                     };
                     let plain_offered = batch::plain_offered(order, &pools_filtered);
                     let plain_floors = batch::plain_floors(order, &pools_filtered);
-                    match candidate.try_add_liquidity_op(order, &burns, &mints, &plain_offered, &plain_floors) {
+                    let limits = {
+                        use num_traits::ToPrimitive;
+                        let budget = order
+                            .datum
+                            .max_per_execution
+                            .clone()
+                            .unwrap()
+                            .to_u64()
+                            .unwrap_or(0);
+                        let base_fee_lov =
+                            v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
+                        router::RoutingLimits::from_budget(
+                            budget,
+                            base_fee_lov,
+                            exec.cost_per_pool_lovelace,
+                            exec.cost_per_step_lovelace,
+                        )
+                    };
+                    match candidate.try_add_liquidity_op(
+                        order,
+                        &burns,
+                        &mints,
+                        &plain_offered,
+                        &plain_floors,
+                        &pools_filtered,
+                        limits,
+                    ) {
                         Ok(()) => true,
                         Err(e) => {
                             skip_add_failed += 1;
