@@ -1026,6 +1026,120 @@ mod tests {
         assert!(r.is_some(), "312 B should route B->A->E");
     }
 
+    /// The router's cached ladder output must equal the step planner's
+    /// output for every input, in band and across bands.
+    #[test]
+    fn ladder_output_matches_step_planner() {
+        use crate::sundaev4::banded_math::{find_witness, swap_steps};
+        use crate::sundaev4::router::BandedLadder;
+        let cfg = bcl_eq8_config(ss_fee_3());
+        for (a, b) in [(8_637_368i64, 624_999i64), (12_000_000, 2_400_000)] {
+            let (a, b) = (BigInt::from(a), BigInt::from(b));
+            let w = find_witness(&cfg, &a, &b).unwrap();
+            let ladder = BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w);
+            for dx in [10_000i64, 300_000, 626_881, 626_882, 1_266_849, 1_759_892, 2_130_380, 2_500_000] {
+                let dx = BigInt::from(dx);
+                let planner = swap_steps(&cfg, &a, &b, false, &dx)
+                    .map(|st| st.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy))
+                    .unwrap_or_else(|_| BigInt::from(0));
+                let router = ladder.output(false, &dx);
+                assert_eq!(router, planner, "pool ({a},{b}) dx={dx}");
+            }
+        }
+    }
+
+    /// Two banded pools in different states, one order big enough that
+    /// each side must cross a band. The blended route must split across
+    /// both, each pool's walk must emit several steps, and the total
+    /// output must be within rounding of the best split found by brute
+    /// force over the step planner.
+    #[test]
+    fn blended_split_across_two_banded_pools_with_crossings() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band, swap_steps};
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        // X at the Aiken vector; Y deeper and further along the ladder.
+        let x = make_bcl_pool(&env, 0x7A, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+        let y = make_bcl_pool(&env, 0x7B, vec![(token_a(), 12_000_000), (token_b(), 2_400_000)], cfg.clone());
+        let pool_map: BTreeMap<_, _> =
+            [x.clone(), y.clone()].into_iter().map(|p| (p.pool_datum.identifier.clone(), p)).collect();
+
+        let cap = |p: &std::sync::Arc<crate::sundaev4::SundaeV4Pool>| {
+            let (a, b) = (&p.pool_datum.assets[0].1, &p.pool_datum.assets[1].1);
+            let w = find_witness(&cfg, a, b).unwrap();
+            max_dx_in_band(&band_view(&cfg, a, b, &w).unwrap(), false)
+        };
+        let (cx, cy) = (cap(&x), cap(&y));
+        // Four bands of B in total: no single pool can keep this in band.
+        let dx: BigInt = &(&cx + &cy) * &BigInt::from(2);
+        let dx_i: i64 = dx.to_string().parse().unwrap();
+
+        let order = make_basic_swap_order(token_b(), dx_i, token_a(), 1, 1);
+        let t0 = std::time::Instant::now();
+        let blend = router::find_blended_route(
+            &pool_map, &[], &token_b(), &token_a(), order.swap_offered().1, router::RoutingLimits::unlimited(),
+        )
+        .expect("a blended route across both pools must exist");
+        eprintln!("router: {:?}; branches {:?}", t0.elapsed(),
+            blend.branches.iter().map(|b| (b.total_input.to_string(), b.hops[0].splits.iter().map(|s| (s.pool.ident.to_string()[..6].to_string(), s.input_amount.to_string())).collect::<Vec<_>>())).collect::<Vec<_>>());
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_blended_order(&order, &blend, &pool_map).expect("blended crossing swap should accumulate");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 2, "both pools carry flow");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("split crossing swap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+
+        // Each pool's transcript has more than one step.
+        let mut steps_per_pool = Vec::new();
+        for (_, data, _) in result.redeemers.iter().filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend) {
+            if let Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) =
+                crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone())
+            {
+                steps_per_pool.push(transcript.len());
+            }
+        }
+        assert_eq!(steps_per_pool.len(), 2);
+        assert!(steps_per_pool.iter().all(|&n| n >= 2), "steps per pool: {steps_per_pool:?}");
+
+        // Realised output vs brute force over splits (1% grid).
+        let mut got = BigInt::from(0);
+        for (ident, _, after) in &result.predicted_pools {
+            let before = &pool_map[ident].pool_datum.assets[0].1;
+            got = &got + &(before - &after.pool_datum.assets[0].1);
+        }
+        let out_of = |p: &std::sync::Arc<crate::sundaev4::SundaeV4Pool>, d: &BigInt| -> BigInt {
+            if !d.is_positive() { return BigInt::from(0); }
+            swap_steps(&cfg, &p.pool_datum.assets[0].1, &p.pool_datum.assets[1].1, false, d)
+                .map(|st| st.iter().fold(BigInt::from(0), |a, s| &a + &s.dy))
+                .unwrap_or_else(|_| BigInt::from(0))
+        };
+        let mut best = BigInt::from(0);
+        let mut best_k = 0;
+        let t1 = std::time::Instant::now();
+        for k in 0..=100 {
+            let dxx = &dx * &BigInt::from(k) / &BigInt::from(100);
+            let dyy = &dx - &dxx;
+            let total = &out_of(&x, &dxx) + &out_of(&y, &dyy);
+            if total > best { best = total; best_k = k; }
+        }
+        eprintln!("brute force: {:?}; best split {best_k}% to X of dx={dx}; cx={cx} cy={cy}; got={got}", t1.elapsed());
+        let single = out_of(&x, &dx).max(out_of(&y, &dx));
+        assert!(got > single, "split {got} must beat the best single pool {single}");
+        // Within 0.05% of the grid optimum.
+        assert!(
+            (&best - &got) * BigInt::from(2_000) <= best,
+            "router output {got} vs brute-force best {best}"
+        );
+    }
+
     /// A cross-pair movement: LP of an A/B pool offered, LP of an A/E pool
     /// asked. The scooper withdraws (A, B), routes B -> E (B -> A through
     /// the source pool, A -> E through the target), and deposits (A, E).

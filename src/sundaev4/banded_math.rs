@@ -193,6 +193,21 @@ pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32
 /// sits on a band edge can have a witness in both neighbouring bands; the
 /// step planner uses this to continue in the band it is crossing into.
 pub fn find_witness_in_band(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize, scan: u32) -> Option<Witness> {
+    find_witness_in_band_from(cfg, a, b, k, scan, None)
+}
+
+/// `find_witness_in_band` seeded at `hint`: the counter only grows along a
+/// swap, so the doubling search starts from the previous witness instead of
+/// from 1. Falls back to the unseeded search when the hint does not satisfy
+/// the sign and curve predicates.
+pub fn find_witness_in_band_from(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    k: usize,
+    scan: u32,
+    hint: Option<&BigInt>,
+) -> Option<Witness> {
     let one = BigInt::from(1);
     let two = BigInt::from(2);
     let cap = {
@@ -202,6 +217,50 @@ pub fn find_witness_in_band(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usi
         }
         c
     };
+    if let Some(h) = hint {
+        let ok = |x: &BigInt| -> bool {
+            match ladder_at(cfg, x, k) {
+                Ok(st) => {
+                    let ra = a - &st.ca;
+                    let rb = b - &st.cb;
+                    !ra.is_negative() && !rb.is_negative() && !g_of(&st, &ra, &rb, &st.l_k).is_negative()
+                }
+                Err(_) => false,
+            }
+        };
+        if ok(h) {
+            // Doubling from the hint, then bisection to the last ok x.
+            let mut lo = h.clone();
+            let mut span = one.clone();
+            let mut hi = &lo + &span;
+            while ok(&hi) {
+                lo = hi;
+                span = &span * &two;
+                hi = h + &span;
+                if hi >= cap {
+                    break;
+                }
+            }
+            while &lo + &one < hi {
+                let m = &(&lo + &hi) / &two;
+                if ok(&m) {
+                    lo = m;
+                } else {
+                    hi = m;
+                }
+            }
+            let sp = BigInt::from(scan as i64);
+            let from = if &lo > &sp { &lo - &sp } else { one.clone() };
+            let to = &lo + &sp;
+            let mut x = to;
+            while x >= from {
+                if is_witness(cfg, a, b, &x, k) {
+                    return Some(Witness { x, k });
+                }
+                x = &x - &one;
+            }
+        }
+    }
     {
         let sign_ok = |x: &BigInt| -> bool {
             match ladder_at(cfg, x, k) {
@@ -291,6 +350,20 @@ pub fn swap_steps(
     is_a_input: bool,
     dx: &BigInt,
 ) -> Result<Vec<SwapStepPlan>, String> {
+    swap_steps_from(cfg, a, b, is_a_input, dx, None)
+}
+
+/// `swap_steps` with the pool's current witness already known, so the first
+/// step skips the unseeded search and every later step is seeded by the one
+/// before it.
+pub fn swap_steps_from(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    is_a_input: bool,
+    dx: &BigInt,
+    start: Option<&Witness>,
+) -> Result<Vec<SwapStepPlan>, String> {
     if !dx.is_positive() {
         return Err("swap input is not positive".into());
     }
@@ -298,7 +371,9 @@ pub fn swap_steps(
     let mut steps: Vec<SwapStepPlan> = Vec::new();
     let (mut ca, mut cb) = (a.clone(), b.clone());
     let mut remaining = dx.clone();
-    let mut prefer: Option<usize> = None;
+    let mut prefer: Option<usize> = start.map(|w| w.k);
+    let mut hint: Option<BigInt> = start.map(|w| w.x.clone());
+    let mut known: Option<Witness> = start.filter(|w| is_witness(cfg, a, b, &w.x, w.k)).cloned();
     // At most one step per band plus one retry at each edge.
     let mut guard = 2 * n + 2;
     while remaining.is_positive() {
@@ -306,10 +381,15 @@ pub fn swap_steps(
         if guard == 0 {
             return Err("banded swap plan did not converge".into());
         }
-        let before = match prefer.and_then(|k| find_witness_in_band(cfg, &ca, &cb, k, 400)) {
+        let before = match known.take() {
             Some(w) => w,
-            None => find_witness(cfg, &ca, &cb)
-                .ok_or_else(|| format!("no ladder witness for reserves ({ca}, {cb})"))?,
+            None => match prefer
+                .and_then(|k| find_witness_in_band_from(cfg, &ca, &cb, k, 400, hint.as_ref()))
+            {
+                Some(w) => w,
+                None => find_witness(cfg, &ca, &cb)
+                    .ok_or_else(|| format!("no ladder witness for reserves ({ca}, {cb})"))?,
+            },
         };
         let v = band_view(cfg, &ca, &cb, &before)?;
         let cap_dx = max_dx_in_band(&v, is_a_input);
@@ -336,10 +416,11 @@ pub fn swap_steps(
         let crossing = step_dx < remaining;
         let after = if crossing {
             next_band(before.k, is_a_input, n)
-                .and_then(|k| find_witness_in_band(cfg, &na, &nb, k, 400))
+                .and_then(|k| find_witness_in_band_from(cfg, &na, &nb, k, 400, Some(&before.x)))
                 .or_else(|| find_witness(cfg, &na, &nb))
         } else {
-            find_witness_in_band(cfg, &na, &nb, before.k, 400).or_else(|| find_witness(cfg, &na, &nb))
+            find_witness_in_band_from(cfg, &na, &nb, before.k, 400, Some(&before.x))
+                .or_else(|| find_witness(cfg, &na, &nb))
         }
         .ok_or_else(|| format!("no ladder witness for the after reserves ({na}, {nb})"))?;
         if after.x < before.x {
@@ -353,6 +434,8 @@ pub fn swap_steps(
         ca = na;
         cb = nb;
         prefer = Some(after.k);
+        hint = Some(after.x.clone());
+        known = Some(after);
     }
     Ok(steps)
 }
@@ -490,14 +573,15 @@ pub fn max_dx_in_band(v: &BandView, is_a_input: bool) -> BigInt {
 /// The state a swap of `dx` leaves behind: the reserves and the band view
 /// at the final step's after-witness. `None` when the ladder cannot absorb
 /// `dx`.
-pub fn view_after(
+pub fn view_after_from(
     cfg: &BandedCLConfig,
     a: &BigInt,
     b: &BigInt,
     is_a_input: bool,
     dx: &BigInt,
+    start: Option<&Witness>,
 ) -> Option<(BigInt, BigInt, BandView)> {
-    let steps = swap_steps(cfg, a, b, is_a_input, dx).ok()?;
+    let steps = swap_steps_from(cfg, a, b, is_a_input, dx, start).ok()?;
     let last = steps.last()?;
     let (mut na, mut nb) = (a.clone(), b.clone());
     for st in &steps {
@@ -516,20 +600,36 @@ pub fn view_after(
 /// The largest input the whole ladder absorbs in one direction: the sum of
 /// every band's capacity from the active band to the ladder's end.
 pub fn ladder_capacity(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, is_a_input: bool) -> BigInt {
+    ladder_capacity_from(cfg, a, b, is_a_input, None)
+}
+
+pub fn ladder_capacity_from(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    is_a_input: bool,
+    start: Option<&Witness>,
+) -> BigInt {
     let n = cfg.bands.len();
-    let Some(w) = find_witness(cfg, a, b) else {
-        return BigInt::zero();
+    let w = match start {
+        Some(w) if is_witness(cfg, a, b, &w.x, w.k) => w.clone(),
+        _ => match find_witness(cfg, a, b) {
+            Some(w) => w,
+            None => return BigInt::zero(),
+        },
     };
     let (mut ca, mut cb) = (a.clone(), b.clone());
     let mut prefer = Some(w.k);
+    let mut hint = w.x.clone();
     let mut total = BigInt::zero();
     for _ in 0..(2 * n + 2) {
         let Some(wk) = prefer
-            .and_then(|k| find_witness_in_band(cfg, &ca, &cb, k, 400))
+            .and_then(|k| find_witness_in_band_from(cfg, &ca, &cb, k, 400, Some(&hint)))
             .or_else(|| find_witness(cfg, &ca, &cb))
         else {
             break;
         };
+        hint = wk.x.clone();
         let Ok(v) = band_view(cfg, &ca, &cb, &wk) else {
             break;
         };
@@ -888,6 +988,28 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].dy, BigInt::from(616));
         assert_eq!(steps[0].after.x, BigInt::from(999_999_641i64));
+    }
+
+    #[test]
+    fn primitive_timings() {
+        let cfg = eq8();
+        let (a, b) = (BigInt::from(12_000_000i64), BigInt::from(2_400_000i64));
+        let t = std::time::Instant::now();
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        eprintln!("find_witness: {:?} -> {:?}", t.elapsed(), w);
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        let t = std::time::Instant::now();
+        let cap = max_dx_in_band(&v, false);
+        eprintln!("max_dx_in_band: {:?} -> {cap}", t.elapsed());
+        let t = std::time::Instant::now();
+        let st = swap_steps(&cfg, &a, &b, false, &(&cap * &BigInt::from(3))).unwrap();
+        eprintln!("swap_steps x3 bands: {:?} -> {} steps", t.elapsed(), st.len());
+        let t = std::time::Instant::now();
+        let lc = ladder_capacity(&cfg, &a, &b, false);
+        eprintln!("ladder_capacity: {:?} -> {lc}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = view_after_from(&cfg, &a, &b, false, &(&cap * &BigInt::from(3)), Some(&w));
+        eprintln!("view_after: {:?}", t.elapsed());
     }
 
     #[test]

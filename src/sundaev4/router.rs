@@ -68,11 +68,86 @@ pub enum PoolViewType {
 }
 
 /// A banded pool's ladder and reserves, enough to plan multi-band swaps.
-#[derive(Clone, Debug)]
+/// Caches what the route search asks for repeatedly: the ladder capacity per
+/// direction and the state after each input amount.
+#[derive(Debug)]
 pub struct BandedLadder {
     pub cfg: crate::sundaev4::types::BandedCLConfig,
     pub a: BigInt,
     pub b: BigInt,
+    pub witness: crate::sundaev4::banded_math::Witness,
+    capacity: [std::sync::OnceLock<BigInt>; 2],
+    after: std::sync::Mutex<
+        std::collections::BTreeMap<(bool, BigInt), Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>>,
+    >,
+}
+
+impl BandedLadder {
+    pub fn new(
+        cfg: crate::sundaev4::types::BandedCLConfig,
+        a: BigInt,
+        b: BigInt,
+        witness: crate::sundaev4::banded_math::Witness,
+    ) -> Self {
+        Self {
+            cfg,
+            a,
+            b,
+            witness,
+            capacity: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+            after: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub fn capacity(&self, is_a_input: bool) -> BigInt {
+        self.capacity[usize::from(is_a_input)]
+            .get_or_init(|| {
+                crate::sundaev4::banded_math::ladder_capacity_from(
+                    &self.cfg,
+                    &self.a,
+                    &self.b,
+                    is_a_input,
+                    Some(&self.witness),
+                )
+            })
+            .clone()
+    }
+
+    /// Total output for `dx`, crossing bands as needed; zero when the ladder
+    /// cannot absorb it.
+    pub fn output(&self, is_a_input: bool, dx: &BigInt) -> BigInt {
+        match self.view_after(is_a_input, dx) {
+            Some((na, nb, _)) => {
+                if is_a_input { &self.b - &nb } else { &self.a - &na }
+            }
+            None => BigInt::from(0),
+        }
+    }
+
+    pub fn view_after(
+        &self,
+        is_a_input: bool,
+        dx: &BigInt,
+    ) -> Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)> {
+        let key = (is_a_input, dx.clone());
+        if let Some(v) = self.after.lock().unwrap().get(&key) {
+            return v.clone();
+        }
+        let v = crate::sundaev4::banded_math::view_after_from(
+            &self.cfg,
+            &self.a,
+            &self.b,
+            is_a_input,
+            dx,
+            Some(&self.witness),
+        );
+        let mut m = self.after.lock().unwrap();
+        if m.len() > 4096 {
+            m.clear();
+        }
+        m.insert(key, v.clone());
+        v
+    }
 }
 
 /// Marginal output per unit input (scaled by `scale()`) on one band view
@@ -335,12 +410,7 @@ fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
         PoolViewType::ConstantProduct => None,
         PoolViewType::Banded {
             is_a_input, ladder, ..
-        } => Some(crate::sundaev4::banded_math::ladder_capacity(
-            &ladder.cfg,
-            &ladder.a,
-            &ladder.b,
-            *is_a_input,
-        )),
+        } => Some(ladder.capacity(*is_a_input)),
         // The curve is asymptotic in the out reserve: the pinned output is
         // always below it, and a fee-bearing step never lowers D.
         PoolViewType::StableSwap { .. } => None,
@@ -405,10 +475,7 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
                 bm::band_output(band, *is_a_input, dx)
             } else {
                 // Crosses band edges: price the whole step sequence.
-                match bm::swap_steps(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, dx) {
-                    Ok(steps) => steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy),
-                    Err(_) => BigInt::from(0),
-                }
+                ladder.output(*is_a_input, dx)
             }
         }
         PoolViewType::ConstantProduct => swap_math::cp_swap_result(
@@ -495,7 +562,7 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             }
             // Past the active band: the marginal is the opening marginal of
             // whichever band the allocation ends in.
-            match bm::view_after(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, raw_allocated) {
+            match ladder.view_after(*is_a_input, raw_allocated) {
                 Some((_, _, v)) => banded_marginal(&v, *is_a_input, &BigInt::from(0)),
                 None => BigInt::from(0),
             }
@@ -588,7 +655,6 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     band,
                     ladder,
                 } => {
-                    use crate::sundaev4::banded_math as bm;
                     // Fill band by band while the band's opening marginal
                     // clears lambda; stop inside the first band that does
                     // not fill completely.
@@ -598,9 +664,7 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     }
                     let mut total = first;
                     for _ in 0..ladder.cfg.bands.len() {
-                        let Some((_, _, v)) =
-                            bm::view_after(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, &total)
-                        else {
+                        let Some((_, _, v)) = ladder.view_after(*is_a_input, &total) else {
                             break;
                         };
                         let (alloc, cap) = banded_alloc_in_band(&v, *is_a_input, lambda);
@@ -956,16 +1020,15 @@ fn build_graph(
             let Ok(view) = band_view(config, a, b, &w) else {
                 continue;
             };
-            let ladder = std::sync::Arc::new(BandedLadder {
-                cfg: config.clone(),
-                a: a.clone(),
-                b: b.clone(),
-            });
+            let ladder = std::sync::Arc::new(BandedLadder::new(config.clone(), a.clone(), b.clone(), w.clone()));
             for (i, j) in [(0usize, 1usize), (1, 0)] {
                 let is_a_input = i == 0;
                 let fee = fee_for(&view, is_a_input);
+                // Full reserves, not the band residuals: `pool_output` clips
+                // at `reserve_out`, and a crossing swap pays out of several
+                // bands. The ladder itself bounds what each direction absorbs.
                 let (reserve_in, reserve_out) =
-                    if is_a_input { (view.ra.clone(), view.rb.clone()) } else { (view.rb.clone(), view.ra.clone()) };
+                    if is_a_input { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
                 graph
                     .entry(assets[i].0.clone())
                     .or_default()
@@ -1543,6 +1606,44 @@ pub fn find_blended_route(
     }
 
     // Materialize branches with positive allocation.
+    // Refine the greedy split: move an eighth of a chunk between branches
+    // while the total output improves. Bounded, so a flat optimum ends it.
+    {
+        let delta = &chunk / &BigInt::from(8);
+        if delta.is_positive() {
+            let mut rounds = 0;
+            'refine: while rounds < 64 {
+                rounds += 1;
+                let mut improved = false;
+                for from in 0..alloc.len() {
+                    if alloc[from] < delta {
+                        continue;
+                    }
+                    for to in 0..alloc.len() {
+                        if to == from {
+                            continue;
+                        }
+                        let new_from = out_at(chosen[from], &(&alloc[from] - &delta));
+                        let new_to = out_at(chosen[to], &(&alloc[to] + &delta));
+                        let before = &cur_out[from] + &cur_out[to];
+                        let after = &new_from + &new_to;
+                        if after > before {
+                            alloc[from] = &alloc[from] - &delta;
+                            alloc[to] = &alloc[to] + &delta;
+                            cur_out[from] = new_from;
+                            cur_out[to] = new_to;
+                            improved = true;
+                            continue 'refine;
+                        }
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+        }
+    }
+
     let mut branches: Vec<RoutingPlan> = Vec::new();
     for (ci, path_idx) in chosen.iter().enumerate() {
         if !alloc[ci].is_positive() {
