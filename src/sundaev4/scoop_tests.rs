@@ -1598,6 +1598,56 @@ mod tests {
         assert_eq!(s2.twap_num, &(&s2.last_time - &s1.last_time) * &s1.last_price);
     }
 
+    /// Where the memory goes: per-redeemer budgets for a CS scoop, a banded
+    /// scoop, a two-step banded scoop and a two-pool banded scoop.
+    #[test]
+    fn budget_profile_banded_vs_cs() {
+        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let report = |label: &str, eval: &crate::sundaev4::evaluator::EvalResult| {
+            let mut rows: Vec<(String, u64, u64)> = eval
+                .budgets
+                .iter()
+                .map(|(k, b)| (format!("{:?}#{}", k.tag, k.index), b.mem, b.steps))
+                .collect();
+            rows.sort();
+            let total: u64 = rows.iter().map(|r| r.1).sum();
+            eprintln!("== {label}: total mem {total}");
+            for (k, m, s) in rows {
+                eprintln!("   {k:<12} mem {m:>9} steps {s:>12}");
+            }
+        };
+        let cfg = bcl_eq8_config(ss_fee_3());
+        // CS reference.
+        let cs = make_cs_pool(&env, 0x80, vec![(token_a(), 300_000_000), (token_b(), 300_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], ss_fee_3());
+        let b = assemble_batch(&cs, &[make_order(token_a(), 1_000_000, token_b(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
+        report("constant sum, one swap", &e);
+        // Banded, one step.
+        let p = make_bcl_pool(&env, 0x81, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+        let b = assemble_batch(&p, &[make_order(token_b(), 624, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
+        report("banded, one in-band step", &e);
+        // Banded, crossing (two steps).
+        let (a, bb) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let w = find_witness(&cfg, &a, &bb).unwrap();
+        let cap = max_dx_in_band(&band_view(&cfg, &a, &bb, &w).unwrap(), false);
+        let dx: i64 = (&cap + &BigInt::from(50_000)).to_string().parse().unwrap();
+        let p2 = make_bcl_pool(&env, 0x82, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+        let b = assemble_batch(&p2, &[make_order(token_b(), dx, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
+        report("banded, two steps (crossing)", &e);
+        // Two banded pools, one order each.
+        let p3 = make_bcl_pool(&env, 0x83, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+        let p4 = make_bcl_pool(&env, 0x84, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg);
+        let b3 = assemble_batch(&p3, &[make_order(token_b(), 624, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let b4 = assemble_batch(&p4, &[make_order(token_b(), 624, token_a(), 1, 2)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let (_, e) = env.build_and_eval(&[b3, b4], &settings, 1000).unwrap();
+        report("two banded pools, one step each", &e);
+    }
+
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
     /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_478 in
