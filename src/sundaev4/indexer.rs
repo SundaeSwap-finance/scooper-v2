@@ -792,6 +792,8 @@ pub fn module_ref_utxos(
         &scripts.fairness_order,
         &scripts.strategy_order,
         &scripts.fee_constraint,
+        &scripts.banded_concentrated_liquidity,
+        &scripts.oracle,
     ];
     required
         .into_iter()
@@ -2414,8 +2416,8 @@ mod mainnet_create_tx_tests {
             settings: next(CS_HASH),
             constant_sum: Some(next(CS_HASH)),
             stableswap: None,
-            banded_concentrated_liquidity: None,
-            oracle: None,
+            banded_concentrated_liquidity: Some(next(CS_HASH)),
+            oracle: Some(next(CS_HASH)),
             swap_order: Some(next(CS_HASH)),
             basic_order: Some(next(CS_HASH)),
             route_order: Some(next(CS_HASH)),
@@ -2426,8 +2428,13 @@ mod mainnet_create_tx_tests {
         let tracked = module_ref_utxos(&scripts);
         assert_eq!(
             tracked.len(),
-            14,
-            "six required modules and eight optional ones"
+            16,
+            "six required modules and ten optional ones"
+        );
+        let bcl_ref = scripts.banded_concentrated_liquidity.as_ref().unwrap().ref_utxo.clone();
+        assert!(
+            tracked.contains(&bcl_ref),
+            "the banded module is invoked by every banded scoop and must be in the store"
         );
         let fee_constraint_ref = scripts.fee_constraint.as_ref().unwrap().ref_utxo.clone();
         assert!(

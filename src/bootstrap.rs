@@ -2365,6 +2365,12 @@ async fn bootstrap_v4(
         if let Some(ref fc) = scripts.fee_constraint {
             all_refs.push(fc);
         }
+        if let Some(ref bcl) = scripts.banded_concentrated_liquidity {
+            all_refs.push(bcl);
+        }
+        if let Some(ref o) = scripts.oracle {
+            all_refs.push(o);
+        }
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {
