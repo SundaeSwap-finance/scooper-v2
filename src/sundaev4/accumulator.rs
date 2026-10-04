@@ -749,8 +749,41 @@ impl Accumulator {
                             &dx,
                             limits,
                         ) else {
+                            // Diagnose: which single hops resolve on their own?
+                            let probe = |a: &AssetClass, b: &AssetClass| -> String {
+                                let mut found = Vec::new();
+                                for (ident, p) in pools {
+                                    let has = |x: &AssetClass| p.pool_datum.assets.iter().any(|(q, _)| q == x);
+                                    if has(a) && has(b) {
+                                        let one: BTreeMap<_, _> = [(ident.clone(), p.clone())].into_iter().collect();
+                                        let ok = crate::sundaev4::router::find_blended_route(
+                                            &one,
+                                            &[],
+                                            a,
+                                            b,
+                                            &dx,
+                                            crate::sundaev4::router::RoutingLimits::unlimited(),
+                                        )
+                                        .is_some();
+                                        found.push(format!("{ident}:{}", if ok { "ok" } else { "no" }));
+                                    }
+                                }
+                                found.join(",")
+                            };
+                            let via: Vec<String> = needed
+                                .iter()
+                                .filter(|x| *x != to)
+                                .map(|mid| format!("{}->{}: [{}] then [{}]", hex::encode(&from.token), hex::encode(&mid.token), probe(&from, mid), probe(mid, to)))
+                                .collect();
                             return Err(format!(
-                                "liquidity op: no route for {dx} of a withdrawn asset into a target asset"
+                                "liquidity op: no route for {dx} {}->{} across {} pools (max_pools {}, max_steps {}); direct [{}]; via {:?}",
+                                hex::encode(&from.token),
+                                hex::encode(&to.token),
+                                pools.len(),
+                                limits.max_pools,
+                                limits.max_steps,
+                                probe(&from, to),
+                                via
                             ));
                         };
                         let first_route = self.routes.len();

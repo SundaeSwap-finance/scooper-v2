@@ -1010,6 +1010,22 @@ mod tests {
         }
     }
 
+    /// Preview repro: a 312-unit B -> E route through two banded pools
+    /// under budget-derived limits (2 pools, 4 steps).
+    #[test]
+    fn small_two_hop_route_between_banded_pools() {
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let x = make_bcl_pool(&env, 0x78, vec![(token_a(), 6_161_607), (token_b(), 6_469_719)], cfg.clone());
+        let y = make_bcl_pool(&env, 0x79, vec![(token_a(), 5_952_381), (token_e(), 6_250_000)], cfg);
+        let pool_map: BTreeMap<_, _> = [x, y].into_iter().map(|p| (p.pool_datum.identifier.clone(), p)).collect();
+        let limits = router::RoutingLimits { max_pools: 2, max_steps: 4 };
+        let r = router::find_blended_route(&pool_map, &[], &token_b(), &token_e(), &BigInt::from(312), limits);
+        assert!(r.is_some(), "312 B should route B->A->E");
+    }
+
     /// A cross-pair movement: LP of an A/B pool offered, LP of an A/E pool
     /// asked. The scooper withdraws (A, B), routes B -> E (B -> A through
     /// the source pool, A -> E through the target), and deposits (A, E).
