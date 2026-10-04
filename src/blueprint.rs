@@ -274,19 +274,6 @@ impl Blueprint {
             "fee_constraint",
         )
         .ok();
-        // Concentrated liquidity module (optional — only present when CL pools exist).
-        let concentrated_liquidity = make_info(
-            self,
-            &[
-                "concentrated_liquidity.withdraw",
-                "concentrated_liquidity_module",
-                "concentrated_liquidity",
-                "concentratedLiquidity",
-            ],
-            "concentrated_liquidity.withdraw",
-            "concentrated_liquidity",
-        )
-        .ok();
 
         // Stableswap module (optional — only present once the module is deployed).
         let stableswap = make_info(
@@ -334,7 +321,6 @@ impl Blueprint {
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
             constant_sum,
             fee_constraint,
-            concentrated_liquidity,
             stableswap,
             banded_concentrated_liquidity,
             oracle,

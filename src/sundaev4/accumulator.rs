@@ -22,7 +22,7 @@ use crate::sundaev4::types::SundaeV4Pool;
 /// Per-pool running state within a multi-pool tx being built incrementally.
 ///
 /// The accumulator mirrors the tx-builder's streaming walk so that
-/// CL swap math (which depends on `total_lp` via virtual reserves) gives the
+/// LP-dependent swap math (the banded ladder reads `total_lp` as its counter) gives the
 /// *same* dy at accumulation time as at tx-build time. Without this, the
 /// router would route against the accumulator's projection and the tx-builder
 /// would compute different dys, leading to value-conservation failures.
@@ -183,7 +183,7 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> PoolAccum {
-        // CS pools capture protocol revenue like CP/CL post-SUN-101 (cs_check
+        // CS pools capture protocol revenue like CP post-SUN-101 (cs_check
         // no longer forbids LP growth on swap entries). Must stay in lockstep
         // with tx_builder's per_pool_ps or predicted pool state diverges from
         // the built tx.
@@ -276,7 +276,7 @@ impl Accumulator {
 
         // Per-entry protocol_lp bump (cumulative-target trick — see tx_builder).
         // Keeps running_total_lp in sync with what tx_builder will see, so any
-        // CL dys computed against the post-bump LP match between accumulator
+        // LP-dependent dys computed against the post-bump LP match between accumulator
         // and tx_builder. CS pools have ps=(0, _) by current design so this is
         // a no-op for them.
         let fb = swap_math::compute_fee_budget(
@@ -815,7 +815,7 @@ impl Accumulator {
                 accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
                 accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
 
-                // Per-entry protocol_lp bump (mirrors tx_builder) so CL dy
+                // Per-entry protocol_lp bump (mirrors tx_builder) so LP-dependent dy
                 // computed for subsequent ops in this pool matches tx-time.
                 let fb = swap_math::compute_fee_budget(
                     &effective_pool.pool_type,
@@ -827,10 +827,10 @@ impl Accumulator {
                 // means the leg lost the pool value, and the pool contract's
                 // check_lp_accounting (circulating_lp <= total_lp) rejects it,
                 // quarantining the order. The router's value-preservation cap
-                // (cl_max_dx_value_preserving) should already prevent this; this
+                // (the per-curve absorb caps) should already prevent this; this
                 // is the fail-fast backstop so a mispriced leg can never build an
                 // invalid tx. (Currently trips for B-input swaps on range-above-
-                // 1.0 CL pools — the spa_num/spa_den slip filed for audit.)
+                // 1.0 pools.)
                 if fb.is_negative() {
                     return Err(format!(
                         "leg would make pool {pool_ident} lose value \

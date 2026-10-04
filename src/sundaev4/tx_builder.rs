@@ -506,7 +506,7 @@ pub fn build_multi_pool_scoop_tx(
     // routed-order hop inputs cascade from previous hops' actual dy, and
     // routed-order final fulfillment amounts accumulate into `final_output`.
     //
-    // Why this matters for CL: per-entry protocol_lp distribution bumps
+    // Why this matters for LP-dependent curves: per-entry protocol_lp distribution bumps
     // `lp_before` for subsequent entries, which changes the validator's
     // expected dy. Recomputing here against the *bumped* running_total_lp
     // gives the validator-tight dy; for routed orders this dy propagates
@@ -579,7 +579,7 @@ pub fn build_multi_pool_scoop_tx(
     //
     // CS pools now capture protocol revenue normally (post-SUN-101: the
     // `before_lp == after_lp` invariant was removed from cs_check's swap
-    // path, so total_lp can grow each step like CP/CL).
+    // path, so total_lp can grow each step like CP).
     let per_pool_ps: Vec<(BigInt, BigInt)> = batches
         .iter()
         .map(|batch| {
@@ -598,7 +598,7 @@ pub fn build_multi_pool_scoop_tx(
         .collect();
 
     // Per-pool operation_tag for swap entries. CS dispatches on tag==3
-    // (`tag_swap` in cs_check.ak); CP/CL infer from asset deltas.
+    // (`tag_swap` in cs_check.ak); CP and banded infer from asset deltas.
     let per_pool_swap_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -606,13 +606,12 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_SWAP)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
             PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
         })
         .collect();
 
     // Per-pool operation_tag for deposit entries. CS dispatches on tag==6
-    // (`tag_deposit` in cs_check.ak); CP/CL infer from asset deltas.
+    // (`tag_deposit` in cs_check.ak); CP and banded infer from asset deltas.
     let per_pool_deposit_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -620,7 +619,6 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
             PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
         })
         .collect();
@@ -764,7 +762,7 @@ pub fn build_multi_pool_scoop_tx(
                 // split allocation (routed primary); both stored on `s.dx`.
                 let dx = s.dx.clone();
                 // dy: recompute fresh against the current pool state
-                // (including any LP bumps from prior CL entries).
+                // (including any LP bumps from prior entries).
                 let dy = crate::sundaev4::batch::compute_swap_result(
                     &pool_type,
                     running_assets,
@@ -940,7 +938,7 @@ pub fn build_multi_pool_scoop_tx(
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
                 *running_preminted = &*running_preminted + &w.lp_burned;
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
-                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
+                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP and banded infer
                 // from asset deltas, so any sentinel tag works.
                 tracing::debug!(
                     order = %w.order.input,
@@ -951,8 +949,7 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
-                    PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                    PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
+                            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
@@ -1296,7 +1293,6 @@ pub fn build_multi_pool_scoop_tx(
 
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
-    let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
     let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
     let mut bcl_entries: Vec<crate::sundaev4::types::BandedOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
@@ -1409,41 +1405,6 @@ pub fn build_multi_pool_scoop_tx(
                 cs_entries.push(CSOperateEntry {
                     pool_oref: pool_oref_plutus.clone(),
                     config: cs_cfg,
-                });
-            }
-            PoolType::ConcentratedLiquidity {
-                sqrt_price_a,
-                sqrt_price_b,
-                fee,
-            } => {
-                let cl_cfg = ConcentratedLiquidityConfig {
-                    sqrt_price_a: sqrt_price_a.clone(),
-                    sqrt_price_b: sqrt_price_b.clone(),
-                    fee: fee.clone(),
-                };
-                if let Some(cl_script) = exec.module_scripts.concentrated_liquidity.as_ref() {
-                    let cl_cred = cl_script.hash.as_ref();
-                    let stored = batch
-                        .pool
-                        .pool_datum
-                        .module_state
-                        .iter()
-                        .find(|(cred, _)| cred.as_slice() == cl_cred)
-                        .map(|(_, h)| hex::encode(h));
-                    let pd = cl_cfg.clone().to_plutus();
-                    let cbor = minicbor::to_vec(&pd).unwrap_or_default();
-                    let expected = hex::encode(pallas_crypto::hash::Hasher::<256>::hash(&cbor));
-                    tracing::info!(
-                        pool = %batch.pool.pool_datum.identifier,
-                        stored_cl_hash = ?stored,
-                        expected_cl_hash = %expected,
-                        cl_cbor = %hex::encode(&cbor),
-                        "concentrated_liquidity hash diagnostic",
-                    );
-                }
-                cl_entries.push(CLOperateEntry {
-                    pool_oref: pool_oref_plutus.clone(),
-                    config: cl_cfg,
                 });
             }
             PoolType::StableSwap { config } => {
@@ -1712,7 +1673,6 @@ pub fn build_multi_pool_scoop_tx(
 
     let has_cp = !cp_entries.is_empty();
     let has_cs = !cs_entries.is_empty();
-    let has_cl = !cl_entries.is_empty();
     let has_ss = !ss_entries.is_empty();
     let has_bcl = !bcl_entries.is_empty();
 
@@ -1751,9 +1711,6 @@ pub fn build_multi_pool_scoop_tx(
     }
     if has_cs && let Some(cs) = &exec.module_scripts.constant_sum {
         all_ref_inputs.push(cs.ref_utxo.0.clone());
-    }
-    if has_cl && let Some(cl) = &exec.module_scripts.concentrated_liquidity {
-        all_ref_inputs.push(cl.ref_utxo.0.clone());
     }
     if has_ss && let Some(ss) = &exec.module_scripts.stableswap {
         all_ref_inputs.push(ss.ref_utxo.0.clone());
@@ -1958,14 +1915,6 @@ pub fn build_multi_pool_scoop_tx(
             entries: cs_entries,
         };
         withdrawals.push((reward_account(&cs_script.hash), cs_redeemer.to_plutus()));
-    }
-
-    // Conditionally add CL withdrawal
-    if has_cl && let Some(cl_script) = &exec.module_scripts.concentrated_liquidity {
-        let cl_redeemer = ConcentratedLiquidityRedeemer::Operate {
-            entries: cl_entries,
-        };
-        withdrawals.push((reward_account(&cl_script.hash), cl_redeemer.to_plutus()));
     }
 
     // Conditionally add stableswap withdrawal
@@ -2276,7 +2225,7 @@ pub fn build_multi_pool_scoop_tx(
     //
     // Pool output ADA delta: derived directly from the actual per-pool
     // final reserves we tracked in `per_pool[i].final_assets_actual`,
-    // which reflects every applied op (including any recomputed CL dys
+    // which reflects every applied op (including any recomputed LP-dependent dys
     // that diverge from the accumulator's projection). This is more
     // robust than summing per-op `dx`/`dy` aggregates that ignore the
     // recompute path.
@@ -2552,7 +2501,7 @@ pub fn build_multi_pool_scoop_tx(
                 // streaming walk's accumulated final-hop output (sum across
                 // any splits of the last hop). Direct swaps use the dy we
                 // recomputed against the pool's running state — that's
-                // already the validator-tight bound after any CL lp bump.
+                // already the validator-tight bound after any lp bump.
                 let (output_asset, dy_owned);
                 let (output_asset_ref, dy_ref): (&AssetClass, &BigInt) = match &swap.route {
                     Some(rref) => {

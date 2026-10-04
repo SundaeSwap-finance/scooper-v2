@@ -1809,7 +1809,6 @@ impl AdminServer {
             let kind = match &pool.pool_type {
                 PoolType::ConstantProduct { .. } => "cp",
                 PoolType::ConstantSum { .. } => "cs",
-                PoolType::ConcentratedLiquidity { .. } => "cl",
                 PoolType::StableSwap { .. } => "ss",
                 PoolType::BandedConcentratedLiquidity { .. } => "bcl",
             };

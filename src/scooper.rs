@@ -1462,8 +1462,8 @@ impl Scooper {
                     // Swap: route through the optimizer against the
                     // accumulator's *current* pool state, so prior orders'
                     // depletion is visible. The router then naturally splits
-                    // across CL+non-CL pools when an earlier order has
-                    // drained the optimal CL pool.
+                    // across pools when an earlier order has
+                    // drained the optimal one.
                     let (offer_asset, offer_amount) = order.swap_offered();
                     let (ask_asset, _) = order.swap_min_received();
                     if offer_asset == ask_asset {
@@ -2533,9 +2533,6 @@ impl Scooper {
                             crate::metrics::PoolFamily::ConstantProduct
                         }
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
-                        PoolType::ConcentratedLiquidity { .. } => {
-                            crate::metrics::PoolFamily::ConcentratedLiquidity
-                        }
                         PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
                         PoolType::BandedConcentratedLiquidity { .. } => {
                             crate::metrics::PoolFamily::BandedConcentratedLiquidity

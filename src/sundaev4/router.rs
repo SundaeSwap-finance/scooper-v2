@@ -39,19 +39,6 @@ pub enum PoolViewType {
         /// Price of the output asset in this direction.
         price_out: BigInt,
     },
-    /// Concentrated liquidity. Stored in pool-positional `(a, b)` order
-    /// plus a flag for swap direction so `pool_output` can dispatch to
-    /// the right validator-matching branch of `cl_swap_result`. `lp` is
-    /// the pool's current `total_lp` (CL swap math depends on LP via
-    /// virtual reserves).
-    ConcentratedLiquidity {
-        is_a_input: bool,
-        spa_num: BigInt,
-        spa_den: BigInt,
-        spb_num: BigInt,
-        spb_den: BigInt,
-        lp: BigInt,
-    },
     /// Curve-style stableswap, direction-oriented: `rate_in` / `rate_out`
     /// are the config rates of the view's in / out asset. `d` is the sum
     /// invariant for the view's reserves at those rates, computed once at
@@ -225,14 +212,14 @@ pub struct RoutingPlan {
 
 /// Whether a pool can absorb a given dx without its dy exceeding actual
 /// reserve_out. Always true for CP/CS (their dy is bounded by reserve_out
-/// naturally — CP — or by the input value — CS). For CL, checks against
-/// `cl_max_dx_for_reserve`.
+/// naturally — CP — or by the input value — CS). A banded band is capped at
+/// its residual output reserve.
 fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
     match pool_absorb_cap(pool) {
         // Unbounded (CP): always absorbs.
         None => true,
         // Bounded: dx must fit under the cap. `Some(0)`/negative cap ⇒ nothing
-        // fits (a saturated CS/CL pool, or one whose max_dx solver bailed).
+        // fits (a saturated CS or banded pool, or one whose max_dx solver bailed).
         Some(cap) => dx <= &cap,
     }
 }
@@ -287,55 +274,6 @@ fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
                 .unwrap_or_else(|| BigInt::from(0)),
             )
         }
-        PoolViewType::ConcentratedLiquidity {
-            is_a_input,
-            spa_num,
-            spa_den,
-            spb_num,
-            spb_den,
-            lp,
-        } => {
-            let (a, b) = if *is_a_input {
-                (&pool.reserve_in, &pool.reserve_out)
-            } else {
-                (&pool.reserve_out, &pool.reserve_in)
-            };
-            let fee_num = BigInt::from(pool.fee_num);
-            let fee_den = BigInt::from(pool.fee_den);
-            // Cap 1: don't drain the output reserve below zero.
-            let reserve_cap = match swap_math::cl_max_dx_for_reserve(
-                a,
-                b,
-                lp,
-                *is_a_input,
-                spa_num,
-                spa_den,
-                spb_num,
-                spb_den,
-                &fee_num,
-                &fee_den,
-            ) {
-                Some(cap) => cap,
-                None => return Some(BigInt::from(0)),
-            };
-            // Cap 2: don't push the swap into its value-losing range (the pool
-            // contract rejects fee_budget < 0). For a healthy in-range pool this
-            // returns reserve_cap unchanged; for a pool swapped in its
-            // value-losing direction it returns ~0, excluding it from routing.
-            Some(swap_math::cl_max_dx_value_preserving(
-                a,
-                b,
-                lp,
-                &reserve_cap,
-                *is_a_input,
-                spa_num,
-                spa_den,
-                spb_num,
-                spb_den,
-                &fee_num,
-                &fee_den,
-            ))
-        }
     }
 }
 
@@ -380,37 +318,6 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
                 &[price_in.clone(), price_out.clone()],
                 0,
                 1,
-                &fee_num,
-                &fee_den,
-            )
-        }
-        PoolViewType::ConcentratedLiquidity {
-            is_a_input,
-            spa_num,
-            spa_den,
-            spb_num,
-            spb_den,
-            lp,
-        } => {
-            let fee_num = BigInt::from(pool.fee_num);
-            let fee_den = BigInt::from(pool.fee_den);
-            // pool.reserve_in / reserve_out are direction-oriented; map back
-            // to pool-positional (a, b) using is_a_input.
-            let (a, b) = if *is_a_input {
-                (&pool.reserve_in, &pool.reserve_out)
-            } else {
-                (&pool.reserve_out, &pool.reserve_in)
-            };
-            swap_math::cl_swap_result(
-                a,
-                b,
-                lp,
-                dx,
-                *is_a_input,
-                spa_num,
-                spa_den,
-                spb_num,
-                spb_den,
                 &fee_num,
                 &fee_den,
             )
@@ -513,45 +420,6 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             // in place of the price ratio.
             let _ = raw_allocated;
             &fee_mult * rate_num * &scale() / &(rate_den * &fee_den)
-        }
-        PoolViewType::ConcentratedLiquidity {
-            is_a_input,
-            spa_num,
-            spa_den,
-            spb_num,
-            spb_den,
-            lp,
-        } => {
-            // Marginal dy/dx in CL = derivative of the validator formula:
-            //   A→B:  dy = vb0·dva_eff / (spa_den·(va0+dva_eff))
-            //         where va0 = a·spb_num + L·spb_den
-            //               vb0 = b·spa_den + L·spa_num
-            //               dva_eff = (fee_mult/fee_den)·dx·spb_num
-            //         d(dy)/dx = (fm·vb0·va0·spb_num) / (fd·spa_den·va²)
-            //   B→A:  symmetric with (spa↔spb), (a↔b), va↔vb
-            let (a, b) = if *is_a_input {
-                (&pool.reserve_in, &pool.reserve_out)
-            } else {
-                (&pool.reserve_out, &pool.reserve_in)
-            };
-            let va0 = &(a * spb_num) + &(lp * spb_den);
-            let vb0 = &(b * spa_den) + &(lp * spa_num);
-            let dx_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
-            if *is_a_input {
-                let va = &va0 + &(&dx_eff * spb_num);
-                let denom = &fee_den * spa_den * &va * &va;
-                if !denom.is_positive() {
-                    return BigInt::from(0);
-                }
-                &fee_mult * &vb0 * &va0 * spb_num * &scale() / &denom
-            } else {
-                let vb = &vb0 + &(&dx_eff * spa_num);
-                let denom = &fee_den * spb_num * &vb * &vb;
-                if !denom.is_positive() {
-                    return BigInt::from(0);
-                }
-                &fee_mult * &va0 * &vb0 * spa_num * &scale() / &denom
-            }
         }
         PoolViewType::StableSwap {
             amp,
@@ -711,76 +579,6 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         BigInt::from(0)
                     }
                 }
-                PoolViewType::ConcentratedLiquidity {
-                    is_a_input,
-                    spa_num,
-                    spa_den,
-                    spb_num,
-                    spb_den,
-                    lp,
-                } => {
-                    // Invert marginal = λ:
-                    //   A→B: va² = (fm·vb0·va0·spb_num·SCALE) / (λ·fd·spa_den)
-                    //   dva_eff = isqrt(va²) − va0
-                    //   dx_eff  = dva_eff / spb_num
-                    //   dx_raw  = dx_eff · fd / fm
-                    //   B→A: symmetric (swap spa↔spb, va↔vb)
-                    let (a, b) = if *is_a_input {
-                        (&pool.reserve_in, &pool.reserve_out)
-                    } else {
-                        (&pool.reserve_out, &pool.reserve_in)
-                    };
-                    let va0 = &(a * spb_num) + &(lp * spb_den);
-                    let vb0 = &(b * spa_den) + &(lp * spa_num);
-                    let (numerator, denom, sp_input_num) = if *is_a_input {
-                        (
-                            &fee_mult * &vb0 * &va0 * spb_num * &sc,
-                            &fee_den * spa_den * lambda,
-                            spb_num,
-                        )
-                    } else {
-                        (
-                            &fee_mult * &va0 * &vb0 * spa_num * &sc,
-                            &fee_den * spb_num * lambda,
-                            spa_num,
-                        )
-                    };
-                    if !denom.is_positive() || !sp_input_num.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let v_target = swap_math::isqrt(&(&numerator / &denom));
-                    let v0 = if *is_a_input { &va0 } else { &vb0 };
-                    let dv_eff = &v_target - v0;
-                    if !dv_eff.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let dx_eff = &dv_eff / sp_input_num;
-                    if !dx_eff.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let raw = &dx_eff * &fee_den / &fee_mult;
-                    // Cap at the dx that would drive dy to reserve_out. CL
-                    // virtual reserves can far exceed the actual pool reserves;
-                    // without this cap the bisection happily allocates more
-                    // than the pool can pay out, and the tx_builder produces
-                    // a negative pool output → ValueNotConservedUTxO at submit.
-                    let max_dx = swap_math::cl_max_dx_for_reserve(
-                        a,
-                        b,
-                        lp,
-                        *is_a_input,
-                        spa_num,
-                        spa_den,
-                        spb_num,
-                        spb_den,
-                        &fee_num,
-                        &fee_den,
-                    );
-                    match max_dx {
-                        Some(cap) if raw > cap => cap,
-                        _ => raw,
-                    }
-                }
                 PoolViewType::StableSwap {
                     rate_in, rate_out, ..
                 } => {
@@ -871,7 +669,7 @@ fn tiebreak_score(pool: &PoolView, dx: &BigInt) -> BigInt {
 /// Returns `SplitEntry` for each pool with positive allocation.
 pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntry> {
     // Drop pools that can't absorb ANY value-preserving input (absorb cap 0) —
-    // e.g. a CL pool swapped in its value-losing direction. Leaving one in would
+    // e.g. a pool with no capacity in this direction. Leaving one in would
     // let the λ-search allocate to it, then `clamp_to_absorb` would zero that
     // allocation, dropping the routed sum below `total_input` and failing the
     // whole path. Excluding it up front lets the split fill via the real pools.
@@ -882,7 +680,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         return vec![];
     }
     if pools.len() == 1 {
-        // Clamp to the pool's absorb cap: a lone CL/CS pool can't take the full
+        // Clamp to the pool's absorb cap: a lone CS or banded pool can't take the full
         // input if that would drive its dy past reserve_out. An undersized
         // result lets `evaluate_path` reject the path (sum < input) rather than
         // handing the accumulator an over-draining leg.
@@ -987,14 +785,14 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     }
 
     // Normalize allocations to sum exactly to total_input — but only when we
-    // can do so without exceeding any per-pool CL cap. Adjust the largest
+    // can do so without exceeding any per-pool absorb cap. Adjust the largest
     // allocation by the rounding remainder; if the result would push it past
-    // its CL cap, leave the allocation undersized so the caller can detect
+    // its cap, leave the allocation undersized so the caller can detect
     // "can't fully route" via the sum-check in `evaluate_path`.
     let alloc_sum: BigInt = best_allocs.iter().fold(BigInt::from(0), |a, b| &a + b);
     if &alloc_sum < total_input && alloc_sum.is_positive() {
         let remainder = total_input - &alloc_sum;
-        // Find a pool whose CL cap (or unbounded CP/CS) can absorb the remainder.
+        // Find a pool whose cap (or unbounded CP) can absorb the remainder.
         let mut absorber: Option<usize> = None;
         for (i, pool) in pools.iter().enumerate() {
             if !best_allocs[i].is_positive() {
@@ -1017,7 +815,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
     // Build results. Clamp each allocation to the pool's absorb cap as a final
     // backstop: whatever the bisection/scaling produced, no SplitEntry may carry
     // an input whose dy would exceed reserve_out. `pool_output` masks over-drains
-    // (it clamps the *output* at reserve_out), so an over-allocated CL pool would
+    // (it clamps the *output* at reserve_out), so an over-allocated banded pool would
     // otherwise slip through here looking optimal and over-drain at accumulate
     // time. An undersized sum is caught by `evaluate_path` (path rejected).
     let mut results = Vec::new();
@@ -1117,31 +915,6 @@ fn build_graph(
                     fn_num,
                     fn_den,
                     Box::new(|_, _| PoolViewType::ConstantProduct),
-                )
-            }
-            PoolType::ConcentratedLiquidity {
-                sqrt_price_a,
-                sqrt_price_b,
-                fee,
-            } => {
-                let fn_num = fee.num.clone().unwrap().to_u64().unwrap_or(0);
-                let fn_den = fee.den.clone().unwrap().to_u64().unwrap_or(1);
-                let spa_num = sqrt_price_a.num.clone();
-                let spa_den = sqrt_price_a.den.clone();
-                let spb_num = sqrt_price_b.num.clone();
-                let spb_den = sqrt_price_b.den.clone();
-                let lp = pool.pool_datum.total_lp.clone();
-                (
-                    fn_num,
-                    fn_den,
-                    Box::new(move |i, _| PoolViewType::ConcentratedLiquidity {
-                        is_a_input: i == 0,
-                        spa_num: spa_num.clone(),
-                        spa_den: spa_den.clone(),
-                        spb_num: spb_num.clone(),
-                        spb_den: spb_den.clone(),
-                        lp: lp.clone(),
-                    }),
                 )
             }
             PoolType::ConstantSum { prices, fee, .. } => {
@@ -1316,7 +1089,7 @@ fn find_paths(
 
 /// Evaluate a path: for each hop, split optimally among available pools.
 /// Returns an empty Vec when any hop can't fully consume its input — e.g. all
-/// the hop's CL pools are saturated and CP/CS alternatives can't soak the
+/// the hop's capped pools are saturated and CP alternatives can't soak the
 /// remainder, or the route's pool/step budget would be exceeded. Caller
 /// treats empty as "this path is infeasible".
 fn evaluate_path(
@@ -1341,7 +1114,7 @@ fn evaluate_path(
         let splits = if hop.pools.len() == 1 || max_splits_here == 1 {
             // Single-pool hop OR budget allows only one split: pick the
             // best single pool for current_amount and route everything
-            // through it. For CL, this guards against virtual-reserve
+            // through it. For a banded band, this guards against
             // overrun; CP/CS pass unconditionally.
             let candidates: Vec<&PoolView> =
                 hop.pools.iter().filter(|p| pool_can_absorb(p, &current_amount)).collect();
@@ -1370,7 +1143,7 @@ fn evaluate_path(
                     s.iter().take(max_splits_here).map(|e| e.pool.clone()).collect();
                 s = optimize_split(&kept_pools, &current_amount);
             }
-            // optimize_split may return undersized allocations when CL caps
+            // optimize_split may return undersized allocations when band caps
             // prevent fully absorbing current_amount. Reject the path in that
             // case — the order can't fill via this routing.
             let total_in: BigInt = s.iter().fold(BigInt::from(0), |a, e| &a + &e.input_amount);
@@ -2675,94 +2448,12 @@ mod tests {
         assert_eq!(limits.max_steps, usize::MAX);
     }
 
-    /// Adjacent concentrated-liquidity bands, each capped by its own reserve,
+    /// Adjacent price bands, each capped by its own reserve,
     /// must be filled in price order: the best band first, the next one only
     /// once the first is exhausted. Each band `k` covers √p ∈ [0.99^(k+1),
     /// 0.99^k] (≈2 % in price) and sits just above spot, so it holds only the
     /// output token. The order needs about three bands; the far ones must get
     /// nothing, and adding them must never lower the output.
-    #[test]
-    fn test_split_fills_adjacent_cl_bands_in_price_order() {
-        let den: i64 = 1_000_000_000;
-        let sqrt_p = |k: i32| (den as f64 * 0.99f64.powi(k)).round() as i64;
-        let lp: i64 = 1_000_000_000_000;
-        let band = |k: i32| {
-            let (spb, spa) = (sqrt_p(k), sqrt_p(k + 1));
-            PoolView {
-                ident: Ident::new(&[k as u8 + 1]),
-                // Selling A: real A reserve 0, real B = L·(√pb − √pa).
-                reserve_in: BigInt::from(0),
-                reserve_out: BigInt::from(lp / den * (spb - spa)),
-                fee_num: 3,
-                fee_den: 1000,
-                view_type: PoolViewType::ConcentratedLiquidity {
-                    is_a_input: true,
-                    spa_num: BigInt::from(spa),
-                    spa_den: BigInt::from(den),
-                    spb_num: BigInt::from(spb),
-                    spb_den: BigInt::from(den),
-                    lp: BigInt::from(lp),
-                },
-            }
-        };
-        let bands: Vec<PoolView> = (0..14).map(band).collect();
-        let cap = |p: &PoolView| pool_absorb_cap(p).expect("CL bands are capped");
-        // Two full bands plus half of the third.
-        let dx = &(&cap(&bands[0]) + &cap(&bands[1])) + &(&cap(&bands[2]) / &BigInt::from(2));
-
-        // Reference: greedy fill in price order.
-        let mut left = dx.clone();
-        let mut greedy = BigInt::from(0);
-        for b in &bands {
-            let take = if left > cap(b) { cap(b) } else { left.clone() };
-            greedy = &greedy + &pool_output(b, &take);
-            left = &left - &take;
-        }
-        assert!(!left.is_positive());
-
-        let total = |splits: &[SplitEntry]| {
-            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.output_amount)
-        };
-        let routed = |splits: &[SplitEntry]| {
-            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.input_amount)
-        };
-
-        let near = optimize_split(&bands[..3], &dx);
-        let all = optimize_split(&bands, &dx);
-        assert_eq!(routed(&near), dx);
-        assert_eq!(routed(&all), dx);
-
-        // Within 1e-6 of the greedy optimum.
-        let tol = &greedy / &BigInt::from(1_000_000);
-        assert!(
-            &total(&all) + &tol >= greedy,
-            "14 bands: {} vs greedy {}",
-            total(&all),
-            greedy,
-        );
-        assert!(
-            &total(&near) + &tol >= greedy,
-            "3 bands: {} vs greedy {}",
-            total(&near),
-            greedy,
-        );
-        for s in &all {
-            let k = bands.iter().position(|b| b.ident == s.pool.ident).unwrap();
-            assert!(
-                k < 3,
-                "band {} gets {} but should be untouched",
-                k,
-                s.input_amount
-            );
-        }
-    }
-
-    /// The proportional rescale of an over-allocation can land exactly on
-    /// `total_input`; the bisection must not take that for convergence. Three
-    /// constant-sum pools of 1M capacity each, priced 1.2, 1.1 and 1.0, sell
-    /// 1.5M (no pool can take it alone). The first λ is below every marginal:
-    /// all three absorb their cap, 3M, and halving it gives exactly 1.5M. The
-    /// worst pool must still end up with nothing.
     #[test]
     fn test_split_exact_rescale_keeps_raising_lambda() {
         let cs = |byte: u8, price_in: i64, reserve_out: i64| PoolView {

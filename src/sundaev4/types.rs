@@ -629,16 +629,6 @@ pub enum PoolType {
         bounty_k: Rational,
         balance_fee: Rational,
     },
-    /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
-    /// bound the pool's price range (`a < b`). The validator works on
-    /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
-    /// and the CP invariant `VA·VB = L²·spb_num·spa_den`. Cross-range
-    /// execution is done by the router splitting across multiple CL pools.
-    ConcentratedLiquidity {
-        sqrt_price_a: Rational,
-        sqrt_price_b: Rational,
-        fee: Rational,
-    },
     /// Curve-style stableswap (`validators/modules/stableswap.ak`). The whole
     /// config preimage rides along: the Operate redeemer re-sends it, the
     /// output datum's `module_state` slot is its hash, and `rates` may change
@@ -725,13 +715,6 @@ pub struct ConstantSumConfig {
     /// OP-PORTION V (claim restored), so the claim is bounded by cap_b plus
     /// the no-overshoot guard — cap_a (claim <= v_increase) is gone.
     pub balance_fee: Rational,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ConcentratedLiquidityConfig {
-    pub sqrt_price_a: Rational,
-    pub sqrt_price_b: Rational,
-    pub fee: Rational,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -977,26 +960,6 @@ pub enum ConstantSumRedeemer {
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub enum ConcentratedLiquidityRedeemer {
-    Create {
-        initial_state: ConcentratedLiquidityConfig,
-    },
-    Operate {
-        entries: Vec<CLOperateEntry>,
-    },
-    /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy {
-        entries: Vec<PlutusData>,
-    },
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct CLOperateEntry {
-    pub pool_oref: OutputRef,
-    pub config: ConcentratedLiquidityConfig,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct CSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: ConstantSumConfig,
@@ -1174,14 +1137,6 @@ impl SlotConfig {
 pub enum PoolConfig {
     ConstantSum {
         prices: Vec<i64>,
-        fee: (u64, u64),
-    },
-    /// Operator-provided override for CL pools whose Create-redeemer
-    /// config wasn't recoverable from chain history. Stored as a sqrt-
-    /// price range `[a, b]` with `a < b`, fee as `(num, den)`.
-    ConcentratedLiquidity {
-        sqrt_price_a: (i64, i64),
-        sqrt_price_b: (i64, i64),
         fee: (u64, u64),
     },
 }
@@ -1421,9 +1376,6 @@ pub struct ModuleScripts {
     /// Optional: only required when scooping constant-sum pools.
     #[serde(default)]
     pub constant_sum: Option<ScriptRefInfo>,
-    /// Optional: only required when scooping concentrated-liquidity pools.
-    #[serde(default)]
-    pub concentrated_liquidity: Option<ScriptRefInfo>,
     /// Optional: only required when scooping stableswap pools. Without it
     /// the scooper cannot classify a stableswap pool and skips it (see
     /// `detect_pool_type`).

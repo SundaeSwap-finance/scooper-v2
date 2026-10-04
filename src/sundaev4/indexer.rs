@@ -116,7 +116,6 @@ pub struct SundaeV4Indexer {
 pub struct PoolModuleConfigCache {
     pub cs: BTreeMap<Ident, crate::sundaev4::types::ConstantSumConfig>,
     pub cp: BTreeMap<Ident, crate::sundaev4::types::ConstantProductConfig>,
-    pub cl: BTreeMap<Ident, crate::sundaev4::types::ConcentratedLiquidityConfig>,
     /// Stableswap configs carry the pool's current `rates`; a tag-7 update
     /// replaces the entry (the persisted row is upserted).
     pub ss: BTreeMap<Ident, crate::sundaev4::types::StableSwapConfig>,
@@ -177,8 +176,7 @@ impl SundaeV4Indexer {
     /// to default configs (wrong module_state hash → on-chain eval fails).
     pub async fn rehydrate_module_configs(&self) -> Result<()> {
         use crate::sundaev4::types::{
-            ConcentratedLiquidityConfig, ConstantProductConfig, ConstantSumConfig, FeeSplitConfig,
-            StableSwapConfig,
+            ConstantProductConfig, ConstantSumConfig, FeeSplitConfig, StableSwapConfig,
         };
         let persisted_configs = self.dao.load_module_configs().await?;
         let ss_module_hash: Option<Vec<u8>> = self
@@ -205,12 +203,6 @@ impl SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_product.as_ref())
             .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .map(|cl| cl.hash.as_ref().to_vec());
         let fs_module_hash: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -228,10 +220,6 @@ impl SundaeV4Indexer {
                 let parsed = ConstantProductConfig::from_plutus(pd)
                     .context("could not parse persisted ConstantProductConfig")?;
                 cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == cl_module_hash.as_ref() {
-                let parsed = ConcentratedLiquidityConfig::from_plutus(pd)
-                    .context("could not parse persisted ConcentratedLiquidityConfig")?;
-                cache.cl.insert(Ident::new(&cfg.pool_id), parsed);
             } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
                 let parsed = FeeSplitConfig::from_plutus(pd)
                     .context("could not parse persisted FeeSplitConfig")?;
@@ -249,7 +237,6 @@ impl SundaeV4Indexer {
         info!(
             cs = cache.cs.len(),
             cp = cache.cp.len(),
-            cl = cache.cl.len(),
             ss = cache.ss.len(),
             bcl = cache.bcl.len(),
             fs = cache.fee_split.len(),
@@ -288,7 +275,6 @@ impl SundaeV4Indexer {
                 self.protocol.execution.as_ref(),
                 cache.cs.get(ident),
                 cache.cp.get(ident),
-                cache.cl.get(ident),
                 ss.as_ref(),
                 bcl.as_ref(),
             );
@@ -626,7 +612,6 @@ impl SundaeV4Indexer {
     ) -> crate::sundaev4::types::PoolType {
         let cs = cache.cs.get(&pool_datum.identifier);
         let cp = cache.cp.get(&pool_datum.identifier);
-        let cl = cache.cl.get(&pool_datum.identifier);
         let ss = self.cached_ss_config(pool_datum, cache);
         let bcl = self.cached_bcl_config(pool_datum, cache);
         detect_pool_type(
@@ -634,7 +619,6 @@ impl SundaeV4Indexer {
             self.protocol.execution.as_ref(),
             cs,
             cp,
-            cl,
             ss.as_ref(),
             bcl.as_ref(),
         )
@@ -801,7 +785,6 @@ pub fn module_ref_utxos(
     let optional = [
         &scripts.constant_product,
         &scripts.constant_sum,
-        &scripts.concentrated_liquidity,
         &scripts.stableswap,
         &scripts.swap_order,
         &scripts.basic_order,
@@ -904,28 +887,6 @@ pub fn extract_cp_config_from_tx(
     let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
     match parsed {
         ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
-        _ => None,
-    }
-}
-
-/// Try to extract a `ConcentratedLiquidityConfig` from a tx's CL module
-/// withdrawal Create redeemer (the pool's mint tx). Operate redeemers
-/// carry per-pool entries and need to be matched by `pool_oref`.
-pub fn extract_cl_config_from_tx(
-    tx: &MultiEraTx,
-    cl_script_hash: &ScriptHash,
-) -> Option<crate::sundaev4::types::ConcentratedLiquidityConfig> {
-    use crate::sundaev4::types::ConcentratedLiquidityRedeemer;
-
-    let wd_index = withdrawal_index_of_script(tx, cl_script_hash)?;
-    let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
-    let parsed: ConcentratedLiquidityRedeemer =
-        AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
-    match parsed {
-        ConcentratedLiquidityRedeemer::Create { initial_state } => Some(initial_state),
         _ => None,
     }
 }
@@ -1233,12 +1194,6 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
             .and_then(|h| extract_cp_config_from_tx(&tx, &h));
-        let cl_config_from_tx = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .and_then(|cl| extract_cl_config_from_tx(&tx, &cl.hash));
         let fs_config_from_tx =
             self.protocol.execution.as_ref().and_then(|e| {
                 extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
@@ -1295,12 +1250,6 @@ impl ChainIndex for SundaeV4Indexer {
             .as_ref()
             .and_then(|e| e.module_scripts.constant_product.as_ref())
             .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .map(|cl| cl.hash.as_ref().to_vec());
         let ss_module_hash_bytes: Option<Vec<u8>> = self
             .protocol
             .execution
@@ -1350,8 +1299,6 @@ impl ChainIndex for SundaeV4Indexer {
                         cs_config_from_tx.as_ref().or_else(|| module_cache.cs.get(&pool_id));
                     let resolved_cp =
                         cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
-                    let resolved_cl =
-                        cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
                     // Stableswap: the datum's module_state hash selects among
                     // this tx's candidates and the cache. A cached config a
                     // rate update has superseded is not used.
@@ -1376,7 +1323,6 @@ impl ChainIndex for SundaeV4Indexer {
                         self.protocol.execution.as_ref(),
                         resolved_cs,
                         resolved_cp,
-                        resolved_cl,
                         resolved_ss.as_ref(),
                         resolved_bcl.as_ref(),
                     );
@@ -1466,29 +1412,6 @@ impl ChainIndex for SundaeV4Indexer {
                         info!(
                             pool = %hex::encode(pool_id.to_bytes()),
                             "v4: persisted CP pool config from redeemer"
-                        );
-                    }
-                    // Same for CL: persist the spa/spb/fee from Create.
-                    if let (
-                        Some(cfg),
-                        crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. },
-                    ) = (cl_config_from_tx.as_ref(), &pool_type)
-                        && !module_cache.cl.contains_key(&pool_id)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode ConcentratedLiquidityConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: cl_module_hash_bytes
-                                .clone()
-                                .expect("cl_module_hash present when CL pool detected"),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            "v4: persisted CL pool config from Create redeemer"
                         );
                     }
 
@@ -2166,7 +2089,6 @@ pub fn detect_pool_type(
     execution: Option<&crate::sundaev4::types::ScooperExecution>,
     cs_config_from_tx: Option<&crate::sundaev4::types::ConstantSumConfig>,
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
-    cl_config_from_tx: Option<&crate::sundaev4::types::ConcentratedLiquidityConfig>,
     ss_config: Option<&crate::sundaev4::types::StableSwapConfig>,
     bcl_config: Option<&crate::sundaev4::types::BandedCLConfig>,
 ) -> crate::sundaev4::types::PoolType {
@@ -2187,8 +2109,6 @@ pub fn detect_pool_type(
     // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by tag.
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cl_hash =
-        exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash.as_ref().to_vec());
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
     let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash.as_ref().to_vec());
     let bcl_hash = exec
@@ -2217,13 +2137,6 @@ pub fn detect_pool_type(
         {
             matched_action = Some(action);
             matched_kind = Some("cs");
-            break;
-        }
-        if let Some(h) = &cl_hash
-            && first.as_slice() == h.as_slice()
-        {
-            matched_action = Some(action);
-            matched_kind = Some("cl");
             break;
         }
         if let Some(h) = &ss_hash
@@ -2389,61 +2302,6 @@ pub fn detect_pool_type(
         };
     }
 
-    if matched_kind == Some("cl") {
-        // Priority: operator override > on-chain Create redeemer > defaults
-        if let Some(crate::sundaev4::types::PoolConfig::ConcentratedLiquidity {
-            sqrt_price_a,
-            sqrt_price_b,
-            fee,
-        }) = exec.pool_configs.get(&ident_hex)
-        {
-            info!(pool = %ident_hex, "CL pool config from operator override");
-            return PoolType::ConcentratedLiquidity {
-                sqrt_price_a: Rational {
-                    num: BigInt::from(sqrt_price_a.0),
-                    den: BigInt::from(sqrt_price_a.1),
-                },
-                sqrt_price_b: Rational {
-                    num: BigInt::from(sqrt_price_b.0),
-                    den: BigInt::from(sqrt_price_b.1),
-                },
-                fee: Rational {
-                    num: BigInt::from(fee.0),
-                    den: BigInt::from(fee.1),
-                },
-            };
-        }
-        if let Some(cl_config) = cl_config_from_tx {
-            info!(pool = %ident_hex, "CL pool config extracted from Create redeemer");
-            return PoolType::ConcentratedLiquidity {
-                sqrt_price_a: cl_config.sqrt_price_a.clone(),
-                sqrt_price_b: cl_config.sqrt_price_b.clone(),
-                fee: cl_config.fee.clone(),
-            };
-        }
-        // CL pools require their sqrt-price bounds from the Create redeemer
-        // (or a stored config); there's no sensible default. Fall back to
-        // a tight range to avoid silent miscalculation — scoops against
-        // this pool will fail with module-state hash mismatch, which is
-        // the right loud failure.
-        warn!(pool = %ident_hex, "CL pool but no Create-redeemer config recovered yet — \
-            set a `concentrated-liquidity` pool-config override in scooper config to scoop this pool");
-        return PoolType::ConcentratedLiquidity {
-            sqrt_price_a: Rational {
-                num: BigInt::from(1),
-                den: BigInt::from(1),
-            },
-            sqrt_price_b: Rational {
-                num: BigInt::from(1),
-                den: BigInt::from(1),
-            },
-            fee: Rational {
-                num: BigInt::from(exec.fee.0),
-                den: BigInt::from(exec.fee.1),
-            },
-        };
-    }
-
     // CP path: prefer the per-pool config (this tx's redeemer OR cached) over
     // the global default — different CP pools can have different fees, and
     // `verify_module_state` hashes the config we send.
@@ -2558,7 +2416,6 @@ mod mainnet_create_tx_tests {
             stableswap: None,
             banded_concentrated_liquidity: None,
             oracle: None,
-            concentrated_liquidity: Some(next(CS_HASH)),
             swap_order: Some(next(CS_HASH)),
             basic_order: Some(next(CS_HASH)),
             route_order: Some(next(CS_HASH)),
@@ -2569,8 +2426,8 @@ mod mainnet_create_tx_tests {
         let tracked = module_ref_utxos(&scripts);
         assert_eq!(
             tracked.len(),
-            15,
-            "six required modules and nine optional ones"
+            14,
+            "six required modules and eight optional ones"
         );
         let fee_constraint_ref = scripts.fee_constraint.as_ref().unwrap().ref_utxo.clone();
         assert!(

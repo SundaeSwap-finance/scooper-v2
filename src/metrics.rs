@@ -48,7 +48,6 @@ impl BatchFailureReason {
 pub enum PoolFamily {
     ConstantProduct,
     ConstantSum,
-    ConcentratedLiquidity,
     StableSwap,
     BandedConcentratedLiquidity,
 }
@@ -58,7 +57,6 @@ impl PoolFamily {
         match self {
             Self::ConstantProduct => "cp",
             Self::ConstantSum => "cs",
-            Self::ConcentratedLiquidity => "cl",
             Self::StableSwap => "ss",
             Self::BandedConcentratedLiquidity => "bcl",
         }
@@ -148,7 +146,6 @@ pub struct Metrics {
     /// increments multiple families.
     scooped_cp: AtomicU64,
     scooped_cs: AtomicU64,
-    scooped_cl: AtomicU64,
     scooped_ss: AtomicU64,
     scooped_bcl: AtomicU64,
     /// Submit latency histogram in seconds. Buckets are tuned for
@@ -244,7 +241,6 @@ impl Metrics {
             failed_eval_error: AtomicU64::new(0),
             scooped_cp: AtomicU64::new(0),
             scooped_cs: AtomicU64::new(0),
-            scooped_cl: AtomicU64::new(0),
             scooped_ss: AtomicU64::new(0),
             scooped_bcl: AtomicU64::new(0),
             submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
@@ -285,7 +281,6 @@ impl Metrics {
         let counter = match family {
             PoolFamily::ConstantProduct => &self.scooped_cp,
             PoolFamily::ConstantSum => &self.scooped_cs,
-            PoolFamily::ConcentratedLiquidity => &self.scooped_cl,
             PoolFamily::StableSwap => &self.scooped_ss,
             PoolFamily::BandedConcentratedLiquidity => &self.scooped_bcl,
         };
@@ -633,10 +628,6 @@ pub async fn render_metrics(
         (
             PoolFamily::ConstantSum.label(),
             metrics.scooped_cs.load(Ordering::Relaxed),
-        ),
-        (
-            PoolFamily::ConcentratedLiquidity.label(),
-            metrics.scooped_cl.load(Ordering::Relaxed),
         ),
         (
             PoolFamily::StableSwap.label(),
