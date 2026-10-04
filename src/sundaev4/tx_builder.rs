@@ -1349,17 +1349,12 @@ pub fn build_multi_pool_scoop_tx(
         // slot in the output datum on every scoop. None of that is built
         // yet, so such a pool is refused here with its reason rather than
         // failing on chain.
-        if let Some(oracle) = exec.module_scripts.oracle.as_ref() {
-            let needs_oracle = batch.pool.pool_datum.actions.iter().any(|a| {
-                a.enabled && a.modules.iter().any(|m| m.as_slice() == oracle.hash.as_ref())
-            });
-            if needs_oracle {
-                bail!(
-                    "pool {} lists the oracle module in its trade action; this scooper does not \
-                     build oracle entries yet",
-                    batch.pool.pool_datum.identifier
-                );
-            }
+        if pool_needs_oracle(exec, &batch.pool) {
+            bail!(
+                "pool {} lists the oracle module in its trade action; this scooper does not \
+                 build oracle entries yet",
+                batch.pool.pool_datum.identifier
+            );
         }
 
         match &batch.pool.pool_type {
@@ -3642,6 +3637,19 @@ fn build_pool_output_value(
 /// Resolve a pool's LP-token AssetClass. Sundae's LP asset is minted under
 /// the pool_mint policy with name `0014df10 ++ pool_ident` (CIP-67 label 222
 /// for LP).
+/// True when the pool's enabled trade action lists the oracle module.
+/// Scooping such a pool needs an oracle Operate entry that this scooper
+/// does not build yet, so dispatch withholds the pool from the router.
+pub fn pool_needs_oracle(exec: &ScooperExecution, pool: &SundaeV4Pool) -> bool {
+    let Some(oracle) = exec.module_scripts.oracle.as_ref() else {
+        return false;
+    };
+    pool.pool_datum
+        .actions
+        .iter()
+        .any(|a| a.enabled && a.modules.iter().any(|m| m.as_slice() == oracle.hash.as_ref()))
+}
+
 fn pool_lp_asset(exec: &ScooperExecution, pool: &SundaeV4Pool) -> Result<AssetClass> {
     let mut name = vec![0x00, 0x14, 0xdf, 0x10];
     name.extend_from_slice(pool.pool_datum.identifier.to_bytes());
