@@ -108,6 +108,7 @@ pub struct Accumulator {
     pub pools: BTreeMap<Ident, PoolAccum>,
     routes: Vec<RouteInfo>,
     conversions: Vec<batch::PlannedConversion>,
+    moves: Vec<batch::ResolvedMove>,
     /// Order ops were added across all pools, stored as `(pool_ident, op_idx_in_pool)`.
     /// Resolved to `(batch_idx, op_idx)` in `into_plan` once batches are materialised.
     global_seq_raw: Vec<(Ident, usize)>,
@@ -172,6 +173,7 @@ impl Accumulator {
             pools: BTreeMap::new(),
             routes: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
             global_seq_raw: Vec::new(),
             protocol_share,
         }
@@ -510,6 +512,132 @@ impl Accumulator {
     ///
     /// Fee budget computed here is router-projected; tx_builder recomputes
     /// fresh per-pool fee budgets during its streaming walk.
+    /// Add a liquidity movement: burn the order's offered LP in `from` and
+    /// deposit the proportional payout into `to`, minting `to`'s LP. Both
+    /// legs are proportional steps (fee_budget 0 on every curve), so the
+    /// only curve maths is the ceil/floor pin each pool already applies to
+    /// its deposits and withdraws. The caller works on a cloned accumulator
+    /// and drops it on `Err`, so a failed deposit leg after an applied
+    /// withdraw leg leaves no partial state behind.
+    pub fn try_add_move(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        from_ident: &Ident,
+        from_pool: &Arc<SundaeV4Pool>,
+        to_ident: &Ident,
+        to_pool: &Arc<SundaeV4Pool>,
+    ) -> Result<(), String> {
+        use num_traits::Signed;
+
+        let crate::sundaev4::types::Constraint::Swap {
+            offered,
+            remaining_offered,
+            min_received,
+            ..
+        } = &order.constraint
+        else {
+            return Err("movement order is not Swap-constrained".into());
+        };
+        if from_ident == to_ident {
+            return Err("movement must name two different pools".into());
+        }
+        let Some(min_lp) = batch::declared_min_lp(min_received, to_ident).cloned() else {
+            return Err("movement needs the order's declared LP minimum for the target pool".into());
+        };
+
+        // Withdraw leg.
+        let fresh = self.fresh_pool_accum(from_ident, from_pool);
+        let accum = self.pools.entry(from_ident.clone()).or_insert(fresh);
+        accum.check_canonical_append(&order.input)?;
+        let mut transient = (**from_pool).clone();
+        transient.pool_datum.assets = accum.running_assets.clone();
+        transient.pool_datum.total_lp = accum.running_total_lp.clone();
+        let offered_list = [(offered.clone(), remaining_offered.clone())];
+        let (lp_burned, dy, wd_target) =
+            batch::resolve_withdraw_of_offered(&transient, &offered_list)?;
+        let next_preminted = accum.lp_return_after(&lp_burned)?;
+        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+            *amt = &*amt - &dy[i];
+        }
+        accum.running_total_lp = &accum.running_total_lp - &lp_burned;
+        accum.running_circ_lp = &accum.running_circ_lp - &lp_burned;
+        accum.running_preminted = next_preminted;
+        let withdrawn: Vec<(AssetClass, BigInt)> = accum
+            .running_assets
+            .iter()
+            .zip(dy.iter())
+            .map(|((a, _), q)| (a.clone(), q.clone()))
+            .collect();
+        let w_idx = accum.withdraws.len();
+        accum.withdraws.push(batch::ResolvedWithdraw {
+            order: order.clone(),
+            lp_burned: lp_burned.clone(),
+            dy,
+            target_delta_v: wd_target,
+        });
+        let op_idx = accum.ops_order.len();
+        accum.ops_order.push(BatchOp::Withdraw(w_idx));
+        self.global_seq_raw.push((from_ident.clone(), op_idx));
+
+        // Deposit leg, fed by the withdraw payout.
+        let fresh = self.fresh_pool_accum(to_ident, to_pool);
+        let accum = self.pools.entry(to_ident.clone()).or_insert(fresh);
+        accum.check_canonical_append(&order.input)?;
+        let basket = batch::align_offered_to_pool(&withdrawn, &accum.running_assets);
+        let (dx, lp_minted, dep_target) = batch::resolve_deposit_basket(
+            &to_pool.pool_type,
+            &accum.running_assets,
+            &accum.running_total_lp,
+            &basket,
+        )?;
+        if !lp_minted.is_positive() {
+            return Err("movement deposit produces zero LP".into());
+        }
+        if lp_minted < min_lp {
+            return Err(format!(
+                "movement mints {lp_minted} LP, below the order's minimum {min_lp}"
+            ));
+        }
+        let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
+        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+            *amt = &*amt + &dx[i];
+        }
+        accum.running_total_lp = &accum.running_total_lp + &lp_minted;
+        accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
+        accum.running_preminted = next_preminted;
+        accum.running_minted = next_minted;
+        let deposited: Vec<(AssetClass, BigInt)> = accum
+            .running_assets
+            .iter()
+            .zip(dx.iter())
+            .map(|((a, _), q)| (a.clone(), q.clone()))
+            .collect();
+        let dep_idx = accum.deposits.len();
+        accum.deposits.push(batch::ResolvedDeposit {
+            order: order.clone(),
+            dx,
+            lp_minted: lp_minted.clone(),
+            surplus: Vec::new(),
+            target_delta_v: dep_target,
+        });
+        let op_idx = accum.ops_order.len();
+        accum.ops_order.push(BatchOp::Deposit(dep_idx));
+        self.global_seq_raw.push((to_ident.clone(), op_idx));
+
+        self.moves.push(batch::ResolvedMove {
+            order: order.clone(),
+            from_pool: from_ident.clone(),
+            to_pool: to_ident.clone(),
+            from_batch: usize::MAX,
+            to_batch: usize::MAX,
+            lp_burned,
+            withdrawn,
+            deposited,
+            lp_minted,
+        });
+        Ok(())
+    }
+
     pub fn try_add_routed_order(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,
@@ -1058,11 +1186,22 @@ impl Accumulator {
             })
             .collect();
 
+        let moves = self
+            .moves
+            .into_iter()
+            .map(|mut m| {
+                m.from_batch = ident_to_batch_idx[&m.from_pool];
+                m.to_batch = ident_to_batch_idx[&m.to_pool];
+                m
+            })
+            .collect();
+
         ScoopPlan {
             batches,
             routes: self.routes,
             global_seq,
             conversions,
+            moves,
         }
     }
 

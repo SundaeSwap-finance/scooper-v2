@@ -189,6 +189,30 @@ pub struct ScoopPlan {
     /// Off-protocol conversion legs (Butane mints, …) the tx must compose
     /// alongside the pool ops. Empty for pool-only plans.
     pub conversions: Vec<PlannedConversion>,
+    /// Liquidity movements: one order that burns pool X's LP and mints pool
+    /// Y's. Each move also appears as a withdraw leg in X's batch and a
+    /// deposit leg in Y's batch, so the pool walks need no new op kind; the
+    /// order itself is fulfilled once, from this record.
+    pub moves: Vec<ResolvedMove>,
+}
+
+/// An "offer LP_X, ask LP_Y" order resolved into a proportional withdraw
+/// from pool X and a proportional deposit into pool Y, in one transaction.
+/// Any withdrawn asset the deposit does not consume returns to the user.
+#[derive(Clone, Debug)]
+pub struct ResolvedMove {
+    pub order: Arc<SundaeV4Order>,
+    pub from_pool: Ident,
+    pub to_pool: Ident,
+    /// Batch indices, filled in by `into_plan`.
+    pub from_batch: usize,
+    pub to_batch: usize,
+    pub lp_burned: BigInt,
+    /// Withdraw payout, in pool X's asset order.
+    pub withdrawn: Vec<(AssetClass, BigInt)>,
+    /// Deposit contribution, in pool Y's asset order.
+    pub deposited: Vec<(AssetClass, BigInt)>,
+    pub lp_minted: BigInt,
 }
 
 /// One planned off-protocol conversion leg: `dx` of `from` becomes `out` of
@@ -377,9 +401,36 @@ pub fn find_pool_for_withdraw_order(
     find_pool_by_lp_asset(offered, pools)
 }
 
+/// Detect a liquidity movement: a Swap-constrained order whose offered asset
+/// is one indexed pool's LP token and whose `min_received` names another
+/// indexed pool's LP token. Returns `(from_pool, to_pool)`. The basic module
+/// checks only aggregate consumption and floors on chain, so such an order
+/// is valid; the router cannot serve it because no pool edge trades LP.
+pub fn movement_pools(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Option<(Ident, Ident)> {
+    let Constraint::Swap {
+        offered,
+        remaining_offered,
+        min_received,
+        ..
+    } = &order.constraint
+    else {
+        return None;
+    };
+    let offered_list = [(offered.clone(), remaining_offered.clone())];
+    let from = find_pool_by_lp_asset(&offered_list, pools)?;
+    let to = find_pool_by_lp_asset(min_received, pools)?;
+    if from == to {
+        return None;
+    }
+    Some((from, to))
+}
+
 /// Search a `(asset, qty)` list for a CIP-67 LP token (label `0014df10`) and
 /// return the pool whose identifier matches the token's suffix.
-fn find_pool_by_lp_asset(
+pub fn find_pool_by_lp_asset(
     assets: &[(AssetClass, BigInt)],
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
@@ -1269,12 +1320,28 @@ pub fn resolve_proportional_withdraw(
     pool: &SundaeV4Pool,
     order: &Arc<SundaeV4Order>,
 ) -> Result<ResolvedWithdraw, String> {
-    use num_traits::Signed;
-
     let offered = match &order.constraint {
         Constraint::Withdraw { offered, .. } => offered,
         _ => return Err("order is not a Withdraw".into()),
     };
+    let (lp_burned, dy, target_delta_v) = resolve_withdraw_of_offered(pool, offered)?;
+    Ok(ResolvedWithdraw {
+        order: order.clone(),
+        lp_burned,
+        dy,
+        target_delta_v,
+    })
+}
+
+/// Resolve a proportional withdraw from an offered list that must name this
+/// pool's LP token. Returns `(lp_burned, dy, target_delta_v)`; `lp_burned`
+/// can fall short of the offered LP when the curve's pin leaves a remainder,
+/// which the fulfillment returns to the user.
+pub fn resolve_withdraw_of_offered(
+    pool: &SundaeV4Pool,
+    offered: &[(AssetClass, BigInt)],
+) -> Result<(BigInt, Vec<BigInt>, Option<BigInt>), String> {
+    use num_traits::Signed;
 
     // Withdrawals offer exactly one LP token; locate it via the CIP-67 label
     // and confirm it belongs to this pool.
@@ -1351,12 +1418,7 @@ pub fn resolve_proportional_withdraw(
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned: actual_burn,
-                dy,
-                target_delta_v: Some(t),
-            })
+            Ok((actual_burn, dy, Some(t)))
         }
         // Target-pinned withdraw (ss_check tag 4): the entry declares a
         // negative D delta t; each reserve moves by ceil(r_i · t / D) (so
@@ -1378,7 +1440,6 @@ pub fn resolve_proportional_withdraw(
             let step =
                 super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, Some(&d_before))?;
             tracing::debug!(
-                order = %order.input,
                 reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                 total_lp = %total_lp,
                 lp_burned = %lp_burned,
@@ -1397,12 +1458,7 @@ pub fn resolve_proportional_withdraw(
             if dy.iter().all(|q| !q.is_positive()) {
                 return Err("withdraw pays out zero of every reserve".into());
             }
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned: actual_burn,
-                dy,
-                target_delta_v: Some(t),
-            })
+            Ok((actual_burn, dy, Some(t)))
         }
         _ => {
             let dy: Vec<BigInt> =
@@ -1412,12 +1468,7 @@ pub fn resolve_proportional_withdraw(
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned,
-                dy,
-                target_delta_v: None,
-            })
+            Ok((lp_burned, dy, None))
         }
     }
 }

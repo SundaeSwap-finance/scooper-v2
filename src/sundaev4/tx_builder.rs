@@ -435,12 +435,15 @@ pub fn build_multi_pool_scoop_tx(
     let n_zap_orders: usize = batches.iter().map(|b| b.zaps.len()).sum();
     let n_claim_orders: usize = batches.iter().map(|b| b.claims.len()).sum();
     let n_conversion_orders: usize = plan.conversions.iter().filter(|c| c.primary).count();
+    // A movement contributes one withdraw leg and one deposit leg but is a
+    // single order, fulfilled once from plan.moves.
     let n_orders: usize = n_swap_orders
         + n_deposit_orders
         + n_withdraw_orders
         + n_zap_orders
         + n_claim_orders
-        + n_conversion_orders;
+        + n_conversion_orders
+        - plan.moves.len();
     // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
     // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
     if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
@@ -1180,6 +1183,9 @@ pub fn build_multi_pool_scoop_tx(
         /// Index into plan.conversions — a conversion leg that IS the
         /// order's primary op (pure-conversion orders; batch_idx unused).
         Conversion(usize),
+        /// Index into plan.moves — a liquidity movement whose withdraw and
+        /// deposit legs sit in two batches; batch_idx is the deposit pool.
+        Move(usize),
     }
     #[derive(Clone)]
     struct FlatOrder {
@@ -1187,6 +1193,11 @@ pub fn build_multi_pool_scoop_tx(
         kind: FlatOrderKind,
         order_ref: TransactionInput,
     }
+    // A movement's withdraw and deposit legs are pool ops, not orders of
+    // their own: the order is fulfilled once, from plan.moves.
+    let move_orders: std::collections::BTreeSet<&TransactionInput> =
+        plan.moves.iter().map(|m| &m.order.input.0).collect();
+    let move_orders = &move_orders;
     let flat_orders: Vec<FlatOrder> = batches
         .iter()
         .enumerate()
@@ -1196,16 +1207,26 @@ pub fn build_multi_pool_scoop_tx(
                 kind: FlatOrderKind::Swap(si),
                 order_ref: s.order.input.0.clone(),
             });
-            let deps = b.deposits.iter().enumerate().map(move |(di, d)| FlatOrder {
-                batch_idx: bi,
-                kind: FlatOrderKind::Deposit(di),
-                order_ref: d.order.input.0.clone(),
-            });
-            let wds = b.withdraws.iter().enumerate().map(move |(wi, w)| FlatOrder {
-                batch_idx: bi,
-                kind: FlatOrderKind::Withdraw(wi),
-                order_ref: w.order.input.0.clone(),
-            });
+            let deps = b
+                .deposits
+                .iter()
+                .enumerate()
+                .filter(move |(_, d)| !move_orders.contains(&d.order.input.0))
+                .map(move |(di, d)| FlatOrder {
+                    batch_idx: bi,
+                    kind: FlatOrderKind::Deposit(di),
+                    order_ref: d.order.input.0.clone(),
+                });
+            let wds = b
+                .withdraws
+                .iter()
+                .enumerate()
+                .filter(move |(_, w)| !move_orders.contains(&w.order.input.0))
+                .map(move |(wi, w)| FlatOrder {
+                    batch_idx: bi,
+                    kind: FlatOrderKind::Withdraw(wi),
+                    order_ref: w.order.input.0.clone(),
+                });
             let zps = b.zaps.iter().enumerate().map(move |(zi, z)| FlatOrder {
                 batch_idx: bi,
                 kind: FlatOrderKind::Zap(zi),
@@ -1228,6 +1249,13 @@ pub fn build_multi_pool_scoop_tx(
                 order_ref: c.order_input.0.clone(),
             });
         }
+    }
+    for (mi, m) in plan.moves.iter().enumerate() {
+        flat_orders.push(FlatOrder {
+            batch_idx: m.to_batch,
+            kind: FlatOrderKind::Move(mi),
+            order_ref: m.order.input.0.clone(),
+        });
     }
     let flat_orders = flat_orders;
     let all_order_orefs: Vec<TransactionInput> =
@@ -1604,6 +1632,7 @@ pub fn build_multi_pool_scoop_tx(
                 batches[flat.batch_idx].claims[*i].order.datum.config_token.clone()
             }
             FlatOrderKind::Conversion(i) => plan.conversions[*i].order.datum.config_token.clone(),
+            FlatOrderKind::Move(i) => plan.moves[*i].order.datum.config_token.clone(),
         }
     };
     let flat_order_ref_and_datum =
@@ -1633,6 +1662,7 @@ pub fn build_multi_pool_scoop_tx(
                 FlatOrderKind::Conversion(i) => {
                     (&flat.order_ref, &plan.conversions[*i].order.datum)
                 }
+                FlatOrderKind::Move(i) => (&flat.order_ref, &plan.moves[*i].order.datum),
             }
         };
     let mut unique_config_tokens: Vec<Vec<u8>> = Vec::new();
@@ -2336,6 +2366,7 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Zap(i) => &batches[fo_meta.batch_idx].zaps[*i].order,
             FlatOrderKind::Claim(i) => &batches[fo_meta.batch_idx].claims[*i].order,
             FlatOrderKind::Conversion(i) => &plan.conversions[*i].order,
+            FlatOrderKind::Move(i) => &plan.moves[*i].order,
         };
         // Partial fill detection (swap-module orders only): the fill size
         // is the route's hop-0 input (routed) or the resolved swap's dx
@@ -2601,6 +2632,28 @@ pub fn build_multi_pool_scoop_tx(
                     &total_out,
                     actual_fee,
                 )?
+            }
+            FlatOrderKind::Move(i) => {
+                // Order value − LP_X·burned + LP_Y·minted + (withdrawn −
+                // deposited) per asset − fee. The LP assets differ by pool,
+                // so they are keyed separately; pool assets shared by both
+                // pools net against each other.
+                let m = &plan.moves[*i];
+                let lp_from = pool_lp_asset(exec, &batches[m.from_batch].pool)?;
+                let lp_to = pool_lp_asset(exec, &batches[m.to_batch].pool)?;
+                let mut net: std::collections::BTreeMap<AssetClass, BigInt> =
+                    std::collections::BTreeMap::new();
+                *net.entry(lp_from).or_insert_with(|| BigInt::from(0)) -= &m.lp_burned;
+                *net.entry(lp_to).or_insert_with(|| BigInt::from(0)) += &m.lp_minted;
+                for (a, q) in &m.withdrawn {
+                    *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+                }
+                for (a, q) in &m.deposited {
+                    *net.entry(a.clone()).or_insert_with(|| BigInt::from(0)) -= q;
+                }
+                let moves: Vec<(&AssetClass, BigInt)> =
+                    net.iter().map(|(a, q)| (a, q.clone())).collect();
+                build_fulfillment_value_with_moves(&m.order.value, &moves, actual_fee)?
             }
             FlatOrderKind::Claim(i) => {
                 // Fulfillment = order value moved by the NEGATED pool deltas

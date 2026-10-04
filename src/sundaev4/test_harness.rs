@@ -312,6 +312,7 @@ impl TestEnv {
             routes: Vec::new(),
             global_seq: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
         };
         self.build_and_eval_plan(&plan, settings, slot)
     }

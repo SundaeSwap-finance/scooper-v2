@@ -1469,6 +1469,60 @@ impl Scooper {
                         }
                     }
                 }
+                crate::sundaev4::Constraint::Swap { .. }
+                    if batch::movement_pools(order, &pools_filtered).is_some() =>
+                {
+                    // Liquidity movement: offer pool X's LP, ask pool Y's LP.
+                    // No pool edge trades LP, so the router can't serve it;
+                    // it resolves as a withdraw from X and a deposit into Y.
+                    let (from_ident, to_ident) =
+                        batch::movement_pools(order, &pools_filtered).expect("checked by guard");
+                    let permitted = [&from_ident, &to_ident]
+                        .iter()
+                        .all(|p| exec.pool_allowlists.permits(p, order, order_strategy));
+                    if !permitted {
+                        trace!(
+                            order = %order.input,
+                            from = %from_ident,
+                            to = %to_ident,
+                            "order dispatch: movement, not on a pool's allowlist",
+                        );
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
+                    tracing::info!(
+                        order = %order.input,
+                        kind = "move",
+                        from_pool = %from_ident,
+                        to_pool = %to_ident,
+                        "order dispatch",
+                    );
+                    let from_pool = pick_effective_pool(
+                        &candidate,
+                        &self.v4_chain_tracker,
+                        &v4_state,
+                        &from_ident,
+                    );
+                    let to_pool = pick_effective_pool(
+                        &candidate,
+                        &self.v4_chain_tracker,
+                        &v4_state,
+                        &to_ident,
+                    );
+                    let (Some(from_pool), Some(to_pool)) = (from_pool, to_pool) else {
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    match candidate.try_add_move(order, &from_ident, &from_pool, &to_ident, &to_pool)
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
+                            skip_add_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add failed");
+                            false
+                        }
+                    }
+                }
                 _ => {
                     // Swap: route through the optimizer against the
                     // accumulator's *current* pool state, so prior orders'
@@ -2176,13 +2230,15 @@ impl Scooper {
         foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
         funding_is_predicted: bool,
     ) -> bool {
+        // A movement's two legs serve one order; count distinct orders.
         let n_orders: usize = final_plan
             .batches
             .iter()
             .map(|b| {
                 b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len()
             })
-            .sum();
+            .sum::<usize>()
+            - final_plan.moves.len();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
             final_plan.batches.iter().map(|b| b.pool_ident.clone()).collect();
@@ -2198,6 +2254,8 @@ impl Scooper {
                     .chain(b.zaps.iter().map(|o| o.order.input.clone()))
                     .chain(b.claims.iter().map(|o| o.order.input.clone()))
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         // Refresh the validity window — the binary search phase may have taken
         // many seconds, so the window captured at the start of the cycle could
@@ -2576,7 +2634,13 @@ impl Scooper {
                     // appears ONLY here, and missing it would let the next
                     // cycle re-dispatch a spent order.
                     .chain(final_plan.conversions.iter().map(|c| c.order.clone()))
-                    .collect();
+                    // A movement's two legs name the same order once each.
+                    .fold(Vec::new(), |mut acc: Vec<Arc<crate::sundaev4::SundaeV4Order>>, o| {
+                        if !acc.iter().any(|a| a.input == o.input) {
+                            acc.push(o);
+                        }
+                        acc
+                    });
 
                 // Build predicted pools for chain tracker
                 let predicted_pools: Vec<_> = final_tx
@@ -2957,6 +3021,7 @@ impl Scooper {
                 op_idx: 0,
             }],
             conversions: Vec::new(),
+            moves: Vec::new(),
         };
         Some((scoop_plan, sse_pd))
     }
