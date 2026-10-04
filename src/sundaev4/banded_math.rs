@@ -399,7 +399,8 @@ pub fn swap_steps_from(
             // This band pays nothing more: cross to the next one, once.
             let Some(k_next) = next_band(before.k, is_a_input, n) else {
                 return Err(format!(
-                    "swap of {dx} exhausts the ladder in band {} with {remaining} unfilled",
+                    "swap of {dx} cannot be completed: band {} is the ladder's last in this \
+                     direction and {remaining} of input would pay no output there",
                     before.k
                 ));
             };
@@ -1010,6 +1011,42 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = view_after_from(&cfg, &a, &b, false, &(&cap * &BigInt::from(3)), Some(&w));
         eprintln!("view_after: {:?}", t.elapsed());
+    }
+
+    /// Prints the vectors the Aiken adversarial tests use for the flow
+    /// fixture (4 bands 1.00..1.04 at 1e6, counter 1e9, band 2).
+    #[test]
+    fn flow_fixture_vectors() {
+        let r = |n: i64, d: i64| Rational { num: BigInt::from(n), den: BigInt::from(d) };
+        let cfg = BandedCLConfig {
+            bands: [1_000_000i64, 1_010_000, 1_020_000, 1_030_000]
+                .iter()
+                .map(|&n| BandSpec {
+                    start: r(n, 1_000_000),
+                    weight: BigInt::from(1),
+                    curve: BigInt::from(0),
+                    fee_buy: r(3, 1000),
+                    fee_sell: r(3, 1000),
+                })
+                .collect(),
+            closing: r(1_040_000, 1_000_000),
+            weight_total: BigInt::from(4),
+        };
+        let (a, b) = (BigInt::from(4_689_396i64), BigInt::from(5_025_000i64));
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        eprintln!("witness x={} k={} ra={} rb={} l={}", w.x, w.k, v.ra, v.rb, v.l);
+        // B-input: the step takes A out of band 2's residual `ra`.
+        let cap = max_dx_in_band(&v, false);
+        let dy_cap = band_output(&v, false, &cap);
+        let over = &cap + &BigInt::from(1);
+        let dy_over = band_output(&v, false, &over);
+        eprintln!("B-in cap dx={cap} dy={dy_cap}; over dx={over} dy={dy_over} (ra={})", v.ra);
+        let capped = swap_step(&cfg, &a, &b, &BigInt::from(1_000_000i64), false, &cap).unwrap();
+        eprintln!("cap step: dy={} after x={} k={} fb={}", capped.dy, capped.after.x, capped.after.k, capped.fee_budget);
+        eprintln!("over as plan: {:?}", swap_steps(&cfg, &a, &b, false, &over).map(|s| s.len()));
+        let one = swap_step(&cfg, &a, &b, &BigInt::from(1_000_000i64), false, &BigInt::from(5_000)).unwrap();
+        eprintln!("flow vector: dy={} after x={} k={} fb={}", one.dy, one.after.x, one.after.k, one.fee_budget);
     }
 
     #[test]
