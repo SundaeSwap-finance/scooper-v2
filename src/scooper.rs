@@ -1391,12 +1391,21 @@ impl Scooper {
                             .unwrap_or(0);
                         let base_fee_lov =
                             v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
-                        router::RoutingLimits::from_budget(
+                        // Every burn and mint leg is a pool touch and a
+                        // transcript step the order's budget has to buy,
+                        // priced like a routed hop. What is left buys the
+                        // swap stage between the legs.
+                        let legs = burn_specs.len() + mint_specs.len();
+                        let all = router::RoutingLimits::from_budget(
                             budget,
                             base_fee_lov,
                             exec.cost_per_pool_lovelace,
                             exec.cost_per_step_lovelace,
-                        )
+                        );
+                        router::RoutingLimits {
+                            max_pools: all.max_pools.saturating_sub(legs),
+                            max_steps: all.max_steps.saturating_sub(legs),
+                        }
                     };
                     match candidate.try_add_liquidity_op(
                         order,

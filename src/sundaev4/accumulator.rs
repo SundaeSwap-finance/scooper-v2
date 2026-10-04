@@ -732,6 +732,13 @@ impl Accumulator {
                 .cloned()
                 .collect();
             if !deficit.is_empty() {
+                if limits.max_pools == 0 || limits.max_steps == 0 {
+                    return Err(format!(
+                        "liquidity op needs a swap between its legs but the order's budget buys \
+                         no pool beyond the {} legs (raise max_per_execution)",
+                        burns.len() + mints.len()
+                    ));
+                }
                 for from in surplus {
                     let total = basket.get(&from).cloned().unwrap_or_else(|| BigInt::from(0));
                     let n = BigInt::from(deficit.len() as i64);
