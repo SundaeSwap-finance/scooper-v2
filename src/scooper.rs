@@ -1268,17 +1268,6 @@ impl Scooper {
             .pools
             .iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
-            // Oracle pools are withheld here rather than refused at build
-            // time: a swap the router sends through one would otherwise
-            // quarantine the order permanently, when another pool for the
-            // pair would have served it.
-            .filter(|(ident, pool)| {
-                let needs = crate::sundaev4::tx_builder::pool_needs_oracle(&exec, pool);
-                if needs {
-                    tracing::debug!(pool = %ident, "dispatch: withholding oracle pool (entries not built)");
-                }
-                !needs
-            })
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);

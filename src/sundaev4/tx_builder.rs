@@ -1345,6 +1345,42 @@ pub fn build_multi_pool_scoop_tx(
         let final_circ_lp = per_pool_running_circ_lp[i].clone();
         let final_assets_actual = per_pool_running_assets[i].clone();
 
+        // The oracle module recomputes its 128-byte slot from the scoop's
+        // transcript and the validity lower bound; the output datum must
+        // carry exactly that value.
+        let mut module_state = pool.pool_datum.module_state.clone();
+        if pool_needs_oracle(exec, pool) {
+            let oracle_hash = exec.module_scripts.oracle.as_ref().map(|o| o.hash.as_ref().to_vec()).unwrap_or_default();
+            let Some(slot) = module_state.iter_mut().find(|(h, _)| *h == oracle_hash) else {
+                bail!(
+                    "pool {}: lists the oracle module but has no oracle slot in module_state",
+                    pool.pool_datum.identifier
+                );
+            };
+            if pool.pool_datum.assets.len() != 2 {
+                bail!("pool {}: the oracle needs a two-asset pool", pool.pool_datum.identifier);
+            }
+            let now_ms = BigInt::from(exec.slot_config.slot_to_posix_ms(validity.start));
+            let states = per_pool_transcripts[i]
+                .iter()
+                .map(|e| (e.state_after.assets[0].1.clone(), e.state_after.assets[1].1.clone()));
+            let next = crate::sundaev4::types::OracleSlot::after_scoop(
+                &slot.1,
+                &now_ms,
+                (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1),
+                states,
+            )
+            .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
+            tracing::debug!(
+                pool = %pool.pool_datum.identifier,
+                now_ms = %now_ms,
+                volume_a = %next.volume_a,
+                volume_b = %next.volume_b,
+                last_price = %next.last_price,
+                "oracle slot after scoop",
+            );
+            slot.1 = next.encode().map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
+        }
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
             total_lp: final_total_lp,
@@ -1352,7 +1388,7 @@ pub fn build_multi_pool_scoop_tx(
             preminted_lp: per_pool_running_preminted[i].clone(),
             identifier: pool.pool_datum.identifier.clone(),
             actions: pool.pool_datum.actions.clone(),
-            module_state: pool.pool_datum.module_state.clone(),
+            module_state,
             min_surplus: pool.pool_datum.min_surplus.clone(),
             extension: pool.pool_datum.extension.clone(),
         };
@@ -1532,6 +1568,7 @@ pub fn build_multi_pool_scoop_tx(
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
     let mut bcl_entries: Vec<crate::sundaev4::types::BandedOperateEntry> = Vec::new();
+    let mut oracle_entries: Vec<crate::sundaev4::types::OracleEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -1582,16 +1619,12 @@ pub fn build_multi_pool_scoop_tx(
         };
 
         // A pool whose enabled action lists the oracle module needs an
-        // oracle Operate entry, its reference input and a fresh accumulator
-        // slot in the output datum on every scoop. None of that is built
-        // yet, so such a pool is refused here with its reason rather than
-        // failing on chain.
+        // oracle Operate entry; the output datum's accumulator slot is
+        // rewritten in the per-pool datum assembly above.
         if pool_needs_oracle(exec, &batch.pool) {
-            bail!(
-                "pool {} lists the oracle module in its trade action; this scooper does not \
-                 build oracle entries yet",
-                batch.pool.pool_datum.identifier
-            );
+            oracle_entries.push(crate::sundaev4::types::OracleEntry {
+                pool_oref: pool_oref_plutus.clone(),
+            });
         }
 
         match &batch.pool.pool_type {
@@ -1909,6 +1942,7 @@ pub fn build_multi_pool_scoop_tx(
     let has_cs = !cs_entries.is_empty();
     let has_ss = !ss_entries.is_empty();
     let has_bcl = !bcl_entries.is_empty();
+    let has_oracle = !oracle_entries.is_empty();
 
     // pool_mint is only needed when the preminted reserve couldn't cover a
     // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
@@ -1951,6 +1985,9 @@ pub fn build_multi_pool_scoop_tx(
     }
     if has_bcl && let Some(bcl) = &exec.module_scripts.banded_concentrated_liquidity {
         all_ref_inputs.push(bcl.ref_utxo.0.clone());
+    }
+    if has_oracle && let Some(o) = &exec.module_scripts.oracle {
+        all_ref_inputs.push(o.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -2165,6 +2202,13 @@ pub fn build_multi_pool_scoop_tx(
             entries: bcl_entries,
         };
         withdrawals.push((reward_account(&bcl_script.hash), bcl_redeemer.to_plutus()));
+    }
+    // Conditionally add the oracle withdrawal
+    if has_oracle && let Some(oracle_script) = &exec.module_scripts.oracle {
+        let oracle_redeemer = crate::sundaev4::types::OracleRedeemer::Operate {
+            entries: oracle_entries,
+        };
+        withdrawals.push((reward_account(&oracle_script.hash), oracle_redeemer.to_plutus()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in
@@ -3911,9 +3955,9 @@ fn build_pool_output_value(
 /// Resolve a pool's LP-token AssetClass. Sundae's LP asset is minted under
 /// the pool_mint policy with name `0014df10 ++ pool_ident` (CIP-67 label 222
 /// for LP).
-/// True when the pool's enabled trade action lists the oracle module.
-/// Scooping such a pool needs an oracle Operate entry that this scooper
-/// does not build yet, so dispatch withholds the pool from the router.
+/// True when the pool's enabled trade action lists the oracle module: the
+/// scoop then carries an oracle Operate entry, the module's reference input,
+/// and a recomputed accumulator slot in the output datum.
 pub fn pool_needs_oracle(exec: &ScooperExecution, pool: &SundaeV4Pool) -> bool {
     let Some(oracle) = exec.module_scripts.oracle.as_ref() else {
         return false;

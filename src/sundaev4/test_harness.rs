@@ -651,6 +651,33 @@ impl TestEnv {
 
     /// The action entry modules list for banded pools:
     /// `[bcl_hash, fs_hash, fairness_hash]`.
+    /// Module list and module_state for a banded pool that also carries the
+    /// oracle module: the ladder hash, fee_split, fairness, and the oracle's
+    /// fresh slot `0x80`.
+    pub fn bcl_oracle_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let oracle = self
+            .exec
+            .module_scripts
+            .oracle
+            .as_ref()
+            .expect("blueprint must include the oracle validator for oracle tests");
+        let mut ms = self.bcl_module_state(config);
+        ms.push((oracle.hash.to_vec(), vec![0x80]));
+        ms
+    }
+
+    pub fn bcl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
+        let oracle = self
+            .exec
+            .module_scripts
+            .oracle
+            .as_ref()
+            .expect("blueprint must include the oracle validator for oracle tests");
+        let mut m = self.bcl_action_modules();
+        m.push(oracle.hash.to_vec());
+        m
+    }
+
     pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
         let script = self
             .exec
@@ -1019,6 +1046,18 @@ pub fn make_bcl_pool(
     assets: Vec<(AssetClass, i64)>,
     config: BandedCLConfig,
 ) -> Arc<SundaeV4Pool> {
+    make_bcl_pool_with_oracle(env, ident_byte, assets, config, false)
+}
+
+/// `make_bcl_pool`, optionally listing the oracle module in the trade
+/// action with a fresh accumulator slot.
+pub fn make_bcl_pool_with_oracle(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: BandedCLConfig,
+    with_oracle: bool,
+) -> Arc<SundaeV4Pool> {
     assert_eq!(assets.len(), 2, "banded pools hold exactly two assets");
     let ident_bytes = vec![ident_byte; 28];
 
@@ -1074,9 +1113,9 @@ pub fn make_bcl_pool(
             actions: vec![ActionEntry {
                 tag: BigInt::from(100),
                 enabled: true,
-                modules: env.bcl_action_modules(),
+                modules: if with_oracle { env.bcl_oracle_action_modules() } else { env.bcl_action_modules() },
             }],
-            module_state: env.bcl_module_state(&config),
+            module_state: if with_oracle { env.bcl_oracle_module_state(&config) } else { env.bcl_module_state(&config) },
             min_surplus: BigInt::from(0),
             extension: crate::sundaev4::types::plutus_void(),
         },

@@ -1537,6 +1537,67 @@ mod tests {
         assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
     }
 
+    /// A banded pool that also lists the oracle module: the scoop carries the
+    /// oracle Operate entry and rewrites the accumulator slot from the
+    /// transcript. Two scoops in a row exercise initialise and advance.
+    #[test]
+    fn bcl_oracle_pool_scoops_and_advances_the_slot() {
+        use crate::sundaev4::types::OracleSlot;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool_with_oracle(
+            &env,
+            0x7C,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg,
+            true,
+        );
+        let oracle_hash = env.exec.module_scripts.oracle.as_ref().unwrap().hash.to_vec();
+        let slot_of = |p: &crate::sundaev4::SundaeV4Pool| -> Vec<u8> {
+            p.pool_datum.module_state.iter().find(|(h, _)| *h == oracle_hash).unwrap().1.clone()
+        };
+        assert_eq!(slot_of(&pool), vec![0x80]);
+
+        // First scoop: initialise.
+        let orders = vec![make_order(token_b(), 624, token_a(), 1, 1)];
+        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("oracle pool batch should assemble");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("oracle pool scoop should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let rewards = eval
+            .budgets
+            .iter()
+            .filter(|(k, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
+            .count();
+        assert!(rewards >= 4, "expected banded + fee_split + fairness + oracle withdrawals, got {rewards}");
+        let after1 = result.predicted_pools[0].2.clone();
+        let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
+        assert_eq!(s1.volume_b, BigInt::from(624));
+        assert_eq!(s1.volume_a, BigInt::from(616));
+        assert_eq!(s1.creation_time, s1.last_time);
+        assert_eq!(s1.twap_num, BigInt::from(0));
+        assert_eq!(s1.last_price, &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(616));
+
+        // Second scoop, later: advance.
+        let pool2 = std::sync::Arc::new(after1);
+        let orders2 = vec![make_order(token_b(), 1_000, token_a(), 1, 2)];
+        let batch2 = assemble_batch(&pool2, &orders2, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
+            .expect("second oracle pool batch should assemble");
+        let (result2, eval2) = env
+            .build_and_eval(&[batch2], &settings, 2000)
+            .expect("second oracle scoop should evaluate");
+        assert!(!eval2.budgets.is_empty());
+        let s2 = OracleSlot::decode(&slot_of(&result2.predicted_pools[0].2)).unwrap();
+        assert_eq!(s2.creation_time, s1.creation_time);
+        assert!(s2.last_time > s1.last_time);
+        assert_eq!(s2.volume_b, &s1.volume_b + &BigInt::from(1_000));
+        assert_eq!(s2.twap_num, &(&s2.last_time - &s1.last_time) * &s1.last_price);
+    }
+
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
     /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_478 in

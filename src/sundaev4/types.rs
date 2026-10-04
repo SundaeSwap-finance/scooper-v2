@@ -1030,6 +1030,155 @@ pub struct BandedOperateEntry {
     pub active_band: BigInt,
 }
 
+/// `modules/oracle.ak`'s redeemer. `Create` pins the fresh slot (`0x80`);
+/// `Operate` carries one entry per oracle pool in the scoop; the module
+/// recomputes the slot from the transcript and the validity lower bound.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum OracleRedeemer {
+    Create,
+    Operate { entries: Vec<OracleEntry> },
+    Destroy { entries: Vec<PlutusData> },
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OracleEntry {
+    pub pool_oref: OutputRef,
+}
+
+/// The oracle module's 128-byte accumulator slot (`lib/modules/oracle_check.ak`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleSlot {
+    pub creation_time: BigInt,
+    pub last_time: BigInt,
+    pub last_price: BigInt,
+    pub volume_a: BigInt,
+    pub volume_b: BigInt,
+    pub twap_num: BigInt,
+}
+
+impl OracleSlot {
+    pub const FRESH: &'static [u8] = &[0x80];
+    pub const BYTES: usize = 128;
+    /// `price_scale` in the module: B per A, scaled by 1e18.
+    pub fn price_scale() -> BigInt {
+        let mut s = BigInt::from(1);
+        for _ in 0..18 {
+            s = &s * &BigInt::from(10);
+        }
+        s
+    }
+
+    fn put(out: &mut Vec<u8>, v: &BigInt, width: usize) -> Result<(), String> {
+        let (sign, bytes) = v.clone().unwrap().to_bytes_be();
+        if sign == num_bigint::Sign::Minus {
+            return Err("oracle slot field is negative".into());
+        }
+        if bytes.len() > width {
+            return Err(format!("oracle slot field does not fit {width} bytes"));
+        }
+        out.extend(std::iter::repeat_n(0u8, width - bytes.len()));
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(Self::BYTES);
+        Self::put(&mut out, &self.creation_time, 8)?;
+        Self::put(&mut out, &self.last_time, 8)?;
+        Self::put(&mut out, &self.last_price, 16)?;
+        Self::put(&mut out, &self.volume_a, 32)?;
+        Self::put(&mut out, &self.volume_b, 32)?;
+        Self::put(&mut out, &self.twap_num, 32)?;
+        Ok(out)
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, String> {
+        if b.len() != Self::BYTES {
+            return Err(format!("oracle slot is {} bytes, expected {}", b.len(), Self::BYTES));
+        }
+        let be = |r: std::ops::Range<usize>| BigInt::from(num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &b[r]));
+        Ok(Self {
+            creation_time: be(0..8),
+            last_time: be(8..16),
+            last_price: be(16..32),
+            volume_a: be(32..64),
+            volume_b: be(64..96),
+            twap_num: be(96..128),
+        })
+    }
+
+    /// `oracle_check.initialise`.
+    pub fn initialise(now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Self {
+        use num_traits::Signed;
+        let last_price = if volume_a.is_positive() {
+            &(volume_b * &Self::price_scale()) / volume_a
+        } else {
+            BigInt::from(0)
+        };
+        Self {
+            creation_time: now.clone(),
+            last_time: now.clone(),
+            last_price,
+            volume_a: volume_a.clone(),
+            volume_b: volume_b.clone(),
+            twap_num: BigInt::from(0),
+        }
+    }
+
+    /// `oracle_check.advance`; `now` must not precede `last_time`.
+    pub fn advance(&self, now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Result<Self, String> {
+        use num_traits::Signed;
+        let dt = now - &self.last_time;
+        if dt.is_negative() {
+            return Err(format!(
+                "oracle: validity start {now} precedes the slot's last_time {}",
+                self.last_time
+            ));
+        }
+        let last_price = if volume_a.is_positive() {
+            &(volume_b * &Self::price_scale()) / volume_a
+        } else {
+            self.last_price.clone()
+        };
+        Ok(Self {
+            creation_time: self.creation_time.clone(),
+            last_time: now.clone(),
+            last_price,
+            volume_a: &self.volume_a + volume_a,
+            volume_b: &self.volume_b + volume_b,
+            twap_num: &self.twap_num + &(&dt * &self.last_price),
+        })
+    }
+
+    /// The slot after a scoop: `oracle_check.walk_deltas` over the transcript
+    /// (swap steps add |Δa| and |Δb|; non-swap steps add nothing), then
+    /// initialise or advance.
+    pub fn after_scoop(
+        in_slot: &[u8],
+        now: &BigInt,
+        reserves_before: (&BigInt, &BigInt),
+        transcript_states: impl Iterator<Item = (BigInt, BigInt)>,
+    ) -> Result<Self, String> {
+        let (mut a0, mut b0) = (reserves_before.0.clone(), reserves_before.1.clone());
+        let mut va = BigInt::from(0);
+        let mut vb = BigInt::from(0);
+        for (a1, b1) in transcript_states {
+            let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
+            if is_swap {
+                va = &va + &(if a1 > a0 { &a1 - &a0 } else { &a0 - &a1 });
+                vb = &vb + &(if b1 > b0 { &b1 - &b0 } else { &b0 - &b1 });
+            }
+            a0 = a1;
+            b0 = b1;
+        }
+        if in_slot == Self::FRESH {
+            Ok(Self::initialise(now, &va, &vb))
+        } else {
+            Self::decode(in_slot)?.advance(now, &va, &vb)
+        }
+    }
+}
+
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FeeSplitConfig {
     pub protocol_share: Rational,
