@@ -972,6 +972,51 @@ mod tests {
         );
     }
 
+    /// A zap whose rebalancing swap is larger than the active band: the
+    /// swap half crosses an edge (several entries), then the deposit pins.
+    #[test]
+    fn bcl_zap_crossing_a_band_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool(
+            &env,
+            0x71,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        let cap0 = max_dx_in_band(&v, false);
+        let offered: i64 = (&cap0 * &BigInt::from(4)).to_string().parse().unwrap();
+        let lp_asset = lp_asset_for(&env, 0x71);
+        let order = make_basic_deposit_order(vec![(token_b(), offered)], lp_asset.clone(), 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("large single-asset banded deposit should fill as a zap");
+        let plan = accum.into_plan();
+        let zap = &plan.batches[0].zaps[0];
+        assert!(zap.swap_deltas[1] > cap0, "the swap half crosses band 0");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("crossing zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(plan.batches[0].final_assets, after.pool_datum.assets);
+        assert_eq!(plan.batches[0].final_total_lp, after.pool_datum.total_lp);
+        let used_b = &zap.swap_deltas[1] + &zap.deposit_dx[1];
+        assert!(
+            (&BigInt::from(offered) - &used_b) * BigInt::from(100) < BigInt::from(offered),
+            "zap uses more than 99% of the offered B ({used_b} of {offered})"
+        );
+    }
+
     /// A single-asset deposit into a banded pool fills as a zap: an in-band
     /// swap step rebalances the basket, then a proportional deposit step
     /// mints LP. Both are ordinary transcript steps for the module.
@@ -1017,6 +1062,142 @@ mod tests {
             after.pool_datum.circulating_lp,
             &pool.pool_datum.circulating_lp + &zap.lp_minted
         );
+    }
+
+    /// The production path for a crossing swap: the router prices the
+    /// whole ladder, the accumulator accrues each in-band step, and the
+    /// walk emits them; all three must agree with the module.
+    #[test]
+    fn bcl_routed_swap_crossing_bands_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool(
+            &env,
+            0x70,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        let cap0 = max_dx_in_band(&v, false);
+        // Three bands' worth of B: crosses two edges.
+        let dx: i64 = (&cap0 * &BigInt::from(3)).to_string().parse().unwrap();
+
+        let mut pool_map: BTreeMap<_, _> = BTreeMap::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+        let order = make_basic_swap_order(token_b(), dx, token_a(), 1, 1);
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("the ladder absorbs three bands of B");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("crossing swap should accumulate");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 1);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("routed crossing swap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let transcript = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) => {
+                        Some(transcript)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pool spend redeemer");
+        assert!(transcript.len() >= 3, "expected at least three steps, got {}", transcript.len());
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[1].1, &b + &BigInt::from(dx), "all of the B went in");
+        // The accumulator's prediction matches the walk exactly.
+        assert_eq!(plan.batches[0].final_assets, after.pool_datum.assets);
+        assert_eq!(plan.batches[0].final_total_lp, after.pool_datum.total_lp);
+    }
+
+    /// A swap larger than the active band can pay is emitted as two
+    /// transcript steps: the first drains band 0, the second continues in
+    /// band 1. The module walks both with chained witnesses.
+    #[test]
+    fn bcl_swap_crossing_a_band_evaluates() {
+        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let pool = make_bcl_pool(
+            &env,
+            0x6F,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        let cap = max_dx_in_band(&v, false);
+        let dx: i64 = (&cap + &BigInt::from(50_000)).to_string().parse().unwrap();
+        let orders = vec![make_order(token_b(), dx, token_a(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("crossing swap should assemble");
+        assert_eq!(batch.swaps.len(), 1);
+        let dy = batch.swaps[0].dy.clone();
+        assert!(dy > v.ra, "crossing pays more than band 0 held ({dy} <= {})", v.ra);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("crossing swap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let transcript = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) => {
+                        Some(transcript)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pool spend redeemer");
+        assert_eq!(transcript.len(), 2, "one entry per in-band step");
+        let bands: Vec<BigInt> = transcript
+            .iter()
+            .map(|e| {
+                let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(e.operation_data.clone())
+                    .unwrap();
+                BigInt::from_plutus(pair[1].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(bands, vec![BigInt::from(1), BigInt::from(1)], "both steps end in band 1");
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[1].1, &b + &BigInt::from(dx));
+        assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
     }
 
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the

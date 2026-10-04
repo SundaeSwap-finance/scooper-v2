@@ -59,8 +59,109 @@ pub enum PoolViewType {
     /// edge's hard capacity.
     Banded {
         is_a_input: bool,
+        /// The active band at the pool's current reserves: the cheap path
+        /// for inputs the band can absorb.
         band: crate::sundaev4::banded_math::BandView,
+        /// The whole ladder, for inputs that cross band edges.
+        ladder: std::sync::Arc<BandedLadder>,
     },
+}
+
+/// A banded pool's ladder and reserves, enough to plan multi-band swaps.
+#[derive(Clone, Debug)]
+pub struct BandedLadder {
+    pub cfg: crate::sundaev4::types::BandedCLConfig,
+    pub a: BigInt,
+    pub b: BigInt,
+}
+
+/// Marginal output per unit input (scaled by `scale()`) on one band view
+/// after `raw_allocated` has already gone in, with that band's own fee.
+fn banded_marginal(
+    band: &crate::sundaev4::banded_math::BandView,
+    is_a_input: bool,
+    raw_allocated: &BigInt,
+) -> BigInt {
+    let fee = crate::sundaev4::banded_math::fee_for(band, is_a_input);
+    let fee_num = fee.num.clone();
+    let fee_den = fee.den.clone();
+    let fee_mult = &fee_den - &fee_num;
+    let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
+    let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
+    if band.curve != 0 {
+        let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
+        return if is_a_input {
+            &fee_mult * &pn * &scale() / &(&fee_den * &pd)
+        } else {
+            &fee_mult * &pd * &scale() / &(&fee_den * &pn)
+        };
+    }
+    let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
+    let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
+    let dx_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
+    if is_a_input {
+        let va = &va0 + &(&dx_eff * spb_num);
+        let denom = &fee_den * spa_den * &va * &va;
+        if !denom.is_positive() {
+            return BigInt::from(0);
+        }
+        &fee_mult * &vb0 * &va0 * spb_num * &scale() / &denom
+    } else {
+        let vb = &vb0 + &(&dx_eff * spa_den);
+        let denom = &fee_den * spb_num * &vb * &vb;
+        if !denom.is_positive() {
+            return BigInt::from(0);
+        }
+        &fee_mult * &va0 * &vb0 * spa_den * &scale() / &denom
+    }
+}
+
+/// The input one band view takes before its marginal falls to `lambda`,
+/// capped at what the band can pay. Zero when the band's opening marginal
+/// is already below `lambda`.
+fn banded_alloc_in_band(
+    band: &crate::sundaev4::banded_math::BandView,
+    is_a_input: bool,
+    lambda: &BigInt,
+) -> (BigInt, BigInt) {
+    let cap = crate::sundaev4::banded_math::max_dx_in_band(band, is_a_input);
+    let fee = crate::sundaev4::banded_math::fee_for(band, is_a_input);
+    let fee_num = fee.num.clone();
+    let fee_den = fee.den.clone();
+    let fee_mult = &fee_den - &fee_num;
+    let sc = scale();
+    let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
+    let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
+    if band.curve != 0 {
+        let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
+        let marginal = if is_a_input {
+            &fee_mult * &pn * &sc / &(&fee_den * &pd)
+        } else {
+            &fee_mult * &pd * &sc / &(&fee_den * &pn)
+        };
+        return if lambda <= &marginal { (cap.clone(), cap) } else { (BigInt::from(0), cap) };
+    }
+    let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
+    let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
+    let (numerator, denom, v0, sp_input) = if is_a_input {
+        (&fee_mult * &vb0 * &va0 * spb_num * &sc, &fee_den * spa_den * lambda, &va0, spb_num)
+    } else {
+        (&fee_mult * &va0 * &vb0 * spa_den * &sc, &fee_den * spb_num * lambda, &vb0, spa_den)
+    };
+    if !denom.is_positive() || !sp_input.is_positive() {
+        return (BigInt::from(0), cap);
+    }
+    let v_target = swap_math::isqrt(&(&numerator / &denom));
+    let dv_eff = &v_target - v0;
+    if !dv_eff.is_positive() {
+        return (BigInt::from(0), cap);
+    }
+    let dx_eff = &dv_eff / sp_input;
+    if !dx_eff.is_positive() {
+        return (BigInt::from(0), cap);
+    }
+    let raw = &dx_eff * &fee_den / &fee_mult;
+    if raw > cap { (cap.clone(), cap) } else { (raw, cap) }
 }
 
 /// The stableswap swap for a view: `dx` of the in asset against the out
@@ -232,9 +333,14 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
-        PoolViewType::Banded { is_a_input, band } => {
-            Some(crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input))
-        }
+        PoolViewType::Banded {
+            is_a_input, ladder, ..
+        } => Some(crate::sundaev4::banded_math::ladder_capacity(
+            &ladder.cfg,
+            &ladder.a,
+            &ladder.b,
+            *is_a_input,
+        )),
         // The curve is asymptotic in the out reserve: the pinned output is
         // always below it, and a fee-bearing step never lowers D.
         PoolViewType::StableSwap { .. } => None,
@@ -289,8 +395,21 @@ fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
 /// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
     let raw = match &pool.view_type {
-        PoolViewType::Banded { is_a_input, band } => {
-            crate::sundaev4::banded_math::band_output(band, *is_a_input, dx)
+        PoolViewType::Banded {
+            is_a_input,
+            band,
+            ladder,
+        } => {
+            use crate::sundaev4::banded_math as bm;
+            if dx <= &bm::max_dx_in_band(band, *is_a_input) {
+                bm::band_output(band, *is_a_input, dx)
+            } else {
+                // Crosses band edges: price the whole step sequence.
+                match bm::swap_steps(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, dx) {
+                    Ok(steps) => steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy),
+                    Err(_) => BigInt::from(0),
+                }
+            }
         }
         PoolViewType::ConstantProduct => swap_math::cp_swap_result(
             &pool.reserve_in,
@@ -365,44 +484,20 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
                 / &(&fee_den * &denom * &denom)
         }
-        PoolViewType::Banded { is_a_input, band } => {
-            // The band's arc is the CL curve on the residuals at liquidity
-            // L_k, with the module's B-input scale (`dvb_eff = dx_eff *
-            // spa_den`):
-            //   A→B: dy = vb0·dva_eff / ((va0+dva_eff)·spa_den),
-            //        dva_eff = (fm/fd)·dx·spb_num
-            //        d(dy)/dx = fm·vb0·va0·spb_num / (fd·spa_den·va²)
-            //   B→A: dy = va0·dvb_eff / ((vb0+dvb_eff)·spb_num),
-            //        dvb_eff = (fm/fd)·dx·spa_den
-            //        d(dy)/dx = fm·va0·vb0·spa_den / (fd·spb_num·vb²)
-            // A constant-sum bin has a constant marginal at its price.
-            let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
-            let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
-            if band.curve != 0 {
-                let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
-                return if *is_a_input {
-                    &fee_mult * &pn * &scale() / &(&fee_den * &pd)
-                } else {
-                    &fee_mult * &pd * &scale() / &(&fee_den * &pn)
-                };
+        PoolViewType::Banded {
+            is_a_input,
+            band,
+            ladder,
+        } => {
+            use crate::sundaev4::banded_math as bm;
+            if raw_allocated <= &bm::max_dx_in_band(band, *is_a_input) {
+                return banded_marginal(band, *is_a_input, raw_allocated);
             }
-            let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
-            let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
-            let dx_eff = raw_allocated - &(raw_allocated * &fee_num / &fee_den);
-            if *is_a_input {
-                let va = &va0 + &(&dx_eff * spb_num);
-                let denom = &fee_den * spa_den * &va * &va;
-                if !denom.is_positive() {
-                    return BigInt::from(0);
-                }
-                &fee_mult * &vb0 * &va0 * spb_num * &scale() / &denom
-            } else {
-                let vb = &vb0 + &(&dx_eff * spa_den);
-                let denom = &fee_den * spb_num * &vb * &vb;
-                if !denom.is_positive() {
-                    return BigInt::from(0);
-                }
-                &fee_mult * &va0 * &vb0 * spa_den * &scale() / &denom
+            // Past the active band: the marginal is the opening marginal of
+            // whichever band the allocation ends in.
+            match bm::view_after(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, raw_allocated) {
+                Some((_, _, v)) => banded_marginal(&v, *is_a_input, &BigInt::from(0)),
+                None => BigInt::from(0),
             }
         }
         PoolViewType::ConstantSum {
@@ -488,57 +583,36 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
             let fee_mult = &fee_den - &fee_num;
 
             match &pool.view_type {
-                PoolViewType::Banded { is_a_input, band } => {
-                    let cap = crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input);
-                    let (spa_num, spa_den) = (&band.lo.num, &band.lo.den);
-                    let (spb_num, spb_den) = (&band.hi.num, &band.hi.den);
-                    if band.curve != 0 {
-                        // Constant marginal: take the whole bin when the
-                        // price beats lambda, nothing otherwise.
-                        let (pn, pd) = (spa_num * spb_num, spa_den * spb_den);
-                        let marginal = if *is_a_input {
-                            &fee_mult * &pn * &sc / &(&fee_den * &pd)
-                        } else {
-                            &fee_mult * &pd * &sc / &(&fee_den * &pn)
+                PoolViewType::Banded {
+                    is_a_input,
+                    band,
+                    ladder,
+                } => {
+                    use crate::sundaev4::banded_math as bm;
+                    // Fill band by band while the band's opening marginal
+                    // clears lambda; stop inside the first band that does
+                    // not fill completely.
+                    let (first, first_cap) = banded_alloc_in_band(band, *is_a_input, lambda);
+                    if first < first_cap {
+                        return first;
+                    }
+                    let mut total = first;
+                    for _ in 0..ladder.cfg.bands.len() {
+                        let Some((_, _, v)) =
+                            bm::view_after(&ladder.cfg, &ladder.a, &ladder.b, *is_a_input, &total)
+                        else {
+                            break;
                         };
-                        return if lambda <= &marginal { cap } else { BigInt::from(0) };
+                        let (alloc, cap) = banded_alloc_in_band(&v, *is_a_input, lambda);
+                        if !alloc.is_positive() {
+                            break;
+                        }
+                        total = &total + &alloc;
+                        if alloc < cap {
+                            break;
+                        }
                     }
-                    // Invert the arc's marginal = λ (see marginal_at_allocation):
-                    //   A→B: va² = fm·vb0·va0·spb_num·SCALE / (λ·fd·spa_den),
-                    //        dx_eff = (isqrt(va²) − va0) / spb_num
-                    //   B→A: vb² = fm·va0·vb0·spa_den·SCALE / (λ·fd·spb_num),
-                    //        dx_eff = (isqrt(vb²) − vb0) / spa_den
-                    let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
-                    let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
-                    let (numerator, denom, v0, sp_input) = if *is_a_input {
-                        (
-                            &fee_mult * &vb0 * &va0 * spb_num * &sc,
-                            &fee_den * spa_den * lambda,
-                            &va0,
-                            spb_num,
-                        )
-                    } else {
-                        (
-                            &fee_mult * &va0 * &vb0 * spa_den * &sc,
-                            &fee_den * spb_num * lambda,
-                            &vb0,
-                            spa_den,
-                        )
-                    };
-                    if !denom.is_positive() || !sp_input.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let v_target = swap_math::isqrt(&(&numerator / &denom));
-                    let dv_eff = &v_target - v0;
-                    if !dv_eff.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let dx_eff = &dv_eff / sp_input;
-                    if !dx_eff.is_positive() {
-                        return BigInt::from(0);
-                    }
-                    let raw = &dx_eff * &fee_den / &fee_mult;
-                    if raw > cap { cap } else { raw }
+                    total
                 }
                 PoolViewType::ConstantProduct => {
                     // x_eff = isqrt(fee_mult * A * B * SCALE / (fee_den * lambda)) - A
@@ -882,6 +956,11 @@ fn build_graph(
             let Ok(view) = band_view(config, a, b, &w) else {
                 continue;
             };
+            let ladder = std::sync::Arc::new(BandedLadder {
+                cfg: config.clone(),
+                a: a.clone(),
+                b: b.clone(),
+            });
             for (i, j) in [(0usize, 1usize), (1, 0)] {
                 let is_a_input = i == 0;
                 let fee = fee_for(&view, is_a_input);
@@ -901,6 +980,7 @@ fn build_graph(
                         view_type: PoolViewType::Banded {
                             is_a_input,
                             band: view.clone(),
+                            ladder: ladder.clone(),
                         },
                     });
             }

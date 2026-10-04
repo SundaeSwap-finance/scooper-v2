@@ -167,6 +167,51 @@ impl PoolAccum {
     }
 }
 
+/// Apply a banded swap of `dx` to a running pool state as in-band steps,
+/// accruing each step's fee budget and protocol LP exactly as the tx walk
+/// does, so a deposit pinned after the swap sees the walk's `total_lp`.
+/// Returns the total output.
+#[allow(clippy::too_many_arguments)]
+pub fn accrue_banded_swap(
+    cfg: &crate::sundaev4::types::BandedCLConfig,
+    assets: &mut [(AssetClass, BigInt)],
+    total_lp: &mut BigInt,
+    ps: &(BigInt, BigInt),
+    cum_gross_fb: &mut BigInt,
+    cum_protocol_lp: &mut BigInt,
+    input_idx: usize,
+    dx: &BigInt,
+) -> Result<BigInt, String> {
+    use crate::sundaev4::banded_math;
+    use num_traits::Signed;
+    if assets.len() != 2 || input_idx > 1 {
+        return Err("banded swap needs a two-asset pool".into());
+    }
+    let is_a_input = input_idx == 0;
+    let steps = banded_math::swap_steps(cfg, &assets[0].1, &assets[1].1, is_a_input, dx)?;
+    let mut total_dy = BigInt::from(0);
+    for st in &steps {
+        let fb = banded_math::fee_budget(total_lp, &st.before.x, &st.after.x, total_lp);
+        if fb.is_negative() {
+            return Err(format!("banded step lowers the ladder counter (fee_budget={fb})"));
+        }
+        if is_a_input {
+            assets[0].1 = &assets[0].1 + &st.dx;
+            assets[1].1 = &assets[1].1 - &st.dy;
+        } else {
+            assets[1].1 = &assets[1].1 + &st.dx;
+            assets[0].1 = &assets[0].1 - &st.dy;
+        }
+        *cum_gross_fb = &*cum_gross_fb + &fb;
+        let new_cum_protocol_lp = &*cum_gross_fb * &ps.0 / &ps.1;
+        let op_protocol_lp = &new_cum_protocol_lp - &*cum_protocol_lp;
+        *cum_protocol_lp = new_cum_protocol_lp;
+        *total_lp = &*total_lp + &op_protocol_lp;
+        total_dy = &total_dy + &st.dy;
+    }
+    Ok(total_dy)
+}
+
 impl Accumulator {
     pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
@@ -385,29 +430,57 @@ impl Accumulator {
 
         // Swap step.
         let mut after_swap = assets.clone();
-        for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
-            *amt = &*amt + &swap_deltas[i];
-            if amt.is_negative() {
+        let mut lp_at_deposit = lp_before.clone();
+        let mut cum_gross_fb = cum_gross_fb_before.clone();
+        let mut new_cum_protocol_lp = cum_protocol_lp_before.clone();
+        if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { config } =
+            &effective_pool.pool_type
+        {
+            let Some(in_idx) = swap_deltas.iter().position(|d| d.is_positive()) else {
+                return Err("zap swap pays nothing in".into());
+            };
+            let dy = accrue_banded_swap(
+                config,
+                &mut after_swap,
+                &mut lp_at_deposit,
+                &ps,
+                &mut cum_gross_fb,
+                &mut new_cum_protocol_lp,
+                in_idx,
+                &swap_deltas[in_idx],
+            )
+            .map_err(|e| format!("zap swap on pool {pool_ident}: {e}"))?;
+            if -&dy != swap_deltas[1 - in_idx] {
                 return Err(format!(
-                    "zap swap would drive pool {pool_ident} asset {i} negative"
+                    "zap swap plan pays {dy} but the basket split expected {}",
+                    -&swap_deltas[1 - in_idx]
                 ));
             }
+        } else {
+                for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
+                *amt = &*amt + &swap_deltas[i];
+                if amt.is_negative() {
+                    return Err(format!(
+                        "zap swap would drive pool {pool_ident} asset {i} negative"
+                    ));
+                }
+            }
+            let fb = swap_math::compute_fee_budget(
+                &effective_pool.pool_type,
+                &assets,
+                &after_swap,
+                &lp_before,
+            );
+            if fb.is_negative() {
+                return Err(format!(
+                    "zap swap would make pool {pool_ident} lose value (fee_budget={fb})"
+                ));
+            }
+            cum_gross_fb = &cum_gross_fb_before + &fb;
+            new_cum_protocol_lp = &cum_gross_fb * &ps.0 / &ps.1;
+            let op_protocol_lp = &new_cum_protocol_lp - &cum_protocol_lp_before;
+            lp_at_deposit = &lp_before + &op_protocol_lp;
         }
-        let fb = swap_math::compute_fee_budget(
-            &effective_pool.pool_type,
-            &assets,
-            &after_swap,
-            &lp_before,
-        );
-        if fb.is_negative() {
-            return Err(format!(
-                "zap swap would make pool {pool_ident} lose value (fee_budget={fb})"
-            ));
-        }
-        let cum_gross_fb = &cum_gross_fb_before + &fb;
-        let new_cum_protocol_lp = &cum_gross_fb * &ps.0 / &ps.1;
-        let op_protocol_lp = &new_cum_protocol_lp - &cum_protocol_lp_before;
-        let lp_at_deposit = &lp_before + &op_protocol_lp;
 
         // Deposit step, against the post-swap reserves and the basket the swap
         // left the order holding.
@@ -910,66 +983,91 @@ impl Accumulator {
                     proportional
                 };
 
-                let dy = batch::compute_swap_result(
-                    &effective_pool.pool_type,
-                    &accum.running_assets,
-                    &accum.running_total_lp,
-                    input_idx,
-                    output_idx,
-                    &dx,
-                );
-                if !dy.is_positive() {
-                    return Err(format!("zero output from pool {}", pool_ident));
-                }
+                let dy = if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity {
+                    config,
+                } = &effective_pool.pool_type
+                {
+                    // Several in-band steps, each accruing its own fee
+                    // budget, exactly as the tx walk emits them.
+                    let ps = accum.ps.clone();
+                    let dy = accrue_banded_swap(
+                        config,
+                        &mut accum.running_assets,
+                        &mut accum.running_total_lp,
+                        &ps,
+                        &mut accum.cum_gross_fb,
+                        &mut accum.cum_protocol_lp,
+                        input_idx,
+                        &dx,
+                    )
+                    .map_err(|e| format!("pool {pool_ident}: {e}"))?;
+                    if !dy.is_positive() {
+                        return Err(format!("zero output from pool {}", pool_ident));
+                    }
+                    dy
+                } else {
+                    let dy = batch::compute_swap_result(
+                        &effective_pool.pool_type,
+                        &accum.running_assets,
+                        &accum.running_total_lp,
+                        input_idx,
+                        output_idx,
+                        &dx,
+                    );
+                    if !dy.is_positive() {
+                        return Err(format!("zero output from pool {}", pool_ident));
+                    }
 
-                // Never emit a leg that drains a pool below zero. The pool
-                // contract rejects it (check_reserves_covered: `amount >= 0`),
-                // so building + evaluating it is wasted work ending in a
-                // quarantine loop. Reject the order up front instead — an
-                // over-allocated leg (the router put more input into this pool
-                // than its output reserve can cover) fails fast here.
-                if dy > accum.running_assets[output_idx].1 {
-                    return Err(format!(
-                        "leg would over-drain pool {pool_ident} output reserve \
-                         (dy={dy} > running reserve={})",
-                        accum.running_assets[output_idx].1
-                    ));
-                }
+                    // Never emit a leg that drains a pool below zero. The pool
+                    // contract rejects it (check_reserves_covered: `amount >= 0`),
+                    // so building + evaluating it is wasted work ending in a
+                    // quarantine loop. Reject the order up front instead — an
+                    // over-allocated leg (the router put more input into this pool
+                    // than its output reserve can cover) fails fast here.
+                    if dy > accum.running_assets[output_idx].1 {
+                        return Err(format!(
+                            "leg would over-drain pool {pool_ident} output reserve \
+                             (dy={dy} > running reserve={})",
+                            accum.running_assets[output_idx].1
+                        ));
+                    }
 
-                // Capture reserves before update for fee budget computation
-                let prev_assets = accum.running_assets.clone();
+                    // Capture reserves before update for fee budget computation
+                    let prev_assets = accum.running_assets.clone();
 
-                // Update running reserves
-                accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
-                accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
+                    // Update running reserves
+                    accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
+                    accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
 
-                // Per-entry protocol_lp bump (mirrors tx_builder) so LP-dependent dy
-                // computed for subsequent ops in this pool matches tx-time.
-                let fb = swap_math::compute_fee_budget(
-                    &effective_pool.pool_type,
-                    &prev_assets,
-                    &accum.running_assets,
-                    &accum.running_total_lp,
-                );
-                // A swap must never drive the pool's fee budget negative — that
-                // means the leg lost the pool value, and the pool contract's
-                // check_lp_accounting (circulating_lp <= total_lp) rejects it,
-                // quarantining the order. The router's value-preservation cap
-                // (the per-curve absorb caps) should already prevent this; this
-                // is the fail-fast backstop so a mispriced leg can never build an
-                // invalid tx. (Currently trips for B-input swaps on range-above-
-                // 1.0 pools.)
-                if fb.is_negative() {
-                    return Err(format!(
-                        "leg would make pool {pool_ident} lose value \
-                         (fee_budget={fb} < 0); swap outside its value-preserving range"
-                    ));
-                }
-                accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
-                let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
-                let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
-                accum.cum_protocol_lp = new_cum_protocol_lp;
-                accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
+                    // Per-entry protocol_lp bump (mirrors tx_builder) so LP-dependent dy
+                    // computed for subsequent ops in this pool matches tx-time.
+                    let fb = swap_math::compute_fee_budget(
+                        &effective_pool.pool_type,
+                        &prev_assets,
+                        &accum.running_assets,
+                        &accum.running_total_lp,
+                    );
+                    // A swap must never drive the pool's fee budget negative — that
+                    // means the leg lost the pool value, and the pool contract's
+                    // check_lp_accounting (circulating_lp <= total_lp) rejects it,
+                    // quarantining the order. The router's value-preservation cap
+                    // (the per-curve absorb caps) should already prevent this; this
+                    // is the fail-fast backstop so a mispriced leg can never build an
+                    // invalid tx. (Currently trips for B-input swaps on range-above-
+                    // 1.0 pools.)
+                    if fb.is_negative() {
+                        return Err(format!(
+                            "leg would make pool {pool_ident} lose value \
+                             (fee_budget={fb} < 0); swap outside its value-preserving range"
+                        ));
+                    }
+                    accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
+                    let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
+                    let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
+                    accum.cum_protocol_lp = new_cum_protocol_lp;
+                    accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
+                    dy
+                };
 
                 this_hop_output = &this_hop_output + &dy;
 

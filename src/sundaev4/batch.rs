@@ -721,15 +721,15 @@ pub fn explain_swap_result(
                     assets.len()
                 ));
             }
-            match super::banded_math::swap_step(
+            let _ = total_lp;
+            match super::banded_math::swap_steps(
                 config,
                 &assets[0].1,
                 &assets[1].1,
-                total_lp,
                 input_idx == 0,
                 dx,
             ) {
-                Ok(s) => Ok(s.dy),
+                Ok(steps) => Ok(steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy)),
                 Err(e) => Err(format!("banded: {e}")),
             }
         }

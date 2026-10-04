@@ -147,6 +147,117 @@ fn ss_swap_op_data(
 /// two positionally), plus the serving order's reference for the indexer.
 /// A state with no witness cannot be the after state of a valid step, so
 /// the tx is refused rather than built.
+/// The banded entry's operation_data for a known after-witness: `[X, k]`
+/// plus the attribution.
+fn banded_op_data_for(
+    w: &crate::sundaev4::banded_math::Witness,
+    attribution: Option<pallas_primitives::PlutusData>,
+) -> pallas_primitives::PlutusData {
+    let mut items = vec![w.x.clone().to_plutus(), BigInt::from(w.k as u64).to_plutus()];
+    if let Some(a) = attribution {
+        items.push(a);
+    }
+    pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items))
+}
+
+/// Per-pool running state the streaming walk threads through every op.
+struct WalkPoolState<'a> {
+    running_assets: &'a mut Vec<(AssetClass, BigInt)>,
+    running_total_lp: &'a mut BigInt,
+    running_circ_lp: &'a BigInt,
+    running_preminted: &'a BigInt,
+    ps: &'a (BigInt, BigInt),
+    cum_gross_fb: &'a mut BigInt,
+    cum_protocol_lp: &'a mut BigInt,
+    transcript: &'a mut Vec<TranscriptEntry>,
+}
+
+/// Apply a banded swap of `dx` as in-band steps. Every step but the last is
+/// accrued and pushed as its own transcript entry here; the last step's
+/// deltas are applied and its gross fee budget and after-witness returned,
+/// so the caller's common tail emits it like any other op. Returns
+/// `(total dy, gross fee budget of the last step, after-witness)`.
+fn walk_banded_swap(
+    config: &crate::sundaev4::types::BandedCLConfig,
+    st: &mut WalkPoolState<'_>,
+    input_idx: usize,
+    dx: &BigInt,
+    swap_tag: &BigInt,
+    attribution: pallas_primitives::PlutusData,
+) -> Result<(BigInt, BigInt, crate::sundaev4::banded_math::Witness)> {
+    use crate::sundaev4::banded_math;
+    use num_traits::Signed;
+    if st.running_assets.len() != 2 || input_idx > 1 {
+        bail!("banded pool must hold exactly two assets");
+    }
+    let is_a_input = input_idx == 0;
+    let steps = banded_math::swap_steps(
+        config,
+        &st.running_assets[0].1,
+        &st.running_assets[1].1,
+        is_a_input,
+        dx,
+    )
+    .map_err(|e| anyhow::anyhow!("banded swap plan: {e}"))?;
+    let n = steps.len();
+    let mut total_dy = BigInt::from(0);
+    let mut last: Option<(BigInt, banded_math::Witness)> = None;
+    for (i, step) in steps.iter().enumerate() {
+        let gross_fb = banded_math::fee_budget(
+            st.running_total_lp,
+            &step.before.x,
+            &step.after.x,
+            st.running_total_lp,
+        );
+        if gross_fb.is_negative() {
+            bail!("banded step lowers the ladder counter (fee_budget={gross_fb})");
+        }
+        if is_a_input {
+            st.running_assets[0].1 = &st.running_assets[0].1 + &step.dx;
+            st.running_assets[1].1 = &st.running_assets[1].1 - &step.dy;
+        } else {
+            st.running_assets[1].1 = &st.running_assets[1].1 + &step.dx;
+            st.running_assets[0].1 = &st.running_assets[0].1 - &step.dy;
+        }
+        total_dy = &total_dy + &step.dy;
+        if i + 1 == n {
+            last = Some((gross_fb, step.after.clone()));
+            break;
+        }
+        // Intermediate step: accrue and emit now.
+        *st.cum_gross_fb = &*st.cum_gross_fb + &gross_fb;
+        let new_cum_protocol_lp = &*st.cum_gross_fb * &st.ps.0 / &st.ps.1;
+        let op_protocol_lp = &new_cum_protocol_lp - &*st.cum_protocol_lp;
+        let submitted_fee_budget = &gross_fb - &op_protocol_lp;
+        *st.cum_protocol_lp = new_cum_protocol_lp;
+        *st.running_total_lp = &*st.running_total_lp + &op_protocol_lp;
+        tracing::debug!(
+            walk = "op-swap-step",
+            step = i,
+            of = n,
+            dx = %step.dx,
+            dy = %step.dy,
+            band_before = step.before.k,
+            band_after = step.after.k,
+            fee_budget = %gross_fb,
+            "streaming walk: banded crossing step",
+        );
+        st.transcript.push(TranscriptEntry {
+            state_after: PoolState {
+                assets: st.running_assets.clone(),
+                total_lp: st.running_total_lp.clone(),
+                circulating_lp: st.running_circ_lp.clone(),
+                preminted_lp: st.running_preminted.clone(),
+            },
+            fee_budget: submitted_fee_budget,
+            operation_tag: swap_tag.clone(),
+            operation_data: banded_op_data_for(&step.after, Some(attribution.clone())),
+        });
+    }
+    let (gross_fb, after) = last.expect("swap_steps returns at least one step");
+    Ok((total_dy, gross_fb, after))
+}
+
 fn banded_op_data(
     config: &crate::sundaev4::types::BandedCLConfig,
     after: &[(AssetClass, BigInt)],
@@ -698,6 +809,9 @@ pub fn build_multi_pool_scoop_tx(
         // Claims carry a BountyClaim as operation_data; everything else
         // uses the void placeholder.
         let mut op_data_override: Option<pallas_primitives::PlutusData> = None;
+        // Set by banded swap arms: the planned after-witness of the final
+        // step, which the entry's operation_data must name.
+        let mut banded_after: Option<crate::sundaev4::banded_math::Witness> = None;
         let (operation_tag, gross_fb) = match op {
             crate::sundaev4::batch::BatchOp::Claim(i) => {
                 // CS bounty claim (cs_check tag 5): the reserve vector moves by
@@ -766,17 +880,43 @@ pub fn build_multi_pool_scoop_tx(
                 let dx = s.dx.clone();
                 // dy: recompute fresh against the current pool state
                 // (including any LP bumps from prior entries).
-                let dy = crate::sundaev4::batch::compute_swap_result(
-                    &pool_type,
-                    running_assets,
-                    running_total_lp,
-                    s.input_idx,
-                    s.output_idx,
-                    &dx,
-                );
+                let mut banded_fb: Option<BigInt> = None;
+                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                    let mut wst = WalkPoolState {
+                        running_assets,
+                        running_total_lp,
+                        running_circ_lp,
+                        running_preminted,
+                        ps: &per_pool_ps[batch_idx],
+                        cum_gross_fb: &mut per_pool_cum_gross_fb[batch_idx],
+                        cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
+                        transcript: &mut per_pool_transcripts[batch_idx],
+                    };
+                    let (dy, fb, after) = walk_banded_swap(
+                        config,
+                        &mut wst,
+                        s.input_idx,
+                        &dx,
+                        &per_pool_swap_tag[batch_idx],
+                        order_ref_to_plutus(&s.order.input),
+                    )?;
+                    banded_fb = Some(fb);
+                    banded_after = Some(after);
+                    dy
+                } else {
+                    let dy = crate::sundaev4::batch::compute_swap_result(
+                        &pool_type,
+                        running_assets,
+                        running_total_lp,
+                        s.input_idx,
+                        s.output_idx,
+                        &dx,
+                    );
+                    running_assets[s.input_idx].1 = &running_assets[s.input_idx].1 + &dx;
+                    running_assets[s.output_idx].1 = &running_assets[s.output_idx].1 - &dy;
+                    dy
+                };
                 per_pool_effective_swap_dys[batch_idx][*i] = dy.clone();
-                running_assets[s.input_idx].1 = &running_assets[s.input_idx].1 + &dx;
-                running_assets[s.output_idx].1 = &running_assets[s.output_idx].1 - &dy;
                 tracing::debug!(
                     walk = "op-swap",
                     batch_idx,
@@ -797,12 +937,14 @@ pub fn build_multi_pool_scoop_tx(
                         rs.final_output = &rs.final_output + &dy;
                     }
                 }
-                let fb = swap_math::compute_fee_budget(
-                    &pool_type,
-                    &prev_assets,
-                    running_assets,
-                    running_total_lp,
-                );
+                let fb = banded_fb.unwrap_or_else(|| {
+                    swap_math::compute_fee_budget(
+                        &pool_type,
+                        &prev_assets,
+                        running_assets,
+                        running_total_lp,
+                    )
+                });
                 (per_pool_swap_tag[batch_idx].clone(), fb)
             }
             crate::sundaev4::batch::BatchOp::Continuation(i) => {
@@ -837,16 +979,42 @@ pub fn build_multi_pool_scoop_tx(
                         c.dx.clone()
                     }
                 };
-                let dy = crate::sundaev4::batch::compute_swap_result(
-                    &pool_type,
-                    running_assets,
-                    running_total_lp,
-                    c.input_idx,
-                    c.output_idx,
-                    &dx,
-                );
-                running_assets[c.input_idx].1 = &running_assets[c.input_idx].1 + &dx;
-                running_assets[c.output_idx].1 = &running_assets[c.output_idx].1 - &dy;
+                let mut banded_fb: Option<BigInt> = None;
+                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                    let mut wst = WalkPoolState {
+                        running_assets,
+                        running_total_lp,
+                        running_circ_lp,
+                        running_preminted,
+                        ps: &per_pool_ps[batch_idx],
+                        cum_gross_fb: &mut per_pool_cum_gross_fb[batch_idx],
+                        cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
+                        transcript: &mut per_pool_transcripts[batch_idx],
+                    };
+                    let (dy, fb, after) = walk_banded_swap(
+                        config,
+                        &mut wst,
+                        c.input_idx,
+                        &dx,
+                        &per_pool_swap_tag[batch_idx],
+                        order_ref_to_plutus(&route.order.input),
+                    )?;
+                    banded_fb = Some(fb);
+                    banded_after = Some(after);
+                    dy
+                } else {
+                    let dy = crate::sundaev4::batch::compute_swap_result(
+                        &pool_type,
+                        running_assets,
+                        running_total_lp,
+                        c.input_idx,
+                        c.output_idx,
+                        &dx,
+                    );
+                    running_assets[c.input_idx].1 = &running_assets[c.input_idx].1 + &dx;
+                    running_assets[c.output_idx].1 = &running_assets[c.output_idx].1 - &dy;
+                    dy
+                };
                 tracing::debug!(
                     walk = "op-cont",
                     batch_idx,
@@ -865,26 +1033,62 @@ pub fn build_multi_pool_scoop_tx(
                 } else {
                     rs.final_output = &rs.final_output + &dy;
                 }
-                let fb = swap_math::compute_fee_budget(
-                    &pool_type,
-                    &prev_assets,
-                    running_assets,
-                    running_total_lp,
-                );
+                let fb = banded_fb.unwrap_or_else(|| {
+                    swap_math::compute_fee_budget(
+                        &pool_type,
+                        &prev_assets,
+                        running_assets,
+                        running_total_lp,
+                    )
+                });
                 (per_pool_swap_tag[batch_idx].clone(), fb)
             }
             crate::sundaev4::batch::BatchOp::ZapSwap(i) => {
                 let z = &batch.zaps[*i];
                 op_data_override = Some(order_ref_to_plutus(&z.order.input));
-                for (idx, amt) in running_assets.iter_mut().enumerate() {
-                    amt.1 = &amt.1 + &z.swap_deltas[idx];
-                }
-                let fb = swap_math::compute_fee_budget(
-                    &pool_type,
-                    &prev_assets,
-                    running_assets,
-                    running_total_lp,
-                );
+                let fb = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                    let in_idx = z
+                        .swap_deltas
+                        .iter()
+                        .position(|d| num_traits::Signed::is_positive(d))
+                        .context("zap swap pays nothing in")?;
+                    let mut wst = WalkPoolState {
+                        running_assets,
+                        running_total_lp,
+                        running_circ_lp,
+                        running_preminted,
+                        ps: &per_pool_ps[batch_idx],
+                        cum_gross_fb: &mut per_pool_cum_gross_fb[batch_idx],
+                        cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
+                        transcript: &mut per_pool_transcripts[batch_idx],
+                    };
+                    let (dy, fb, after) = walk_banded_swap(
+                        config,
+                        &mut wst,
+                        in_idx,
+                        &z.swap_deltas[in_idx],
+                        &per_pool_swap_tag[batch_idx],
+                        order_ref_to_plutus(&z.order.input),
+                    )?;
+                    if -&dy != z.swap_deltas[1 - in_idx] {
+                        bail!(
+                            "zap swap plan pays {dy} but the batch expected {}",
+                            -&z.swap_deltas[1 - in_idx]
+                        );
+                    }
+                    banded_after = Some(after);
+                    fb
+                } else {
+                    for (idx, amt) in running_assets.iter_mut().enumerate() {
+                        amt.1 = &amt.1 + &z.swap_deltas[idx];
+                    }
+                    swap_math::compute_fee_budget(
+                        &pool_type,
+                        &prev_assets,
+                        running_assets,
+                        running_total_lp,
+                    )
+                };
                 tracing::debug!(
                     walk = "op-zap-swap",
                     batch_idx,
@@ -1045,11 +1249,10 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             };
-            op_data_override = Some(banded_op_data(
-                config,
-                running_assets,
-                served_order.map(order_ref_to_plutus),
-            )?);
+            op_data_override = Some(match &banded_after {
+                Some(w) => banded_op_data_for(w, served_order.map(order_ref_to_plutus)),
+                None => banded_op_data(config, running_assets, served_order.map(order_ref_to_plutus))?,
+            });
         }
 
         // Per-entry protocol_lp share. fee_split.Operate's check is

@@ -186,6 +186,13 @@ pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witn
 }
 
 pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32) -> Option<Witness> {
+    (0..cfg.bands.len()).find_map(|k| find_witness_in_band(cfg, a, b, k, scan))
+}
+
+/// The witness for `(a, b)` with band `k` active, if one exists. A state that
+/// sits on a band edge can have a witness in both neighbouring bands; the
+/// step planner uses this to continue in the band it is crossing into.
+pub fn find_witness_in_band(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize, scan: u32) -> Option<Witness> {
     let one = BigInt::from(1);
     let two = BigInt::from(2);
     let cap = {
@@ -195,7 +202,7 @@ pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32
         }
         c
     };
-    for k in 0..cfg.bands.len() {
+    {
         let sign_ok = |x: &BigInt| -> bool {
             match ladder_at(cfg, x, k) {
                 Ok(st) => !(a - &st.ca).is_negative() && !(b - &st.cb).is_negative(),
@@ -247,6 +254,107 @@ pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32
         }
     }
     None
+}
+
+/// One in-band step of a swap plan: `dx` in, `dy` out, with the witnesses
+/// the module sees before and after.
+#[derive(Debug, Clone)]
+pub struct SwapStepPlan {
+    pub dx: BigInt,
+    pub dy: BigInt,
+    pub before: Witness,
+    pub after: Witness,
+}
+
+/// The band a swap moves into when it drains the active band: selling A
+/// takes the active band's B, so the ladder steps down; selling B steps up.
+fn next_band(k: usize, is_a_input: bool, n: usize) -> Option<usize> {
+    if is_a_input {
+        k.checked_sub(1)
+    } else if k + 1 < n {
+        Some(k + 1)
+    } else {
+        None
+    }
+}
+
+/// Plan a swap of `dx` as a sequence of in-band steps. Each step fills at
+/// most what the active band can pay; a step that empties the band is
+/// followed by one in the neighbouring band, whose witness is looked up
+/// there first so the module's before-witness matches. Fails when the
+/// ladder runs out before `dx` is consumed, or when no next-band witness
+/// exists for an edge state.
+pub fn swap_steps(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    is_a_input: bool,
+    dx: &BigInt,
+) -> Result<Vec<SwapStepPlan>, String> {
+    if !dx.is_positive() {
+        return Err("swap input is not positive".into());
+    }
+    let n = cfg.bands.len();
+    let mut steps: Vec<SwapStepPlan> = Vec::new();
+    let (mut ca, mut cb) = (a.clone(), b.clone());
+    let mut remaining = dx.clone();
+    let mut prefer: Option<usize> = None;
+    // At most one step per band plus one retry at each edge.
+    let mut guard = 2 * n + 2;
+    while remaining.is_positive() {
+        guard -= 1;
+        if guard == 0 {
+            return Err("banded swap plan did not converge".into());
+        }
+        let before = match prefer.and_then(|k| find_witness_in_band(cfg, &ca, &cb, k, 400)) {
+            Some(w) => w,
+            None => find_witness(cfg, &ca, &cb)
+                .ok_or_else(|| format!("no ladder witness for reserves ({ca}, {cb})"))?,
+        };
+        let v = band_view(cfg, &ca, &cb, &before)?;
+        let cap_dx = max_dx_in_band(&v, is_a_input);
+        let step_dx = if remaining <= cap_dx { remaining.clone() } else { cap_dx };
+        let dy = if step_dx.is_positive() { band_output(&v, is_a_input, &step_dx) } else { BigInt::zero() };
+        if !dy.is_positive() {
+            // This band pays nothing more: cross to the next one, once.
+            let Some(k_next) = next_band(before.k, is_a_input, n) else {
+                return Err(format!(
+                    "swap of {dx} exhausts the ladder in band {} with {remaining} unfilled",
+                    before.k
+                ));
+            };
+            if prefer == Some(k_next) {
+                return Err(format!(
+                    "swap of {dx} cannot continue past band {}: no witness in band {k_next}                      for reserves ({ca}, {cb}), {remaining} unfilled",
+                    before.k
+                ));
+            }
+            prefer = Some(k_next);
+            continue;
+        }
+        let (na, nb) = if is_a_input { (&ca + &step_dx, &cb - &dy) } else { (&ca - &dy, &cb + &step_dx) };
+        let crossing = step_dx < remaining;
+        let after = if crossing {
+            next_band(before.k, is_a_input, n)
+                .and_then(|k| find_witness_in_band(cfg, &na, &nb, k, 400))
+                .or_else(|| find_witness(cfg, &na, &nb))
+        } else {
+            find_witness_in_band(cfg, &na, &nb, before.k, 400).or_else(|| find_witness(cfg, &na, &nb))
+        }
+        .ok_or_else(|| format!("no ladder witness for the after reserves ({na}, {nb})"))?;
+        if after.x < before.x {
+            return Err(format!(
+                "step lowers the ladder counter ({} -> {}); the module requires fee_budget >= 0",
+                before.x, after.x
+            ));
+        }
+        remaining = &remaining - &step_dx;
+        steps.push(SwapStepPlan { dx: step_dx, dy, before, after: after.clone() });
+        ca = na;
+        cb = nb;
+        prefer = Some(after.k);
+    }
+    Ok(steps)
 }
 
 /// What the active band looks like at a witness: the residual reserves the
@@ -379,6 +487,75 @@ pub fn max_dx_in_band(v: &BandView, is_a_input: bool) -> BigInt {
 /// x_before)`, and the step's `fee_budget = bp - lp_after`. For a swap
 /// `lp_after == lp_before`, so the budget is the LP the counter's growth is
 /// worth.
+/// The state a swap of `dx` leaves behind: the reserves and the band view
+/// at the final step's after-witness. `None` when the ladder cannot absorb
+/// `dx`.
+pub fn view_after(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    is_a_input: bool,
+    dx: &BigInt,
+) -> Option<(BigInt, BigInt, BandView)> {
+    let steps = swap_steps(cfg, a, b, is_a_input, dx).ok()?;
+    let last = steps.last()?;
+    let (mut na, mut nb) = (a.clone(), b.clone());
+    for st in &steps {
+        if is_a_input {
+            na = &na + &st.dx;
+            nb = &nb - &st.dy;
+        } else {
+            nb = &nb + &st.dx;
+            na = &na - &st.dy;
+        }
+    }
+    let v = band_view(cfg, &na, &nb, &last.after).ok()?;
+    Some((na, nb, v))
+}
+
+/// The largest input the whole ladder absorbs in one direction: the sum of
+/// every band's capacity from the active band to the ladder's end.
+pub fn ladder_capacity(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, is_a_input: bool) -> BigInt {
+    let n = cfg.bands.len();
+    let Some(w) = find_witness(cfg, a, b) else {
+        return BigInt::zero();
+    };
+    let (mut ca, mut cb) = (a.clone(), b.clone());
+    let mut prefer = Some(w.k);
+    let mut total = BigInt::zero();
+    for _ in 0..(2 * n + 2) {
+        let Some(wk) = prefer
+            .and_then(|k| find_witness_in_band(cfg, &ca, &cb, k, 400))
+            .or_else(|| find_witness(cfg, &ca, &cb))
+        else {
+            break;
+        };
+        let Ok(v) = band_view(cfg, &ca, &cb, &wk) else {
+            break;
+        };
+        let cap_dx = max_dx_in_band(&v, is_a_input);
+        let dy = if cap_dx.is_positive() { band_output(&v, is_a_input, &cap_dx) } else { BigInt::zero() };
+        if dy.is_positive() {
+            total = &total + &cap_dx;
+            if is_a_input {
+                ca = &ca + &cap_dx;
+                cb = &cb - &dy;
+            } else {
+                cb = &cb + &cap_dx;
+                ca = &ca - &dy;
+            }
+        }
+        let Some(k_next) = next_band(wk.k, is_a_input, n) else {
+            break;
+        };
+        if !dy.is_positive() && prefer == Some(k_next) {
+            break;
+        }
+        prefer = Some(k_next);
+    }
+    total
+}
+
 pub fn fee_budget(lp_before: &BigInt, x_before: &BigInt, x_after: &BigInt, lp_after: &BigInt) -> BigInt {
     &(&(lp_before * x_after) / x_before) - lp_after
 }
@@ -661,6 +838,54 @@ mod tests {
         assert!(band_output(&v, true, &(&max + &BigInt::from(1))) > v.rb);
         // The capped step itself resolves.
         assert!(swap_step(&cfg, &a, &b, &lp, true, &max).is_ok());
+    }
+
+    /// A B-input swap larger than band 0 can pay splits into steps: the
+    /// first drains band 0's A, the next continues in band 1. Every step's
+    /// before-witness is the previous step's after-witness, and the counter
+    /// never falls, which is what the module's walk checks.
+    #[test]
+    fn a_swap_past_the_band_edge_plans_two_steps() {
+        let cfg = eq8();
+        let a = BigInt::from(RESERVE_A);
+        let b = BigInt::from(RESERVE_B);
+        let w = find_witness(&cfg, &a, &b).unwrap();
+        let v = band_view(&cfg, &a, &b, &w).unwrap();
+        let cap = max_dx_in_band(&v, false);
+        let dx = &cap + &BigInt::from(50_000);
+        let steps = swap_steps(&cfg, &a, &b, false, &dx).expect("plan should cross into band 1");
+        assert_eq!(steps.len(), 2, "steps: {steps:?}");
+        assert_eq!(steps[0].before.k, 0);
+        assert_eq!(steps[0].dx, cap);
+        assert_eq!(steps[1].before, steps[0].after, "witness chains across the edge");
+        assert_eq!(steps[1].before.k, 1);
+        assert_eq!(steps[1].dx, BigInt::from(50_000));
+        assert!(steps[1].dy.is_positive());
+        for st in &steps {
+            assert!(st.after.x >= st.before.x, "counter falls in {st:?}");
+        }
+        let total_dx: BigInt = steps.iter().fold(BigInt::zero(), |acc, s| &acc + &s.dx);
+        assert_eq!(total_dx, dx);
+        // Each step passes the module's own checks on its before state.
+        let (mut ca, mut cb) = (a.clone(), b.clone());
+        for st in &steps {
+            assert!(is_witness(&cfg, &ca, &cb, &st.before.x, st.before.k));
+            ca = &ca - &st.dy;
+            cb = &cb + &st.dx;
+            assert!(is_witness(&cfg, &ca, &cb, &st.after.x, st.after.k));
+        }
+    }
+
+    /// A single-band swap plans one step identical to `swap_step`.
+    #[test]
+    fn an_in_band_swap_plans_one_step() {
+        let cfg = eq8();
+        let a = BigInt::from(RESERVE_A);
+        let b = BigInt::from(RESERVE_B);
+        let steps = swap_steps(&cfg, &a, &b, false, &BigInt::from(624)).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].dy, BigInt::from(616));
+        assert_eq!(steps[0].after.x, BigInt::from(999_999_641i64));
     }
 
     #[test]
