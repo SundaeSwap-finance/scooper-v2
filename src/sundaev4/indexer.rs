@@ -2295,6 +2295,7 @@ pub fn detect_pool_type(
         return PoolType::BandedConcentratedLiquidity {
             config: crate::sundaev4::types::BandedCLConfig {
                 bands: vec![],
+                index: vec![],
                 closing: Rational {
                     num: BigInt::from(1),
                     den: BigInt::from(1),

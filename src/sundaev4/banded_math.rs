@@ -20,6 +20,11 @@
 //!   - `L_k` floors          (a shallower curve buys less)
 //!   - saturation ceils      (a bigger constant leaves a smaller residual)
 //!   - saturation takes ONE division, never materialising `L_i` first.
+//!   - the PREFIX sums round up ONCE, not once per band: the config carries
+//!     the cumulative coefficients in fixed point at `2^64` (the ladder
+//!     index, spec section 2.3) and a spend multiplies by the counter and
+//!     ceils the product. A per-band sum of ceilings is a DIFFERENT number
+//!     and the chain will reject every transaction built from it.
 
 use crate::bigint::BigInt;
 use crate::sundaev4::types::{BandSpec, BandedCLConfig, PoolDatum, Rational};
@@ -76,6 +81,82 @@ fn b_sat(cfg: &BandedCLConfig, x: &BigInt, i: usize) -> BigInt {
     ceil_div(&num, &den)
 }
 
+/// `2^64`: the fixed-point scale of the ladder index, and the bound every
+/// rational component of a config must respect (V9).
+pub fn fixed_one() -> BigInt {
+    let mut c = BigInt::from(1);
+    for _ in 0..64 {
+        c = &c * &BigInt::from(2);
+    }
+    c
+}
+
+/// Band `i`'s saturation coefficient on the A side: the part of `a_sat_i`
+/// that does not depend on the counter, in fixed point and rounded UP.
+///
+///     a_sat_i = ceil(coeff_a_i * X / 2^64)   with the aggregate rounding
+fn coeff_a(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
+    let lo = &cfg.bands[i].start;
+    let hi = upper_edge(cfg, i);
+    let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * scale;
+    let den = &(&cfg.weight_total * &lo.num) * &hi.num;
+    ceil_div(&num, &den)
+}
+
+/// The same on the B side.
+fn coeff_b(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
+    let lo = &cfg.bands[i].start;
+    let hi = upper_edge(cfg, i);
+    let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * scale;
+    let den = &(&cfg.weight_total * &lo.den) * &hi.den;
+    ceil_div(&num, &den)
+}
+
+/// The ladder index: entry `k` is the pair of cumulative coefficients for
+/// the bands strictly ABOVE and strictly BELOW band `k`.
+///
+/// `cfg.index` is ignored; this derives it from the bands, which is exactly
+/// what `Create` pins (V13). Build a config with `with_index` rather than
+/// calling this directly.
+pub fn build_index(cfg: &BandedCLConfig) -> Vec<(BigInt, BigInt)> {
+    let n = cfg.bands.len();
+    let scale = fixed_one();
+    let a: Vec<BigInt> = (0..n).map(|i| coeff_a(cfg, i, &scale)).collect();
+    let b: Vec<BigInt> = (0..n).map(|i| coeff_b(cfg, i, &scale)).collect();
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut ca = BigInt::zero();
+        let mut cb = BigInt::zero();
+        for i in 0..n {
+            if i > k {
+                ca = &ca + &a[i];
+            } else if i < k {
+                cb = &cb + &b[i];
+            }
+        }
+        out.push((ca, cb));
+    }
+    out
+}
+
+/// A config with its index derived from its bands. Every constructor goes
+/// through here: a config whose index does not match its bands fails
+/// `Create` and bricks every spend of a pool that already has one.
+pub fn with_index(
+    bands: Vec<BandSpec>,
+    closing: Rational,
+    weight_total: BigInt,
+) -> BandedCLConfig {
+    let mut cfg = BandedCLConfig {
+        bands,
+        index: vec![],
+        closing,
+        weight_total,
+    };
+    cfg.index = build_index(&cfg);
+    cfg
+}
+
 /// One pass over the ladder at `(x, k)`. `Err` when `k` is out of range.
 pub fn ladder_at(cfg: &BandedCLConfig, x: &BigInt, k: usize) -> Result<LadderState, String> {
     let n = cfg.bands.len();
@@ -84,19 +165,20 @@ pub fn ladder_at(cfg: &BandedCLConfig, x: &BigInt, k: usize) -> Result<LadderSta
     }
     let one = BigInt::from(1);
     let x1 = x + &one;
-    let mut ca = BigInt::zero();
-    let mut cb = BigInt::zero();
-    let mut ca_next = BigInt::zero();
-    let mut cb_next = BigInt::zero();
-    for i in 0..n {
-        if i < k {
-            cb = &cb + &b_sat(cfg, x, i);
-            cb_next = &cb_next + &b_sat(cfg, &x1, i);
-        } else if i > k {
-            ca = &ca + &a_sat(cfg, x, i);
-            ca_next = &ca_next + &a_sat(cfg, &x1, i);
-        }
-    }
+    // The prefix sums come from the pinned index, rounded up ONCE after the
+    // multiply by the counter. Summing `a_sat`/`b_sat` per band gives a
+    // different number and the chain rejects it.
+    let Some((ca_coeff, cb_coeff)) = cfg.index.get(k) else {
+        return Err(format!(
+            "ladder index has {} entries for a {n}-band ladder",
+            cfg.index.len()
+        ));
+    };
+    let scale = fixed_one();
+    let ca = ceil_div(&(ca_coeff * x), &scale);
+    let cb = ceil_div(&(cb_coeff * x), &scale);
+    let ca_next = ceil_div(&(ca_coeff * &x1), &scale);
+    let cb_next = ceil_div(&(cb_coeff * &x1), &scale);
     let band = cfg.bands[k].clone();
     let lo = band.start.clone();
     let hi = upper_edge(cfg, k).clone();
@@ -746,13 +828,10 @@ pub fn config_matches_datum(cfg: &BandedCLConfig, datum: &PoolDatum, module_hash
         .is_some_and(|(_, stored)| *stored == config_hash(cfg))
 }
 
-/// `2^64`, the bound on every rational component (V9).
+/// `2^64`, the bound on every rational component (V9). The same number the
+/// ladder index is scaled by.
 fn rational_bound() -> BigInt {
-    let mut c = BigInt::from(1);
-    for _ in 0..64 {
-        c = &c * &BigInt::from(2);
-    }
-    c
+    fixed_one()
 }
 
 fn check_fee(f: &Rational, what: &str) -> Result<(), String> {
@@ -763,7 +842,7 @@ fn check_fee(f: &Rational, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// V1 to V9 of the spec: the Create-time shape checks
+/// V1 to V9 and V13 of the spec: the Create-time shape checks
 /// (`banded_cl_check.check_shape`). A config that fails these did not come
 /// from a real pool.
 pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
@@ -797,6 +876,17 @@ pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
     if wt != cfg.weight_total {
         return Err(format!("weight_total {} != sum of weights {wt}", cfg.weight_total));
     }
+    // V13: the index is exactly the cumulative coefficients of these bands.
+    // A spend reads one entry of it instead of walking, so a wrong entry is
+    // a wrong residual on every step of the pool's life.
+    let expected = build_index(cfg);
+    if cfg.index != expected {
+        return Err(format!(
+            "ladder index does not match the bands ({} entries, expected {})",
+            cfg.index.len(),
+            expected.len()
+        ));
+    }
     Ok(())
 }
 
@@ -821,11 +911,11 @@ mod tests {
     /// The eight equal-weight arcs of `lib/tests/unit/banded_cl_check.ak`:
     /// sqrt-price 1.00 .. 1.08 in steps of 0.01, fee 0.3%.
     fn eq8() -> BandedCLConfig {
-        BandedCLConfig {
-            bands: (0..8).map(|i| band(1_000_000 + 10_000 * i, 1_000_000, 0, (3, 1000))).collect(),
-            closing: r(1_080_000, 1_000_000),
-            weight_total: BigInt::from(8),
-        }
+        with_index(
+            (0..8).map(|i| band(1_000_000 + 10_000 * i, 1_000_000, 0, (3, 1000))).collect(),
+            r(1_080_000, 1_000_000),
+            BigInt::from(8),
+        )
     }
 
     const RESERVE_A: i64 = 8_637_368;
@@ -835,20 +925,20 @@ mod tests {
     fn witness_matches_the_aiken_vector() {
         let cfg = eq8();
         let w = find_witness(&cfg, &BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B)).unwrap();
-        assert_eq!(w.x, BigInt::from(999_999_478i64));
+        assert_eq!(w.x, BigInt::from(999_999_813i64));
         assert_eq!(w.k, 0);
         let st = ladder_at(&cfg, &w.x, w.k).unwrap();
         assert_eq!(st.ca, BigInt::from(8_021_634i64));
         assert_eq!(st.cb, BigInt::from(0));
-        assert_eq!(st.l_k, BigInt::from(124_999_934i64));
+        assert_eq!(st.l_k, BigInt::from(124_999_976i64));
         assert_eq!(st.a_sat_k, BigInt::from(1_237_624i64));
         assert!(band_proof(&BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B), &st, true));
         // The far band at the counter a dishonest scooper would name.
-        assert!(!is_witness(&cfg, &BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B), &BigInt::from(71_428_000i64), 7));
+        assert!(!is_witness(&cfg, &BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B), &BigInt::from(71_428_457i64), 7));
     }
 
     /// `banded_swap_accepts_the_true_witness`: 624 B in, 616 A out, counter
-    /// 999_999_478 -> 999_999_641, fee_budget 163 at total_lp 1e9.
+    /// 999_999_813 -> 999_999_938, fee_budget 125 at total_lp 1e9.
     #[test]
     fn swap_matches_the_aiken_vector() {
         let cfg = eq8();
@@ -862,21 +952,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.dy, BigInt::from(616));
-        assert_eq!(s.before.x, BigInt::from(999_999_478i64));
+        assert_eq!(s.before.x, BigInt::from(999_999_813i64));
         assert_eq!(s.a_after, BigInt::from(8_636_752i64));
         assert_eq!(s.b_after, BigInt::from(625_623i64));
-        assert_eq!(s.after.x, BigInt::from(999_999_641i64));
+        assert_eq!(s.after.x, BigInt::from(999_999_938i64));
         assert_eq!(s.after.k, 0);
-        assert_eq!(s.fee_budget, BigInt::from(163));
+        assert_eq!(s.fee_budget, BigInt::from(125));
     }
 
     /// The proportional deposit of `banded_walk_accepts_swap_then_deposit`:
-    /// doubling the pool lands on counter 1_999_999_693.
+    /// doubling the pool lands on counter 2_000_000_000.
     #[test]
     fn doubled_pool_has_the_aiken_counter() {
         let cfg = eq8();
         let w = find_witness(&cfg, &BigInt::from(17_273_504i64), &BigInt::from(1_251_246i64)).unwrap();
-        assert_eq!(w.x, BigInt::from(1_999_999_693i64));
+        assert_eq!(w.x, BigInt::from(2_000_000_000i64));
         assert_eq!(w.k, 0);
     }
 
@@ -885,11 +975,7 @@ mod tests {
     /// pays 5_982_000 B. Fee budgets 3 and 18 at total_lp 1e6.
     #[test]
     fn cs_bin_matches_the_aiken_vectors() {
-        let cfg = BandedCLConfig {
-            bands: vec![band(2, 1, 1, (3, 1000))],
-            closing: r(3, 1),
-            weight_total: BigInt::from(1),
-        };
+        let cfg = with_index(vec![band(2, 1, 1, (3, 1000))], r(3, 1), BigInt::from(1));
         let (a, b) = (BigInt::from(41_666_666i64), BigInt::from(750_000_004i64));
         let lp = BigInt::from(1_000_000i64);
         let w = find_witness(&cfg, &a, &b).unwrap();
@@ -914,15 +1000,76 @@ mod tests {
     /// `banded_cl_cs.ak`: the witness is at band 1, counter 1_000_000_001.
     #[test]
     fn mixed_ladder_witness_is_in_the_bin() {
-        let cfg = BandedCLConfig {
-            bands: vec![band(1, 1, 0, (3, 1000)), band(2, 1, 1, (3, 1000)), band(3, 1, 0, (3, 1000))],
-            closing: r(4, 1),
-            weight_total: BigInt::from(3),
-        };
+        let cfg = with_index(
+            vec![band(1, 1, 0, (3, 1000)), band(2, 1, 1, (3, 1000)), band(3, 1, 0, (3, 1000))],
+            r(4, 1),
+            BigInt::from(3),
+        );
         let w = find_witness(&cfg, &BigInt::from(41_666_666i64), &BigInt::from(583_333_339i64)).unwrap();
         assert_eq!(w.k, 1);
         assert_eq!(w.x, BigInt::from(1_000_000_001i64));
         assert!(check_shape(&cfg).is_ok());
+    }
+
+    /// V13: a config whose index does not match its bands is refused before
+    /// it can reach a transaction. The chain rebuilds the index at `Create`
+    /// and compares, so a wrong one bricks a pool for its whole life.
+    #[test]
+    fn check_shape_rejects_a_tampered_index() {
+        let mut cfg = eq8();
+        assert!(check_shape(&cfg).is_ok());
+        // Halve one coefficient: that understates `C_A`, which inflates the
+        // residual the active band pays out of -- the extracting direction.
+        cfg.index[0].0 = &cfg.index[0].0 / &BigInt::from(2);
+        let err = check_shape(&cfg).unwrap_err();
+        assert!(err.contains("ladder index"), "{err}");
+
+        let mut short = eq8();
+        short.index.pop();
+        assert!(check_shape(&short).is_err());
+    }
+
+    /// The direction argument of spec section 2.2, checked rather than
+    /// asserted: the index form of the prefix sums never lands BELOW the
+    /// exact sum, which is what keeps the residual from inflating, and it
+    /// overshoots by at most one base unit per band plus one.
+    ///
+    /// It is NOT always at or below the per-band sum of ceilings. Each
+    /// coefficient is itself rounded up, so at small counters the
+    /// accumulated coefficient rounding can exceed what the per-band
+    /// ceilings add: at `x = 1_000` on this ladder the index gives
+    /// `cb = 1_251` where the per-band sum gives `1_250`. Both are above
+    /// the exact value, so both are safe; the bounds are what differ, and
+    /// the index's bound is the tighter one at any realistic counter.
+    #[test]
+    fn the_index_rounds_up_and_stays_within_its_bound() {
+        let cfg = eq8();
+        let n = BigInt::from(cfg.bands.len() as i64);
+        for x in [1_000i64, 1_000_000, 999_999_813, 4_000_000_000] {
+            let x = BigInt::from(x);
+            for k in 0..cfg.bands.len() {
+                let st = ladder_at(&cfg, &x, k).unwrap();
+                // The truncating sum is at or below the exact value, and
+                // the exact value is at or below it plus one per band.
+                let mut floor_a = BigInt::zero();
+                let mut floor_b = BigInt::zero();
+                for i in 0..cfg.bands.len() {
+                    let lo = &cfg.bands[i].start;
+                    let hi = upper_edge(&cfg, i);
+                    let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * &x;
+                    if i > k {
+                        floor_a = &floor_a + &(&num / &(&(&cfg.weight_total * &lo.num) * &hi.num));
+                    } else if i < k {
+                        floor_b = &floor_b + &(&num / &(&(&cfg.weight_total * &lo.den) * &hi.den));
+                    }
+                }
+                let one = BigInt::from(1);
+                assert!(st.ca >= floor_a, "ca {} below the exact sum", st.ca);
+                assert!(st.cb >= floor_b, "cb {} below the exact sum", st.cb);
+                assert!(st.ca <= &(&floor_a + &n) + &one, "ca {} over its bound", st.ca);
+                assert!(st.cb <= &(&floor_b + &n) + &one, "cb {} over its bound", st.cb);
+            }
+        }
     }
 
     #[test]
@@ -988,7 +1135,7 @@ mod tests {
         let steps = swap_steps(&cfg, &a, &b, false, &BigInt::from(624)).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].dy, BigInt::from(616));
-        assert_eq!(steps[0].after.x, BigInt::from(999_999_641i64));
+        assert_eq!(steps[0].after.x, BigInt::from(999_999_938i64));
     }
 
     #[test]
@@ -1018,8 +1165,8 @@ mod tests {
     #[test]
     fn flow_fixture_vectors() {
         let r = |n: i64, d: i64| Rational { num: BigInt::from(n), den: BigInt::from(d) };
-        let cfg = BandedCLConfig {
-            bands: [1_000_000i64, 1_010_000, 1_020_000, 1_030_000]
+        let cfg = with_index(
+            [1_000_000i64, 1_010_000, 1_020_000, 1_030_000]
                 .iter()
                 .map(|&n| BandSpec {
                     start: r(n, 1_000_000),
@@ -1029,9 +1176,9 @@ mod tests {
                     fee_sell: r(3, 1000),
                 })
                 .collect(),
-            closing: r(1_040_000, 1_000_000),
-            weight_total: BigInt::from(4),
-        };
+            r(1_040_000, 1_000_000),
+            BigInt::from(4),
+        );
         let (a, b) = (BigInt::from(4_689_396i64), BigInt::from(5_025_000i64));
         let w = find_witness(&cfg, &a, &b).unwrap();
         let v = band_view(&cfg, &a, &b, &w).unwrap();

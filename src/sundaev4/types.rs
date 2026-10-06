@@ -697,6 +697,14 @@ pub struct BandSpec {
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BandedCLConfig {
     pub bands: Vec<BandSpec>,
+    /// The ladder index (sundae-v4 spec section 2.3): one entry per band,
+    /// each the pair of cumulative saturation coefficients for the bands
+    /// ABOVE and BELOW it, in fixed point at `2^64` and rounded up. `Create`
+    /// pins it against `bands` (V13) and a spend reads one entry instead of
+    /// walking the ladder, so the prefix sums round up ONCE rather than once
+    /// per band. Build it with `banded_math::build_index`; never write one by
+    /// hand.
+    pub index: Vec<(BigInt, BigInt)>,
     pub closing: Rational,
     pub weight_total: BigInt,
 }

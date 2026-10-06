@@ -1650,9 +1650,9 @@ mod tests {
 
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
-    /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_478 in
-    /// band 0; 624 B in pays 616 A out, the counter moves to 999_999_641 and
-    /// the step's fee budget is 163 LP.
+    /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_813 in
+    /// band 0; 624 B in pays 616 A out, the counter moves to 999_999_938 and
+    /// the step's fee budget is 125 LP.
     #[test]
     fn bcl_single_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
@@ -1663,7 +1663,7 @@ mod tests {
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
             cfg.clone(),
         );
-        assert_eq!(pool.pool_datum.total_lp, BigInt::from(999_999_478i64));
+        assert_eq!(pool.pool_datum.total_lp, BigInt::from(999_999_813i64));
         let orders = vec![make_order(token_b(), 624, token_a(), 1, 1)];
         let batch = assemble_batch(
             &pool,
@@ -1706,7 +1706,7 @@ mod tests {
             .remove(0);
         let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(step.operation_data)
             .expect("banded entry carries a list");
-        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(999_999_641i64));
+        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(999_999_938i64));
         assert_eq!(BigInt::from_plutus(pair[1].clone()).unwrap(), BigInt::from(0));
         // The module entry names the INPUT witness.
         let entry = result
@@ -1723,13 +1723,13 @@ mod tests {
             })
             .expect("banded withdrawal redeemer")
             .remove(0);
-        assert_eq!(entry.counter, BigInt::from(999_999_478i64));
+        assert_eq!(entry.counter, BigInt::from(999_999_813i64));
         assert_eq!(entry.active_band, BigInt::from(0));
         assert_eq!(entry.config, cfg);
         let after = &result.predicted_pools[0].2;
         assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_752i64));
         assert_eq!(after.pool_datum.assets[1].1, BigInt::from(625_623i64));
-        // fee_budget 163 at the default protocol share grows total_lp, not
+        // fee_budget 125 at the default protocol share grows total_lp, not
         // circulating_lp.
         assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
         assert_eq!(after.pool_datum.circulating_lp, pool.pool_datum.circulating_lp);

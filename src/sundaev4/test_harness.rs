@@ -1021,8 +1021,8 @@ pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
         num: BigInt::from(n),
         den: BigInt::from(d),
     };
-    BandedCLConfig {
-        bands: (0..8)
+    crate::sundaev4::banded_math::with_index(
+        (0..8)
             .map(|i| BandSpec {
                 start: r(1_000_000 + 10_000 * i, 1_000_000),
                 weight: BigInt::from(1),
@@ -1031,9 +1031,9 @@ pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
                 fee_sell: fee.clone(),
             })
             .collect(),
-        closing: r(1_080_000, 1_000_000),
-        weight_total: BigInt::from(8),
-    }
+        r(1_080_000, 1_000_000),
+        BigInt::from(8),
+    )
 }
 
 /// Create a banded concentrated-liquidity pool with the proper module
