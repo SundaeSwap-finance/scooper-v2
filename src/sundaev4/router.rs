@@ -1416,10 +1416,72 @@ pub fn collapse_to_serial(plan: &RoutingPlan, input: &BigInt) -> Option<RoutingP
     })
 }
 
+/// Whether `plan` follows `path`: the same tokens, hop by hop.
+fn routes_along(plan: &RoutingPlan, path: &[PathHop]) -> bool {
+    plan.hops.len() == path.len()
+        && plan
+            .hops
+            .iter()
+            .zip(path)
+            .all(|(h, p)| h.input_token == p.token_in && h.output_token == p.token_out)
+}
+
 /// The distinct pool/edge idents a path's hops could touch (candidate set —
 /// conservative: `optimize_split` may end up allocating 0 to some of them).
 fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {
     path.iter().flat_map(|h| h.pools.iter().map(|p| p.ident.clone())).collect()
+}
+
+/// Split `amount` across the `chosen` paths in `chunks` equal parts, each
+/// going to the path whose output it raises the most. Returns each path's
+/// allocation and output; a path whose allocation exceeds its capacity
+/// outputs 0.
+fn water_fill(
+    paths: &[Vec<PathHop>],
+    chosen: &[usize],
+    amount: &BigInt,
+    chunks: u64,
+    limits: &RoutingLimits,
+) -> (Vec<BigInt>, Vec<BigInt>) {
+    let chunk = amount / &BigInt::from(chunks);
+    let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
+        if !alloc.is_positive() {
+            return BigInt::from(0);
+        }
+        evaluate_path(&paths[path_idx], alloc, limits)
+            .last()
+            .map(|h| h.total_output.clone())
+            .unwrap_or_else(|| BigInt::from(0))
+    };
+    let mut alloc: Vec<BigInt> = chosen.iter().map(|_| BigInt::from(0)).collect();
+    let mut cur_out: Vec<BigInt> = alloc.clone();
+    let mut remaining = amount.clone();
+    for step in 0..chunks {
+        // Last chunk absorbs the division remainder so value is conserved.
+        let this_chunk = if step == chunks - 1 {
+            remaining.clone()
+        } else {
+            chunk.clone()
+        };
+        let mut best: Option<(usize, BigInt, BigInt)> = None; // (idx, new_out, gain)
+        for (ci, path_idx) in chosen.iter().enumerate() {
+            let trial = &alloc[ci] + &this_chunk;
+            let new_out = out_at(*path_idx, &trial);
+            let gain = &new_out - &cur_out[ci];
+            let better = match &best {
+                Some((_, _, bg)) => &gain > bg,
+                None => true,
+            };
+            if better {
+                best = Some((ci, new_out, gain));
+            }
+        }
+        let (ci, new_out, _) = best.expect("chosen is non-empty");
+        alloc[ci] = &alloc[ci] + &this_chunk;
+        cur_out[ci] = new_out;
+        remaining = &remaining - &this_chunk;
+    }
+    (alloc, cur_out)
 }
 
 /// Find the optimal allocation of `amount` across parallel routes over the
@@ -1473,20 +1535,19 @@ pub fn find_blended_route(
         return single.map(single_plan);
     }
 
-    // Rank paths by standalone output at the full amount, then greedily keep
-    // the strongest pairwise pool-disjoint ones. Disjointness is what makes
-    // branch evaluations independent (a shared pool would let both branches
-    // count the same depth twice).
+    // Rank paths by one chunk's output, the marginal the water-fill below
+    // allocates on, then greedily keep the strongest pairwise pool-disjoint
+    // ones. Disjointness is what makes branch evaluations independent (a
+    // shared pool would let both branches count the same depth twice). Output
+    // at the full amount is no rank: it puts a path that absorbs the whole
+    // amount but loses most of it ahead of a better path that only lacks
+    // depth, and the latter is then excluded for sharing a pool, or for want
+    // of a branch slot, while the former gets no allocation.
     let mut ranked: Vec<(usize, BigInt)> = paths
         .iter()
         .enumerate()
         .filter_map(|(i, path)| {
-            let mut hops = evaluate_path(path, amount, &limits);
-            if hops.is_empty() {
-                // Too capped for the full amount: still a candidate partial
-                // branch, ranked (below full-amount paths) by one chunk's output.
-                hops = evaluate_path(path, &(amount / &BigInt::from(CHUNKS)), &limits);
-            }
+            let hops = evaluate_path(path, &(amount / &BigInt::from(CHUNKS)), &limits);
             let out = hops.last().map(|h| h.total_output.clone())?;
             out.is_positive().then_some((i, out))
         })
@@ -1514,42 +1575,20 @@ pub fn find_blended_route(
     if !chunk.is_positive() {
         return single.map(single_plan);
     }
-    let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
-        if !alloc.is_positive() {
-            return BigInt::from(0);
-        }
-        evaluate_path(&paths[path_idx], alloc, &limits)
-            .last()
-            .map(|h| h.total_output.clone())
-            .unwrap_or_else(|| BigInt::from(0))
-    };
-    let mut alloc: Vec<BigInt> = chosen.iter().map(|_| BigInt::from(0)).collect();
-    let mut cur_out: Vec<BigInt> = alloc.clone();
-    let mut remaining = amount.clone();
-    for step in 0..CHUNKS {
-        // Last chunk absorbs the division remainder so value is conserved.
-        let this_chunk = if step == CHUNKS - 1 {
-            remaining.clone()
-        } else {
-            chunk.clone()
-        };
-        let mut best: Option<(usize, BigInt, BigInt)> = None; // (idx, new_out, gain)
-        for (ci, path_idx) in chosen.iter().enumerate() {
-            let trial = &alloc[ci] + &this_chunk;
-            let new_out = out_at(*path_idx, &trial);
-            let gain = &new_out - &cur_out[ci];
-            let better = match &best {
-                Some((_, _, bg)) => &gain > bg,
-                None => true,
-            };
-            if better {
-                best = Some((ci, new_out, gain));
-            }
-        }
-        let (ci, new_out, _) = best.expect("chosen is non-empty");
-        alloc[ci] = &alloc[ci] + &this_chunk;
-        cur_out[ci] = new_out;
-        remaining = &remaining - &this_chunk;
+    let (mut alloc, cur_out) = water_fill(&paths, &chosen, amount, CHUNKS, &limits);
+    // The chosen paths lack the depth for the whole amount: a chunk went past
+    // a path's capacity, where it pays nothing. `single`'s path has the depth:
+    // it takes the last slot, and the water-fill starts over.
+    let lacks_depth = alloc.iter().zip(&cur_out).any(|(a, o)| a.is_positive() && !o.is_positive());
+    if lacks_depth
+        && let Some(single) = &single
+        && let Some(i) = (0..paths.len()).find(|&i| routes_along(single, &paths[i]))
+        && chosen[..chosen.len() - 1]
+            .iter()
+            .all(|&c| path_ident_set(&paths[c]).is_disjoint(&path_ident_set(&paths[i])))
+    {
+        *chosen.last_mut().expect("chosen has at least 2 paths") = i;
+        (alloc, _) = water_fill(&paths, &chosen, amount, CHUNKS, &limits);
     }
 
     // Materialize branches with positive allocation.
