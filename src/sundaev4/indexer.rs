@@ -972,30 +972,64 @@ pub fn extract_ss_config_candidates(
 }
 
 /// Every banded ladder a transaction vouches for: a `Create`'s
-/// `initial_state`, and each `Operate` entry's `config`. The ladder never
-/// changes after Create, so there is no post-update form to add.
+/// `initial_state`, and each `Operate` entry's `config`.
+///
+/// The caller accepts a candidate only when it hashes to the pool datum's
+/// `module_state` slot, so this function is deliberately permissive. It does
+/// two things beyond reading the current module's own withdrawal redeemer:
+///
+///  1. It reads EVERY withdrawal redeemer in the transaction, not only the
+///     one at `bcl_script_hash`. A pool created under an earlier banded
+///     module hash keeps its ladder; the hash the config must match is in
+///     the pool datum, not in the withdrawal.
+///  2. It parses the pre-V13 redeemer form as well, and rebuilds the index
+///     from the bands (`banded_math::with_index`). An index-swap governor
+///     adds the index in place without writing the new config to any
+///     redeemer, so the derived form is the only way to recover the config
+///     of a migrated pool from chain history.
+///
+/// Both rules only ADD candidates. The hash pin rejects anything wrong.
 pub fn extract_bcl_config_candidates(
     tx: &MultiEraTx,
     bcl_script_hash: &ScriptHash,
 ) -> Vec<crate::sundaev4::types::BandedCLConfig> {
-    use crate::sundaev4::types::BandedCLRedeemer;
-    let Some(wd_index) = withdrawal_index_of_script(tx, bcl_script_hash) else {
-        return vec![];
-    };
-    let redeemers = tx.redeemers();
-    let Some(redeemer) =
-        redeemers.iter().find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)
-    else {
-        return vec![];
-    };
-    let Ok(parsed) = BandedCLRedeemer::from_plutus(redeemer.data().clone()) else {
-        return vec![];
-    };
-    match parsed {
-        BandedCLRedeemer::Create { initial_state, .. } => vec![initial_state],
-        BandedCLRedeemer::Operate { entries } => entries.into_iter().map(|e| e.config).collect(),
-        BandedCLRedeemer::Destroy { .. } => vec![],
+    use crate::sundaev4::banded_math::with_index;
+    use crate::sundaev4::types::{BandedCLRedeemer, LegacyBandedCLRedeemer};
+    // Read the configured module's redeemer first, so its candidates come
+    // first in the list; then every other withdrawal redeemer.
+    let preferred = withdrawal_index_of_script(tx, bcl_script_hash).map(|i| i as u32);
+    let mut redeemers: Vec<_> =
+        tx.redeemers().into_iter().filter(|r| r.tag() == RedeemerTag::Reward).collect();
+    redeemers.sort_by_key(|r| (Some(r.index()) != preferred, r.index()));
+
+    let mut out = vec![];
+    for redeemer in redeemers {
+        let data = redeemer.data().clone();
+        if let Ok(parsed) = BandedCLRedeemer::from_plutus(data.clone()) {
+            match parsed {
+                BandedCLRedeemer::Create { initial_state, .. } => out.push(initial_state),
+                BandedCLRedeemer::Operate { entries } => {
+                    out.extend(entries.into_iter().map(|e| e.config))
+                }
+                BandedCLRedeemer::Destroy { .. } => {}
+            }
+            continue;
+        }
+        let Ok(parsed) = LegacyBandedCLRedeemer::from_plutus(data) else {
+            continue;
+        };
+        let rebuild = |c: crate::sundaev4::types::LegacyBandedCLConfig| {
+            with_index(c.bands, c.closing, c.weight_total)
+        };
+        match parsed {
+            LegacyBandedCLRedeemer::Create { initial_state, .. } => out.push(rebuild(initial_state)),
+            LegacyBandedCLRedeemer::Operate { entries } => {
+                out.extend(entries.into_iter().map(|e| rebuild(e.config)))
+            }
+            LegacyBandedCLRedeemer::Destroy { .. } => {}
+        }
     }
+    out
 }
 
 /// The banded ladder for `pool_datum`: the first of `candidates`, else
@@ -2441,6 +2475,44 @@ mod mainnet_create_tx_tests {
         assert!(
             tracked.contains(&fee_constraint_ref),
             "fee_constraint is invoked by every scoop and must be in the store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preview_banded_recovery_tests {
+    //! Preview pool 622cee5f…, Create transaction c601f694…. The pool was
+    //! created under banded module 0977898c… with the pre-V13 config, and an
+    //! index-swap governor later rewrote its `module_state` to the indexed
+    //! config 361006908c…. The governor derives the new config on chain, so
+    //! no redeemer anywhere holds it. Recovery must therefore read a
+    //! withdrawal of a module hash it is not configured with, parse the old
+    //! config form, and rebuild the index from the bands.
+    use super::*;
+    use crate::sundaev4::banded_math::config_hash;
+
+    const CREATE_TX_HEX: &str =
+        include_str!("../../test/fixtures/preview-banded-create-c601f694.hex");
+    /// The banded module the scooper is configured with today.
+    const NEW_BCL_HASH: &str = "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18";
+    /// The pool datum's banded `module_state` slot after the migration.
+    const MIGRATED_STATE: &str =
+        "361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9";
+
+    #[test]
+    fn recovers_the_migrated_config_from_the_legacy_create_redeemer() {
+        let cbor = hex::decode(CREATE_TX_HEX.trim()).expect("fixture is hex");
+        let tx = MultiEraTx::decode(&cbor).expect("fixture decodes");
+        let configured: ScriptHash =
+            hex::decode(NEW_BCL_HASH).expect("hex").as_slice().try_into().expect("28 bytes");
+
+        let candidates = extract_bcl_config_candidates(&tx, &configured);
+        assert!(!candidates.is_empty(), "no banded candidate recovered from the Create tx");
+        let want = hex::decode(MIGRATED_STATE).expect("hex");
+        assert!(
+            candidates.iter().any(|c| config_hash(c) == want),
+            "no candidate hashes to the migrated module_state; got {:?}",
+            candidates.iter().map(|c| hex::encode(config_hash(c))).collect::<Vec<_>>()
         );
     }
 }

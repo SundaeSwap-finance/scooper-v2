@@ -1038,6 +1038,44 @@ pub struct BandedOperateEntry {
     pub active_band: BigInt,
 }
 
+/// The pre-V13 ladder: `BandedCLConfig` without the index (spec section
+/// 2.3). Pools created before the index carry this form in their `Create`
+/// redeemer. The index is a pure function of the bands, so
+/// `banded_math::with_index` rebuilds the current config from this one; the
+/// indexer uses that to recover the config of a pool an index-swap governor
+/// migrated. Parsed only; the scooper never writes this form.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct LegacyBandedCLConfig {
+    pub bands: Vec<BandSpec>,
+    pub closing: Rational,
+    pub weight_total: BigInt,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct LegacyBandedOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: LegacyBandedCLConfig,
+    pub counter: BigInt,
+    pub active_band: BigInt,
+}
+
+/// `BandedCLRedeemer` in its pre-V13 form. See `LegacyBandedCLConfig`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum LegacyBandedCLRedeemer {
+    Create {
+        initial_state: LegacyBandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<LegacyBandedOperateEntry>,
+    },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
 /// `modules/oracle.ak`'s redeemer. `Create` pins the fresh slot (`0x80`);
 /// `Operate` carries one entry per oracle pool in the scoop; the module
 /// recomputes the slot from the transcript and the validity lower bound.
