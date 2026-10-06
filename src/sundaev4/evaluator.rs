@@ -12,6 +12,18 @@ use pallas_primitives::{ExUnits, Hash, PlutusData};
 use tracing::warn;
 
 use crate::cardano_types;
+
+/// The protocol version the UPLC decoder gates builtins against.
+///
+/// The decoder refuses a builtin the given (plutus version, protocol
+/// version) pair does not admit, so this has to match the chain we build
+/// for or a valid script is rejected locally. Protocol 11 is what admits
+/// the Value builtins -- `lookup_value` (`LookupCoin`), `un_value_data`
+/// (`UnValueData`) and the rest of batch 6 -- and `drop_list`, all of
+/// which the vault and the modules use today. Preview's own V3 cost model
+/// in `config/preview-v4.json` carries 350 entries, which is the batch-6
+/// model, so the chain admits them and so do we.
+const PROTOCOL_VERSION: u32 = 11;
 use crate::sundaev4::script_context::{
     self, Credential, DatumOption, OutputReference, ResolvedTxOut, ScriptPurpose,
 };
@@ -188,8 +200,23 @@ pub fn evaluate_scoop_tx(
         // Evaluate in a fresh arena (16MB stack not needed for single-threaded)
         let arena = Arena::new();
 
-        // Decode FLAT script
-        let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, flat_bytes).map_err(|e| {
+        // Decode FLAT script.
+        //
+        // The decoder gates builtins on (plutus version, protocol version).
+        // `PROTOCOL_VERSION` is what the chain we build for admits; see its
+        // definition for why it is 11.
+        let plutus_version = if version == 2 {
+            PlutusVersion::V2
+        } else {
+            PlutusVersion::V3
+        };
+        let program = uplc_turbo::flat::decode::<DeBruijn>(
+            &arena,
+            flat_bytes,
+            plutus_version,
+            PROTOCOL_VERSION,
+        )
+        .map_err(|e| {
             anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash))
         })?;
 
@@ -398,6 +425,7 @@ mod debug_eval {
         use uplc_turbo::arena::Arena;
         use uplc_turbo::binder::DeBruijn;
         use uplc_turbo::data::PlutusData as UplcPlutusData;
+        use super::PROTOCOL_VERSION;
         use uplc_turbo::machine::{ExBudget, PlutusVersion};
         use uplc_turbo::term::Term;
 
@@ -410,7 +438,13 @@ mod debug_eval {
         let ctx = std::fs::read(std::env::var("CTX_FILE").unwrap()).unwrap();
 
         let arena = Arena::new();
-        let program = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat).unwrap();
+        let program = uplc_turbo::flat::decode::<DeBruijn>(
+            &arena,
+            &flat,
+            PlutusVersion::V3,
+            PROTOCOL_VERSION,
+        )
+        .unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {

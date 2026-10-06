@@ -193,6 +193,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "amaru-uplc"
+version = "0.4.0"
+source = "git+https://github.com/pragma-org/uplc.git?rev=39c82af#39c82af9b23e2d611f1eac4a905b5e421c755631"
+dependencies = [
+ "append-only-vec",
+ "blst",
+ "bumpalo",
+ "chumsky",
+ "cryptoxide 0.4.4",
+ "divan",
+ "hamming",
+ "hex",
+ "minicbor 0.25.1",
+ "num",
+ "num-bigint",
+ "num-integer",
+ "once_cell",
+ "secp256k1",
+ "thiserror 1.0.69",
+ "walkdir",
+]
+
+[[package]]
 name = "amq-protocol"
 version = "10.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4979,6 +5002,7 @@ dependencies = [
  "acropolis_module_genesis_bootstrapper",
  "acropolis_module_mithril_snapshot_fetcher",
  "acropolis_module_peer_network_interface",
+ "amaru-uplc",
  "anyhow",
  "async-trait",
  "bech32 0.11.1",
@@ -5014,7 +5038,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "uplc-turbo",
  "url",
 ]
 
@@ -6287,28 +6310,6 @@ name = "unty"
 version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
-
-[[package]]
-name = "uplc-turbo"
-version = "0.1.0"
-source = "git+https://github.com/pragma-org/uplc.git?rev=6152616#6152616cfb32b18c32aaaa0b0529b8711ac2fc26"
-dependencies = [
- "append-only-vec",
- "blst",
- "bumpalo",
- "chumsky",
- "cryptoxide 0.4.4",
- "divan",
- "hamming",
- "hex",
- "minicbor 0.25.1",
- "num",
- "num-bigint",
- "num-integer",
- "once_cell",
- "secp256k1",
- "thiserror 1.0.69",
-]
 
 [[package]]
 name = "url"
