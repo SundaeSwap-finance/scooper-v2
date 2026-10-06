@@ -629,9 +629,83 @@ fn sig6(x: f64) -> String {
     format!("{x:.prec$}")
 }
 
+/// Search hints, a pure optimization of the bisection on K in `run_job`.
+///
+/// Each probe of that bisection is a full router search plus a tx build and
+/// evaluation, and from scratch it takes about log2(U) probes per tx limit.
+/// But where the bisection ends barely moves from run to run, so a previous
+/// run's answer is a good first guess: probing it and the next K up (no
+/// overflow at K, overflow at K + 1) settles the search in two probes. A guess
+/// that turns out wrong just narrows the bisection's interval, to [0, K] or
+/// [K + 1, U], and the search goes on from there.
+///
+/// Hints are never trusted, only verified: a wrong, stale or missing hint
+/// (other market, limits, sizes or router) costs extra probes but leaves the
+/// result unchanged. Removing this table entirely is also correct, just slower.
+///
+/// Entries: (pair, size in USD, mainnet K, raised K), each the K the bisection
+/// ended on in a run with the default market and limits: the largest K whose
+/// route does not overflow that limit. Usually that route fits (K is the
+/// largest K that fits); when it is missing, no K fits, and K is where routes
+/// start to exist, all overflowing (a hint all the same: the expensive searches
+/// are the ones that fail). U when the unlimited route fits; 0: no hint. A run
+/// ends by printing the entries it contradicts or lacks, ready to paste here.
+const K_HINTS: &[(&str, u64, usize, usize)] = &[
+    ("ADA-USDM", 500_000, 8, 8),
+    ("ADA-USDM", 1_000_000, 9, 14),
+    ("ADA-USDM", 2_000_000, 9, 13),
+    ("ADA-USDM", 5_000_000, 9, 16),
+    ("ADA-NIGHT", 500_000, 1, 1),
+    ("ADA-NIGHT", 1_000_000, 1, 1),
+    ("ADA-NIGHT", 2_000_000, 5, 5),
+    ("ADA-NIGHT", 5_000_000, 6, 6),
+    ("ADA-SNEK", 500_000, 1, 1),
+    ("ADA-SNEK", 1_000_000, 5, 5),
+    ("ADA-SNEK", 2_000_000, 5, 5),
+    ("ADA-SNEK", 5_000_000, 7, 7),
+    ("SNEK-USDM", 500_000, 6, 6),
+    ("SNEK-USDM", 1_000_000, 8, 8),
+    ("SNEK-USDM", 2_000_000, 9, 9),
+    ("SNEK-USDM", 5_000_000, 9, 14),
+    ("NIGHT-USDCx", 500_000, 7, 7),
+    ("NIGHT-USDCx", 1_000_000, 7, 7),
+    ("NIGHT-USDCx", 2_000_000, 10, 11),
+    ("NIGHT-USDCx", 5_000_000, 10, 14),
+];
+
+/// A USD size as a Rust integer literal with `_` separators: `5_000_000`.
+fn usd_literal(size: f64) -> String {
+    let digits = format!("{}", size as u64);
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The `K_HINTS` of one order, for (mainnet, raised); `None`: no entry.
+fn k_hints(pair: &str, size: f64) -> Option<[usize; 2]> {
+    K_HINTS.iter().find(|&&(p, s, _, _)| p == pair && s as f64 == size).map(|&(_, _, m, r)| [m, r])
+}
+
+/// What `run_job` returns.
+struct JobResult {
+    /// Printed table row.
+    row: String,
+    csv: String,
+    /// Failure messages seen.
+    errors: Vec<String>,
+    /// K the search ended on per limit (mainnet, raised), for `K_HINTS`.
+    found: [usize; 2],
+    /// How much the paths' mids disagree: `1 − worst / best` (see `Mid`).
+    mid_spread: f64,
+}
+
 /// Route one order, cost each route's tx, and find for each tx limit the
-/// largest cap K whose route fits it. Returns the printed table row, its CSV
-/// rows, and the failure messages seen.
+/// largest cap K whose route fits it.
 ///
 /// The unlimited route is computed first and stored under the number of pools
 /// it uses, U: at any K ≥ U that route fits the budget as is, so it is reused
@@ -643,6 +717,9 @@ fn sig6(x: f64) -> String {
 /// find no route that fills the order), "overflows" (a route exists and its
 /// tx exceeds the limit) is assumed to be: the search keeps the largest K
 /// whose route does not overflow. If the route there is missing, no K fits.
+/// The search starts from the `K_HINTS` guess G when there is one: G not
+/// overflowing and G + 1 overflowing settles it in two probes, otherwise the
+/// bisection goes on over [0, G] or [G + 1, U].
 fn run_job(
     blueprint_path: &str,
     market_path: &str,
@@ -650,7 +727,7 @@ fn run_job(
     (mainnet, raised): (&TxLimit, &TxLimit),
     pair: &str,
     size: f64,
-) -> (String, String, Vec<String>, f64) {
+) -> JobResult {
     let env = TestEnv::from_blueprint_file(blueprint_path);
     let m = load_market(&env, market_path, pair);
     let (ta, tz) = pair.split_once('-').expect("pair A-Z");
@@ -687,13 +764,37 @@ fn run_job(
         });
         k
     };
-    for limit in [mainnet, raised] {
+    // K the search ends on, per limit (0: no route at all), for `K_HINTS`.
+    let mut found = [0; 2];
+    let hints = k_hints(pair, size).unwrap_or_default();
+    for (i, (limit, hint)) in [mainnet, raised].into_iter().zip(hints).enumerate() {
         let overflows = |p: &Option<Point>| p.as_ref().is_some_and(|p| !p.cost.fits(limit));
-        if unl_pools == 0 || !overflows(&by_k[&unl_pools]) {
+        if unl_pools == 0 {
+            continue;
+        }
+        if !overflows(&by_k[&unl_pools]) {
+            found[i] = unl_pools;
             continue;
         }
         // Invariant: K = lo does not overflow (K = 0 is no route), K = hi does.
         let (mut lo, mut hi) = (0, unl_pools);
+        let g = hint;
+        if 0 < g && g < unl_pools {
+            let k = at(&mut by_k, g);
+            if overflows(&by_k[&k]) {
+                hi = g;
+            } else {
+                lo = g;
+                if g + 1 < unl_pools {
+                    let k = at(&mut by_k, g + 1);
+                    if overflows(&by_k[&k]) {
+                        hi = g + 1;
+                    } else {
+                        lo = g + 1;
+                    }
+                }
+            }
+        }
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
             let k = at(&mut by_k, mid);
@@ -703,6 +804,7 @@ fn run_job(
                 lo = mid;
             }
         }
+        found[i] = lo;
     }
 
     let mut errors = Vec::new();
@@ -777,12 +879,13 @@ fn run_job(
         Some(p) if !p.detail.is_empty() => format!("{row}\n  unlimited route:\n{}", p.detail),
         _ => row,
     };
-    (
+    JobResult {
         row,
         csv,
         errors,
-        mid.map_or(0.0, |mid| 1.0 - mid.worst / mid.best),
-    )
+        found,
+        mid_spread: mid.map_or(0.0, |mid| 1.0 - mid.worst / mid.best),
+    }
 }
 
 /// Route-quality benchmark: trade execution vs max tx complexity. Paths are
@@ -836,7 +939,7 @@ pub fn main() {
         args.pairs.iter().flat_map(|p| args.sizes.iter().map(move |s| (p, *s))).collect();
     let t0 = std::time::Instant::now();
     let done = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<(String, String, Vec<String>, f64)> = std::thread::scope(|scope| {
+    let results: Vec<JobResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .iter()
             .map(|&(pair, size)| {
@@ -870,17 +973,17 @@ pub fn main() {
         "pools",
         "mainnet→raised $"
     );
-    for (i, ((pair, _), (row, rows_csv, errs, _))) in jobs.iter().zip(&results).enumerate() {
+    for (i, ((pair, _), r)) in jobs.iter().zip(&results).enumerate() {
         if i > 0 && jobs[i - 1].0 != *pair {
             println!();
         }
-        println!("{row}");
-        csv += rows_csv;
-        for e in errs {
+        println!("{}", r.row);
+        csv += &r.csv;
+        for e in &r.errors {
             *errors.entry(e.chars().take(160).collect()).or_default() += 1;
         }
     }
-    let mid_spread = results.iter().map(|r| r.3).fold(0.0, f64::max);
+    let mid_spread = results.iter().map(|r| r.mid_spread).fold(0.0, f64::max);
     println!(
         "
   %          implementation shortfall vs the mid: Z received / Z the same order would
@@ -907,6 +1010,35 @@ pub fn main() {
     );
     for (e, n) in &errors {
         println!("failed ×{n}: {e}");
+    }
+
+    // `K_HINTS` entries that this run contradicts or lacks: wrong hints only
+    // cost probes, so this is a suggestion to paste, not an error.
+    let stale: Vec<String> = jobs
+        .iter()
+        .zip(&results)
+        .filter_map(|(&(pair, size), &JobResult { found, .. })| {
+            let hint = k_hints(pair, size);
+            (hint.unwrap_or_default() != found).then(|| {
+                format!(
+                    "    (\"{pair}\", {}, {}, {}),  // was: {}",
+                    usd_literal(size),
+                    found[0],
+                    found[1],
+                    hint.map_or("missing".to_string(), |[m, r]| format!("{m}, {r}")),
+                )
+            })
+        })
+        .collect();
+    if !stale.is_empty() {
+        println!(
+            "\nK_HINTS (route_quality.rs) out of date for {} order(s), suggested entries \
+             (valid for this run's market and limits):",
+            stale.len()
+        );
+        for line in &stale {
+            println!("{line}");
+        }
     }
 
     if let Some(path) = &args.csv {
