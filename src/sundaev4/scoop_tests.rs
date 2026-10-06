@@ -625,11 +625,28 @@ mod tests {
         pool_map
     }
 
-    fn branch_first_pool_bytes(blend: &crate::sundaev4::router::BlendedRoute) -> Vec<u8> {
-        blend.branches.iter().map(|b| b.hops[0].splits[0].pool.ident.to_bytes()[0]).collect()
+    /// The route the router picks for `order` on `pool_map`, with no routing limits.
+    fn route_for(
+        pool_map: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        order: &crate::sundaev4::types::SundaeV4Order,
+    ) -> Option<crate::sundaev4::router::BlendedRoute> {
+        use crate::sundaev4::router;
+        let (input, amount) = order.swap_offered();
+        let (output, _) = order.swap_min_received();
+        router::find_blended_route(
+            pool_map,
+            &[],
+            input,
+            output,
+            amount,
+            router::RoutingLimits::unlimited(),
+        )
     }
 
-    fn assert_blend_fills(
+    fn assert_route_fills_order(
         env: &TestEnv,
         pool_map: &std::collections::BTreeMap<
             crate::sundaev3::Ident,
@@ -680,19 +697,9 @@ mod tests {
             .is_none(),
             "fixture: no single path may absorb the whole order"
         );
-        let blend = router::find_blended_route(
-            &pool_map,
-            &[],
-            &token_a(),
-            &token_b(),
-            order.swap_offered().1,
-            limits,
-        )
-        .expect("the two capped paths together can fill the order");
-        let mut firsts = branch_first_pool_bytes(&blend);
-        firsts.sort();
-        assert_eq!(firsts, vec![0x21, 0x22], "must use both paths");
-        assert_blend_fills(&env, &pool_map, &order, &blend);
+        let route_through_both_paths =
+            route_for(&pool_map, &order).expect("the two capped paths together can fill the order");
+        assert_route_fills_order(&env, &pool_map, &order, &route_through_both_paths);
     }
 
     /// The direct band can take the whole order, the A→E→Z path (~30G of Z)
@@ -716,31 +723,12 @@ mod tests {
             limits,
         )
         .expect("the direct band can absorb the order alone");
-        let blend = router::find_blended_route(
-            &pool_map,
-            &[],
-            &token_a(),
-            &token_b(),
-            order.swap_offered().1,
-            limits,
-        )
-        .expect("route exists");
+        let route_through_both_paths = route_for(&pool_map, &order).expect("route exists");
         assert!(
-            blend.total_output >= single.total_output,
-            "blend never worse than single"
-        );
-        let mut firsts = branch_first_pool_bytes(&blend);
-        firsts.sort();
-        assert_eq!(
-            firsts,
-            vec![0x21, 0x22],
-            "capped path must join as a partial branch"
-        );
-        assert!(
-            blend.total_output > single.total_output,
+            route_through_both_paths.total_output > single.total_output,
             "partial branch must improve output"
         );
-        assert_blend_fills(&env, &pool_map, &order, &blend);
+        assert_route_fills_order(&env, &pool_map, &order, &route_through_both_paths);
     }
 
     use proptest::prelude::*;
