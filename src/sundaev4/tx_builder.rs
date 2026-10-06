@@ -3489,6 +3489,67 @@ pub fn build_multi_pool_scoop_tx(
         );
     }
 
+    // ── Step 13.5: Lovelace conservation ───────────────────────────────────
+    //
+    // The ledger requires consumed == produced. For these transactions that
+    // reduces to a single identity on lovelace: every withdrawal is for 0,
+    // the mint carries only LP tokens, and there are no certificates or
+    // deposits. So
+    //
+    //     sum(input lovelace) == sum(output lovelace) + fee
+    //
+    // Step 8.4 already guards ONE term of this — that the fee-deduction pot
+    // matches `tx_fee + designated_required` when there is no change output
+    // to absorb a difference. That guard is not sufficient: it says nothing
+    // about the pool and order outputs, whose lovelace the builder derives
+    // from values the indexer cached rather than from the chain. A pool
+    // whose cached lovelace is stale by any amount produces a transaction
+    // that passes every local check, passes our own evaluator, and is then
+    // refused by the node as ValueNotConservedUTxO — which reports the two
+    // totals and nothing about which output is wrong.
+    //
+    // Checking the whole identity here costs one pass over the inputs and
+    // outputs, and turns that into a local error naming the shortfall
+    // before anything is submitted. Observed on preview 2026-10-06:
+    // consumed 527766791957 against produced 527742208077.
+    {
+        let ada = AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
+        let mut in_ada: i128 = 0;
+        for i in body.inputs.iter() {
+            let key = crate::cardano_types::TransactionInput(i.clone());
+            let r = resolved_inputs
+                .get(&key)
+                .with_context(|| format!("input {i:?} missing from resolved_inputs"))?;
+            in_ada += r.value.get(&ada).to_string().parse::<i128>().unwrap_or(0);
+        }
+        let mut out_ada: i128 = 0;
+        for o in body.outputs.iter() {
+            out_ada += match o {
+                TransactionOutput::PostAlonzo(b) => match &b.value {
+                    ConwayValue::Coin(c) => *c as i128,
+                    ConwayValue::Multiasset(c, _) => *c as i128,
+                },
+                TransactionOutput::Legacy(b) => match &b.amount {
+                    pallas_primitives::alonzo::Value::Coin(c) => *c as i128,
+                    pallas_primitives::alonzo::Value::Multiasset(c, _) => *c as i128,
+                },
+            };
+        }
+        let produced = out_ada + tx_fee as i128;
+        if in_ada != produced {
+            bail!(
+                "lovelace not conserved: inputs {in_ada} != outputs {out_ada} + fee {tx_fee}                  (short by {}); pools {}, orders {}, funding_input {}, fee pot                  {total_fee_deducted}, designated {designated_required}, pool bumps                  {total_pool_bump}, fulfilment subsidy {total_fulfillment_subsidy}",
+                in_ada - produced,
+                pool_orefs.len(),
+                body.inputs.len() - pool_orefs.len(),
+                funding_input.is_some(),
+            );
+        }
+    }
+
     // Build resolved reference inputs
     let mut resolved_ref_inputs = BTreeMap::new();
     for ref_input_key in all_ref_inputs.iter() {

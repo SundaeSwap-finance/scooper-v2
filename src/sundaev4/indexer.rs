@@ -2516,3 +2516,60 @@ mod preview_banded_recovery_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod steelswap_quote_dump {
+    //! Quotes for the Steelswap integration note, from the live preview
+    //! ladder of pool 622cee5f… at reserves (5,953,003 tOKENA /
+    //! 6,249,988 tOKENC). Ignored by default; run with --ignored.
+    use super::*;
+    use crate::bigint::BigInt;
+    use crate::sundaev4::banded_math::{config_hash, find_witness, swap_steps};
+
+    const CREATE_TX_HEX: &str =
+        include_str!("../../test/fixtures/preview-banded-create-c601f694.hex");
+
+    #[test]
+    #[ignore]
+    fn dump_quotes() {
+        let cbor = hex::decode(CREATE_TX_HEX.trim()).unwrap();
+        let tx = MultiEraTx::decode(&cbor).unwrap();
+        let configured: ScriptHash = hex::decode(
+            "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18",
+        )
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+        let want =
+            hex::decode("361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9")
+                .unwrap();
+        let cfg = extract_bcl_config_candidates(&tx, &configured)
+            .into_iter()
+            .find(|c| config_hash(c) == want)
+            .unwrap();
+        let a = BigInt::from(5953003);
+        let b = BigInt::from(6249988);
+        println!("witness {:?}", find_witness(&cfg, &a, &b));
+        for d in [100i64, 1000, 10000, 100000, 1000000, 5000000] {
+            for a_in in [true, false] {
+                let steps = swap_steps(&cfg, &a, &b, a_in, &BigInt::from(d));
+                match steps {
+                    Ok(s) => {
+                        let out: BigInt =
+                            s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dy);
+                        let spent: BigInt =
+                            s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dx);
+                        let bands: Vec<usize> = s.iter().map(|st| st.before.k).collect();
+                        println!(
+                            "{d:>8} {} in -> out={out} spent={spent} steps={} bands={bands:?}",
+                            if a_in { "A" } else { "B" },
+                            s.len()
+                        );
+                    }
+                    Err(e) => println!("{d:>8} {} in -> ERR {e}", if a_in { "A" } else { "B" }),
+                }
+            }
+        }
+    }
+}
