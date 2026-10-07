@@ -3287,11 +3287,19 @@ pub fn build_multi_pool_scoop_tx(
             let cur = predicted_value.get(&lp_asset);
             predicted_value.insert(&lp_asset, &cur + &per_pool[out_idx].lp_reserve_delta);
         }
-        // Set predicted ADA to match the actual pool output (input ADA + delta)
+        // Set predicted ADA to match the actual pool output: input ADA + delta,
+        // plus the fee surplus (`designated_required`, step 8.4) that lands on
+        // the designated pool, outputs[0]. Without it the next chained scoop
+        // fails with ValueNotConservedUTxO.
         {
             use num_traits::ToPrimitive;
             let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
-            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128)
+            let surplus = if batch_idx == 0 {
+                designated_required as i128
+            } else {
+                0
+            };
+            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128 + surplus)
                 .max(POOL_MIN_ADA as i128) as u64;
             predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));
         }
@@ -3304,6 +3312,27 @@ pub fn build_multi_pool_scoop_tx(
             slot: validity.start,
             fee_split_config: batch.pool.fee_split_config.clone(),
         };
+        // A wrong prediction only surfaces as ValueNotConservedUTxO on the
+        // next chained scoop; fail here, where we can name the pool.
+        {
+            let actual_ada = match body.outputs.get(batch_idx) {
+                Some(TransactionOutput::PostAlonzo(b)) => match &b.value {
+                    ConwayValue::Coin(c) => *c,
+                    ConwayValue::Multiasset(c, _) => *c,
+                },
+                _ => bail!("pool output {batch_idx} missing while predicting pool state"),
+            };
+            let pred_ada: u64 =
+                predicted_pool.value.get(&ada_asset).to_string().parse().unwrap_or(0);
+            if pred_ada != actual_ada {
+                bail!(
+                    "predicted pool {} lovelace disagrees with output {batch_idx}: \
+                     output holds {actual_ada}, prediction says {pred_ada} (difference {})",
+                    hex::encode(batch.pool_ident.to_bytes()),
+                    actual_ada as i128 - pred_ada as i128,
+                );
+            }
+        }
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
     }
 
