@@ -80,6 +80,36 @@ pub struct BandedLadder {
     after: std::sync::Mutex<
         std::collections::BTreeMap<(bool, BigInt), Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>>,
     >,
+    fill: [std::sync::OnceLock<Vec<FillStep>>; 2],
+}
+
+/// One band of a pool's fill curve: what it costs to walk through it.
+///
+/// The lambda bisection in `optimize_split` used to rediscover this on
+/// every iteration — 200 iterations x pools x bands calls to `view_after`,
+/// each doing ladder math in bignums, with a cache keyed on the exact `dx`
+/// that the bisection never probes twice. Measured on 12-band ladders:
+/// 38.7ms for 4 pools, 809ms for 31, 1307ms for 48 — superlinear past
+/// about 16 pools. Preview reached 31 banded pools and the scooper pegged
+/// a core at 100%, dispatching one order every 16-63 seconds and starving
+/// its own metrics listener.
+///
+/// The sequence of bands a fill walks through does NOT depend on lambda.
+/// Lambda only decides where the walk STOPS. So the walk is done once per
+/// pool per direction and shared through the `Arc<BandedLadder>` across
+/// every order in the cycle.
+#[derive(Debug, Clone)]
+pub struct FillStep {
+    /// The band's view at the point the fill reaches it.
+    pub view: crate::sundaev4::banded_math::BandView,
+    /// Input that fills this band completely.
+    pub cap: BigInt,
+    /// Marginal out-per-in at the band's OPENING: the best price it offers.
+    /// A lambda above this takes nothing from the band.
+    pub marginal_open: BigInt,
+    /// Marginal once the band is full: its worst price. A lambda at or
+    /// below this fills the band completely, with no partial solve.
+    pub marginal_full: BigInt,
 }
 
 impl BandedLadder {
@@ -96,7 +126,48 @@ impl BandedLadder {
             witness,
             capacity: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
             after: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            fill: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
         }
+    }
+
+    /// The fill curve for one direction, built once and shared.
+    ///
+    /// Walks the ladder from the pool's current state, filling each band
+    /// completely, and records what the band costs and what it is worth.
+    /// `allocations_for_lambda` then answers any lambda from this table
+    /// with comparisons and AT MOST ONE partial-band solve, instead of
+    /// re-walking the ladder.
+    pub fn fill_curve(&self, is_a_input: bool) -> &[FillStep] {
+        self.fill[usize::from(is_a_input)].get_or_init(|| {
+            let mut out: Vec<FillStep> = Vec::new();
+            let Ok(first) = crate::sundaev4::banded_math::band_view(
+                &self.cfg, &self.a, &self.b, &self.witness,
+            ) else {
+                return out;
+            };
+            let mut view = first;
+            let mut cum = BigInt::from(0);
+            // One pass per band at most: a fill cannot re-enter a band it
+            // has already emptied.
+            for _ in 0..=self.cfg.bands.len() {
+                let cap = crate::sundaev4::banded_math::max_dx_in_band(&view, is_a_input);
+                if !cap.is_positive() {
+                    break;
+                }
+                out.push(FillStep {
+                    marginal_open: banded_marginal(&view, is_a_input, &BigInt::from(0)),
+                    marginal_full: banded_marginal(&view, is_a_input, &cap),
+                    cap: cap.clone(),
+                    view: view.clone(),
+                });
+                cum = &cum + &cap;
+                let Some((_, _, next)) = self.view_after(is_a_input, &cum) else {
+                    break;
+                };
+                view = next;
+            }
+            out
+        })
     }
 
     pub fn capacity(&self, is_a_input: bool) -> BigInt {
@@ -658,23 +729,38 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     // Fill band by band while the band's opening marginal
                     // clears lambda; stop inside the first band that does
                     // not fill completely.
-                    let (first, first_cap) = banded_alloc_in_band(band, *is_a_input, lambda);
-                    if first < first_cap {
-                        return first;
+                    // Answer from the precomputed fill curve. The walk
+                    // through the bands is the same for every lambda, so
+                    // it is done once per pool per direction and shared
+                    // across every order in the cycle; lambda only picks
+                    // where it stops.
+                    //
+                    // Comparisons settle all but one band: a lambda above
+                    // the band's opening marginal takes nothing, one at or
+                    // below its full marginal takes the lot. Only the band
+                    // the fill stops inside needs the isqrt solve, so this
+                    // is one partial solve per pool per lambda instead of
+                    // one per BAND, on top of no ladder math at all.
+                    let curve = ladder.fill_curve(*is_a_input);
+                    if curve.is_empty() {
+                        // No curve (a state off the ladder): fall back to
+                        // the direct solve on the active band.
+                        return banded_alloc_in_band(band, *is_a_input, lambda).0;
                     }
-                    let mut total = first;
-                    for _ in 0..ladder.cfg.bands.len() {
-                        let Some((_, _, v)) = ladder.view_after(*is_a_input, &total) else {
-                            break;
-                        };
-                        let (alloc, cap) = banded_alloc_in_band(&v, *is_a_input, lambda);
-                        if !alloc.is_positive() {
-                            break;
+                    let mut total = BigInt::from(0);
+                    for step in curve {
+                        if lambda > &step.marginal_open {
+                            break; // this band is already too dear
                         }
-                        total = &total + &alloc;
-                        if alloc < cap {
-                            break;
+                        if lambda <= &step.marginal_full {
+                            total = &total + &step.cap; // fills completely
+                            continue;
                         }
+                        let (alloc, _) = banded_alloc_in_band(&step.view, *is_a_input, lambda);
+                        if alloc.is_positive() {
+                            total = &total + &alloc;
+                        }
+                        break; // the fill stops inside this band
                     }
                     total
                 }
@@ -991,6 +1077,57 @@ pub fn conversion_ident(key: &str) -> Ident {
 
 type ViewTypeFn = Box<dyn Fn(usize, usize) -> PoolViewType>;
 
+/// A `BandedLadder` for one pool at one set of reserves, reused across
+/// every order in the cycle.
+///
+/// `build_graph` runs once per ORDER, and used to construct a fresh
+/// `Arc<BandedLadder>` for every banded pool each time. Every cache on it
+/// — the band views, and now the fill curve — therefore started empty for
+/// every order, was filled during that order's `optimize_split`, and was
+/// then dropped. The scooper paid first-call cost on every pool on every
+/// order, forever.
+///
+/// Measured on 12-band ladders, 31 banded pools: 809ms cold against 85ms
+/// warm. That 9.5x was not an algorithmic problem, it was the same work
+/// being redone. Preview reached 31 banded pools and the scooper pegged a
+/// core, taking 16-63 seconds per order.
+///
+/// The key carries the RESERVES, so it cannot serve a stale ladder: a
+/// scoop that moves a pool produces a different key, and the old entry
+/// simply ages out. This is the same argument the witness memo rests on.
+fn ladder_for(
+    ident: &Ident,
+    cfg: &crate::sundaev4::types::BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    w: &crate::sundaev4::banded_math::Witness,
+) -> std::sync::Arc<BandedLadder> {
+    type Key = (Ident, BigInt, BigInt);
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<Key, std::sync::Arc<BandedLadder>>>,
+    > = std::sync::OnceLock::new();
+    // A scooper tracks a few dozen pools, and each keeps one live entry
+    // plus the recently-superseded ones. Dropping the map costs cold
+    // ladders, nothing else.
+    const MAX: usize = 512;
+
+    let key = (ident.clone(), a.clone(), b.clone());
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(m) = cache.lock()
+        && let Some(l) = m.get(&key)
+    {
+        return l.clone();
+    }
+    let built = std::sync::Arc::new(BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w.clone()));
+    if let Ok(mut m) = cache.lock() {
+        if m.len() >= MAX {
+            m.clear();
+        }
+        m.insert(key, built.clone());
+    }
+    built
+}
+
 fn build_graph(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
     conversions: &[crate::sundaev4::conversions::ConversionEdge],
@@ -1020,7 +1157,7 @@ fn build_graph(
             let Ok(view) = band_view(config, a, b, &w) else {
                 continue;
             };
-            let ladder = std::sync::Arc::new(BandedLadder::new(config.clone(), a.clone(), b.clone(), w.clone()));
+            let ladder = ladder_for(&ident, config, a, b, &w);
             for (i, j) in [(0usize, 1usize), (1, 0)] {
                 let is_a_input = i == 0;
                 let fee = fee_for(&view, is_a_input);
@@ -2662,5 +2799,163 @@ mod tests {
             "the worst pool must get nothing: {:?}",
             splits.iter().map(|s| (&s.pool.ident, &s.input_amount)).collect::<Vec<_>>(),
         );
+    }
+}
+
+#[cfg(test)]
+mod split_cost {
+    //! How `optimize_split` scales with the number of banded pools.
+    //!
+    //! Preview, 2026-10-07: the banded pool count went from about 12 to 31
+    //! and the scooper went from 9 orders/min at 3-48% CPU to 3 orders/min
+    //! pegged at 100%, with 16-63 seconds between order dispatches. The
+    //! process showed 601s of user time against 0.8s of system time, so it
+    //! was computing, not waiting. Its own metrics endpoint stopped
+    //! answering because the listener task could not get scheduled.
+    //!
+    //! The shape of the cost is
+    //!     MAX_ITER (200) x pools x bands x view_after
+    //! because the lambda bisection treats the allocation as a black box
+    //! and rediscovers every band's marginal on every iteration. The
+    //! `after` cache cannot help: it is keyed on the exact `dx`, and the
+    //! bisection probes a different `dx` every time.
+    //!
+    //! Ignored by default; run with --ignored --nocapture.
+    use super::*;
+    use crate::sundaev4::banded_math::{band_view, find_witness, with_index};
+    use crate::sundaev4::types::BandSpec;
+
+    fn ladder_cfg(n: usize, lo: i64, hi: i64, den: i64) -> crate::sundaev4::types::BandedCLConfig {
+        let r = |num: i64, d: i64| crate::sundaev4::types::Rational {
+            num: BigInt::from(num),
+            den: BigInt::from(d),
+        };
+        let step = (hi - lo) / n as i64;
+        with_index(
+            (0..n)
+                .map(|i| BandSpec {
+                    start: r(lo + step * i as i64, den),
+                    weight: BigInt::from(1),
+                    curve: BigInt::from(0),
+                    fee_buy: r(3, 1000),
+                    fee_sell: r(3, 1000),
+                })
+                .collect(),
+            r(lo + step * n as i64, den),
+            BigInt::from(n as i64),
+        )
+    }
+
+    /// One banded pool at a mid-ladder state, as a routable view.
+    fn banded_pool(idx: usize, bands: usize) -> Option<PoolView> {
+        let cfg = ladder_cfg(bands, 950_000_000, 1_050_000_000, 1_000_000_000);
+        let x = BigInt::from(80_279_049_977_900u64);
+        let k = bands / 2;
+        let st = crate::sundaev4::banded_math::ladder_at(&cfg, &x, k).ok()?;
+        let two = BigInt::from(2);
+        let a = &st.ca + &(&st.a_sat_k / &two);
+        let b = &st.cb + &(&st.b_sat_k / &two);
+        let w = find_witness(&cfg, &a, &b)?;
+        let view = band_view(&cfg, &a, &b, &w).ok()?;
+        let ladder = std::sync::Arc::new(BandedLadder::new(cfg, a.clone(), b.clone(), w));
+        Some(PoolView {
+            ident: Ident::new(format!("{idx:056x}").as_bytes()),
+            reserve_in: a,
+            reserve_out: b,
+            fee_num: 3,
+            fee_den: 1000,
+            view_type: PoolViewType::Banded { is_a_input: true, band: view, ladder },
+        })
+    }
+
+    /// What the scooper ACTUALLY does: `build_graph` per order, then
+    /// split. Before the ladder cache this rebuilt every pool's ladder for
+    /// every order, so no cache on it could ever be warm.
+    #[test]
+    #[ignore = "a cost curve, not a check; run with --ignored --nocapture"]
+    fn per_order_cost_with_graph_rebuild() {
+        let bands = 12;
+        println!("  per-order cost: build_graph + optimize_split, {bands}-band ladders");
+        println!("  {:>6} {:>14} {:>14}", "pools", "per order", "per pool");
+        for n in [4usize, 16, 31, 48] {
+            let pools: Vec<PoolView> = (0..n).filter_map(|i| banded_pool(i, bands)).collect();
+            if pools.len() < n {
+                continue;
+            }
+            let input = BigInt::from(500_000_000u64);
+            // Rebuild the ladders the way build_graph does, once per
+            // "order", so the cache is exercised exactly as in production.
+            let rebuild = || -> Vec<PoolView> {
+                pools
+                    .iter()
+                    .map(|p| {
+                        let PoolViewType::Banded { is_a_input, band, ladder } = &p.view_type else {
+                            unreachable!()
+                        };
+                        let l = ladder_for(&p.ident, &ladder.cfg, &ladder.a, &ladder.b, &ladder.witness);
+                        PoolView {
+                            ident: p.ident.clone(),
+                            reserve_in: p.reserve_in.clone(),
+                            reserve_out: p.reserve_out.clone(),
+                            fee_num: p.fee_num,
+                            fee_den: p.fee_den,
+                            view_type: PoolViewType::Banded {
+                                is_a_input: *is_a_input,
+                                band: band.clone(),
+                                ladder: l,
+                            },
+                        }
+                    })
+                    .collect()
+            };
+            let _ = optimize_split(&rebuild(), &input); // first order warms
+            let orders = 5;
+            let t = std::time::Instant::now();
+            for _ in 0..orders {
+                let _ = optimize_split(&rebuild(), &input);
+            }
+            let per = t.elapsed().as_secs_f64() / orders as f64;
+            println!(
+                "  {n:>6} {:>14} {:>14}",
+                format!("{:.1} ms", per * 1000.0),
+                format!("{:.2} ms", per * 1000.0 / n as f64)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "a cost curve, not a check; run with --ignored --nocapture"]
+    fn split_cost_against_banded_pool_count() {
+        let bands = 12;
+        println!("  optimize_split, {bands}-band ladders, MAX_ITER={}", 200);
+        println!("  {:>6} {:>12} {:>14} {:>12}", "pools", "time", "per pool", "vs 4 pools");
+        let mut base: Option<f64> = None;
+        for n in [4usize, 8, 12, 16, 24, 31, 48] {
+            let pools: Vec<PoolView> =
+                (0..n).filter_map(|i| banded_pool(i, bands)).collect();
+            if pools.len() < n {
+                println!("  {n:>6}  (could not build {n} pools)");
+                continue;
+            }
+            let input = BigInt::from(500_000_000u64);
+            // Warm the per-pool fill curves first. Without this the
+            // one-time build is amortised over however many reps the loop
+            // happens to run, which is not the steady-state cost a cycle
+            // actually pays.
+            let _ = optimize_split(&pools, &input);
+            let reps = if n > 24 { 3 } else { 10 };
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = optimize_split(&pools, &input);
+            }
+            let per = t.elapsed().as_secs_f64() / reps as f64;
+            let b = *base.get_or_insert(per);
+            println!(
+                "  {n:>6} {:>12} {:>14} {:>11.1}x",
+                format!("{:.1} ms", per * 1000.0),
+                format!("{:.2} ms", per * 1000.0 / n as f64),
+                per / b
+            );
+        }
     }
 }
