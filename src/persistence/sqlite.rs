@@ -204,7 +204,15 @@ impl IndexerDao for SqliteIndexerDao {
                 let values_clauses =
                     vec!["(?,?,?,?,NULL,NULL,?,?,?,?)".to_string(); changes.created_txos.len()]
                         .join(",");
-                format!("INSERT INTO {txos_table} ({column_names}) VALUES {values_clauses};")
+                // OR IGNORE, like the scoop-record insert below: a block
+                // that was only partly applied before a restart gets
+                // re-delivered and re-processed, so the txos of its already
+                // applied transactions are inserted a second time. Without
+                // this the replay dies on the (tx_id, txo_index) primary key
+                // and takes the rest of the block with it.
+                format!(
+                    "INSERT OR IGNORE INTO {txos_table} ({column_names}) VALUES {values_clauses};"
+                )
             };
             let mut query = sqlx::query(&insert_created_txo_query);
 
@@ -777,6 +785,91 @@ mod tests {
             datum: hex::decode("d8799fd8799f581c711aba6b66849e39f31b99e21bce68addf0dc80426d01e84cfd8d30dffd8799f581c9095c31cb90ada28af85689f241acd13c52bc1be231a5bd0301bb7b6ff1a0007a120d8799fd8799fd87a9f581ccfad1914b599d18bffd14d2bbd696019c2899cbdd6a03325cdf680bcffd87a80ffd87a9f582018e7433189c114a1f0474624cfb69ba21bf751b6be574d4af2276f6f7976c717ffffd87a9f9f40401a0001cf62ff9f581c63f9a5fc96d4f87026e97af4569975016b50eef092a46859b61898e54f0014df106f7263666178746f6b656e1a00989680ffff43d87980ff").unwrap(),
             created_slot: 69882150,
         }
+    }
+
+    /// A block that was only partly applied before a restart is
+    /// re-delivered and re-processed. Re-applying a transaction that was
+    /// already written must not fail, or the replay dies on the primary key
+    /// and the rest of the block -- the part that was NEVER applied -- is
+    /// lost with it.
+    ///
+    /// Preview, 2026-10-07: block 4733493 held three transactions, the
+    /// service stopped after the first, and the two that remained were
+    /// dropped. One of them spent two pool UTxOs, so the indexer kept two
+    /// dead pools and the scooper rebuilt against one of them 125 times
+    /// over four hours while 119 orders queued behind it.
+    #[tokio::test]
+    async fn replaying_a_partly_applied_block_does_not_fail() -> Result<()> {
+        let db = new_db().await?;
+        let dao = db.indexer_dao("sundae_v4");
+
+        let pool = preview_pool();
+        let order = preview_order();
+        let block_slot = pool.created_slot;
+
+        // The block is applied as far as its first transaction, then the
+        // service stops.
+        dao.apply_tx_changes(TxChanges {
+            slot: block_slot,
+            height: 7,
+            created_txos: vec![pool.clone()],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            module_configs: vec![],
+        })
+        .await?;
+
+        // On restart the whole block is re-delivered. Transaction one is a
+        // repeat; transaction two was never applied and carries the spend.
+        dao.apply_tx_changes(TxChanges {
+            slot: block_slot,
+            height: 7,
+            created_txos: vec![pool.clone()],
+            spent_txos: vec![],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            module_configs: vec![],
+        })
+        .await
+        .expect("re-applying an already-written txo must not fail");
+
+        dao.apply_tx_changes(TxChanges {
+            slot: block_slot,
+            height: 7,
+            created_txos: vec![order.clone()],
+            spent_txos: vec![SpentTxo {
+                input: pool.txo_id.clone(),
+                spending_tx_id: vec![9u8; 32],
+            }],
+            metadata_datums: vec![],
+            scoop_records: vec![],
+            module_configs: vec![],
+        })
+        .await?;
+
+        // The spend from the replayed transaction must be recorded. If it
+        // is not, the indexer believes a spent pool UTxO is still current
+        // and every scoop built on it is rejected by the node.
+        let unspent = dao.load_txos().await?;  // WHERE spent_slot IS NULL
+        assert!(
+            !unspent.iter().any(|t| t.txo_id == pool.txo_id),
+            "the pool UTxO is still believed unspent after the replay"
+        );
+        assert!(
+            unspent.iter().any(|t| t.txo_id == order.txo_id),
+            "the replayed transaction's own output was not recorded"
+        );
+        // And exactly one row, not a duplicate.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sundae_v4_txos WHERE tx_id = ? AND txo_index = ?",
+        )
+        .bind(pool.txo_id.0.transaction_id.to_vec())
+        .bind(pool.txo_id.0.index as i64)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(n, 1, "the replay duplicated the row");
+        Ok(())
     }
 
     #[tokio::test]

@@ -93,7 +93,45 @@ pub struct Scooper {
     /// (tx hash, consecutive node-reject count) — a tx rejected repeatedly
     /// is structurally stuck, not transiently contested.
     last_node_reject: Option<(String, u32)>,
+    /// How many times in a row the node has called a given pool UTxO a bad
+    /// input. Keyed on the UTxO, NOT the tx hash: every rebuild produces a
+    /// new hash, so the tx-keyed `last_node_reject` counter resets each
+    /// cycle and its three-strike guard can never fire.
+    pool_reject_streak: BTreeMap<(Ident, TransactionInput), u32>,
+    /// Pool UTxOs already reported as stale, so the report is made once and
+    /// not every cycle.
+    reported_stale_pools: BTreeSet<(Ident, TransactionInput)>,
 }
+
+/// Consecutive node rejections of the SAME pool UTxO before the scooper
+/// reports that its own index, not the chain, is what is wrong.
+///
+/// This REPORTS; it does not recover. Recovery is a resync. The point is
+/// that the condition is loud instead of silent: the scooper will go on
+/// rebuilding against the dead UTxO, but an operator can see why.
+///
+/// A lost race also produces `BadInputsUTxO` on a pool input, so a couple of
+/// rejections prove nothing. But a race is resolved by the next block: the
+/// winner's tx arrives, the indexer advances the pool, and the next build
+/// uses a different UTxO. A pool input that is STILL rejected after three
+/// rebuilds across separate cycles is one the chain has moved past and the
+/// indexer has not.
+///
+/// Why that happens: the indexer commits its per-transaction writes
+/// immediately but advances its cursor per block, so stopping the service
+/// partway through a block durably applies the transactions already
+/// processed and records the block as complete. Transactions after the stop
+/// point are never processed and their pool spends are lost. Nothing
+/// reconciles the index against the chain afterwards, so the pool keeps its
+/// dead UTxO for the life of the database.
+///
+/// Observed on preview 2026-10-07: block 4733493 held three transactions,
+/// the service stopped after the first, and transaction [2] — which spent
+/// two pool UTxOs — was never seen. The scooper then rebuilt against one of
+/// those dead UTxOs 125 times over four hours, scooping nothing, while 119
+/// orders queued behind it. Every one of those rejections was counted as a
+/// lost race.
+const STALE_POOL_REJECTS: u32 = 3;
 
 /// Where a node-rejected tx is kept for offline re-evaluation, and how many
 /// to keep.
@@ -178,6 +216,8 @@ impl Scooper {
             v4_provisional,
             v4_node_submit,
             last_node_reject: None,
+            pool_reject_streak: BTreeMap::new(),
+            reported_stale_pools: BTreeSet::new(),
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
@@ -540,6 +580,13 @@ impl Scooper {
                 }
                 IndexEvent::V4PoolUpdated { id, pool, .. } => {
                     trace!(slot, pool = %id, "v4 pool updated");
+                    // The index has moved the pool on, so whatever UTxO we
+                    // were stuck on is behind us.
+                    if self.reported_stale_pools.iter().any(|(i, u)| i == &id && *u != pool.input) {
+                        info!(pool = %id, now = %pool.input, "stale pool recovered");
+                    }
+                    self.pool_reject_streak.retain(|(i, _), _| i != &id);
+                    self.reported_stale_pools.retain(|(i, _)| i != &id);
                     // Check if this update settles one of our in-flight txs
                     if let Some(tx_hash) = self.v4_chain_tracker.find_settled_tx(&id, &pool.input) {
                         self.v4_chain_tracker.confirm_settlement(&id, &tx_hash);
@@ -553,6 +600,8 @@ impl Scooper {
                 }
                 IndexEvent::V4PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "v4 pool removed");
+                    self.pool_reject_streak.retain(|(i, _), _| i != &id);
+                    self.reported_stale_pools.retain(|(i, _)| i != &id);
                     self.v4_chain_tracker.discard_chain_and_related(&id);
                 }
                 IndexEvent::V4OrderCreated { order } => {
@@ -2793,6 +2842,11 @@ impl Scooper {
                     // inputs; for node rejects, scan the reason hex for each
                     // plan input's tx hash.
                     let mut bad_refs = parse_bad_inputs(&msg);
+                    // Pool UTxOs the node called bad. A pool is not an order:
+                    // it never enters `bad_refs`, so without this a rejection
+                    // that implicated only pools looks like it implicated
+                    // nothing at all, and falls through to a blind retry.
+                    let mut rejected_pools: Vec<(Ident, TransactionInput)> = vec![];
                     if let Some(hex_reason) = node_reject_hex {
                         let mut implicated_kinds: Vec<String> = Vec::new();
                         for input in plan_order_inputs.iter() {
@@ -2806,6 +2860,7 @@ impl Scooper {
                             if hex_reason.contains(&hex::encode(pin.0.transaction_id.as_ref())) {
                                 implicated_kinds
                                     .push(format!("pool {} ({})", batch.pool_ident, pin));
+                                rejected_pools.push((batch.pool_ident.clone(), pin.clone()));
                             }
                         }
                         if let Some((fi, _)) = &funding_owned
@@ -2839,6 +2894,37 @@ impl Scooper {
                     };
                     if node_reject_hex.is_some() {
                         self.last_node_reject = Some((final_tx.tx_hash_hex.clone(), repeat_count));
+                    }
+                    // A pool UTxO the node keeps calling bad is evidence
+                    // about OUR INDEX, not about contention. Count the streak
+                    // against the UTxO so rebuilds accumulate.
+                    for (ident, input) in &rejected_pools {
+                        let key = (ident.clone(), input.clone());
+                        let n = *self
+                            .pool_reject_streak
+                            .entry(key.clone())
+                            .and_modify(|n| *n += 1)
+                            .or_insert(1);
+                        if n >= STALE_POOL_REJECTS && self.reported_stale_pools.insert(key) {
+                            error!(
+                                pool = %ident,
+                                dead_utxo = %input,
+                                rejects = n,
+                                "pool UTxO rejected repeatedly: the INDEX is stale, not the \
+                                 chain. The chain has spent this UTxO and the indexer did not \
+                                 record it, so every scoop built on this pool will be rejected \
+                                 and its orders cannot be served. Recover with a resync.",
+                            );
+                        }
+                    }
+                    // Pools that were NOT implicated this time are healthy
+                    // again: drop any streak so a later genuine race starts
+                    // from zero.
+                    if node_reject_hex.is_some() {
+                        let implicated: std::collections::BTreeSet<&Ident> =
+                            rejected_pools.iter().map(|(i, _)| i).collect();
+                        self.pool_reject_streak
+                            .retain(|(ident, _), _| implicated.contains(ident));
                     }
                     let until_slot = self.now_slot(tip_slot) + TEMP_QUARANTINE_SLOTS;
                     let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
@@ -3253,6 +3339,7 @@ fn carries_route_constraint(
 /// Resolve the effective pool snapshot to scoop against — preferring an
 /// already-accumulated state, then the chain tracker's in-flight prediction
 /// (so we chain off our own pending tx), then the on-chain state.
+///
 fn pick_effective_pool(
     accum: &Accumulator,
     chain_tracker: &crate::sundaev4::chain_tracker::ChainTracker,

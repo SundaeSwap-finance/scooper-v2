@@ -97,9 +97,29 @@ pub struct SundaeV4Indexer {
     scooper_keyhash: Option<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
     tip_event_counter: u64,
-    /// The slot of the latest block loaded from DB. Blocks at or before this
-    /// slot are skipped in handle_block/handle_onchain_tx_bytes to avoid the
-    /// "cannot update slot" error when the cursor lags behind the DB state.
+    /// The slot of the latest block loaded from DB. Blocks STRICTLY before
+    /// this slot are skipped in handle_block/handle_onchain_tx_bytes to
+    /// avoid the "cannot update slot" error when the cursor lags behind the
+    /// DB state.
+    ///
+    /// The block AT this slot is re-processed, and must be. `loaded_slot` is
+    /// the highest slot with any row in the database, which a block that was
+    /// only PARTLY applied also sets: the writes commit per transaction, so
+    /// stopping the service partway through a block leaves the transactions
+    /// already processed durable and the rest missing. Skipping that slot on
+    /// restart drops those remaining transactions permanently, with no error
+    /// and nothing to reconcile them later.
+    ///
+    /// This cost four hours of preview on 2026-10-07. Block 4733493 held
+    /// three transactions; the service was stopped after the first; on
+    /// restart the driver correctly re-delivered the block and this guard
+    /// threw all three away. Transaction [2] spent two pool UTxOs, so the
+    /// indexer kept two dead pool UTxOs forever, and the scooper rebuilt
+    /// against one of them 125 times while 119 orders queued behind it.
+    ///
+    /// Re-processing the boundary block is safe: `update_slot` rejects only
+    /// a slot strictly below the current one, and every insert on this path
+    /// is `INSERT OR IGNORE`.
     loaded_slot: u64,
     /// Resolved per-module configs keyed by pool ident.
     ///
@@ -1137,7 +1157,7 @@ impl ChainIndex for SundaeV4Indexer {
     }
 
     async fn handle_block(&mut self, info: &BlockInfo) -> Result<()> {
-        if info.slot <= self.loaded_slot {
+        if info.slot < self.loaded_slot {
             // Block already covered by load(). Update network tip and emit
             // TipAdvanced so the scooper can detect sync progress, but skip
             // the state mutation that would fail with "cannot update slot".
@@ -1182,7 +1202,7 @@ impl ChainIndex for SundaeV4Indexer {
     }
 
     async fn handle_onchain_tx_bytes(&mut self, info: &BlockInfo, raw_tx: &[u8]) -> Result<()> {
-        if info.slot <= self.loaded_slot {
+        if info.slot < self.loaded_slot {
             return Ok(());
         }
         let slot = info.slot;
