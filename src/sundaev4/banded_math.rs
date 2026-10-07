@@ -264,6 +264,13 @@ pub fn is_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: u
 /// short scan follows. `None` when the reserves sit on no point of the
 /// ladder; the chain would reject them too. Mirrors `banded-math.ts`.
 pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+    let t0 = std::time::Instant::now();
+    let out = find_witness_inner(cfg, a, b);
+    note_witness_time(t0.elapsed().as_secs_f64());
+    out
+}
+
+fn find_witness_inner(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
     // Try to start from where this ladder was last seen before falling back
     // to the exhaustive search. See `seeded_find` for why this is safe.
     if let Some(w) = seeded_find(cfg, a, b) {
@@ -274,6 +281,39 @@ pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witn
         remember_witness(cfg, w);
     }
     found
+}
+
+// ── Witness-search timing ───────────────────────────────────────────────
+//
+// This call cost 92-159ms cold and took the scooper from scooping every
+// block to ninety seconds per order dispatch, and NOTHING measured it —
+// the cost was found by hand-benchmarking after the stall. The seeded path
+// is ~0.4ms, so the two differ by three orders of magnitude and "which one
+// are we on" is the question an operator needs answered.
+//
+// Durations are buffered here rather than reported directly so this module
+// keeps no dependency on the metrics layer; the scooper drains them into a
+// histogram each cycle. The buffer is bounded: if nobody drains, old
+// observations are dropped rather than growing without limit.
+const WITNESS_TIME_CAP: usize = 4096;
+
+thread_local! {
+    static WITNESS_TIMES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+fn note_witness_time(secs: f64) {
+    WITNESS_TIMES.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.len() >= WITNESS_TIME_CAP {
+            v.clear();
+        }
+        v.push(secs);
+    });
+}
+
+/// Take the witness-search durations recorded since the last drain.
+pub fn drain_witness_times() -> Vec<f64> {
+    WITNESS_TIMES.with(|v| std::mem::take(&mut *v.borrow_mut()))
 }
 
 // ── Seeding the witness search ──────────────────────────────────────────

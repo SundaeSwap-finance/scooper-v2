@@ -164,7 +164,26 @@ pub struct Metrics {
     /// Times we lost a scoop race and rebuilt on the winner's mempool tx
     /// immediately, rather than waiting a block.
     pub race_rebuilds: AtomicU64,
+    /// Execution budget of the most recent built scoop, and the peak seen,
+    /// as a FRACTION OF THE CONWAY PER-TX LIMIT in parts per million.
+    ///
+    /// The only figures we had for this were a manual one-off measurement
+    /// (docs/design/banded-cl-budgets.md), which carries its own warning
+    /// that it predates the gap-provenance rule. Every design question
+    /// about ladder length and pools-per-scoop bottoms out in "how close to
+    /// the ceiling are we", so it should be observed continuously rather
+    /// than re-derived by hand.
+    pub scoop_mem_ppm_last: AtomicU64,
+    pub scoop_steps_ppm_last: AtomicU64,
+    pub scoop_size_ppm_last: AtomicU64,
+    pub scoop_mem_ppm_peak: AtomicU64,
+    pub scoop_steps_ppm_peak: AtomicU64,
+    pub scoop_size_ppm_peak: AtomicU64,
+    /// The shape that produced the peak, as pools*1000 + steps.
+    pub scoop_peak_shape: AtomicU64,
     pub mempool_lead_time: Histogram,
+    /// Time spent solving a banded pool's witness. See the boundaries.
+    pub witness_latency: Histogram,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
     /// Unix seconds of the last mempool snapshot processed. Age > ~1 min
@@ -187,6 +206,22 @@ const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
 /// a tx. Preview/mainnet blocks average 20s, so the interesting range is
 /// 1-60s with a tail for txs that waited out several blocks.
 const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0];
+
+/// Witness-search latency for one banded pool, seconds.
+///
+/// `find_witness` walks every band with an 800-counter scan per band and
+/// cost 92-159ms cold on the ladders the traffic simulator provisions. The
+/// router calls it once per pool per graph build and twice per step
+/// evaluation, which took the scooper from scooping every block to 90
+/// seconds per order dispatch. Nothing measured it: the cost was found by
+/// hand-benchmarking after the scooper had already stalled.
+///
+/// Buckets span microseconds to a tenth of a second because the seeded
+/// path is ~0.4ms and the cold path is ~160ms — four orders of magnitude,
+/// and the whole point is seeing which one we are on.
+const WITNESS_LATENCY_BOUNDARIES: &[f64] = &[
+    0.0002, 0.0005, 0.001, 0.005, 0.02, 0.05, 0.1, 0.25,
+];
 
 /// Point-in-time operator health, refreshed by the scooper each batch cycle.
 /// Everything an operator needs to answer "why is nothing happening":
@@ -254,7 +289,15 @@ impl Metrics {
             mempool_confirmed: AtomicU64::new(0),
             mempool_evicted: AtomicU64::new(0),
             race_rebuilds: AtomicU64::new(0),
+            scoop_mem_ppm_last: AtomicU64::new(0),
+            scoop_steps_ppm_last: AtomicU64::new(0),
+            scoop_size_ppm_last: AtomicU64::new(0),
+            scoop_mem_ppm_peak: AtomicU64::new(0),
+            scoop_steps_ppm_peak: AtomicU64::new(0),
+            scoop_size_ppm_peak: AtomicU64::new(0),
+            scoop_peak_shape: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
+            witness_latency: Histogram::new(WITNESS_LATENCY_BOUNDARIES),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
             node_rejects: AtomicU64::new(0),
@@ -270,6 +313,41 @@ impl Metrics {
     /// to the now-private per-reason atomics.
     /// A lost race whose winner was already in our mempool, so we chained
     /// onto it instead of backing off for a block.
+    /// Record a built scoop's execution budget against the Conway
+    /// per-transaction limits. `pools` and `steps` describe the shape, so a
+    /// peak can be attributed rather than just observed.
+    pub fn note_scoop_budget(
+        &self,
+        mem: u64,
+        steps: u64,
+        size_bytes: u64,
+        pools: u64,
+        transcript_steps: u64,
+    ) {
+        // Conway per-tx maxima. Hardcoded rather than read from protocol
+        // params because these are the numbers the budget doc quotes and a
+        // drifting denominator would make the series meaningless.
+        const MAX_MEM: u64 = 16_500_000;
+        const MAX_STEPS: u64 = 10_000_000_000;
+        const MAX_SIZE: u64 = 16_384;
+        let ppm = |v: u64, max: u64| if max == 0 { 0 } else { (v.saturating_mul(1_000_000)) / max };
+        let m = ppm(mem, MAX_MEM);
+        let st = ppm(steps, MAX_STEPS);
+        let sz = ppm(size_bytes, MAX_SIZE);
+        self.scoop_mem_ppm_last.store(m, Ordering::Relaxed);
+        self.scoop_steps_ppm_last.store(st, Ordering::Relaxed);
+        self.scoop_size_ppm_last.store(sz, Ordering::Relaxed);
+        // Peak is tracked on MEMORY, which the budget doc identifies as the
+        // binding limit (about 2.2M per additional pool).
+        if m > self.scoop_mem_ppm_peak.load(Ordering::Relaxed) {
+            self.scoop_mem_ppm_peak.store(m, Ordering::Relaxed);
+            self.scoop_steps_ppm_peak.store(st, Ordering::Relaxed);
+            self.scoop_size_ppm_peak.store(sz, Ordering::Relaxed);
+            self.scoop_peak_shape
+                .store(pools.saturating_mul(1000) + transcript_steps, Ordering::Relaxed);
+        }
+    }
+
     pub fn note_race_rebuild(&self) {
         self.race_rebuilds.fetch_add(1, Ordering::Relaxed);
     }
@@ -778,6 +856,17 @@ pub async fn render_metrics(
         "Mempool-seen txs later confirmed in a block",
         metrics.mempool_confirmed.load(Ordering::Relaxed),
     );
+    for (name, help, v) in [
+        ("scooper_scoop_mem_ppm", "Memory of the last built scoop, millionths of the Conway per-tx limit", &metrics.scoop_mem_ppm_last),
+        ("scooper_scoop_steps_ppm", "Steps of the last built scoop, millionths of the limit", &metrics.scoop_steps_ppm_last),
+        ("scooper_scoop_size_ppm", "Size of the last built scoop, millionths of the limit", &metrics.scoop_size_ppm_last),
+        ("scooper_scoop_mem_ppm_peak", "Highest scoop memory seen, millionths of the limit", &metrics.scoop_mem_ppm_peak),
+        ("scooper_scoop_steps_ppm_peak", "Steps of the highest-memory scoop, millionths of the limit", &metrics.scoop_steps_ppm_peak),
+        ("scooper_scoop_size_ppm_peak", "Size of the highest-memory scoop, millionths of the limit", &metrics.scoop_size_ppm_peak),
+        ("scooper_scoop_peak_shape", "Shape of the highest-memory scoop, as pools*1000 + transcript steps", &metrics.scoop_peak_shape),
+    ] {
+        write_gauge(&mut out, name, help, v.load(Ordering::Relaxed));
+    }
     write_counter(
         &mut out,
         "scooper_race_rebuilds_total",
@@ -789,6 +878,11 @@ pub async fn render_metrics(
         "scooper_mempool_evicted_total",
         "Mempool-seen txs that vanished without confirming",
         metrics.mempool_evicted.load(Ordering::Relaxed),
+    );
+    metrics.witness_latency.write(
+        &mut out,
+        "scooper_banded_witness_seconds",
+        "Time to solve a banded pool's witness (find_witness)",
     );
     metrics.mempool_lead_time.write(
         &mut out,

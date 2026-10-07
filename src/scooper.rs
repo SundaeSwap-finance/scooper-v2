@@ -2421,6 +2421,36 @@ impl Scooper {
                 first_pass.total_ref_script_bytes,
             ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
 
+            // Drain the witness-search timings this cycle accumulated. The
+            // router calls find_witness once per banded pool per graph build
+            // and twice per step evaluation, so a cycle produces many
+            // observations; this is where they become a histogram.
+            for secs in crate::sundaev4::banded_math::drain_witness_times() {
+                self.metrics.witness_latency.observe(secs);
+            }
+
+            // Record the budget against the Conway per-tx limits. This is
+            // the only continuous measurement of how close a scoop runs to
+            // the ceiling; without it, "four banded pools is the practical
+            // limit" is an inference from a stale manual measurement.
+            {
+                let transcript_steps: u64 = final_plan
+                    .batches
+                    .iter()
+                    // ops_order is exactly what the builder turns into
+                    // transcript entries, and it includes continuations —
+                    // the band crossings — so this counts bands traversed.
+                    .map(|b| b.ops_order.len() as u64)
+                    .sum();
+                self.metrics.note_scoop_budget(
+                    total_eval_mem,
+                    total_eval_steps,
+                    first_pass.cbor.len() as u64,
+                    final_plan.batches.len() as u64,
+                    transcript_steps,
+                );
+            }
+
             let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
                 settings,
