@@ -736,15 +736,31 @@ pub fn find_witness_in_band_from(
                     hi = m;
                 }
             }
+            // `lo` is the largest x with non-negative residuals and G >= 0
+            // (P2, P3, P6), and a witness is such an x whose successor
+            // fails G (P7): the witness is `lo` itself unless P4/P5 push
+            // it lower, and nothing above `lo` can be one. Scan DOWN from
+            // `lo`. The scan used to start at `lo + scan` and walk down,
+            // which was 400 failed band proofs per band before the hit —
+            // most of a fill-curve build, and of every planner step that
+            // crosses a band. The window above `lo` is kept as a backstop
+            // in case the predicate is not monotone for some state.
             let sp = BigInt::from(scan as i64);
             let from = if &lo > &sp { &lo - &sp } else { one.clone() };
             let to = &lo + &sp;
-            let mut x = to;
+            let mut x = lo.clone();
             while x >= from {
                 if is_witness(cfg, a, b, &x, k) {
                     return Some(Witness { x, k });
                 }
                 x = &x - &one;
+            }
+            let mut x = &lo + &one;
+            while x <= to {
+                if is_witness(cfg, a, b, &x, k) {
+                    return Some(Witness { x, k });
+                }
+                x = &x + &one;
             }
         }
     }
