@@ -1704,14 +1704,36 @@ pub fn find_blended_route(
     if !chunk.is_positive() {
         return single.map(single_plan);
     }
+    // `out_at` is a pure function of (path, allocation), and both loops
+    // below ask it the same questions over and over.
+    //
+    // The chunk loop re-prices EVERY path at `alloc + chunk` on all 64
+    // steps, but only the winner's allocation changes, so the other P-1
+    // trials are identical to the previous step's. The refinement loop
+    // then probes `alloc +/- delta` across every ordered pair of paths,
+    // restarting the whole scan on each improvement, so it re-prices
+    // allocations it has already priced — up to 64 rounds x P^2 x 2
+    // evaluations, which for four paths is ~2048 against the chunk loop's
+    // 256.
+    //
+    // Each `evaluate_path` runs `optimize_split` per hop. Memoising here
+    // collapses both loops to the distinct allocations actually tried.
+    let memo: std::cell::RefCell<std::collections::BTreeMap<(usize, BigInt), BigInt>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
     let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
         if !alloc.is_positive() {
             return BigInt::from(0);
         }
-        evaluate_path(&paths[path_idx], alloc, &limits)
+        let key = (path_idx, alloc.clone());
+        if let Some(v) = memo.borrow().get(&key) {
+            return v.clone();
+        }
+        let v = evaluate_path(&paths[path_idx], alloc, &limits)
             .last()
             .map(|h| h.total_output.clone())
-            .unwrap_or_else(|| BigInt::from(0))
+            .unwrap_or_else(|| BigInt::from(0));
+        memo.borrow_mut().insert(key, v.clone());
+        v
     };
     let mut alloc: Vec<BigInt> = chosen.iter().map(|_| BigInt::from(0)).collect();
     let mut cur_out: Vec<BigInt> = alloc.clone();
