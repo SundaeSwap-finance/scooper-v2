@@ -142,6 +142,39 @@ fn market(shape: &MarketShape) -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
     pools
 }
 
+/// A market where the best paths on a small amount lack the depth for the
+/// order: four T0→Tᵢ→T1 paths, each through two single cheap bands (0.05 %
+/// fee), outrank the deep but costly T0/T1 ladder (3 % fee) and take every
+/// branch slot, though together they hold far less than the order. The
+/// router then gives the last slot to the T0/T1 path, the one that can absorb
+/// the whole order, and water-fills again.
+fn crowded_market() -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
+    let deep = MarketShape {
+        tokens: 2,
+        bands_per_side: 6,
+        width: 0.02,
+        sigma: 0.10,
+        pair_value: 10e12,
+        fee_ppm: 30_000,
+    };
+    let shallow = MarketShape {
+        tokens: 2,
+        bands_per_side: 0,
+        width: 0.02,
+        sigma: 0.10,
+        pair_value: 0.4e12,
+        fee_ppm: 500,
+    };
+    let mut pools = market(&deep);
+    for i in 2..6 {
+        for (a, b) in [(token(0), token(i)), (token(i), token(1))] {
+            let pool = cl_band(pools.len(), &a, &b, 0, shallow.pair_value, &shallow);
+            pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
+        }
+    }
+    pools
+}
+
 fn bench_find_blended_route(c: &mut Criterion) {
     let shape = MarketShape {
         tokens: 4,
@@ -208,6 +241,23 @@ fn bench_find_blended_route(c: &mut Criterion) {
         eprintln!("  {name:<9} {elapsed:>8.2?}  {summary}");
     }
 
+    let crowded = crowded_market();
+    let t0 = std::time::Instant::now();
+    let blend = find_blended_route(
+        &crowded,
+        &[],
+        &token(0),
+        &token(1),
+        &amount,
+        RoutingLimits::unlimited(),
+    );
+    let elapsed = t0.elapsed();
+    let summary = match &blend {
+        Some(b) => format!("{} branches, output {}", b.branches.len(), b.total_output),
+        None => "no route".to_string(),
+    };
+    eprintln!("  {:<9} {elapsed:>8.2?}  {summary}", "crowded");
+
     let mut group = c.benchmark_group("find_blended_route");
     // The slow cases take seconds per call: criterion's minimum sample count.
     group.sample_size(10);
@@ -229,6 +279,18 @@ fn bench_find_blended_route(c: &mut Criterion) {
             },
         );
     }
+    group.bench_function("crowded", |bench| {
+        bench.iter(|| {
+            find_blended_route(
+                black_box(&crowded),
+                &[],
+                &token(0),
+                &token(1),
+                black_box(&amount),
+                RoutingLimits::unlimited(),
+            )
+        })
+    });
     group.finish();
 }
 
