@@ -191,7 +191,12 @@ pub struct Metrics {
     pub scoop_peak_shape: AtomicU64,
     pub mempool_lead_time: Histogram,
     /// Time spent solving a banded pool's witness. See the boundaries.
+    /// This times the searches that RAN; `witness_memo_hits` counts the
+    /// calls that never had to search, so the two together give the real
+    /// cost per call.
     pub witness_latency: Histogram,
+    /// `find_witness` calls answered from the memo without a search.
+    pub witness_memo_hits: AtomicU64,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
     /// Unix seconds of the last mempool snapshot processed. Age > ~1 min
@@ -306,6 +311,7 @@ impl Metrics {
             scoop_peak_shape: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
             witness_latency: Histogram::new(WITNESS_LATENCY_BOUNDARIES),
+            witness_memo_hits: AtomicU64::new(0),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
             node_rejects: AtomicU64::new(0),
@@ -857,12 +863,12 @@ pub async fn render_metrics(
         metrics.mempool_confirmed.load(Ordering::Relaxed),
     );
     for (name, help, v) in [
-        ("scooper_scoop_mem_ppm", "Memory of the last built scoop, millionths of the Conway per-tx limit", &metrics.scoop_mem_last),
-        ("scooper_scoop_steps_ppm", "Steps of the last built scoop, millionths of the limit", &metrics.scoop_steps_last),
-        ("scooper_scoop_size_ppm", "Size of the last built scoop, millionths of the limit", &metrics.scoop_size_last),
-        ("scooper_scoop_mem_peak", "Highest scoop memory seen, millionths of the limit", &metrics.scoop_mem_peak),
-        ("scooper_scoop_steps_peak", "Steps of the highest-memory scoop, millionths of the limit", &metrics.scoop_steps_peak),
-        ("scooper_scoop_size_peak", "Size of the highest-memory scoop, millionths of the limit", &metrics.scoop_size_peak),
+        ("scooper_scoop_mem", "Execution memory of the last built scoop, in memory units", &metrics.scoop_mem_last),
+        ("scooper_scoop_steps", "Execution steps of the last built scoop, in steps", &metrics.scoop_steps_last),
+        ("scooper_scoop_size_bytes", "Size of the last built scoop, in bytes", &metrics.scoop_size_last),
+        ("scooper_scoop_mem_peak", "Highest scoop execution memory seen, in memory units", &metrics.scoop_mem_peak),
+        ("scooper_scoop_steps_peak", "Execution steps of the highest-memory scoop, in steps", &metrics.scoop_steps_peak),
+        ("scooper_scoop_size_peak_bytes", "Size of the highest-memory scoop, in bytes", &metrics.scoop_size_peak),
         ("scooper_scoop_peak_shape", "Shape of the highest-memory scoop, as pools*1000 + transcript steps", &metrics.scoop_peak_shape),
     ] {
         write_gauge(&mut out, name, help, v.load(Ordering::Relaxed));
@@ -882,7 +888,13 @@ pub async fn render_metrics(
     metrics.witness_latency.write(
         &mut out,
         "scooper_banded_witness_seconds",
-        "Time to solve a banded pool's witness (find_witness)",
+        "Time to solve a banded pool's witness, over the searches that ran",
+    );
+    write_counter(
+        &mut out,
+        "scooper_banded_witness_memo_hits_total",
+        "find_witness calls answered from the memo, with no search",
+        metrics.witness_memo_hits.load(Ordering::Relaxed),
     );
     metrics.mempool_lead_time.write(
         &mut out,

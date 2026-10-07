@@ -264,10 +264,95 @@ pub fn is_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: u
 /// short scan follows. `None` when the reserves sit on no point of the
 /// ladder; the chain would reject them too. Mirrors `banded-math.ts`.
 pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+    if let Some(hit) = memo_get(cfg, a, b) {
+        note_memo_hit();
+        return hit;
+    }
     let t0 = std::time::Instant::now();
     let out = find_witness_inner(cfg, a, b);
     note_witness_time(t0.elapsed().as_secs_f64());
+    memo_put(cfg, a, b, &out);
     out
+}
+
+// ── Memoising the witness ───────────────────────────────────────────────
+//
+// `find_witness` is a pure function of the ladder and the reserves, and a
+// scoop asks it the same question many times over: the router quotes a
+// pool, the splitter re-quotes it at the same fill, and
+// `compute_fee_budget` asks for the before AND after witness of every step
+// it prices. Measured on preview over 2h46m: 521,702 calls, about 800 per
+// build attempt, 3,183s of CPU — 79% of everything the scooper computed.
+//
+// The memo NEVER goes stale and needs no invalidation. A pool's reserves
+// change, but then `(a, b)` is a different key; the answer stored against
+// the old key is still the right answer for the old key.
+//
+// It is keyed on the WHOLE config, unlike the seed cache above. A seed
+// collision costs one failed narrow search. A memo collision would hand
+// back the witness of a DIFFERENT ladder, which the caller has no way to
+// detect.
+const MEMO_LADDERS: usize = 64;
+const MEMO_STATES: usize = 8192;
+
+type MemoStates = BTreeMap<(BigInt, BigInt), Option<Witness>>;
+
+thread_local! {
+    static WITNESS_MEMO: RefCell<Vec<(BandedCLConfig, MemoStates)>> =
+        const { RefCell::new(Vec::new()) };
+    static MEMO_HITS: RefCell<u64> = const { RefCell::new(0) };
+}
+
+fn memo_get(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Option<Witness>> {
+    WITNESS_MEMO.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(c, _)| c == cfg)
+            .and_then(|(_, states)| states.get(&(a.clone(), b.clone())).cloned())
+    })
+}
+
+fn memo_put(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, out: &Option<Witness>) {
+    WITNESS_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded in both dimensions. A scooper sees a few dozen ladders,
+        // and each build adds states for its trial fills, so the state
+        // table is the one that grows without a bound of its own. Dropping
+        // either only costs cold searches.
+        if m.len() > MEMO_LADDERS {
+            m.clear();
+        }
+        let slot = match m.iter().position(|(c, _)| c == cfg) {
+            Some(i) => i,
+            None => {
+                m.push((cfg.clone(), BTreeMap::new()));
+                m.len() - 1
+            }
+        };
+        let states = &mut m[slot].1;
+        if states.len() >= MEMO_STATES {
+            states.clear();
+        }
+        states.insert((a.clone(), b.clone()), out.clone());
+    });
+}
+
+fn note_memo_hit() {
+    MEMO_HITS.with(|h| *h.borrow_mut() += 1);
+}
+
+/// Take the memo hit count since the last drain. The scooper exports it
+/// beside the search histogram: the histogram times the searches that ran,
+/// this says how many never had to.
+pub fn drain_witness_memo_hits() -> u64 {
+    MEMO_HITS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
+/// Drop the memo. Tests that measure a cold search need this; the scooper
+/// never calls it.
+#[cfg(test)]
+pub fn clear_witness_memo() {
+    WITNESS_MEMO.with(|m| m.borrow_mut().clear());
 }
 
 fn find_witness_inner(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
@@ -382,6 +467,7 @@ fn remember_witness(cfg: &BandedCLConfig, w: &Witness) {
 #[cfg(test)]
 pub fn clear_witness_seeds() {
     LAST_WITNESS.with(|m| m.borrow_mut().clear());
+    clear_witness_memo();
 }
 
 fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
@@ -408,6 +494,185 @@ fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> 
 }
 
 pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32) -> Option<Witness> {
+    let n = cfg.bands.len();
+    let Some(range) = candidate_bands(cfg, a, b) else {
+        return (0..n).find_map(|k| find_witness_in_band(cfg, a, b, k, scan));
+    };
+    // The bounds that chose these bands also bound the counter from
+    // BELOW, and a band search that starts from a lower bound costs a
+    // short doubling instead of a blind one from 1. Measured on the
+    // eight-band bell ladder: 50us against 2.9ms for the same band.
+    //
+    // A wrong hint is safe. `find_witness_in_band_from` tests it against
+    // the sign and curve predicates first and falls back to the unseeded
+    // search when it does not hold, and every candidate counter still has
+    // to pass the whole band proof in `is_witness`.
+    if let Some(w) = range.clone().find_map(|k| {
+        let hint = counter_floor(cfg, a, b, k);
+        find_witness_in_band_from(cfg, a, b, k, scan, hint.as_ref())
+    }) {
+        return Some(w);
+    }
+    // The counter bounds are a hint, not a proof: they drop the rounding
+    // slack in `ca`, `cb`, `a_sat` and `b_sat`. A miss costs the bands the
+    // hint excluded, which is what an unpruned search pays anyway.
+    (0..n)
+        .filter(|k| !range.contains(k))
+        .find_map(|k| find_witness_in_band(cfg, a, b, k, scan))
+}
+
+// ── Narrowing the band search ───────────────────────────────────────────
+//
+// `find_witness_scan` ran a doubling search, a bisection and a scan of 801
+// counters for EVERY band, and all but one or two of those bands cannot
+// hold the witness at all. On preview that search was 79% of the whole
+// scooper's CPU.
+//
+// The reserves bound the counter from both sides, per band. Write
+// `S_a_gt(k)` for the index entry that sums `coeff_a` over the bands above
+// `k`, and `S_a_ge(k)` for the same sum including `k`:
+//
+//   P2 (`a >= C_A`)   gives   X <= a * 2^64 / S_a_gt(k)
+//   P4 (`ra <= a_sat`) gives  X >= (a - 2) * 2^64 / S_a_ge(k)
+//
+// and the B side gives the mirror pair from P3 and P5. So each band admits
+// the counter only inside one interval. `S_a_*` falls as `k` rises and
+// `S_b_*` rises, so the A interval moves right with `k` and the B interval
+// moves left. They overlap on one contiguous range of bands, and two
+// binary searches find its ends.
+//
+// The `- 2` is the rounding slack, and it is why the bound is necessary
+// rather than approximate. `C_A` is one `ceil_div`, worth up to 1 over the
+// exact product. `a_sat_k = ceil(w*D*X / (W*p*p))` is a second, and the
+// index coefficient it is compared against rounds up too, so it is worth
+// another 1. `a <= S_a_ge(k) * X / 2^64 + 2` is therefore the tight
+// inequality, and dropping the 2 is what let the search skip a band that
+// really did hold a witness. `SLACK` carries a wider margin than the
+// derivation needs; it costs at most a band or two of extra search.
+//
+// WITHOUT the slack this is not a pruning but a guess. The first version
+// of this code omitted it, and on a two-band ladder the pruned search
+// returned the witness of band 1 where the unpruned search returned
+// band 0 — both valid, but a different counter, and so a different fee
+// budget. `pruning_never_changes_the_witness` is the test that caught it.
+//
+// The comparisons are cross-multiplied, so no division enters the
+// decision. The caller still falls back to the excluded bands when the
+// pruned range yields nothing.
+const SLACK: i64 = 4;
+
+/// The bands whose counter interval overlaps, as a contiguous range.
+/// `None` when the ladder index is not monotone, which means the caller
+/// must search every band: the binary searches below assume monotonicity
+/// and a malformed config would make them drop the right band.
+fn candidate_bands(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+) -> Option<std::ops::Range<usize>> {
+    let n = cfg.bands.len();
+    if n == 0 || cfg.index.len() != n {
+        return None;
+    }
+    // `check_shape` guarantees this for a config the chain accepted. This
+    // is cheap next to one band search, and `find_witness` is reachable
+    // with a config nobody checked.
+    for k in 1..n {
+        if cfg.index[k].0 > cfg.index[k - 1].0 || cfg.index[k].1 < cfg.index[k - 1].1 {
+            return None;
+        }
+    }
+    let scale = fixed_one();
+    let s_a_gt = |k: usize| cfg.index[k].0.clone();
+    let s_a_ge = |k: usize| &cfg.index[k].0 + &coeff_a(cfg, k, &scale);
+    let s_b_lt = |k: usize| cfg.index[k].1.clone();
+    let s_b_le = |k: usize| &cfg.index[k].1 + &coeff_b(cfg, k, &scale);
+
+    let slack = BigInt::from(SLACK);
+    let a_slack = a - &slack;
+    let b_slack = b - &slack;
+    // The A interval starts at or below where the B interval ends. True on
+    // a prefix of the bands, so the first failure is the range's end.
+    let a_lo_under_b_hi = |k: usize| &a_slack * &s_b_lt(k) <= b * &s_a_ge(k);
+    // The B interval starts at or below where the A interval ends. True on
+    // a suffix, so the first success is the range's start.
+    let b_lo_under_a_hi = |k: usize| &b_slack * &s_a_gt(k) <= a * &s_b_le(k);
+
+    let lo = first_true(n, b_lo_under_a_hi);
+    let hi = first_false(n, a_lo_under_b_hi);
+    if lo >= hi {
+        None
+    } else {
+        Some(lo..hi)
+    }
+}
+
+/// A lower bound on band `k`'s ladder counter, from the same P4 and P5
+/// inequalities `candidate_bands` uses:
+///
+///     X >= (a - SLACK) * 2^64 / S_a_ge(k)
+///     X >= (b - SLACK) * 2^64 / S_b_le(k)
+///
+/// The larger of the two, and `None` when neither side gives a positive
+/// one. This is a search start, not a claim about the witness: the band
+/// search validates it and falls back when it does not hold.
+fn counter_floor(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize) -> Option<BigInt> {
+    let (ca_coeff, cb_coeff) = cfg.index.get(k)?;
+    let scale = fixed_one();
+    let slack = BigInt::from(SLACK);
+    let floor_of = |num: &BigInt, den: &BigInt| -> Option<BigInt> {
+        if !den.is_positive() {
+            return None;
+        }
+        let n = num - &slack;
+        if !n.is_positive() {
+            return None;
+        }
+        Some(&(&n * &scale) / den)
+    };
+    let s_a_ge = ca_coeff + &coeff_a(cfg, k, &scale);
+    let s_b_le = cb_coeff + &coeff_b(cfg, k, &scale);
+    let from_a = floor_of(a, &s_a_ge);
+    let from_b = floor_of(b, &s_b_le);
+    let best = match (from_a, from_b) {
+        (Some(x), Some(y)) => Some(if x > y { x } else { y }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+    // P1: the counter is never below the total weight.
+    best.map(|x| if x < cfg.weight_total { cfg.weight_total.clone() } else { x })
+}
+
+/// The least `k` in `0..n` where `pred` holds, for a `pred` that is false
+/// then true. `n` when it never holds.
+fn first_true(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// The least `k` in `0..n` where `pred` fails, for a `pred` that is true
+/// then false. `n` when it holds everywhere.
+fn first_false(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    first_true(n, |k| !pred(k))
+}
+
+/// `find_witness_scan` with the band pruning removed: every band, in
+/// order. The reference the pruned search is tested against.
+#[cfg(test)]
+pub fn find_witness_scan_every_band(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    scan: u32,
+) -> Option<Witness> {
     (0..cfg.bands.len()).find_map(|k| find_witness_in_band(cfg, a, b, k, scan))
 }
 
@@ -1411,9 +1676,13 @@ mod witness_cost {
             let b = &st.cb + &BigInt::from(0);
             clear_witness_seeds();
             let t = std::time::Instant::now();
-            let w = find_witness(&cfg, &a, &b);
+            let w_cold = find_witness(&cfg, &a, &b);
             let dt = t.elapsed();
-            println!("{label}: find_witness -> {:?} in {:?} (cold)", w.map(|w| w.k), dt);
+            println!(
+                "{label}: find_witness -> {:?} in {:?} (cold)",
+                w_cold.as_ref().map(|w| w.k),
+                dt
+            );
 
             let n = 20;
             let t = std::time::Instant::now();
@@ -1421,7 +1690,10 @@ mod witness_cost {
                 clear_witness_seeds();
                 let _ = find_witness(&cfg, &a, &b);
             }
-            println!("  cold (no seed), all bands: {:?}", t.elapsed() / n);
+            // `find_witness` prunes the band set, so this is the cold
+            // PRUNED path, not a scan of every band. The PRUNE line below
+            // is the one that compares the two.
+            println!("  cold (no seed, pruned): {:?}", t.elapsed() / n);
 
             for scan in [400u32, 50, 8] {
                 let t = std::time::Instant::now();
@@ -1430,13 +1702,19 @@ mod witness_cost {
                 }
                 println!("    scan={scan:>3}: {:?}", t.elapsed() / n);
             }
-            // The right band only, scanned wide: isolates the cost of
-            // searching bands that cannot hold the witness.
+            // One band, scanned wide. `k` is the ladder's midpoint, which
+            // is NOT always the band holding the witness, so this is the
+            // cost of searching ONE band whether it holds one or not.
+            let holder = w_cold.as_ref().map(|w| w.k);
             let t = std::time::Instant::now();
             for _ in 0..n {
                 let _ = find_witness_in_band(&cfg, &a, &b, k, 400);
             }
-            println!("    right band only, scan=400: {:?}", t.elapsed() / n);
+            println!(
+                "    one band (k={k}, witness in {:?}), scan=400: {:?}",
+                holder,
+                t.elapsed() / n
+            );
             // Seeded at the true counter, as a chained step would be.
             let t = std::time::Instant::now();
             for _ in 0..n {
@@ -1453,6 +1731,396 @@ mod witness_cost {
                 let _ = find_witness(&cfg, &aa, &b);
             }
             println!("    WARM find_witness, nearby states: {:?}", t.elapsed() / reps);
+
+            // ── What the two optimisations buy, separately ──────────────
+            //
+            // 1. Band pruning, on the cold path: pruned against every band.
+            let kept = candidate_bands(&cfg, &a, &b).map(|r| r.len()).unwrap_or(cfg.bands.len());
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = find_witness_scan_every_band(&cfg, &a, &b, 400);
+            }
+            let every = t.elapsed() / n;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = find_witness_scan(&cfg, &a, &b, 400);
+            }
+            let pruned = t.elapsed() / n;
+            println!(
+                "    PRUNE: {} of {} bands kept, {:?} -> {:?} ({:.1}x)",
+                kept,
+                cfg.bands.len(),
+                every,
+                pruned,
+                every.as_secs_f64() / pruned.as_secs_f64().max(1e-12)
+            );
+
+            // 2. The memo, on the call pattern the router produces: one
+            // state asked for repeatedly, which is what the splitter and
+            // `compute_fee_budget` do.
+            clear_witness_seeds();
+            let _ = find_witness(&cfg, &a, &b);
+            let reps = 2000;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = find_witness(&cfg, &a, &b);
+            }
+            let memo = t.elapsed() / reps;
+            let hits = drain_witness_memo_hits();
+            // `hits` can exceed `reps`: the drain also collects hits from
+            // the calls above that primed the memo.
+            println!("    MEMO: repeat call {:?}, {hits} hits over {reps} repeats", memo);
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod witness_pruning_tests {
+    //! The band pruning and the memo are both pure-function optimisations.
+    //! Neither may change an answer. These compare them against the
+    //! unpruned, unmemoised search.
+    use super::*;
+    use crate::sundaev4::types::BandSpec;
+
+    fn r(num: i64, den: i64) -> Rational {
+        Rational { num: BigInt::from(num), den: BigInt::from(den) }
+    }
+
+    /// An `n`-band ladder over `[lo, hi]/den` with the given weights and
+    /// curves. Mirrors the creamery's archetypes.
+    fn ladder(n: usize, lo: i64, hi: i64, den: i64, weights: &[i64], cs_at: Option<usize>) -> BandedCLConfig {
+        let step = (hi - lo) / n as i64;
+        let w_total: i64 = weights.iter().take(n).sum();
+        with_index(
+            (0..n)
+                .map(|i| BandSpec {
+                    start: r(lo + step * i as i64, den),
+                    weight: BigInt::from(weights[i]),
+                    curve: BigInt::from(if cs_at == Some(i) { 1 } else { 0 }),
+                    fee_buy: r(3, 1000),
+                    fee_sell: r(3, 1000),
+                })
+                .collect(),
+            r(lo + step * n as i64, den),
+            BigInt::from(w_total),
+        )
+    }
+
+    /// The ladders the creamery provisions, by archetype.
+    fn archetypes() -> Vec<(&'static str, BandedCLConfig)> {
+        vec![
+            ("tight 8 bell", ladder(8, 996_000_000, 1_004_000_000, 1_000_000_000, &[2, 9, 40, 87, 87, 40, 9, 2], None)),
+            ("core 12 bell", ladder(12, 980_000_000, 1_020_000_000, 1_000_000_000, &[2, 5, 12, 28, 60, 96, 96, 60, 28, 12, 5, 2], None)),
+            ("wide 16 flat", ladder(16, 880_000_000, 1_120_000_000, 1_000_000_000, &[1; 16], None)),
+            ("tail 8 skewed", ladder(8, 550_000_000, 1_450_000_000, 1_000_000_000, &[96, 60, 28, 12, 5, 3, 2, 1], None)),
+            ("split 12 bimodal", ladder(12, 920_000_000, 1_080_000_000, 1_000_000_000, &[40, 87, 40, 9, 2, 1, 1, 2, 9, 40, 87, 40], None)),
+            ("pegged 10 with a cs bin", ladder(10, 990_000_000, 1_010_000_000, 1_000_000_000, &[4, 12, 30, 70, 96, 96, 70, 30, 12, 4], Some(4))),
+            ("two bands", ladder(2, 900_000_000, 1_100_000_000, 1_000_000_000, &[1, 1], None)),
+            ("one band", ladder(1, 950_000_000, 1_050_000_000, 1_000_000_000, &[1], None)),
+        ]
+    }
+
+    /// Reserves that lie ON the ladder: pick a counter and a band, then
+    /// read the saturated state back out. A state built this way has a
+    /// witness, so a search that returns `None` for it is a defect.
+    fn on_ladder(cfg: &BandedCLConfig, x: &BigInt, k: usize) -> Option<(BigInt, BigInt)> {
+        let st = ladder_at(cfg, x, k).ok()?;
+        // Mid-band: half of each side's saturation on top of the prefix.
+        let two = BigInt::from(2);
+        let a = &st.ca + &(&st.a_sat_k / &two);
+        let b = &st.cb + &(&st.b_sat_k / &two);
+        Some((a, b))
+    }
+
+    /// Compare the pruned search against the unpruned one over a sweep of
+    /// ladders, counters, bands and small reserve offsets. The unpruned
+    /// side costs 90-160ms per state in a debug build, so the always-run
+    /// test takes a slice and the ignored one takes the lot.
+    fn sweep(archs: &[(&str, BandedCLConfig)], counters: &[u64], deltas: &[(i64, i64)], band_step: usize) {
+        let mut checked = 0usize;
+        let mut pruned_none = 0usize;
+        for (name, cfg) in archs {
+            let n = cfg.bands.len();
+            for cx in counters {
+                let x = BigInt::from(*cx);
+                if x < cfg.weight_total {
+                    continue;
+                }
+                for k in (0..n).step_by(band_step) {
+                    let Some((a, b)) = on_ladder(cfg, &x, k) else { continue };
+                    // On-ladder states with a small offset, then states
+                    // off the ladder. The pruned search must agree on
+                    // both: a state with no witness is what sends it down
+                    // the fallback path.
+                    //
+                    // Scaling BOTH reserves by the same factor does not
+                    // leave the ladder, it only moves the counter, and
+                    // scaling one of them moves the band. To leave the
+                    // ladder the price has to go outside its range: P2
+                    // bounds the counter above by `a`, so a small `a` with
+                    // a large `b` asks for more B than any admissible
+                    // counter can hold.
+                    let mut probes: Vec<(BigInt, BigInt)> = deltas
+                        .iter()
+                        .map(|(da, db)| (&a + &BigInt::from(*da), &b + &BigInt::from(*db)))
+                        .collect();
+                    for (da, mb) in [(1000i64, 1000i64), (7, 100_000), (100_000, 7)] {
+                        probes.push((&a / &BigInt::from(da), &b * &BigInt::from(mb)));
+                    }
+                    for (aa, bb) in probes {
+                        if aa.is_negative() || bb.is_negative() {
+                            continue;
+                        }
+                        clear_witness_seeds();
+                        let want = find_witness_scan_every_band(cfg, &aa, &bb, 400);
+                        clear_witness_seeds();
+                        let got = find_witness_scan(cfg, &aa, &bb, 400);
+                        assert_eq!(
+                            got, want,
+                            "{name}: pruned search disagrees at band {k}, X={x}, a={aa}, b={bb}"
+                        );
+                        checked += 1;
+                        if want.is_none() {
+                            pruned_none += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} states compared");
+        // Reserves with NO witness are what send the pruned search down
+        // its fallback path, and this sweep does not reach them: a ladder
+        // admits every A:B ratio, because band 0 unsaturated holds only A
+        // and the top band saturated holds only B. Scaling both reserves
+        // moves the counter, scaling one moves the band, and a one unit
+        // offset is absorbed by a neighbouring counter.
+        // `find_states_with_no_witness` searched 1,600 small states on the
+        // eight-arc ladder and found none.
+        //
+        // So the fallback is a safety net that this suite does not
+        // exercise, and the slack in `candidate_bands` carries the
+        // correctness on its own. Treat a change to that derivation as
+        // unguarded by tests.
+        assert!(
+            checked - pruned_none > 10,
+            "too few witnessed states: {}",
+            checked - pruned_none
+        );
+        println!("  compared {checked} states, {pruned_none} with no witness");
+    }
+
+    #[test]
+    fn pruning_never_changes_the_witness() {
+        // Every band of three shapes, at one counter, with the offsets
+        // that straddle a band edge.
+        let archs = archetypes();
+        let slice: Vec<(&str, BandedCLConfig)> = archs
+            .iter()
+            .filter(|(n, _)| matches!(*n, "tight 8 bell" | "pegged 10 with a cs bin" | "two bands"))
+            .cloned()
+            .collect();
+        sweep(&slice, &[80_279_049_977_900], &[(0, 0), (1, 0), (0, -1)], 1);
+    }
+
+    #[test]
+    #[ignore = "90-160ms per state in debug; run with --ignored"]
+    fn pruning_never_changes_the_witness_exhaustively() {
+        sweep(
+            &archetypes(),
+            &[1_000_000_000, 80_279_049_977_900, 1_452_199_123_434, 7_000_000_000_000_000, 123_456_789],
+            &[(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (7, -5)],
+            1,
+        );
+    }
+
+    #[test]
+    fn the_memo_returns_what_a_cold_search_returns() {
+        for (name, cfg) in archetypes() {
+            let x = BigInt::from(80_279_049_977_900u64);
+            if x < cfg.weight_total {
+                continue;
+            }
+            for k in 0..cfg.bands.len() {
+                let Some((a, b)) = on_ladder(&cfg, &x, k) else { continue };
+                clear_witness_seeds();
+                let cold = find_witness(&cfg, &a, &b);
+                // Second call must come from the memo, and agree.
+                let before = drain_witness_memo_hits();
+                let warm = find_witness(&cfg, &a, &b);
+                let hits = drain_witness_memo_hits();
+                assert_eq!(cold, warm, "{name}: memo disagrees with the cold search at band {k}");
+                assert_eq!(before, 0, "{name}: unexpected memo hit before the repeat");
+                assert_eq!(hits, 1, "{name}: repeat did not come from the memo");
+            }
+        }
+    }
+
+    #[test]
+    fn the_memo_does_not_confuse_two_ladders() {
+        // Two ladders that a cheap fingerprint could conflate: same band
+        // count, same weight_total, same first edge, different shape.
+        let left = ladder(8, 990_000_000, 1_010_000_000, 1_000_000_000, &[1, 1, 1, 1, 1, 1, 1, 1], None);
+        let right = ladder(8, 990_000_000, 1_030_000_000, 1_000_000_000, &[1, 1, 1, 1, 1, 1, 1, 1], None);
+        assert_eq!(left.bands.len(), right.bands.len());
+        assert_eq!(left.weight_total, right.weight_total);
+        assert_eq!(left.bands[0].start, right.bands[0].start);
+        assert_ne!(left, right, "the two ladders must differ");
+
+        let x = BigInt::from(80_279_049_977_900u64);
+        for k in 0..8 {
+            let (Some((la, lb)), Some((ra, rb))) = (on_ladder(&left, &x, k), on_ladder(&right, &x, k)) else {
+                continue;
+            };
+            clear_witness_seeds();
+            let l_alone = find_witness(&left, &la, &lb);
+            clear_witness_seeds();
+            let r_alone = find_witness(&right, &ra, &rb);
+
+            // Interleaved, through one memo.
+            clear_witness_seeds();
+            let l_mixed = find_witness(&left, &la, &lb);
+            let r_mixed = find_witness(&right, &ra, &rb);
+            let l_again = find_witness(&left, &la, &lb);
+            assert_eq!(l_alone, l_mixed, "left changed when right shared the memo (band {k})");
+            assert_eq!(r_alone, r_mixed, "right changed when left shared the memo (band {k})");
+            assert_eq!(l_alone, l_again, "left changed on a memo hit (band {k})");
+        }
+    }
+
+    /// The eight equal arcs of `lib/tests/unit/banded_cl_check.ak`:
+    /// sqrt-price 1.00 .. 1.08 in steps of 0.01, weight 1, fee 0.3%.
+    fn eq8() -> BandedCLConfig {
+        with_index(
+            (0..8)
+                .map(|i| BandSpec {
+                    start: r(100 + i, 100),
+                    weight: BigInt::from(1),
+                    curve: BigInt::from(0),
+                    fee_buy: r(3, 1000),
+                    fee_sell: r(3, 1000),
+                })
+                .collect(),
+            r(108, 100),
+            BigInt::from(8),
+        )
+    }
+
+    #[test]
+    fn the_memo_freezes_one_of_two_witnesses_at_a_band_edge() {
+        // A state ON a band edge satisfies the band proof in BOTH
+        // neighbouring bands, at DIFFERENT counters. `find_witness`
+        // already picks between them by what the seed cache holds, so the
+        // answer was never a function of the reserves alone. The memo
+        // freezes the first answer instead, which narrows the variance
+        // but does not remove it.
+        //
+        // This is NOT a correctness claim about which band is right. Both
+        // pass P1-P7 and the chain accepts either. It is here so that a
+        // change in the choice shows up as a failing test rather than as
+        // a fee budget that disagrees with the transcript.
+        let cfg = eq8();
+        let (a, b) = (BigInt::from(5_618_482), BigInt::from(3_750_000));
+
+        let admitted: Vec<Witness> = (0..cfg.bands.len())
+            .filter_map(|k| find_witness_in_band(&cfg, &a, &b, k, 400))
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            2,
+            "the fixture must sit on an edge; admitted {admitted:?}"
+        );
+        assert_ne!(
+            admitted[0].x, admitted[1].x,
+            "the two witnesses must differ in the counter, or there is nothing to freeze"
+        );
+
+        // Cold, the search takes the lower band.
+        clear_witness_seeds();
+        let cold = find_witness(&cfg, &a, &b).expect("a witness exists");
+        assert_eq!(cold, admitted[0], "a cold search no longer takes the first band");
+
+        // The memo returns that same answer, and does not search again.
+        let _ = drain_witness_memo_hits();
+        let again = find_witness(&cfg, &a, &b).expect("a witness exists");
+        assert_eq!(again, cold, "the memo changed the answer");
+        assert_eq!(drain_witness_memo_hits(), 1, "the repeat searched again");
+
+        // Seeded into the upper band, a search WITHOUT the memo takes the
+        // upper one: the pre-existing seed dependence, recorded.
+        clear_witness_seeds();
+        let upper = find_witness_in_band(&cfg, &a, &b, admitted[1].k, 8)
+            .expect("the upper band admits a witness");
+        assert_eq!(upper, admitted[1]);
+        assert_ne!(upper, cold, "the two paths must reach different witnesses");
+    }
+
+    #[test]
+    #[ignore = "a search for fixtures, not a check; run with --ignored"]
+    fn find_states_with_no_witness() {
+        // Which reserves lie on no point of a ladder? Scaling does not
+        // leave the ladder (it moves the counter) and neither does a one
+        // unit offset (a neighbouring counter absorbs it), so the sweep
+        // needs real fixtures. This prints them.
+        let cfg = eq8();
+        let mut found = 0usize;
+        for a in (1u64..120).step_by(3) {
+            for b in (1u64..120).step_by(3) {
+                clear_witness_seeds();
+                let (aa, bb) = (BigInt::from(a), BigInt::from(b));
+                if find_witness_scan_every_band(&cfg, &aa, &bb, 400).is_none() {
+                    if found < 12 {
+                        println!("  no witness: a={a} b={b}");
+                    }
+                    found += 1;
+                }
+            }
+        }
+        println!("  {found} of {} probed states have no witness", (120 / 3) * (120 / 3));
+    }
+
+    #[test]
+    fn pruning_survives_a_malformed_index() {
+        // A config whose index does not match its bands must fall back to
+        // the full scan, not drop bands by a broken binary search.
+        let good = ladder(8, 990_000_000, 1_010_000_000, 1_000_000_000, &[2, 9, 40, 87, 87, 40, 9, 2], None);
+        let x = BigInt::from(80_279_049_977_900u64);
+        let (a, b) = on_ladder(&good, &x, 4).expect("state on the ladder");
+
+        let mut scrambled = good.clone();
+        scrambled.index.reverse();
+        assert!(candidate_bands(&scrambled, &a, &b).is_none(), "a non-monotone index must not be pruned");
+
+        let mut truncated = good.clone();
+        truncated.index.pop();
+        assert!(candidate_bands(&truncated, &a, &b).is_none(), "a short index must not be pruned");
+    }
+
+    #[test]
+    fn pruning_reports_how_many_bands_it_keeps() {
+        // Not a correctness claim. This is the number the optimisation is
+        // for, printed so a change in it is visible.
+        let x = BigInt::from(80_279_049_977_900u64);
+        for (name, cfg) in archetypes() {
+            if x < cfg.weight_total {
+                continue;
+            }
+            let n = cfg.bands.len();
+            let mut kept = Vec::new();
+            for k in 0..n {
+                let Some((a, b)) = on_ladder(&cfg, &x, k) else { continue };
+                kept.push(candidate_bands(&cfg, &a, &b).map(|r| r.len()).unwrap_or(n));
+            }
+            if kept.is_empty() {
+                continue;
+            }
+            let worst = *kept.iter().max().unwrap();
+            let total: usize = kept.iter().sum();
+            println!(
+                "  {name}: {n} bands -> mean {:.1}, worst {worst}",
+                total as f64 / kept.len() as f64
+            );
+            assert!(worst <= n, "{name}: pruning kept more bands than exist");
         }
     }
 }

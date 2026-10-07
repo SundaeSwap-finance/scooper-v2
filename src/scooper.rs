@@ -2428,6 +2428,15 @@ impl Scooper {
             for secs in crate::sundaev4::banded_math::drain_witness_times() {
                 self.metrics.witness_latency.observe(secs);
             }
+            // Calls the memo answered. The histogram above only sees the
+            // searches that ran, so without this the per-call cost reads
+            // far higher than it is.
+            let memo_hits = crate::sundaev4::banded_math::drain_witness_memo_hits();
+            if memo_hits > 0 {
+                self.metrics
+                    .witness_memo_hits
+                    .fetch_add(memo_hits, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Record the budget against the Conway per-tx limits. This is
             // the only continuous measurement of how close a scoop runs to
