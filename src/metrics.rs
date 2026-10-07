@@ -165,7 +165,7 @@ pub struct Metrics {
     /// immediately, rather than waiting a block.
     pub race_rebuilds: AtomicU64,
     /// Execution budget of the most recent built scoop, and the peak seen,
-    /// as a FRACTION OF THE CONWAY PER-TX LIMIT in parts per million.
+    /// in ABSOLUTE units.
     ///
     /// The only figures we had for this were a manual one-off measurement
     /// (docs/design/banded-cl-budgets.md), which carries its own warning
@@ -173,12 +173,20 @@ pub struct Metrics {
     /// about ladder length and pools-per-scoop bottoms out in "how close to
     /// the ceiling are we", so it should be observed continuously rather
     /// than re-derived by hand.
-    pub scoop_mem_ppm_last: AtomicU64,
-    pub scoop_steps_ppm_last: AtomicU64,
-    pub scoop_size_ppm_last: AtomicU64,
-    pub scoop_mem_ppm_peak: AtomicU64,
-    pub scoop_steps_ppm_peak: AtomicU64,
-    pub scoop_size_ppm_peak: AtomicU64,
+    ///
+    /// Absolute, not a percentage of the limit. The first version divided
+    /// by hardcoded Conway maxima taken from that same budget doc — and
+    /// the memory figure there (16,500,000) is not preview's actual limit
+    /// (17,500,000), so it reported 99.6% where the truth was 93.9%. A
+    /// wrong denominator is worse than an explicit one: export the
+    /// numerator and let the consumer divide by the protocol parameter it
+    /// can actually read.
+    pub scoop_mem_last: AtomicU64,
+    pub scoop_steps_last: AtomicU64,
+    pub scoop_size_last: AtomicU64,
+    pub scoop_mem_peak: AtomicU64,
+    pub scoop_steps_peak: AtomicU64,
+    pub scoop_size_peak: AtomicU64,
     /// The shape that produced the peak, as pools*1000 + steps.
     pub scoop_peak_shape: AtomicU64,
     pub mempool_lead_time: Histogram,
@@ -289,12 +297,12 @@ impl Metrics {
             mempool_confirmed: AtomicU64::new(0),
             mempool_evicted: AtomicU64::new(0),
             race_rebuilds: AtomicU64::new(0),
-            scoop_mem_ppm_last: AtomicU64::new(0),
-            scoop_steps_ppm_last: AtomicU64::new(0),
-            scoop_size_ppm_last: AtomicU64::new(0),
-            scoop_mem_ppm_peak: AtomicU64::new(0),
-            scoop_steps_ppm_peak: AtomicU64::new(0),
-            scoop_size_ppm_peak: AtomicU64::new(0),
+            scoop_mem_last: AtomicU64::new(0),
+            scoop_steps_last: AtomicU64::new(0),
+            scoop_size_last: AtomicU64::new(0),
+            scoop_mem_peak: AtomicU64::new(0),
+            scoop_steps_peak: AtomicU64::new(0),
+            scoop_size_peak: AtomicU64::new(0),
             scoop_peak_shape: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
             witness_latency: Histogram::new(WITNESS_LATENCY_BOUNDARIES),
@@ -324,25 +332,17 @@ impl Metrics {
         pools: u64,
         transcript_steps: u64,
     ) {
-        // Conway per-tx maxima. Hardcoded rather than read from protocol
-        // params because these are the numbers the budget doc quotes and a
-        // drifting denominator would make the series meaningless.
-        const MAX_MEM: u64 = 16_500_000;
-        const MAX_STEPS: u64 = 10_000_000_000;
-        const MAX_SIZE: u64 = 16_384;
-        let ppm = |v: u64, max: u64| if max == 0 { 0 } else { (v.saturating_mul(1_000_000)) / max };
-        let m = ppm(mem, MAX_MEM);
-        let st = ppm(steps, MAX_STEPS);
-        let sz = ppm(size_bytes, MAX_SIZE);
-        self.scoop_mem_ppm_last.store(m, Ordering::Relaxed);
-        self.scoop_steps_ppm_last.store(st, Ordering::Relaxed);
-        self.scoop_size_ppm_last.store(sz, Ordering::Relaxed);
+        self.scoop_mem_last.store(mem, Ordering::Relaxed);
+        self.scoop_steps_last.store(steps, Ordering::Relaxed);
+        self.scoop_size_last.store(size_bytes, Ordering::Relaxed);
         // Peak is tracked on MEMORY, which the budget doc identifies as the
-        // binding limit (about 2.2M per additional pool).
-        if m > self.scoop_mem_ppm_peak.load(Ordering::Relaxed) {
-            self.scoop_mem_ppm_peak.store(m, Ordering::Relaxed);
-            self.scoop_steps_ppm_peak.store(st, Ordering::Relaxed);
-            self.scoop_size_ppm_peak.store(sz, Ordering::Relaxed);
+        // binding limit (about 2.2M per additional pool) and which the
+        // first live measurement confirms: 93.9% of memory against 63.9%
+        // of steps and 59.1% of size, on the same transaction.
+        if mem > self.scoop_mem_peak.load(Ordering::Relaxed) {
+            self.scoop_mem_peak.store(mem, Ordering::Relaxed);
+            self.scoop_steps_peak.store(steps, Ordering::Relaxed);
+            self.scoop_size_peak.store(size_bytes, Ordering::Relaxed);
             self.scoop_peak_shape
                 .store(pools.saturating_mul(1000) + transcript_steps, Ordering::Relaxed);
         }
@@ -857,12 +857,12 @@ pub async fn render_metrics(
         metrics.mempool_confirmed.load(Ordering::Relaxed),
     );
     for (name, help, v) in [
-        ("scooper_scoop_mem_ppm", "Memory of the last built scoop, millionths of the Conway per-tx limit", &metrics.scoop_mem_ppm_last),
-        ("scooper_scoop_steps_ppm", "Steps of the last built scoop, millionths of the limit", &metrics.scoop_steps_ppm_last),
-        ("scooper_scoop_size_ppm", "Size of the last built scoop, millionths of the limit", &metrics.scoop_size_ppm_last),
-        ("scooper_scoop_mem_ppm_peak", "Highest scoop memory seen, millionths of the limit", &metrics.scoop_mem_ppm_peak),
-        ("scooper_scoop_steps_ppm_peak", "Steps of the highest-memory scoop, millionths of the limit", &metrics.scoop_steps_ppm_peak),
-        ("scooper_scoop_size_ppm_peak", "Size of the highest-memory scoop, millionths of the limit", &metrics.scoop_size_ppm_peak),
+        ("scooper_scoop_mem_ppm", "Memory of the last built scoop, millionths of the Conway per-tx limit", &metrics.scoop_mem_last),
+        ("scooper_scoop_steps_ppm", "Steps of the last built scoop, millionths of the limit", &metrics.scoop_steps_last),
+        ("scooper_scoop_size_ppm", "Size of the last built scoop, millionths of the limit", &metrics.scoop_size_last),
+        ("scooper_scoop_mem_peak", "Highest scoop memory seen, millionths of the limit", &metrics.scoop_mem_peak),
+        ("scooper_scoop_steps_peak", "Steps of the highest-memory scoop, millionths of the limit", &metrics.scoop_steps_peak),
+        ("scooper_scoop_size_peak", "Size of the highest-memory scoop, millionths of the limit", &metrics.scoop_size_peak),
         ("scooper_scoop_peak_shape", "Shape of the highest-memory scoop, as pools*1000 + transcript steps", &metrics.scoop_peak_shape),
     ] {
         write_gauge(&mut out, name, help, v.load(Ordering::Relaxed));
