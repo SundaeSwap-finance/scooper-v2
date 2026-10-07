@@ -143,39 +143,87 @@ impl BandedLadder {
     /// re-walking the ladder.
     pub fn fill_curve(&self, is_a_input: bool) -> &[FillStep] {
         self.fill[usize::from(is_a_input)].get_or_init(|| {
-            let mut out: Vec<FillStep> = Vec::new();
-            let Ok(first) = crate::sundaev4::banded_math::band_view(
-                &self.cfg, &self.a, &self.b, &self.witness,
-            ) else {
-                return out;
+            let t0 = std::time::Instant::now();
+            let out = self.build_fill_curve(is_a_input);
+            bump(&ROUTER_PROFILE.fill_curve_builds, 1);
+            bump(&ROUTER_PROFILE.fill_curve_ns, t0.elapsed().as_nanos() as u64);
+            if out.is_empty() {
+                bump(&ROUTER_PROFILE.fill_curve_empty, 1);
+            }
+            out
+        })
+    }
+
+    /// Walk the ladder band by band from the pool's state, one witness
+    /// search per band seeded from the previous band's witness — the walk
+    /// `ladder_capacity_from` makes. The first version asked `view_after`
+    /// for the state after each cumulative cap, which re-walked the ladder
+    /// from the start for every band: O(bands^2) witness searches, 167 ms
+    /// per curve on preview, and 85% of all routing time once every order
+    /// in a cycle saw the previous order's predicted pool states.
+    fn build_fill_curve(&self, is_a_input: bool) -> Vec<FillStep> {
+        use crate::sundaev4::banded_math as bm;
+        let mut out: Vec<FillStep> = Vec::new();
+        let cfg = &self.cfg;
+        let n = cfg.bands.len();
+        let w = if bm::is_witness(cfg, &self.a, &self.b, &self.witness.x, self.witness.k) {
+            self.witness.clone()
+        } else {
+            match bm::find_witness(cfg, &self.a, &self.b) {
+                Some(w) => w,
+                None => return out,
+            }
+        };
+        let (mut ca, mut cb) = (self.a.clone(), self.b.clone());
+        let mut prefer = Some(w.k);
+        let mut hint = w.x.clone();
+        let mut known = Some(w);
+        let mut cum = BigInt::from(0);
+        let mut cum_out = BigInt::from(0);
+        // One pass per band at most: a fill cannot re-enter a band it has
+        // already emptied.
+        for _ in 0..(2 * n + 2) {
+            let Some(wk) = known.take().or_else(|| {
+                prefer
+                    .and_then(|k| bm::find_witness_in_band_from(cfg, &ca, &cb, k, 400, Some(&hint)))
+                    .or_else(|| bm::find_witness(cfg, &ca, &cb))
+            }) else {
+                break;
             };
-            let mut view = first;
-            let mut cum = BigInt::from(0);
-            let mut cum_out = BigInt::from(0);
-            // One pass per band at most: a fill cannot re-enter a band it
-            // has already emptied.
-            for _ in 0..=self.cfg.bands.len() {
-                let cap = crate::sundaev4::banded_math::max_dx_in_band(&view, is_a_input);
-                if !cap.is_positive() {
-                    break;
-                }
+            hint = wk.x.clone();
+            let Ok(view) = bm::band_view(cfg, &ca, &cb, &wk) else {
+                break;
+            };
+            let cap = bm::max_dx_in_band(&view, is_a_input);
+            let dy = if cap.is_positive() { bm::band_output(&view, is_a_input, &cap) } else { BigInt::from(0) };
+            if cap.is_positive() && dy.is_positive() {
                 out.push(FillStep {
                     marginal_open: banded_marginal(&view, is_a_input, &BigInt::from(0)),
                     marginal_full: banded_marginal(&view, is_a_input, &cap),
                     cap: cap.clone(),
-                    view: view.clone(),
+                    view,
                     before_in: cum.clone(),
                     before_out: cum_out.clone(),
                 });
                 cum = &cum + &cap;
-                let Some((na, nb, next)) = self.view_after(is_a_input, &cum) else {
-                    break;
-                };
-                cum_out = if is_a_input { &self.b - &nb } else { &self.a - &na };
-                view = next;
+                cum_out = &cum_out + &dy;
+                if is_a_input {
+                    ca = &ca + &cap;
+                    cb = &cb - &dy;
+                } else {
+                    cb = &cb + &cap;
+                    ca = &ca - &dy;
+                }
             }
-            out
-        })
+            let Some(k_next) = bm::next_band(wk.k, is_a_input, n) else {
+                break;
+            };
+            if !dy.is_positive() && prefer == Some(k_next) {
+                break;
+            }
+            prefer = Some(k_next);
+        }
+        out
     }
 
     pub fn capacity(&self, is_a_input: bool) -> BigInt {
@@ -576,10 +624,7 @@ fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
 
 /// Compute swap output for any pool type, capped at available reserves.
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
-    SPLIT_PROFILE.with(|c| {
-        let (a, b, d, ns) = c.get();
-        c.set((a, b, d + 1, ns));
-    });
+    bump(&ROUTER_PROFILE.pool_outputs, 1);
     let raw = match &pool.view_type {
         PoolViewType::Banded {
             is_a_input,
@@ -942,16 +987,21 @@ fn tiebreak_score(pool: &PoolView, dx: &BigInt) -> BigInt {
 pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntry> {
     let t0 = std::time::Instant::now();
     let r = optimize_split_inner(pools, total_input);
-    SPLIT_PROFILE.with(|c| {
-        let (a, b, d, ns) = c.get();
-        c.set((a + 1, b, d, ns + t0.elapsed().as_nanos() as u64));
-    });
+    bump(&ROUTER_PROFILE.split_calls, 1);
+    bump(&ROUTER_PROFILE.split_ns, t0.elapsed().as_nanos() as u64);
     r
 }
 
-/// Read and reset the split profile counters.
+/// Read and reset the split profile counters:
+/// (optimize_split calls, bisection rounds, pool_output calls, ns in optimize_split).
 pub fn drain_split_profile() -> (u64, u64, u64, u64) {
-    SPLIT_PROFILE.with(|c| c.replace((0, 0, 0, 0)))
+    let p = &ROUTER_PROFILE;
+    (
+        p.split_calls.swap(0, AtomicOrdering::Relaxed),
+        p.split_rounds.swap(0, AtomicOrdering::Relaxed),
+        p.pool_outputs.swap(0, AtomicOrdering::Relaxed),
+        p.split_ns.swap(0, AtomicOrdering::Relaxed),
+    )
 }
 
 fn optimize_split_inner(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntry> {
@@ -1030,10 +1080,7 @@ fn optimize_split_inner(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEn
     let mut candidates: Vec<Vec<BigInt>> = Vec::new();
     let mut under: Option<(BigInt, Vec<BigInt>)> = None;
     for _iter in 0..MAX_ITER {
-        SPLIT_PROFILE.with(|c| {
-            let (a, b, d, ns) = c.get();
-            c.set((a, b + 1, d, ns));
-        });
+        bump(&ROUTER_PROFILE.split_rounds, 1);
         let lambda_mid = &(&lambda_lo + &lambda_hi) / &BigInt::from(2);
         if !lambda_mid.is_positive() {
             break;
@@ -1220,7 +1267,10 @@ fn ladder_for(
     {
         return l.clone();
     }
+    let t0 = std::time::Instant::now();
     let built = std::sync::Arc::new(BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w.clone()));
+    bump(&ROUTER_PROFILE.ladder_builds, 1);
+    bump(&ROUTER_PROFILE.ladder_build_ns, t0.elapsed().as_nanos() as u64);
     if let Ok(mut m) = cache.lock() {
         let stale: Vec<Key> = m
             .range((ident.clone(), BigInt::from(0), BigInt::from(0))..)
@@ -1752,11 +1802,42 @@ fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {
 // so the multiplier has to be either how many times it is called per
 // order or how many `evaluate_path` probes one call makes. Both are
 // recorded here, per call, and the scooper drains them into metrics.
+
+/// Where routing spends its time, process-wide, for the benchmark and the
+/// metrics endpoint. Cumulative; `drain_split_profile` resets the split
+/// counters for the bench, the exporter reads them as counters.
+pub struct RouterProfile {
+    pub split_calls: AtomicU64,
+    pub split_rounds: AtomicU64,
+    pub pool_outputs: AtomicU64,
+    pub split_ns: AtomicU64,
+    /// Ladders built (cache misses in `ladder_for`) and the time it took,
+    /// fill curves included once they are first read.
+    pub ladder_builds: AtomicU64,
+    pub ladder_build_ns: AtomicU64,
+    pub fill_curve_builds: AtomicU64,
+    pub fill_curve_ns: AtomicU64,
+    /// Fill curves that came back EMPTY (a state off the ladder): every
+    /// λ-round on such a pool falls back to a `max_dx_in_band` solve.
+    pub fill_curve_empty: AtomicU64,
+}
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+pub static ROUTER_PROFILE: RouterProfile = RouterProfile {
+    split_calls: AtomicU64::new(0),
+    split_rounds: AtomicU64::new(0),
+    pool_outputs: AtomicU64::new(0),
+    split_ns: AtomicU64::new(0),
+    ladder_builds: AtomicU64::new(0),
+    ladder_build_ns: AtomicU64::new(0),
+    fill_curve_builds: AtomicU64::new(0),
+    fill_curve_ns: AtomicU64::new(0),
+    fill_curve_empty: AtomicU64::new(0),
+};
+fn bump(c: &AtomicU64, n: u64) {
+    c.fetch_add(n, AtomicOrdering::Relaxed);
+}
 thread_local! {
     static EVAL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Where an `evaluate_path` spends its time, for the benchmark:
-    /// (optimize_split calls, bisection rounds, pool_output calls, ns in optimize_split).
-    pub static SPLIT_PROFILE: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
     static ROUTE_STATS: std::cell::RefCell<Vec<RouteStat>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 const ROUTE_STATS_CAP: usize = 4096;

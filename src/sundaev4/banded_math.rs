@@ -814,7 +814,7 @@ pub struct SwapStepPlan {
 
 /// The band a swap moves into when it drains the active band: selling A
 /// takes the active band's B, so the ladder steps down; selling B steps up.
-fn next_band(k: usize, is_a_input: bool, n: usize) -> Option<usize> {
+pub fn next_band(k: usize, is_a_input: bool, n: usize) -> Option<usize> {
     if is_a_input {
         k.checked_sub(1)
     } else if k + 1 < n {

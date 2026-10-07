@@ -930,6 +930,24 @@ pub async fn render_metrics(
         "find_blended_route calls",
         metrics.route_calls.load(Ordering::Relaxed),
     );
+    {
+        // Where routing spends its time: process-wide counters kept by the
+        // router itself, read here as totals.
+        let p = &crate::sundaev4::router::ROUTER_PROFILE;
+        for (name, help, v) in [
+            ("scooper_router_split_calls_total", "optimize_split calls", p.split_calls.load(Ordering::Relaxed)),
+            ("scooper_router_split_rounds_total", "λ-bisection rounds inside optimize_split", p.split_rounds.load(Ordering::Relaxed)),
+            ("scooper_router_pool_outputs_total", "pool_output calls", p.pool_outputs.load(Ordering::Relaxed)),
+            ("scooper_router_split_millis_total", "milliseconds inside optimize_split", p.split_ns.load(Ordering::Relaxed) / 1_000_000),
+            ("scooper_router_ladder_builds_total", "banded ladders built (ladder cache misses)", p.ladder_builds.load(Ordering::Relaxed)),
+            ("scooper_router_ladder_build_millis_total", "milliseconds spent building ladders", p.ladder_build_ns.load(Ordering::Relaxed) / 1_000_000),
+            ("scooper_router_fill_curve_builds_total", "banded fill curves built", p.fill_curve_builds.load(Ordering::Relaxed)),
+            ("scooper_router_fill_curve_millis_total", "milliseconds spent building fill curves", p.fill_curve_ns.load(Ordering::Relaxed) / 1_000_000),
+            ("scooper_router_fill_curve_empty_total", "fill curves that came back empty (state off the ladder; every λ-round then re-solves max_dx_in_band)", p.fill_curve_empty.load(Ordering::Relaxed)),
+        ] {
+            write_counter(&mut out, name, help, v);
+        }
+    }
     metrics.mempool_lead_time.write(
         &mut out,
         "scooper_mempool_lead_time_seconds",
