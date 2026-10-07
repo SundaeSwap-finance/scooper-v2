@@ -125,19 +125,68 @@ fn cl_band(
 /// up to T_last sells each pool's first asset on its main paths (see the CL
 /// contract workaround in `bench/route-quality/route_quality.rs`).
 fn market(shape: &MarketShape) -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
+    let mut pools = BTreeMap::new();
+    for i in 0..shape.tokens {
+        for j in i + 1..shape.tokens {
+            add_ladder(&mut pools, &token(i), &token(j), shape);
+        }
+    }
+    pools
+}
+
+/// Adds the (a, b) pair's ladder of bands, `shape.pair_value` spread over them.
+fn add_ladder(
+    pools: &mut BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    a: &AssetClass,
+    b: &AssetClass,
+    shape: &MarketShape,
+) {
     let h = shape.width.ln_1p();
     let ks = -shape.bands_per_side..=shape.bands_per_side;
     let mass = |k: i32| (-(k as f64 * h).powi(2) / (2.0 * shape.sigma.powi(2))).exp();
     let total: f64 = ks.clone().map(mass).sum();
-    let mut pools = BTreeMap::new();
-    for i in 0..shape.tokens {
-        for j in i + 1..shape.tokens {
-            for k in ks.clone() {
-                let value = shape.pair_value * mass(k) / total;
-                let pool = cl_band(pools.len(), &token(i), &token(j), k, value, shape);
-                pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
-            }
-        }
+    for k in ks {
+        let value = shape.pair_value * mass(k) / total;
+        let pool = cl_band(pools.len(), a, b, k, value, shape);
+        pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
+    }
+}
+
+/// A market where the best paths on a small amount lack the depth for the
+/// order: four T0→Tᵢ→T1 paths through small ladders of cheap bands outrank
+/// the deep but costly T0/T1 ladder (3 % fee) and take every branch slot,
+/// though together they hold far less than the order. The router then gives
+/// the last slot to the T0/T1 path, the one that can absorb the whole order,
+/// and water-fills again. The small paths differ in value, fee, number of
+/// bands and spread; their ladders are about as long as the deep one, so the
+/// first water-fill costs about as much as the second.
+fn crowded_market() -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
+    let deep = MarketShape {
+        tokens: 2,
+        bands_per_side: 6,
+        width: 0.02,
+        sigma: 0.10,
+        pair_value: 10e12,
+        fee_ppm: 30_000,
+    };
+    let shallow = |pair_value: f64, fee_ppm: u64, bands_per_side: i32, sigma: f64| MarketShape {
+        tokens: 2,
+        bands_per_side,
+        width: 0.02,
+        sigma,
+        pair_value,
+        fee_ppm,
+    };
+    let shallows = [
+        shallow(0.5e12, 500, 6, 0.05),
+        shallow(0.4e12, 1_000, 5, 0.10),
+        shallow(0.3e12, 2_000, 6, 0.15),
+        shallow(0.2e12, 3_000, 4, 0.08),
+    ];
+    let mut pools = market(&deep);
+    for (i, shape) in (2..).zip(&shallows) {
+        add_ladder(&mut pools, &token(0), &token(i), shape);
+        add_ladder(&mut pools, &token(i), &token(1), shape);
     }
     pools
 }
@@ -208,6 +257,23 @@ fn bench_find_blended_route(c: &mut Criterion) {
         eprintln!("  {name:<9} {elapsed:>8.2?}  {summary}");
     }
 
+    let crowded = crowded_market();
+    let t0 = std::time::Instant::now();
+    let blend = find_blended_route(
+        &crowded,
+        &[],
+        &token(0),
+        &token(1),
+        &amount,
+        RoutingLimits::unlimited(),
+    );
+    let elapsed = t0.elapsed();
+    let summary = match &blend {
+        Some(b) => format!("{} branches, output {}", b.branches.len(), b.total_output),
+        None => "no route".to_string(),
+    };
+    eprintln!("  {:<9} {elapsed:>8.2?}  {summary}", "crowded");
+
     let mut group = c.benchmark_group("find_blended_route");
     // The slow cases take seconds per call: criterion's minimum sample count.
     group.sample_size(10);
@@ -229,6 +295,18 @@ fn bench_find_blended_route(c: &mut Criterion) {
             },
         );
     }
+    group.bench_function("crowded", |bench| {
+        bench.iter(|| {
+            find_blended_route(
+                black_box(&crowded),
+                &[],
+                &token(0),
+                &token(1),
+                black_box(&amount),
+                RoutingLimits::unlimited(),
+            )
+        })
+    });
     group.finish();
 }
 
