@@ -3733,11 +3733,29 @@ pub fn build_multi_pool_scoop_tx(
             let cur = predicted_value.get(&lp_asset);
             predicted_value.insert(&lp_asset, &cur + &per_pool[out_idx].lp_reserve_delta);
         }
-        // Set predicted ADA to match the actual pool output (input ADA + delta)
+        // Set predicted ADA to match the actual pool output (input ADA +
+        // delta), INCLUDING the fee-constraint surplus.
+        //
+        // Step 8.4 delivers `designated_required` — the deduction pot net of
+        // the tx fee — as extra lovelace on outputs[0], the designated pool.
+        // That is a real change to the pool's value, and `pool_ada_deltas`
+        // does not carry it: the deltas describe the trade, the surplus is
+        // the scooper's compensation routed through the pool.
+        //
+        // Leaving it out makes the prediction understate the designated
+        // pool's lovelace by the surplus. The next scoop chained on this one
+        // then builds against the smaller figure, balances its own books
+        // against it, and is refused by the node as ValueNotConservedUTxO —
+        // consumed exceeds produced by exactly the surplus. Observed on
+        // preview 2026-10-06: pool cdf95fb5 went to 51416063 while the
+        // prediction held 50000000, and the next transaction was short by
+        // 1416063.
         {
             use num_traits::ToPrimitive;
             let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
-            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128)
+            // outputs[0] is the designated pool; batch_idx IS the output index.
+            let surplus = if batch_idx == 0 { designated_required as i128 } else { 0 };
+            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128 + surplus)
                 .max(POOL_MIN_ADA as i128) as u64;
             predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));
         }
@@ -3750,6 +3768,34 @@ pub fn build_multi_pool_scoop_tx(
             slot: validity.start,
             fee_split_config: batch.pool.fee_split_config.clone(),
         };
+        // The prediction must equal the output it predicts. A chained scoop
+        // spends this predicted UTxO, so any disagreement here becomes a
+        // ValueNotConservedUTxO on the NEXT transaction, reported by the
+        // node as two totals with nothing to say about which pool is wrong.
+        // Checking it where both values are in hand turns that into a named
+        // pool and an exact difference.
+        {
+            let actual_ada = match body.outputs.get(batch_idx) {
+                Some(TransactionOutput::PostAlonzo(b)) => match &b.value {
+                    ConwayValue::Coin(c) => *c,
+                    ConwayValue::Multiasset(c, _) => *c,
+                },
+                _ => bail!("pool output {batch_idx} missing while predicting pool state"),
+            };
+            let pred_ada: u64 = predicted_pool
+                .value
+                .get(&ada_asset)
+                .to_string()
+                .parse()
+                .unwrap_or(0);
+            if pred_ada != actual_ada {
+                bail!(
+                    "predicted pool lovelace disagrees with the output it predicts: pool {}                      output {batch_idx} holds {actual_ada}, prediction says {pred_ada}                      (difference {}); chaining on this would break the next scoop",
+                    hex::encode(batch.pool_ident.to_bytes()),
+                    actual_ada as i128 - pred_ada as i128,
+                );
+            }
+        }
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
     }
 
