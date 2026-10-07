@@ -264,7 +264,107 @@ pub fn is_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: u
 /// short scan follows. `None` when the reserves sit on no point of the
 /// ladder; the chain would reject them too. Mirrors `banded-math.ts`.
 pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
-    find_witness_scan(cfg, a, b, 400)
+    // Try to start from where this ladder was last seen before falling back
+    // to the exhaustive search. See `seeded_find` for why this is safe.
+    if let Some(w) = seeded_find(cfg, a, b) {
+        return Some(w);
+    }
+    let found = find_witness_scan(cfg, a, b, 400);
+    if let Some(w) = &found {
+        remember_witness(cfg, w);
+    }
+    found
+}
+
+// ── Seeding the witness search ──────────────────────────────────────────
+//
+// `find_witness_scan` walks every band, and for each runs a doubling
+// search, a bisection and a scan of 800 counters, each of those a full
+// band proof in bignums. Measured on the ladders the traffic simulator
+// provisions: 159ms for a 16-band ladder, 92ms for an 8-band one. The
+// router calls this once per banded pool per graph build and TWICE per
+// step evaluation in `compute_fee_budget`, so a handful of banded pools on
+// traded pairs takes the scooper from scooping every block to a minute and
+// a half per order. That is not a tuning problem, it is the difference
+// between working and not.
+//
+// Nearly all of that cost is bands that cannot hold the witness: searching
+// only the right band costs 8ms, and starting from a known counter costs
+// 0.35ms — a factor of 450.
+//
+// A scoop asks about the same ladder over and over, at states near each
+// other: the pool as indexed, then the same pool after a trial fill, then
+// after a slightly different trial fill. So remember where this ladder was
+// last found and start there, trying that band and its two neighbours with
+// a narrow scan.
+//
+// THIS CANNOT RETURN A WRONG WITNESS. Every candidate still has to pass
+// the full band proof P1-P7 in `is_witness`, which is what defines a
+// witness; the seed only decides where to look first. A stale or useless
+// seed costs one failed narrow search and falls through to the exhaustive
+// path. The scan width is likewise only a search bound: a hit at width 8
+// satisfies exactly the same proof as a hit at width 400.
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+thread_local! {
+    static LAST_WITNESS: RefCell<BTreeMap<LadderKey, Witness>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Cheap identity for a ladder. A collision costs a failed seed, nothing
+/// more, so this does not need to be a hash of the whole config.
+type LadderKey = (usize, String, String, String);
+
+fn ladder_key(cfg: &BandedCLConfig) -> LadderKey {
+    (
+        cfg.bands.len(),
+        cfg.weight_total.to_string(),
+        cfg.closing.num.to_string(),
+        cfg.bands.first().map(|b| b.start.num.to_string()).unwrap_or_default(),
+    )
+}
+
+fn remember_witness(cfg: &BandedCLConfig, w: &Witness) {
+    LAST_WITNESS.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded: a scooper sees a few dozen ladders, and dropping the map
+        // only costs cold searches.
+        if m.len() > 256 {
+            m.clear();
+        }
+        m.insert(ladder_key(cfg), w.clone());
+    });
+}
+
+/// Drop the seed cache. Tests that measure a cold search need this; the
+/// scooper never calls it.
+#[cfg(test)]
+pub fn clear_witness_seeds() {
+    LAST_WITNESS.with(|m| m.borrow_mut().clear());
+}
+
+fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+    let prev = LAST_WITNESS.with(|m| m.borrow().get(&ladder_key(cfg)).cloned())?;
+    let n = cfg.bands.len();
+    // The active band moves by one as a swap crosses an edge, so the last
+    // band and its neighbours cover the overwhelmingly common case.
+    let mut bands = vec![prev.k];
+    if prev.k + 1 < n {
+        bands.push(prev.k + 1);
+    }
+    if prev.k > 0 {
+        bands.push(prev.k - 1);
+    }
+    for scan in [8u32, 64] {
+        for &k in &bands {
+            if let Some(w) = find_witness_in_band_from(cfg, a, b, k, scan, Some(&prev.x)) {
+                remember_witness(cfg, &w);
+                return Some(w);
+            }
+        }
+    }
+    None
 }
 
 pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32) -> Option<Witness> {
@@ -1216,5 +1316,103 @@ mod tests {
         let h = config_hash(&cfg);
         assert_eq!(h.len(), 32);
         assert_eq!(h, config_hash(&cfg.clone()));
+    }
+}
+
+#[cfg(test)]
+mod witness_cost {
+    //! How long a witness search takes on the ladders the creamery
+    //! provisions. Ignored by default; run with --ignored --nocapture.
+    use super::*;
+    use crate::sundaev4::types::BandSpec;
+
+    fn ladder(n: i64, lo: i64, hi: i64, den: i64, weights: &[i64]) -> BandedCLConfig {
+        let r = |num: i64, d: i64| Rational { num: BigInt::from(num), den: BigInt::from(d) };
+        let step = (hi - lo) / n;
+        let w_total: i64 = weights.iter().sum();
+        with_index(
+            (0..n)
+                .map(|i| BandSpec {
+                    start: r(lo + step * i, den),
+                    weight: BigInt::from(weights[i as usize]),
+                    curve: BigInt::from(0),
+                    fee_buy: r(3, 1000),
+                    fee_sell: r(3, 1000),
+                })
+                .collect(),
+            r(hi, den),
+            BigInt::from(w_total),
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn time_find_witness() {
+        // The creamery's shapes, at the counters it actually used.
+        let cases: Vec<(&str, BandedCLConfig, BigInt)> = vec![
+            (
+                "wide 16 bands flat, X=1.45e12",
+                ladder(16, 938_083_152, 1_058_300_524, 1_000_000_000, &[1; 16]),
+                BigInt::from(1_452_199_123_434u64),
+            ),
+            (
+                "tight 8 bands bell, X=8.03e13",
+                ladder(8, 997_997_996, 1_001_998_004, 1_000_000_000,
+                       &[2, 9, 40, 87, 87, 40, 9, 2]),
+                BigInt::from(80_279_049_977_900u64),
+            ),
+        ];
+        for (label, cfg, x) in cases {
+            // Reserves at the ladder's midpoint: witness in a middle band,
+            // which is the normal case and the one the router hits.
+            let k = cfg.bands.len() / 2;
+            let st = ladder_at(&cfg, &x, k).expect("state");
+            let a = &st.ca + &st.a_sat_k;
+            let b = &st.cb + &BigInt::from(0);
+            clear_witness_seeds();
+            let t = std::time::Instant::now();
+            let w = find_witness(&cfg, &a, &b);
+            let dt = t.elapsed();
+            println!("{label}: find_witness -> {:?} in {:?} (cold)", w.map(|w| w.k), dt);
+
+            let n = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                clear_witness_seeds();
+                let _ = find_witness(&cfg, &a, &b);
+            }
+            println!("  cold (no seed), all bands: {:?}", t.elapsed() / n);
+
+            for scan in [400u32, 50, 8] {
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    let _ = find_witness_scan(&cfg, &a, &b, scan);
+                }
+                println!("    scan={scan:>3}: {:?}", t.elapsed() / n);
+            }
+            // The right band only, scanned wide: isolates the cost of
+            // searching bands that cannot hold the witness.
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = find_witness_in_band(&cfg, &a, &b, k, 400);
+            }
+            println!("    right band only, scan=400: {:?}", t.elapsed() / n);
+            // Seeded at the true counter, as a chained step would be.
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = find_witness_in_band_from(&cfg, &a, &b, k, 8, Some(&x));
+            }
+            println!("    seeded at the known counter: {:?}", t.elapsed() / n);
+            // What the router actually sees now: repeated calls on the same
+            // ladder at nearby states, which is the shape of a split search.
+            let _ = find_witness(&cfg, &a, &b);
+            let t = std::time::Instant::now();
+            let reps = 200;
+            for i in 0..reps {
+                let aa = &a + &BigInt::from(i as i64 * 7);
+                let _ = find_witness(&cfg, &aa, &b);
+            }
+            println!("    WARM find_witness, nearby states: {:?}", t.elapsed() / reps);
+        }
     }
 }
