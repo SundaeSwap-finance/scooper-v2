@@ -2490,6 +2490,7 @@ impl Scooper {
             for st in crate::sundaev4::router::drain_route_stats() {
                 self.metrics.route_latency.observe(st.secs);
                 self.metrics.route_evals.observe(st.evals as f64);
+                self.metrics.route_paths.observe(st.paths as f64);
                 self.metrics
                     .route_calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

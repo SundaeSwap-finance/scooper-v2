@@ -4449,11 +4449,17 @@ mod blend_cost {
             den: BigInt::from(1000),
         });
         let mut out = BTreeMap::new();
+        // Preview's shape: a pair carries SEVERAL pools (MINT/MNGO has
+        // five, ADA/MINT four), which is what gives the blend more than
+        // one branch and makes the pairwise refinement loop fire. Pool i
+        // joins pair (i / DUP), so each pair gets DUP pools.
+        const DUP: usize = 4;
         for i in 0..n {
-            let (a, b) = match i % 3 {
-                0 => (0, 1 + (i / 3) % (TOKENS - 1)),                      // hub spoke
-                1 => (1 + (i / 3) % (TOKENS - 1), 1 + (i / 3 + 1) % (TOKENS - 1)), // ring
-                _ => (1 + (i / 3) % (TOKENS - 1), 1 + (i / 3 + 3) % (TOKENS - 1)), // chord
+            let g = i / DUP;
+            let (a, b) = match g % 3 {
+                0 => (0, 1 + (g / 3) % (TOKENS - 1)),                      // hub spoke
+                1 => (1 + (g / 3) % (TOKENS - 1), 1 + (g / 3 + 1) % (TOKENS - 1)), // ring
+                _ => (1 + (g / 3) % (TOKENS - 1), 1 + (g / 3 + 3) % (TOKENS - 1)), // chord
             };
             if a == b {
                 continue;
@@ -4471,28 +4477,33 @@ mod blend_cost {
     fn blend_cost_against_pools_and_depth() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let amount = BigInt::from(400_000);
-        println!("  find_blended_route, one order 1->5, eq8 ladders");
-        println!("  {:>6} {:>8} {:>12} {:>10}", "pools", "depth", "per order", "paths?");
-        for n in [16usize, 48, 100, 200] {
+        println!("  find_blended_route, eq8 ladders, 4 pools per pair");
+        println!("  {:>6} {:>7} {:>8} {:>11} {:>6} {:>7} {:>9}", "pools", "order", "depth", "per order", "paths", "evals", "branches");
+        for n in [16usize, 48, 100, 200, 400] {
             let pools = graph(&env, n);
-            for (label, limits) in [
-                ("1 hop", RoutingLimits { max_pools: 1, max_steps: 1 }),
-                ("2 hops", RoutingLimits { max_pools: 2, max_steps: 3 }),
-                ("4 hops", RoutingLimits { max_pools: 4, max_steps: 8 }),
-            ] {
-                // Warm the ladder cache the way the cycle's first order does.
-                let r0 = router::find_blended_route(&pools, &[], &tok(1), &tok(5), &amount, limits);
-                let reps = 3;
-                let t = std::time::Instant::now();
-                for _ in 0..reps {
-                    let _ = router::find_blended_route(&pools, &[], &tok(1), &tok(5), &amount, limits);
+            // 0->1 is a direct pair carrying 4 parallel pools (preview's
+            // MINT/MNGO shape); 1->5 needs hops.
+            for (oname, from, to) in [("0->1", 0usize, 1usize), ("1->5", 1, 5)] {
+                for (label, limits) in [
+                    ("1 hop", RoutingLimits { max_pools: 1, max_steps: 1 }),
+                    ("2 hops", RoutingLimits { max_pools: 2, max_steps: 3 }),
+                    ("4 hops", RoutingLimits { max_pools: 4, max_steps: 8 }),
+                ] {
+                    let _ = router::find_blended_route(&pools, &[], &tok(from), &tok(to), &amount, limits);
+                    let _ = router::drain_route_stats();
+                    let reps = 3;
+                    let t = std::time::Instant::now();
+                    for _ in 0..reps {
+                        let _ = router::find_blended_route(&pools, &[], &tok(from), &tok(to), &amount, limits);
+                    }
+                    let per = t.elapsed().as_secs_f64() / reps as f64;
+                    let st = router::drain_route_stats();
+                    let (paths, evals, br) = st.last().map(|x| (x.paths, x.evals, x.branches)).unwrap_or((0, 0, 0));
+                    println!(
+                        "  {n:>6} {oname:>7} {label:>8} {:>11} {paths:>6} {evals:>7} {br:>9}",
+                        format!("{:.1} ms", per * 1000.0)
+                    );
                 }
-                let per = t.elapsed().as_secs_f64() / reps as f64;
-                let found = r0.map(|b| b.branches.len()).unwrap_or(0);
-                println!(
-                    "  {n:>6} {label:>8} {:>12} {found:>10}",
-                    format!("{:.1} ms", per * 1000.0)
-                );
             }
         }
     }

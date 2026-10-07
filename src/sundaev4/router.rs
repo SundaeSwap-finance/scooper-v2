@@ -1649,6 +1649,12 @@ pub struct RouteStat {
     pub evals: u64,
     pub pools: usize,
     pub branches: usize,
+    /// Paths `find_paths` enumerated — every one is fully evaluated to be
+    /// ranked, so this is the multiplier on the ranking pass.
+    pub paths: usize,
+}
+thread_local! {
+    static LAST_PATHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Take the route stats recorded since the last drain.
@@ -1672,6 +1678,7 @@ pub fn find_blended_route(
         evals: EVAL_COUNT.with(|c| c.get()) - before,
         pools: pools.len(),
         branches: out.as_ref().map(|b| b.branches.len()).unwrap_or(0),
+        paths: LAST_PATHS.with(|c| c.replace(0)),
     };
     ROUTE_STATS.with(|v| {
         let mut v = v.borrow_mut();
@@ -1718,6 +1725,7 @@ fn find_blended_route_inner(
     let graph = build_graph(pools, conversions);
     let max_depth = 4.min(limits.max_pools.max(1)).min(limits.max_steps.max(1));
     let paths = find_paths(&graph, input_token, output_token, max_depth);
+    LAST_PATHS.with(|c| c.set(paths.len()));
     if paths.len() < 2 {
         return single.map(single_plan);
     }

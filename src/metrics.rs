@@ -202,6 +202,7 @@ pub struct Metrics {
     /// `evaluate_path` probes per route call: the multiplier that turns a
     /// cheap split into an expensive order.
     pub route_evals: Histogram,
+    pub route_paths: Histogram,
     pub route_calls: AtomicU64,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
@@ -322,6 +323,7 @@ impl Metrics {
             witness_memo_hits: AtomicU64::new(0),
             route_latency: Histogram::new(ROUTE_LATENCY_BOUNDARIES),
             route_evals: Histogram::new(ROUTE_EVALS_BOUNDARIES),
+            route_paths: Histogram::new(ROUTE_EVALS_BOUNDARIES),
             route_calls: AtomicU64::new(0),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
@@ -916,6 +918,11 @@ pub async fn render_metrics(
         &mut out,
         "scooper_route_evaluate_path_per_call",
         "evaluate_path probes made by one find_blended_route call",
+    );
+    metrics.route_paths.write(
+        &mut out,
+        "scooper_route_paths_per_call",
+        "paths find_paths enumerated for one find_blended_route call; each is fully evaluated to rank it",
     );
     write_counter(
         &mut out,
