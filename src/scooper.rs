@@ -2871,6 +2871,56 @@ impl Scooper {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
                 }
                 self.sync_in_flight_metrics();
+
+                // Losing a race to another scooper does NOT need a block.
+                //
+                // The default response to a submit failure is to wait for
+                // the tip to advance, which on preview costs 20-70s. That is
+                // right for an unexplained failure: retrying the same thing
+                // against the same state would just fail again.
+                //
+                // It is wrong when we lost to a competitor, because their
+                // transaction is already in OUR mempool. The provisional
+                // store has it, Phase 1 overlays foreign pool predictions on
+                // top of the confirmed state, and the next cycle will chain
+                // onto their output instead of the UTxO they just spent. So
+                // there is nothing to wait for — waiting only hands them the
+                // orders we were both bidding for.
+                //
+                // Third-party scoopers on preview took 7 of the last 12
+                // spends of one pool, and each lost race cost us ~70s of
+                // idleness on top of the loss. Measured: reject at 06:11:21,
+                // next build 06:12:31.
+                //
+                // Bounded by the existing repeat guard: a tx that bounces
+                // three times is structurally stuck, not contested, and
+                // falls through to the block backoff.
+                let contested: Vec<&Ident> = match &self.v4_provisional {
+                    Some(prov) => {
+                        let live = prov.lock().unwrap().foreign_pools();
+                        pool_idents
+                            .iter()
+                            .filter(|ident| live.iter().any(|(i, fp)| i == *ident && !fp.gone))
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                // `last_node_reject` was just updated for this tx, so it
+                // carries the same count the branches above used.
+                let repeats = self.last_node_reject.as_ref().map(|(_, n)| *n).unwrap_or(1);
+                if !contested.is_empty() && repeats < 3 {
+                    info!(
+                        pools = ?contested.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                        repeats,
+                        "lost the race but the winner is in our mempool — rebuilding on it now \
+                         instead of waiting for a block",
+                    );
+                    self.metrics.note_race_rebuild();
+                    // `true` keeps the main loop from blocking on the next
+                    // event, so Phase 1 re-runs immediately with the foreign
+                    // prediction in place.
+                    return true;
+                }
                 if let Some(tip) = self.current_tip_slot().await {
                     self.backoff_until_after_slot = Some(tip);
                 }

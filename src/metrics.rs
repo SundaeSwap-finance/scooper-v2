@@ -161,6 +161,9 @@ pub struct Metrics {
     pub mempool_pool_spends: AtomicU64,
     pub mempool_confirmed: AtomicU64,
     pub mempool_evicted: AtomicU64,
+    /// Times we lost a scoop race and rebuilt on the winner's mempool tx
+    /// immediately, rather than waiting a block.
+    pub race_rebuilds: AtomicU64,
     pub mempool_lead_time: Histogram,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
@@ -250,6 +253,7 @@ impl Metrics {
             mempool_pool_spends: AtomicU64::new(0),
             mempool_confirmed: AtomicU64::new(0),
             mempool_evicted: AtomicU64::new(0),
+            race_rebuilds: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
@@ -264,6 +268,12 @@ impl Metrics {
 
     /// Record a batch failure for the given reason. Replaces direct access
     /// to the now-private per-reason atomics.
+    /// A lost race whose winner was already in our mempool, so we chained
+    /// onto it instead of backing off for a block.
+    pub fn note_race_rebuild(&self) {
+        self.race_rebuilds.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_batch_failure(&self, reason: BatchFailureReason) {
         let counter = match reason {
             BatchFailureReason::RaceLost => &self.failed_race_lost,
@@ -767,6 +777,12 @@ pub async fn render_metrics(
         "scooper_mempool_confirmed_total",
         "Mempool-seen txs later confirmed in a block",
         metrics.mempool_confirmed.load(Ordering::Relaxed),
+    );
+    write_counter(
+        &mut out,
+        "scooper_race_rebuilds_total",
+        "Lost scoop races where the winner was in our mempool and we rebuilt on it immediately",
+        metrics.race_rebuilds.load(Ordering::Relaxed),
     );
     write_counter(
         &mut out,
