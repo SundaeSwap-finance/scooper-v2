@@ -4416,3 +4416,84 @@ mod prop_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod blend_cost {
+    //! What one order costs the router END TO END, against pool count and
+    //! route depth. `split_cost` in router.rs measures `optimize_split` on
+    //! one pair, which is NOT what the scooper pays: `find_blended_route`
+    //! enumerates paths to `max_depth`, then water-fills across them in 64
+    //! chunks, then refines across every ordered pair of branches, calling
+    //! `evaluate_path` (one `optimize_split` per hop) at each probe.
+    //!
+    //! Run with --ignored --nocapture.
+    use crate::bigint::BigInt;
+    use crate::sundaev4::router::{self, RoutingLimits};
+    use crate::sundaev4::test_harness::{bcl_eq8_config, make_bcl_pool, token, TestEnv};
+    use crate::sundaev4::SundaeV4Pool;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const TOKENS: usize = 13;
+
+    fn tok(i: usize) -> crate::cardano_types::AssetClass {
+        token(0x10 + i as u8, 0x20 + i as u8)
+    }
+
+    /// `n` banded pools over 13 tokens: a hub (token 0) plus a ring, so
+    /// every pair is reachable and most have several 2-4 hop paths.
+    fn graph(env: &TestEnv, n: usize) -> BTreeMap<crate::sundaev3::Ident, Arc<SundaeV4Pool>> {
+        let cfg = bcl_eq8_config(crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        });
+        let mut out = BTreeMap::new();
+        for i in 0..n {
+            let (a, b) = match i % 3 {
+                0 => (0, 1 + (i / 3) % (TOKENS - 1)),                      // hub spoke
+                1 => (1 + (i / 3) % (TOKENS - 1), 1 + (i / 3 + 1) % (TOKENS - 1)), // ring
+                _ => (1 + (i / 3) % (TOKENS - 1), 1 + (i / 3 + 3) % (TOKENS - 1)), // chord
+            };
+            if a == b {
+                continue;
+            }
+            let ra = 6_000_000 + (i as i64 * 37_123) % 900_000;
+            let rb = 6_200_000 + (i as i64 * 51_427) % 900_000;
+            let p = make_bcl_pool(env, i as u8, vec![(tok(a), ra), (tok(b), rb)], cfg.clone());
+            out.insert(p.pool_datum.identifier.clone(), p);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "a cost curve, not a check; run with --ignored --nocapture"]
+    fn blend_cost_against_pools_and_depth() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let amount = BigInt::from(400_000);
+        println!("  find_blended_route, one order 1->5, eq8 ladders");
+        println!("  {:>6} {:>8} {:>12} {:>10}", "pools", "depth", "per order", "paths?");
+        for n in [16usize, 48, 100, 200] {
+            let pools = graph(&env, n);
+            for (label, limits) in [
+                ("1 hop", RoutingLimits { max_pools: 1, max_steps: 1 }),
+                ("2 hops", RoutingLimits { max_pools: 2, max_steps: 3 }),
+                ("4 hops", RoutingLimits { max_pools: 4, max_steps: 8 }),
+            ] {
+                // Warm the ladder cache the way the cycle's first order does.
+                let r0 = router::find_blended_route(&pools, &[], &tok(1), &tok(5), &amount, limits);
+                let reps = 3;
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    let _ = router::find_blended_route(&pools, &[], &tok(1), &tok(5), &amount, limits);
+                }
+                let per = t.elapsed().as_secs_f64() / reps as f64;
+                let found = r0.map(|b| b.branches.len()).unwrap_or(0);
+                println!(
+                    "  {n:>6} {label:>8} {:>12} {found:>10}",
+                    format!("{:.1} ms", per * 1000.0)
+                );
+            }
+        }
+    }
+}

@@ -2486,6 +2486,14 @@ impl Scooper {
                     .witness_memo_hits
                     .fetch_add(memo_hits, std::sync::atomic::Ordering::Relaxed);
             }
+            // Route cost per call, and the evaluate_path multiplier.
+            for st in crate::sundaev4::router::drain_route_stats() {
+                self.metrics.route_latency.observe(st.secs);
+                self.metrics.route_evals.observe(st.evals as f64);
+                self.metrics
+                    .route_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Record the budget against the Conway per-tx limits. This is
             // the only continuous measurement of how close a scoop runs to

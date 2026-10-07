@@ -197,6 +197,12 @@ pub struct Metrics {
     pub witness_latency: Histogram,
     /// `find_witness` calls answered from the memo without a search.
     pub witness_memo_hits: AtomicU64,
+    /// Wall time of one `find_blended_route` call.
+    pub route_latency: Histogram,
+    /// `evaluate_path` probes per route call: the multiplier that turns a
+    /// cheap split into an expensive order.
+    pub route_evals: Histogram,
+    pub route_calls: AtomicU64,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
     /// Unix seconds of the last mempool snapshot processed. Age > ~1 min
@@ -232,6 +238,8 @@ const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 
 /// Buckets span microseconds to a tenth of a second because the seeded
 /// path is ~0.4ms and the cold path is ~160ms — four orders of magnitude,
 /// and the whole point is seeing which one we are on.
+const ROUTE_LATENCY_BOUNDARIES: &[f64] = &[0.001, 0.005, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
+const ROUTE_EVALS_BOUNDARIES: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0];
 const WITNESS_LATENCY_BOUNDARIES: &[f64] = &[
     0.0002, 0.0005, 0.001, 0.005, 0.02, 0.05, 0.1, 0.25,
 ];
@@ -312,6 +320,9 @@ impl Metrics {
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
             witness_latency: Histogram::new(WITNESS_LATENCY_BOUNDARIES),
             witness_memo_hits: AtomicU64::new(0),
+            route_latency: Histogram::new(ROUTE_LATENCY_BOUNDARIES),
+            route_evals: Histogram::new(ROUTE_EVALS_BOUNDARIES),
+            route_calls: AtomicU64::new(0),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
             node_rejects: AtomicU64::new(0),
@@ -895,6 +906,22 @@ pub async fn render_metrics(
         "scooper_banded_witness_memo_hits_total",
         "find_witness calls answered from the memo, with no search",
         metrics.witness_memo_hits.load(Ordering::Relaxed),
+    );
+    metrics.route_latency.write(
+        &mut out,
+        "scooper_route_seconds",
+        "Wall time of one find_blended_route call",
+    );
+    metrics.route_evals.write(
+        &mut out,
+        "scooper_route_evaluate_path_per_call",
+        "evaluate_path probes made by one find_blended_route call",
+    );
+    write_counter(
+        &mut out,
+        "scooper_route_calls_total",
+        "find_blended_route calls",
+        metrics.route_calls.load(Ordering::Relaxed),
     );
     metrics.mempool_lead_time.write(
         &mut out,

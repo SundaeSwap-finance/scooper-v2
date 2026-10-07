@@ -1377,6 +1377,7 @@ fn evaluate_path(
     input_amount: &BigInt,
     limits: &RoutingLimits,
 ) -> Vec<HopResult> {
+    EVAL_COUNT.with(|c| c.set(c.get() + 1));
     let mut results = Vec::new();
     let mut current_amount = input_amount.clone();
     // Reserve ≥1 step+pool for each remaining hop so we can't blow the budget
@@ -1624,7 +1625,65 @@ fn path_ident_set(path: &[PathHop]) -> std::collections::BTreeSet<Ident> {
 /// match or beat `find_optimal_route`'s winner-take-all answer. Falls back
 /// to that single-path answer whenever blending is infeasible (shared
 /// pools, budget limits) or doesn't help.
+// ── Route-cost instrumentation ──────────────────────────────────────────
+//
+// The scooper's per-order cost is dominated by this function, and NOTHING
+// measured it: on 2026-10-07 preview sat at 100% CPU dispatching an order
+// every 16-63s while three successive "fixes" targeted functions that
+// looked hot and were not. A benchmark of the function in isolation gave
+// 51ms per call at 48 pools, which is nowhere near what production paid,
+// so the multiplier has to be either how many times it is called per
+// order or how many `evaluate_path` probes one call makes. Both are
+// recorded here, per call, and the scooper drains them into metrics.
+thread_local! {
+    static EVAL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ROUTE_STATS: std::cell::RefCell<Vec<RouteStat>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+const ROUTE_STATS_CAP: usize = 4096;
+
+/// One `find_blended_route` call: wall time, `evaluate_path` probes it
+/// made, pools it was given, branches it returned.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteStat {
+    pub secs: f64,
+    pub evals: u64,
+    pub pools: usize,
+    pub branches: usize,
+}
+
+/// Take the route stats recorded since the last drain.
+pub fn drain_route_stats() -> Vec<RouteStat> {
+    ROUTE_STATS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
 pub fn find_blended_route(
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    conversions: &[crate::sundaev4::conversions::ConversionEdge],
+    input_token: &AssetClass,
+    output_token: &AssetClass,
+    amount: &BigInt,
+    limits: RoutingLimits,
+) -> Option<BlendedRoute> {
+    let before = EVAL_COUNT.with(|c| c.get());
+    let t0 = std::time::Instant::now();
+    let out = find_blended_route_inner(pools, conversions, input_token, output_token, amount, limits);
+    let stat = RouteStat {
+        secs: t0.elapsed().as_secs_f64(),
+        evals: EVAL_COUNT.with(|c| c.get()) - before,
+        pools: pools.len(),
+        branches: out.as_ref().map(|b| b.branches.len()).unwrap_or(0),
+    };
+    ROUTE_STATS.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.len() >= ROUTE_STATS_CAP {
+            v.clear();
+        }
+        v.push(stat);
+    });
+    out
+}
+
+fn find_blended_route_inner(
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
     conversions: &[crate::sundaev4::conversions::ConversionEdge],
     input_token: &AssetClass,
