@@ -4491,6 +4491,7 @@ mod blend_cost {
                 ] {
                     let _ = router::find_blended_route(&pools, &[], &tok(from), &tok(to), &amount, limits);
                     let _ = router::drain_route_stats();
+                    let _ = router::drain_split_profile();
                     let reps = 3;
                     let t = std::time::Instant::now();
                     for _ in 0..reps {

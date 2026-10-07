@@ -303,12 +303,15 @@ fn banded_marginal(
 /// The input one band view takes before its marginal falls to `lambda`,
 /// capped at what the band can pay. Zero when the band's opening marginal
 /// is already below `lambda`.
+///
+/// `cap` is the band's `max_dx_in_band`, passed in because it is a
+/// bisection on `band_output` and the fill curve already holds it.
 fn banded_alloc_in_band(
     band: &crate::sundaev4::banded_math::BandView,
     is_a_input: bool,
     lambda: &BigInt,
+    cap: BigInt,
 ) -> (BigInt, BigInt) {
-    let cap = crate::sundaev4::banded_math::max_dx_in_band(band, is_a_input);
     let fee = crate::sundaev4::banded_math::fee_for(band, is_a_input);
     let fee_num = fee.num.clone();
     let fee_den = fee.den.clone();
@@ -583,13 +586,11 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
             band,
             ladder,
         } => {
-            use crate::sundaev4::banded_math as bm;
-            if dx <= &bm::max_dx_in_band(band, *is_a_input) {
-                bm::band_output(band, *is_a_input, dx)
-            } else {
-                // Crosses band edges: price the whole step sequence.
-                ladder.output(*is_a_input, dx)
-            }
+            // The fill curve's first step is the active band, so this
+            // covers the in-band case without a `max_dx_in_band` solve
+            // (a bisection on `band_output`) per call.
+            let _ = band;
+            ladder.output(*is_a_input, dx)
         }
         PoolViewType::ConstantProduct => swap_math::cp_swap_result(
             &pool.reserve_in,
@@ -669,16 +670,19 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             band,
             ladder,
         } => {
-            use crate::sundaev4::banded_math as bm;
-            if raw_allocated <= &bm::max_dx_in_band(band, *is_a_input) {
+            // The marginal of the band the allocation ends in, at the point
+            // it ends there, read off the fill curve.
+            let curve = ladder.fill_curve(*is_a_input);
+            if curve.is_empty() {
                 return banded_marginal(band, *is_a_input, raw_allocated);
             }
-            // Past the active band: the marginal is the opening marginal of
-            // whichever band the allocation ends in.
-            match ladder.view_after(*is_a_input, raw_allocated) {
-                Some((_, _, v)) => banded_marginal(&v, *is_a_input, &BigInt::from(0)),
-                None => BigInt::from(0),
+            for step in curve {
+                if raw_allocated <= &(&step.before_in + &step.cap) {
+                    let within = raw_allocated - &step.before_in;
+                    return banded_marginal(&step.view, *is_a_input, &within);
+                }
             }
+            BigInt::from(0)
         }
         PoolViewType::ConstantSum {
             price_in,
@@ -787,7 +791,8 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     if curve.is_empty() {
                         // No curve (a state off the ladder): fall back to
                         // the direct solve on the active band.
-                        return banded_alloc_in_band(band, *is_a_input, lambda).0;
+                        let cap = crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input);
+                        return banded_alloc_in_band(band, *is_a_input, lambda, cap).0;
                     }
                     let mut total = BigInt::from(0);
                     for step in curve {
@@ -798,7 +803,8 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                             total = &total + &step.cap; // fills completely
                             continue;
                         }
-                        let (alloc, _) = banded_alloc_in_band(&step.view, *is_a_input, lambda);
+                        let (alloc, _) =
+                            banded_alloc_in_band(&step.view, *is_a_input, lambda, step.cap.clone());
                         if alloc.is_positive() {
                             total = &total + &alloc;
                         }
