@@ -4499,9 +4499,12 @@ mod blend_cost {
                     let per = t.elapsed().as_secs_f64() / reps as f64;
                     let st = router::drain_route_stats();
                     let (paths, evals, br) = st.last().map(|x| (x.paths, x.evals, x.branches)).unwrap_or((0, 0, 0));
+                    let (splits, rounds, outs, ns) = router::drain_split_profile();
                     println!(
-                        "  {n:>6} {oname:>7} {label:>8} {:>11} {paths:>6} {evals:>7} {br:>9}",
-                        format!("{:.1} ms", per * 1000.0)
+                        "  {n:>6} {oname:>7} {label:>8} {:>11} {paths:>6} {evals:>7} {br:>9}   splits {:>5} rounds {:>6} outputs {:>7} in-split {:.0}%",
+                        format!("{:.1} ms", per * 1000.0),
+                        splits / reps as u64, rounds / reps as u64, outs / reps as u64,
+                        (ns as f64 / 1e9 / reps as f64) / per * 100.0,
                     );
                 }
             }
