@@ -3489,60 +3489,103 @@ pub fn build_multi_pool_scoop_tx(
         );
     }
 
-    // ── Step 13.5: Lovelace conservation ───────────────────────────────────
+    // ── Step 13.5: Value conservation ──────────────────────────────────────
     //
-    // The ledger requires consumed == produced. For these transactions that
-    // reduces to a single identity on lovelace: every withdrawal is for 0,
-    // the mint carries only LP tokens, and there are no certificates or
-    // deposits. So
+    // The ledger requires consumed == produced, per asset. Every
+    // withdrawal here is for 0 and there are no certificates or deposits,
+    // so that reduces to
     //
-    //     sum(input lovelace) == sum(output lovelace) + fee
+    //     inputs + mint  ==  outputs + fee      (fee being lovelace only)
     //
-    // Step 8.4 already guards ONE term of this — that the fee-deduction pot
-    // matches `tx_fee + designated_required` when there is no change output
-    // to absorb a difference. That guard is not sufficient: it says nothing
-    // about the pool and order outputs, whose lovelace the builder derives
-    // from values the indexer cached rather than from the chain. A pool
-    // whose cached lovelace is stale by any amount produces a transaction
-    // that passes every local check, passes our own evaluator, and is then
-    // refused by the node as ValueNotConservedUTxO — which reports the two
-    // totals and nothing about which output is wrong.
+    // Step 8.4 already guarded ONE term of the lovelace side — that the
+    // fee-deduction pot matches `tx_fee + designated_required` when there
+    // is no change output to absorb a difference. It says nothing about
+    // the pool and order outputs, whose contents the builder derives from
+    // values the indexer cached rather than reading from the chain. A
+    // cached value that is wrong in either direction produces a
+    // transaction that passes every local check and our own evaluator, and
+    // is then refused by the node as ValueNotConservedUTxO — which reports
+    // two whole Values and leaves you to diff them by hand.
     //
-    // Checking the whole identity here costs one pass over the inputs and
-    // outputs, and turns that into a local error naming the shortfall
-    // before anything is submitted. Observed on preview 2026-10-06:
-    // consumed 527766791957 against produced 527742208077.
+    // Both directions have been seen on preview, 2026-10-06/07: lovelace
+    // short by a fee surplus the prediction omitted, and MNGO over-produced
+    // by 4,280,697 against a pool whose cached token balance was too high.
+    // The first was lovelace, the second was not, which is why this covers
+    // every asset rather than just the coin.
     {
-        let ada = AssetClass {
-            policy: vec![],
-            token: vec![],
-        };
-        let mut in_ada: i128 = 0;
+        use num_traits::ToPrimitive;
+        let big = |v: &crate::bigint::BigInt| v.to_string().parse::<i128>().unwrap_or(0);
+        let mut net: BTreeMap<(Vec<u8>, Vec<u8>), i128> = BTreeMap::new();
+        let ada_key = (Vec::new(), Vec::new());
+
         for i in body.inputs.iter() {
             let key = crate::cardano_types::TransactionInput(i.clone());
             let r = resolved_inputs
                 .get(&key)
                 .with_context(|| format!("input {i:?} missing from resolved_inputs"))?;
-            in_ada += r.value.get(&ada).to_string().parse::<i128>().unwrap_or(0);
+            for (policy, toks) in r.value.0.iter() {
+                for (name, qty) in toks.iter() {
+                    *net.entry((policy.clone(), name.clone())).or_default() += big(qty);
+                }
+            }
         }
-        let mut out_ada: i128 = 0;
+        if let Some(m) = body.mint.as_ref() {
+            for (policy, toks) in m.iter() {
+                for (name, amt) in toks.iter() {
+                    let q: i128 = i128::from(i64::from(*amt));
+                    *net.entry((policy.to_vec(), name.to_vec())).or_default() += q;
+                }
+            }
+        }
         for o in body.outputs.iter() {
-            out_ada += match o {
+            let coin = match o {
                 TransactionOutput::PostAlonzo(b) => match &b.value {
-                    ConwayValue::Coin(c) => *c as i128,
-                    ConwayValue::Multiasset(c, _) => *c as i128,
+                    ConwayValue::Coin(c) => *c,
+                    ConwayValue::Multiasset(c, ma) => {
+                        for (policy, toks) in ma.iter() {
+                            for (name, amt) in toks.iter() {
+                                *net.entry((policy.to_vec(), name.to_vec())).or_default() -=
+                                    u64::from(*amt) as i128;
+                            }
+                        }
+                        *c
+                    }
                 },
                 TransactionOutput::Legacy(b) => match &b.amount {
-                    pallas_primitives::alonzo::Value::Coin(c) => *c as i128,
-                    pallas_primitives::alonzo::Value::Multiasset(c, _) => *c as i128,
+                    pallas_primitives::alonzo::Value::Coin(c) => *c,
+                    pallas_primitives::alonzo::Value::Multiasset(c, ma) => {
+                        for (policy, toks) in ma.iter() {
+                            for (name, amt) in toks.iter() {
+                                *net.entry((policy.to_vec(), name.to_vec())).or_default() -=
+                                    *amt as i128;
+                            }
+                        }
+                        *c
+                    }
                 },
             };
+            *net.entry(ada_key.clone()).or_default() -= coin as i128;
         }
-        let produced = out_ada + tx_fee as i128;
-        if in_ada != produced {
+        *net.entry(ada_key).or_default() -= tx_fee as i128;
+
+        let off: Vec<String> = net
+            .iter()
+            .filter(|(_, v)| **v != 0)
+            .map(|((p, t), v)| {
+                let name = if p.is_empty() {
+                    "lovelace".to_string()
+                } else {
+                    format!("{}.{}", hex::encode(p), hex::encode(t))
+                };
+                // Positive: consumed and never placed. Negative: produced
+                // from nothing.
+                format!("{name} {v:+}")
+            })
+            .collect();
+        if !off.is_empty() {
             bail!(
-                "lovelace not conserved: inputs {in_ada} != outputs {out_ada} + fee {tx_fee}                  (short by {}); pools {}, orders {}, funding_input {}, fee pot                  {total_fee_deducted}, designated {designated_required}, pool bumps                  {total_pool_bump}, fulfilment subsidy {total_fulfillment_subsidy}",
-                in_ada - produced,
+                "value not conserved: {}; pools {}, orders {}, funding_input {}, fee pot                  {total_fee_deducted}, designated {designated_required}, pool bumps                  {total_pool_bump}, fulfilment subsidy {total_fulfillment_subsidy}, fee {tx_fee}",
+                off.join(", "),
                 pool_orefs.len(),
                 body.inputs.len() - pool_orefs.len(),
                 funding_input.is_some(),
@@ -3775,24 +3818,50 @@ pub fn build_multi_pool_scoop_tx(
         // Checking it where both values are in hand turns that into a named
         // pool and an exact difference.
         {
-            let actual_ada = match body.outputs.get(batch_idx) {
+            // Every asset, not just the coin: a wrong token balance breaks
+            // the next scoop exactly as a wrong lovelace balance does, and
+            // both have been seen on preview.
+            let mut diff: BTreeMap<(Vec<u8>, Vec<u8>), i128> = BTreeMap::new();
+            for (policy, toks) in predicted_pool.value.0.iter() {
+                for (name, qty) in toks.iter() {
+                    *diff.entry((policy.clone(), name.clone())).or_default() +=
+                        qty.to_string().parse::<i128>().unwrap_or(0);
+                }
+            }
+            let coin = match body.outputs.get(batch_idx) {
                 Some(TransactionOutput::PostAlonzo(b)) => match &b.value {
                     ConwayValue::Coin(c) => *c,
-                    ConwayValue::Multiasset(c, _) => *c,
+                    ConwayValue::Multiasset(c, ma) => {
+                        for (policy, toks) in ma.iter() {
+                            for (name, amt) in toks.iter() {
+                                *diff.entry((policy.to_vec(), name.to_vec())).or_default() -=
+                                    u64::from(*amt) as i128;
+                            }
+                        }
+                        *c
+                    }
                 },
                 _ => bail!("pool output {batch_idx} missing while predicting pool state"),
             };
-            let pred_ada: u64 = predicted_pool
-                .value
-                .get(&ada_asset)
-                .to_string()
-                .parse()
-                .unwrap_or(0);
-            if pred_ada != actual_ada {
+            *diff.entry((Vec::new(), Vec::new())).or_default() -= coin as i128;
+
+            let off: Vec<String> = diff
+                .iter()
+                .filter(|(_, v)| **v != 0)
+                .map(|((p, t), v)| {
+                    let name = if p.is_empty() {
+                        "lovelace".to_string()
+                    } else {
+                        format!("{}.{}", hex::encode(p), hex::encode(t))
+                    };
+                    format!("{name} {v:+}")
+                })
+                .collect();
+            if !off.is_empty() {
                 bail!(
-                    "predicted pool lovelace disagrees with the output it predicts: pool {}                      output {batch_idx} holds {actual_ada}, prediction says {pred_ada}                      (difference {}); chaining on this would break the next scoop",
+                    "predicted pool state disagrees with the output it predicts: pool {} output {batch_idx}, prediction minus output = {}; chaining on this would break the next scoop",
                     hex::encode(batch.pool_ident.to_bytes()),
-                    actual_ada as i128 - pred_ada as i128,
+                    off.join(", "),
                 );
             }
         }
