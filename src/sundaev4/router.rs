@@ -1205,10 +1205,13 @@ fn ladder_for(
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::BTreeMap<Key, std::sync::Arc<BandedLadder>>>,
     > = std::sync::OnceLock::new();
-    // A scooper tracks a few dozen pools, and each keeps one live entry
-    // plus the recently-superseded ones. Dropping the map costs cold
-    // ladders, nothing else.
-    const MAX: usize = 512;
+    // One live entry per pool: a new state for a pool supersedes its old
+    // ones, which are dropped on insert (an in-flight route holds its own
+    // Arc). The map then holds about as many entries as there are banded
+    // pools, and MAX is a backstop that costs cold ladders, nothing else.
+    // It was 512 with a wholesale clear, which past 512 pool-states would
+    // have rebuilt every ladder on every order.
+    const MAX: usize = 8192;
 
     let key = (ident.clone(), a.clone(), b.clone());
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -1219,6 +1222,14 @@ fn ladder_for(
     }
     let built = std::sync::Arc::new(BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w.clone()));
     if let Ok(mut m) = cache.lock() {
+        let stale: Vec<Key> = m
+            .range((ident.clone(), BigInt::from(0), BigInt::from(0))..)
+            .take_while(|(k, _)| k.0 == *ident)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            m.remove(&k);
+        }
         if m.len() >= MAX {
             m.clear();
         }
