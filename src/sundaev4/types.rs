@@ -1416,6 +1416,11 @@ pub struct ScooperExecution {
     /// Maximum transaction size in bytes. Default: 16_384.
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
+    /// An ogmios endpoint that can MEASURE a tx (`evaluateTransaction`),
+    /// used only to diagnose a rejected scoop: the node's per-redeemer
+    /// numbers next to ours. Default: the scooper box's own ogmios.
+    #[serde(default = "default_evaluate_url")]
+    pub evaluate_url: String,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
     /// Default: (1, 1), no padding. The declared budget is what our
     /// evaluator measures; a rejection at submit then means our
@@ -1485,6 +1490,9 @@ fn default_max_tx_ex_steps() -> u64 {
 }
 fn default_max_tx_size() -> usize {
     16_384
+}
+pub(crate) fn default_evaluate_url() -> String {
+    "http://localhost:1337".to_string()
 }
 pub(crate) fn default_budget_padding() -> (u64, u64) {
     (1, 1)

@@ -254,6 +254,7 @@ impl TestEnv {
             max_tx_ex_steps: 10_000_000_000,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
+            evaluate_url: crate::sundaev4::types::default_evaluate_url(),
             blacklisted_pools: Default::default(),
             pool_allowlists: Default::default(),
             cost_per_pool_lovelace: 0,

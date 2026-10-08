@@ -811,7 +811,8 @@
     "partial-fill-margin": [
      3,
      2
-    ]
+    ],
+    "evaluate-url": "http://localhost:1337"
    },
    "fee-settings-token": "007e873372b3f5f3f8c6c70866acdf2644e7c9af64fa6aa4cff3ff094b417264"
   }

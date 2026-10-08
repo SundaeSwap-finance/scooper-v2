@@ -2286,6 +2286,72 @@ impl Scooper {
     /// rebuild, sign, submit, and record the outcome. Shared by the
     /// normal accumulation path and the dedicated claim path.
     #[allow(clippy::too_many_arguments)]
+
+    /// After a rejection: per redeemer, what the tx declared, what our
+    /// evaluator measured on the final tx, and what the node measures
+    /// (ogmios `evaluateTransaction`), with a flag on any redeemer whose
+    /// declared budget is below the node's number. Also writes the
+    /// ScriptContext our evaluator built for every redeemer to
+    /// /tmp/ctx-<tx>-<purpose><index>.cbor, to diff against the node's.
+    async fn diagnose_rejected_scoop(
+        evaluate_url: &str,
+        final_tx: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
+        padded_budgets: &[(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)],
+        final_raw: &[(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)],
+        slot_config: &crate::sundaev4::SlotConfig,
+    ) {
+        // Per redeemer: what we declared, what our evaluator
+        // measured on the final tx, and what the node measures
+        // (ogmios evaluateTransaction, when the submit endpoint
+        // is ogmios). A declared budget below the node's number
+        // is a phase-2 rejection the local check cannot see.
+        let node = crate::sundaev4::submit::evaluate_ogmios(&evaluate_url, &final_tx.cbor)
+            .await
+            .unwrap_or_default();
+        // The tx itself, for the node-side context tool, then the
+        // contexts our evaluator built for it, one file per redeemer.
+        let tx_dump = format!("/tmp/submit-fail-{}.cbor", final_tx.tx_hash_hex);
+        if let Err(e) = std::fs::write(&tx_dump, &final_tx.cbor) {
+            warn!(error = %e, path = %tx_dump, "failed to write rejected tx dump");
+        }
+        let ctx_paths = crate::sundaev4::evaluator::dump_script_contexts(
+            &final_tx.tx_body,
+            &final_tx.redeemers,
+            &final_tx.resolved_inputs,
+            &final_tx.resolved_ref_inputs,
+            final_tx.tx_hash,
+            slot_config,
+        );
+        warn!(tx_hash = %final_tx.tx_hash_hex, contexts = ?ctx_paths, "submit-fail local script contexts dumped");
+        for (k, declared) in padded_budgets {
+            let local = final_raw.iter().find(|(fk, _)| fk == k).map(|(_, eu)| *eu);
+            let purpose = match k.tag {
+                pallas_primitives::conway::RedeemerTag::Spend => "spend",
+                pallas_primitives::conway::RedeemerTag::Mint => "mint",
+                pallas_primitives::conway::RedeemerTag::Cert => "publish",
+                pallas_primitives::conway::RedeemerTag::Reward => "withdraw",
+                _ => "other",
+            };
+            let measured = node
+                .iter()
+                .find(|(p, i, _, _)| p == purpose && *i == u64::from(k.index))
+                .map(|(_, _, m, c)| (*m, *c));
+            let short = measured.is_some_and(|(m, c)| m > declared.mem || c > declared.steps);
+            warn!(
+                tx_hash = %final_tx.tx_hash_hex,
+                redeemer = format!("{purpose}#{}", k.index),
+                declared_mem = declared.mem,
+                declared_steps = declared.steps,
+                local_mem = local.map(|e| e.mem),
+                local_steps = local.map(|e| e.steps),
+                node_mem = measured.map(|m| m.0),
+                node_steps = measured.map(|m| m.1),
+                short,
+                "submit-fail budget",
+            );
+        }
+    }
+
     async fn build_and_submit_plan(
         &mut self,
         final_plan: crate::sundaev4::batch::ScoopPlan,
@@ -2919,6 +2985,7 @@ impl Scooper {
                             reason_hex = %hex_reason,
                             "node rejected scoop tx",
                         );
+                        Self::diagnose_rejected_scoop(&exec.evaluate_url, &final_tx, &padded_budgets, &final_raw, &exec.slot_config).await;
                     } else {
                         info!(
                             tx_hash = %final_tx.tx_hash_hex,
@@ -3031,52 +3098,7 @@ impl Scooper {
                         dump = %dump_path,
                         "multi-pool scoop tx submit failed — tx CBOR dumped for uplc-turbo diagnosis"
                     );
-                    // Per redeemer: what we declared, what our evaluator
-                    // measured on the final tx, and what the node measures
-                    // (ogmios evaluateTransaction, when the submit endpoint
-                    // is ogmios). A declared budget below the node's number
-                    // is a phase-2 rejection the local check cannot see.
-                    let node = crate::sundaev4::submit::evaluate_ogmios(&exec.submit_url, &final_tx.cbor)
-                        .await
-                        .unwrap_or_default();
-                    // The contexts our evaluator built for this tx, one file
-                    // per redeemer, to diff against the node's.
-                    let ctx_paths = crate::sundaev4::evaluator::dump_script_contexts(
-                        &final_tx.tx_body,
-                        &final_tx.redeemers,
-                        &final_tx.resolved_inputs,
-                        &final_tx.resolved_ref_inputs,
-                        final_tx.tx_hash,
-                        &exec.slot_config,
-                    );
-                    warn!(tx_hash = %final_tx.tx_hash_hex, contexts = ?ctx_paths, "submit-fail local script contexts dumped");
-                    for (k, declared) in &padded_budgets {
-                        let local = final_raw.iter().find(|(fk, _)| fk == k).map(|(_, eu)| *eu);
-                        let purpose = match k.tag {
-                            pallas_primitives::conway::RedeemerTag::Spend => "spend",
-                            pallas_primitives::conway::RedeemerTag::Mint => "mint",
-                            pallas_primitives::conway::RedeemerTag::Cert => "publish",
-                            pallas_primitives::conway::RedeemerTag::Reward => "withdraw",
-                            _ => "other",
-                        };
-                        let measured = node
-                            .iter()
-                            .find(|(p, i, _, _)| p == purpose && *i == u64::from(k.index))
-                            .map(|(_, _, m, c)| (*m, *c));
-                        let short = measured.is_some_and(|(m, c)| m > declared.mem || c > declared.steps);
-                        warn!(
-                            tx_hash = %final_tx.tx_hash_hex,
-                            redeemer = format!("{purpose}#{}", k.index),
-                            declared_mem = declared.mem,
-                            declared_steps = declared.steps,
-                            local_mem = local.map(|e| e.mem),
-                            local_steps = local.map(|e| e.steps),
-                            node_mem = measured.map(|m| m.0),
-                            node_steps = measured.map(|m| m.1),
-                            short,
-                            "submit-fail budget",
-                        );
-                    }
+                    Self::diagnose_rejected_scoop(&exec.evaluate_url, &final_tx, &padded_budgets, &final_raw, &exec.slot_config).await;
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
