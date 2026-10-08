@@ -150,6 +150,9 @@ fn encode_bootstrap_utxo(
 #[async_trait]
 trait BootstrapProvider {
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>>;
+    /// One transaction output by its outpoint, as the chain holds it:
+    /// address, value, datum. `Ok(None)` when the provider cannot answer.
+    async fn fetch_tx_output(&self, tx_hash: &[u8; 32], index: u64) -> Result<Option<FetchedUtxo>>;
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_tip(&self) -> Result<(u64, String)>;
 
@@ -341,6 +344,9 @@ fn parse_kupo_value(kv: &KupoValue) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for KupoProvider {
+    async fn fetch_tx_output(&self, _tx_hash: &[u8; 32], _index: u64) -> Result<Option<FetchedUtxo>> {
+        Ok(None)
+    }
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
         let hash_hex = hex::encode(script_hash.as_ref());
         let url = format!("{}/matches/{}/*?unspent", self.url, hash_hex);
@@ -773,6 +779,49 @@ fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for BlockfrostProvider {
+    async fn fetch_tx_output(&self, tx_hash: &[u8; 32], index: u64) -> Result<Option<FetchedUtxo>> {
+        #[derive(Deserialize)]
+        struct TxUtxos {
+            outputs: Vec<TxOutput>,
+        }
+        #[derive(Deserialize)]
+        struct TxOutput {
+            address: String,
+            output_index: u64,
+            amount: Vec<BlockfrostAmount>,
+            data_hash: Option<String>,
+            inline_datum: Option<serde_json::Value>,
+        }
+        let hash_hex = hex::encode(tx_hash);
+        let url = format!("{}/txs/{}/utxos", self.url, hash_hex);
+        let resp = self.get(&url).await.context("blockfrost: fetch tx utxos")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let tx: TxUtxos = resp
+            .error_for_status()
+            .context("blockfrost: tx utxos status")?
+            .json()
+            .await
+            .context("blockfrost: parse tx utxos")?;
+        let Some(o) = tx.outputs.into_iter().find(|o| o.output_index == index) else {
+            return Ok(None);
+        };
+        let inline = o.inline_datum.as_ref().and_then(blockfrost_inline_datum_cbor);
+        let datum_cbor = match (inline, &o.data_hash) {
+            (Some(bytes), _) => Some(bytes),
+            (None, Some(dh)) => self.fetch_datum_opt(dh).await?,
+            (None, None) => None,
+        };
+        Ok(Some(FetchedUtxo {
+            tx_hash: *tx_hash,
+            output_index: index,
+            address: o.address,
+            value: parse_blockfrost_value(&o.amount),
+            datum_cbor,
+            slot: 0,
+        }))
+    }
     /// Queries by payment credential, so UTxOs at every staking variant of
     /// the script address are returned. Each row's own `address` field says
     /// which variant.
@@ -2380,18 +2429,46 @@ async fn bootstrap_v4(
                     // The API returns: CBOR-wrapped script bytes, same as what
                     // pallas stores in PlutusV3Script.
                     let script = pallas_primitives::PlutusScript::<3>(script_cbor.into());
-                    // Dummy address — only the script_ref field matters.
-                    let dummy_addr =
-                        pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
-                            protocol.network.pallas(),
-                            pallas_addresses::ShelleyPaymentPart::Key(
-                                pallas_primitives::Hash::new([0u8; 28]),
-                            ),
-                            pallas_addresses::ShelleyDelegationPart::Null,
-                        ));
+                    // The output as the chain holds it. This used to be a
+                    // placeholder (zero payment key, no stake part, 2 ADA)
+                    // on the theory that only script_ref matters — but the
+                    // output is a reference input in every scoop's
+                    // ScriptContext, and a script that walks reference
+                    // inputs reads its address and value. On preview
+                    // 2026-10-08 the node's context and ours differed in
+                    // exactly those fields for every module reference
+                    // input, and nothing else.
+                    let real = match provider
+                        .fetch_tx_output(script_ref.ref_utxo.0.transaction_id.as_ref().try_into().expect("32-byte tx id"), script_ref.ref_utxo.0.index)
+                        .await
+                    {
+                        Ok(Some(u)) => Some(u),
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!(error = %e, ref_utxo = %script_ref.ref_utxo, "bootstrap: could not fetch module ref UTxO output; using a placeholder");
+                            None
+                        }
+                    };
+                    let (address, value) = match &real {
+                        Some(u) => (
+                            pallas_addresses::Address::from_bech32(&u.address)
+                                .with_context(|| format!("bootstrap: ref UTxO address {}", u.address))?,
+                            u.value.clone(),
+                        ),
+                        None => (
+                            pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
+                                protocol.network.pallas(),
+                                pallas_addresses::ShelleyPaymentPart::Key(
+                                    pallas_primitives::Hash::new([0u8; 28]),
+                                ),
+                                pallas_addresses::ShelleyDelegationPart::Null,
+                            )),
+                            crate::cardano_types::Value::default(),
+                        ),
+                    };
                     let txo = crate::cardano_types::TransactionOutput {
-                        address: dummy_addr,
-                        value: crate::cardano_types::Value::default(),
+                        address,
+                        value,
                         datum: crate::cardano_types::RawDatum::None,
                         script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(script)),
                     };
@@ -2542,19 +2619,13 @@ async fn bootstrap_v4(
             });
         }
 
-        let dummy_addr = ShelleyAddress::new(
-            protocol.network.pallas(),
-            ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
-            ShelleyDelegationPart::Null,
-        )
-        .to_vec();
         for (input, output) in &ref_utxo_outputs {
             let txo_bytes = match &output.script_ref {
                 Some(crate::cardano_types::ScriptRef::PlutusV3(script)) => {
                     let txo = conway::TransactionOutput::PostAlonzo(
                         pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
-                            address: PallasBytes::from(dummy_addr.clone()),
-                            value: conway::Value::Coin(2_000_000),
+                            address: PallasBytes::from(output.address.to_vec()),
+                            value: value_to_conway(&output.value),
                             datum_option: None,
                             script_ref: Some(CborWrap(conway::PseudoScript::PlutusV3Script(
                                 script.clone(),
@@ -2563,7 +2634,7 @@ async fn bootstrap_v4(
                     );
                     minicbor::to_vec(&txo).expect("infallible encoding")
                 }
-                _ => encode_bootstrap_utxo(&dummy_addr, &output.value, None),
+                _ => encode_bootstrap_utxo(&output.address.to_vec(), &output.value, None),
             };
             persisted_txos.push(PersistedTxo {
                 txo_id: input.clone(),
@@ -2571,7 +2642,7 @@ async fn bootstrap_v4(
                 created_slot: tip_slot,
                 era: 7,
                 txo: txo_bytes,
-                address: dummy_addr.clone(),
+                address: output.address.to_vec(),
                 datum: None,
             });
         }
