@@ -966,6 +966,7 @@ mod tests {
         });
         std::sync::Arc::new(SundaeV4Order {
             input: crate::cardano_types::TransactionInput::new([0xAB; 32].into(), 1),
+            address: Vec::new(),
             value: Value::default(),
             datum: OrderDatum {
                 owner: Multisig::Signature(vec![0x11; 28]),

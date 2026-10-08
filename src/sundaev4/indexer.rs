@@ -398,6 +398,7 @@ impl SundaeV4Indexer {
                         Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
+                                address: output.address.to_vec(),
                                 datum,
                                 constraint,
                                 value: output.value,
@@ -429,6 +430,7 @@ impl SundaeV4Indexer {
                         Ok((datum, constraint)) => {
                             state.orders.push(Arc::new(SundaeV4Order {
                                 input: txo.txo_id,
+                                address: output.address.to_vec(),
                                 datum,
                                 constraint,
                                 value: output.value,
@@ -551,6 +553,7 @@ impl SundaeV4Indexer {
                         state.spent_orders.push(SpentOrder {
                             order: Arc::new(SundaeV4Order {
                                 input: stxo.txo.txo_id,
+                                address: output.address.to_vec(),
                                 datum: od,
                                 constraint,
                                 value: output.value,
@@ -1538,6 +1541,7 @@ impl ChainIndex for SundaeV4Indexer {
 
                         let order = SundaeV4Order {
                             input: this_input,
+                            address: tx_out.address.to_vec(),
                             value: tx_out.value,
                             datum: od,
                             constraint,

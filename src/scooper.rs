@@ -1039,6 +1039,7 @@ impl Scooper {
                     }
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
                         input: order.input.clone(),
+                        address: order.address.clone(),
                         value: order.value.clone(),
                         datum: order.datum.clone(),
                         constraint,
