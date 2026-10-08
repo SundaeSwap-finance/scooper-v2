@@ -2592,6 +2592,34 @@ impl Scooper {
                     return false;
                 }
             };
+            // Budget drift: the declared budget is the FIRST pass's
+            // measurement plus the pad, and the check above only sees the
+            // final tx against that. A script that costs more in the final
+            // tx than in the first pass eats into the pad silently; past
+            // the pad the node rejects the tx at submit with no local
+            // warning. Log every redeemer whose final cost moved by more
+            // than 0.5% either way, so the margin can be sized from data.
+            {
+                let (pad_num, pad_den) = exec.budget_padding;
+                for (k, declared) in &padded_budgets {
+                    let Some((_, raw_final)) = final_raw.iter().find(|(fk, _)| fk == k) else { continue };
+                    let first_mem = declared.mem * pad_den / pad_num;
+                    let first_steps = declared.steps * pad_den / pad_num;
+                    let drift_mem = raw_final.mem as f64 / first_mem.max(1) as f64 - 1.0;
+                    let drift_steps = raw_final.steps as f64 / first_steps.max(1) as f64 - 1.0;
+                    if drift_mem.abs() > 0.005 || drift_steps.abs() > 0.005 {
+                        info!(
+                            tx_hash = %final_tx.tx_hash_hex,
+                            redeemer = format!("{:?}#{}", k.tag, k.index),
+                            first_pass_mem = first_mem,
+                            final_mem = raw_final.mem,
+                            drift_mem_pct = format!("{:+.2}", drift_mem * 100.0),
+                            drift_steps_pct = format!("{:+.2}", drift_steps * 100.0),
+                            "budget drift between first pass and final tx",
+                        );
+                    }
+                }
+            }
             if !over_budget.is_empty() {
                 warn!(
                     tx_hash = %final_tx.tx_hash_hex,

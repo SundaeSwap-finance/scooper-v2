@@ -2399,3 +2399,36 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod datum_round_trip {
+    //! Byte-compare a chain datum with its trip through the scooper's
+    //! parsed types. The evaluator hands scripts the RE-ENCODED datum for
+    //! the settings and order-config reference inputs, so any difference
+    //! here is a difference between the node's ScriptContext and ours.
+    use super::*;
+    use plutus_parser::AsPlutus;
+
+    fn trip<T: AsPlutus + std::fmt::Debug>(name: &str, hex_path: &str) {
+        let hex_str = std::fs::read_to_string(hex_path).unwrap();
+        let bytes = hex::decode(hex_str.trim()).unwrap();
+        let pd: pallas_primitives::PlutusData = minicbor::decode(&bytes).unwrap();
+        let parsed = T::from_plutus(pd.clone()).unwrap();
+        let back = minicbor::to_vec(parsed.to_plutus()).unwrap();
+        println!("{name}: chain {} bytes, re-encoded {} bytes, equal={}", bytes.len(), back.len(), bytes == back);
+        if bytes != back {
+            println!("  chain: {}", hex::encode(&bytes));
+            println!("  ours : {}", hex::encode(&back));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs datum hex files; set DATUM_DIR"]
+    fn chain_datums_survive_the_round_trip() {
+        let dir = std::env::var("DATUM_DIR").unwrap();
+        trip::<SettingsDatum>("settings", &format!("{dir}/datum-settings.hex"));
+        trip::<PoolDatum>("pool", &format!("{dir}/datum-pool.hex"));
+        trip::<OrderDatum>("order", &format!("{dir}/datum-order.hex"));
+        trip::<OrderConfig>("orderconfig", &format!("{dir}/datum-orderconfig.hex"));
+    }
+}
