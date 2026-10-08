@@ -1199,9 +1199,10 @@ pub struct ScooperExecution {
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
-    /// Budgets are evaluated on the first-pass tx; the final rebuild shifts
-    /// output values (~0.2% on a redeemer) and uplc-turbo's step accounting
-    /// differs from cardano-node's (~0.04%). Default: (21, 20), 5%.
+    /// Default: (1, 1), no padding. The declared budget is what our
+    /// evaluator measures, and the evaluator matches the node to the unit
+    /// (amaru-uplc main; the previous revision priced divideInteger short).
+    /// Every padded unit is fee the protocol pays for nothing.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
     /// Pool idents (hex) to exclude from scooping; see
@@ -1265,7 +1266,7 @@ fn default_max_tx_size() -> usize {
     16_384
 }
 pub(crate) fn default_budget_padding() -> (u64, u64) {
-    (21, 20)
+    (1, 1)
 }
 
 impl ScooperExecution {
