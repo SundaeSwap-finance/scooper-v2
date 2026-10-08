@@ -170,10 +170,10 @@ pub fn evaluate_scoop_tx(
     slot_config: &crate::sundaev4::types::SlotConfig,
     failure_capture: Option<&mut Option<FailedScriptContext>>,
 ) -> Result<EvalResult> {
+    use amaru_kernel::cardano::plutus_version::PlutusVersion;
     use uplc_turbo::arena::Arena;
     use uplc_turbo::binder::DeBruijn;
     use uplc_turbo::data::PlutusData as UplcPlutusData;
-    use amaru_kernel::cardano::plutus_version::PlutusVersion;
     use uplc_turbo::machine::{CostModel, ExBudget};
     use uplc_turbo::term::Term;
 
@@ -195,10 +195,18 @@ pub fn evaluate_scoop_tx(
         let arena = Arena::new();
 
         // Decode FLAT script
-        let plutus_version = if version == 2 { PlutusVersion::V2 } else { PlutusVersion::V3 };
-        let (program, _remainder) = uplc_turbo::flat::decode::<DeBruijn>(&arena, flat_bytes, plutus_version, PROTOCOL_VERSION).map_err(|e| {
-            anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash))
-        })?;
+        let plutus_version = if version == 2 {
+            PlutusVersion::V2
+        } else {
+            PlutusVersion::V3
+        };
+        let (program, _remainder) = uplc_turbo::flat::decode::<DeBruijn>(
+            &arena,
+            flat_bytes,
+            plutus_version,
+            PROTOCOL_VERSION,
+        )
+        .map_err(|e| anyhow::anyhow!("FLAT decode failed for {}: {e}", hex::encode(script_hash)))?;
 
         // Build the version-appropriate context and argument list. V3 takes
         // one argument (the full ScriptContext, redeemer embedded); V2 takes
@@ -222,7 +230,11 @@ pub fn evaluate_scoop_tx(
                 .map_err(|e| anyhow::anyhow!("context CBOR decode failed: {e}"))?;
             // CIP-0069: V3 validators receive a single argument
             let applied = program.apply(&arena, Term::data(&arena, context_pd));
-            let result = applied.eval(&arena, CostModel::new(PlutusVersion::V3, PROTOCOL_VERSION, cost_model), budget);
+            let result = applied.eval(
+                &arena,
+                CostModel::new(PlutusVersion::V3, PROTOCOL_VERSION, cost_model),
+                budget,
+            );
             (context_cbor, result)
         } else if version == 2 {
             let cm2 = cost_model_v2.with_context(|| {
@@ -257,7 +269,11 @@ pub fn evaluate_scoop_tx(
             let applied = applied
                 .apply(&arena, Term::data(&arena, redeemer_pd))
                 .apply(&arena, Term::data(&arena, context_pd));
-            let result = applied.eval(&arena, CostModel::new(PlutusVersion::V2, PROTOCOL_VERSION, cm2), budget);
+            let result = applied.eval(
+                &arena,
+                CostModel::new(PlutusVersion::V2, PROTOCOL_VERSION, cm2),
+                budget,
+            );
             (context_cbor, result)
         } else {
             bail!("PlutusV{version} scripts are not supported by the evaluator");
@@ -402,11 +418,11 @@ mod debug_eval {
     #[test]
     #[ignore]
     fn eval_dumped_context() {
+        use amaru_kernel::cardano::plutus_version::PlutusVersion;
         use uplc_turbo::arena::Arena;
         use uplc_turbo::binder::DeBruijn;
         use uplc_turbo::data::PlutusData as UplcPlutusData;
-        use amaru_kernel::cardano::plutus_version::PlutusVersion;
-    use uplc_turbo::machine::{CostModel, ExBudget};
+        use uplc_turbo::machine::{CostModel, ExBudget};
         use uplc_turbo::term::Term;
 
         let script_hex =
@@ -418,7 +434,13 @@ mod debug_eval {
         let ctx = std::fs::read(std::env::var("CTX_FILE").unwrap()).unwrap();
 
         let arena = Arena::new();
-        let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat, PlutusVersion::V3, super::PROTOCOL_VERSION).unwrap();
+        let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(
+            &arena,
+            &flat,
+            PlutusVersion::V3,
+            super::PROTOCOL_VERSION,
+        )
+        .unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {
@@ -429,7 +451,11 @@ mod debug_eval {
             &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
         )
         .unwrap();
-        let result = applied.eval(&arena, CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model), budget);
+        let result = applied.eval(
+            &arena,
+            CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model),
+            budget,
+        );
         println!("logs ({}):", result.info.logs.len());
         for log in &result.info.logs {
             println!("  trace: {log}");
@@ -450,25 +476,47 @@ mod builtin_profile_probe {
     #[test]
     #[ignore = "diagnostic; needs UPLC_FLAT / UPLC_CTX / UPLC_COST_MODEL"]
     fn profile_one_script() {
+        use amaru_kernel::cardano::plutus_version::PlutusVersion;
         use uplc_turbo::arena::Arena;
         use uplc_turbo::binder::DeBruijn;
         use uplc_turbo::data::PlutusData as UplcPlutusData;
-        use amaru_kernel::cardano::plutus_version::PlutusVersion;
-    use uplc_turbo::machine::{CostModel, ExBudget};
+        use uplc_turbo::machine::{CostModel, ExBudget};
         use uplc_turbo::term::Term;
         let flat = std::fs::read(std::env::var("UPLC_FLAT").unwrap()).unwrap();
         let ctx = std::fs::read(std::env::var("UPLC_CTX").unwrap()).unwrap();
-        let cfg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(std::env::var("UPLC_COST_MODEL").unwrap()).unwrap()).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("UPLC_COST_MODEL").unwrap()).unwrap(),
+        )
+        .unwrap();
         let cost_model: Vec<i64> = cfg["protocol"]["v4"]["execution"]["plutus-v3-cost-model"]
-            .as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
         let arena = Arena::new();
-        let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat, PlutusVersion::V3, super::PROTOCOL_VERSION).unwrap();
+        let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(
+            &arena,
+            &flat,
+            PlutusVersion::V3,
+            super::PROTOCOL_VERSION,
+        )
+        .unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
-        let budget = ExBudget { cpu: 10_000_000_000, mem: 14_000_000 };
-        let result = applied.eval(&arena, CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model), budget);
-        let spent = ExBudget { cpu: budget.cpu - result.info.consumed_budget.cpu, mem: budget.mem - result.info.consumed_budget.mem };
+        let budget = ExBudget {
+            cpu: 10_000_000_000,
+            mem: 14_000_000,
+        };
+        let result = applied.eval(
+            &arena,
+            CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model),
+            budget,
+        );
+        let spent = ExBudget {
+            cpu: budget.cpu - result.info.consumed_budget.cpu,
+            mem: budget.mem - result.info.consumed_budget.mem,
+        };
         let _ = spent;
         println!("consumed: {:?}", result.info.consumed_budget);
     }

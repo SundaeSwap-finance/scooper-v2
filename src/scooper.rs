@@ -2212,7 +2212,10 @@ impl Scooper {
         // more declaring the final measurement, which is what the node
         // charges.
         let mut redeclared: Option<
-            Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)>,
+            Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )>,
         > = None;
         let mut redeclare_rounds = 0u32;
         let (padded_budgets, final_tx) = loop {
@@ -2401,8 +2404,10 @@ impl Scooper {
             // can shift a script's cost. The node rejects any script that runs
             // past its declared budget, and that rejection is indistinguishable
             // from a lost race at submit time.
-            let mut final_raw: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)> =
-                Vec::new();
+            let mut final_raw: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = Vec::new();
             let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &final_tx.tx_body,
                 &final_tx.redeemers,
