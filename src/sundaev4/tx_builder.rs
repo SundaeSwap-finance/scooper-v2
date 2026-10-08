@@ -2976,7 +2976,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3006,7 +3006,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 swap.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if swap.order.address.is_empty() { order_addr_bytes.clone() } else { swap.order.address.clone() },
                     value: swap.order.value.clone(),
                     datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3017,7 +3017,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 dep.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if dep.order.address.is_empty() { order_addr_bytes.clone() } else { dep.order.address.clone() },
                     value: dep.order.value.clone(),
                     datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3028,7 +3028,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 wd.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if wd.order.address.is_empty() { order_addr_bytes.clone() } else { wd.order.address.clone() },
                     value: wd.order.value.clone(),
                     datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3039,7 +3039,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 z.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if z.order.address.is_empty() { order_addr_bytes.clone() } else { z.order.address.clone() },
                     value: z.order.value.clone(),
                     datum: DatumOption::InlineDatum(z.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3050,7 +3050,7 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,

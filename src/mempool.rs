@@ -419,6 +419,7 @@ pub fn provisional_orders_from_tx(
             input.clone(),
             Arc::new(crate::sundaev4::SundaeV4Order {
                 input,
+                address: converted.address.to_vec(),
                 value: converted.value,
                 datum,
                 constraint,

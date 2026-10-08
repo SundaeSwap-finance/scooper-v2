@@ -1439,6 +1439,15 @@ impl PartialOrd for SundaeV4Pool {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV4Order {
     pub input: TransactionInput,
+    /// The order UTxO's address as the chain holds it, stake part included.
+    /// The ScriptContext we evaluate against carries this for the order
+    /// input, and scripts compare it with `equalsData` (fee_lib: the
+    /// fulfilment output's address against the order's). A rebuilt
+    /// script-only address lost the stake part — 16 memory units of Data
+    /// per comparison, 436,464 steps of cpu the node charged and we did
+    /// not (preview, 2026-10-08). Empty only for test and provisional
+    /// orders, where the resolver falls back to the script address.
+    pub address: Vec<u8>,
     pub value: Value,
     pub datum: OrderDatum,
     /// Decoded constraint, computed once at index time so consumers don't re-parse.
@@ -1519,6 +1528,7 @@ impl SundaeV4Order {
             .expect("test_swap_order: constraint should decode");
         SundaeV4Order {
             input,
+            address: Vec::new(),
             value,
             datum,
             constraint,
