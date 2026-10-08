@@ -1,5 +1,7 @@
 # ── Base ──────────────────────────────────────────────────────────────────────
 FROM rust:1.98-bookworm AS base
+# The evaluator's workspace builds only on this nightly (see rust-toolchain.toml).
+RUN rustup toolchain install nightly-2026-09-04 --profile minimal
 RUN cargo install cargo-chef --locked
 
 # ── Planner ───────────────────────────────────────────────────────────────────
