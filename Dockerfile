@@ -1,7 +1,9 @@
 # ── Base ──────────────────────────────────────────────────────────────────────
 FROM rust:1.98-bookworm AS base
 # The evaluator's workspace builds only on this nightly (see rust-toolchain.toml).
-RUN rustup toolchain install nightly-2026-09-04 --profile minimal
+# cargo-chef cooks before rust-toolchain.toml is copied in, so the image's
+# default toolchain must already be this nightly.
+RUN rustup toolchain install nightly-2026-09-04 --profile minimal && rustup default nightly-2026-09-04
 RUN cargo install cargo-chef --locked
 
 # ── Planner ───────────────────────────────────────────────────────────────────
