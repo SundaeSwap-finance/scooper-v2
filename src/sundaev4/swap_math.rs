@@ -1,5 +1,5 @@
 use crate::bigint::BigInt;
-use num_traits::{One, Signed, Zero};
+use num_traits::{Signed, Zero};
 use tracing::warn;
 
 /// Integer square root via Newton's method (floor).
@@ -11,8 +11,11 @@ pub(crate) fn isqrt(n: &BigInt) -> BigInt {
     if *n < two {
         return n.clone();
     }
-    let mut x = n.clone();
-    let mut y = (&x + &BigInt::one()) / &two;
+    // Start just above √n: n < 2^bits, so 2^(bits/2 + 1) > √n. Newton's method
+    // descends to ⌊√n⌋ from any start above it.
+    let bits = n.clone().unwrap().bits();
+    let mut x = num_traits::pow(two.clone(), (bits / 2 + 1) as usize);
+    let mut y = (&x + n / &x) / &two;
     while y < x {
         x = y.clone();
         y = (&x + n / &x) / &two;
@@ -521,7 +524,7 @@ pub fn compute_protocol_lp(fee_budget: &BigInt, ps_num: u64, ps_den: u64) -> Big
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_traits::{Signed, Zero};
+    use num_traits::{One, Signed, Zero};
     use proptest::prelude::*;
 
     proptest! {
@@ -590,6 +593,46 @@ mod tests {
                     }
                 }
         }
+
+        /// INVARIANT: `isqrt(n)` is the floor square root, `r² <= n < (r+1)²`, up to
+        /// 512-bit inputs (the router calls it on ~300-bit products). Inputs mix
+        /// random n with n right around a perfect square, where the answer steps up
+        /// and an off-by-one would show: random n almost never land there.
+        #[test]
+        fn isqrt_is_floor_sqrt(n in prop_oneof![any_big(), near_square()]) {
+            let r = isqrt(&n);
+            let r1 = &r + &BigInt::one();
+            prop_assert!(&r * &r <= n, "isqrt({}) = {}: r² > n", n, r);
+            prop_assert!(&r1 * &r1 > n, "isqrt({}) = {}: (r+1)² <= n", n, r);
+        }
+    }
+
+    /// Any n from 0 to 512 bits.
+    fn any_big() -> impl Strategy<Value = BigInt> {
+        proptest::collection::vec(any::<u64>(), 0..9).prop_map(|limbs| from_limbs(&limbs))
+    }
+
+    /// n around a perfect square k² (k ≥ 1, up to 256 bits): k²-1, k², k²+1, or
+    /// k²+2k = (k+1)²-1, the last n whose root is still k.
+    fn near_square() -> impl Strategy<Value = BigInt> {
+        (proptest::collection::vec(any::<u64>(), 0..5), 0u8..4).prop_map(|(limbs, which)| {
+            let k = from_limbs(&limbs) + BigInt::one();
+            let square = &k * &k;
+            match which {
+                0 => &square - &BigInt::one(),
+                1 => square,
+                2 => &square + &BigInt::one(),
+                _ => &square + &(&k * &BigInt::from(2)),
+            }
+        })
+    }
+
+    /// Big integer from 64-bit limbs, most significant first.
+    fn from_limbs(limbs: &[u64]) -> BigInt {
+        let base = BigInt::from(1i128 << 64);
+        limbs.iter().fold(BigInt::zero(), |acc, limb| {
+            &(&acc * &base) + &BigInt::from(*limb)
+        })
     }
 
     #[test]
