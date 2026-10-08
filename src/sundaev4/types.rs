@@ -44,7 +44,11 @@ mod hex_ser {
 /// Void / unit as PlutusData — `Constr 0 []`. The audit-final PoolDatum's
 /// `extension` field is Void on every pool the CLI creates. Used in tests
 /// to build pool datums.
-#[cfg(test)]
+// Not actually dead: feature `route-bench` uses it. But features are
+// crate-wide, so the scooper binary compiles it too, never calls it,
+// and would trip `clippy --all-features -D warnings` in CI.
+#[cfg(any(test, feature = "route-bench"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn plutus_void() -> PlutusData {
     PlutusData::Constr(pallas_primitives::Constr {
         tag: 121,
@@ -1477,7 +1481,11 @@ impl SundaeV4Order {
     /// where qty becomes both `original_offered` and `remaining_offered` (no
     /// partial-fill state). `min_received` becomes a single-entry list. Uses
     /// `unit` for `extension`; `budget` is the per-order tx-fee budget.
-    #[cfg(test)]
+    // Not actually dead: feature `route-bench` uses it. But features are
+    // crate-wide, so the scooper binary compiles it too, never calls it,
+    // and would trip `clippy --all-features -D warnings` in CI.
+    #[cfg(any(test, feature = "route-bench"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub fn test_swap_order(
         input: TransactionInput,
