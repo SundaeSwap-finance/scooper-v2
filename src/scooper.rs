@@ -2343,7 +2343,7 @@ impl Scooper {
         // adding an input shifts the spend redeemer indices, so budgets from a
         // funding-less first pass do not carry over.
         let mut funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> = None;
-        let (padded_budgets, final_tx) = loop {
+        let (padded_budgets, final_tx, final_raw) = loop {
             let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
                 settings,
@@ -2557,6 +2557,8 @@ impl Scooper {
             // can shift a script's cost. The node rejects any script that runs
             // past its declared budget, and that rejection is indistinguishable
             // from a lost race at submit time.
+            let mut final_raw: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)> =
+                Vec::new();
             let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &final_tx.tx_body,
                 &final_tx.redeemers,
@@ -2572,6 +2574,7 @@ impl Scooper {
                 Ok(r) => r
                     .budgets
                     .iter()
+                    .inspect(|(k, raw)| final_raw.push((k.clone(), *raw)))
                     .filter_map(|(k, raw)| {
                         let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
                         (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
@@ -2603,7 +2606,7 @@ impl Scooper {
             // tx fee. Logging which way this went is what tells an operator
             // whether the wallet UTxO a scoop consumed was actually needed.
             info!(funding_input = funding_owned.is_some(), "scoop built");
-            break (padded_budgets, final_tx);
+            break (padded_budgets, final_tx, final_raw);
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
 
@@ -3000,6 +3003,52 @@ impl Scooper {
                         dump = %dump_path,
                         "multi-pool scoop tx submit failed — tx CBOR dumped for uplc-turbo diagnosis"
                     );
+                    // Per redeemer: what we declared, what our evaluator
+                    // measured on the final tx, and what the node measures
+                    // (ogmios evaluateTransaction, when the submit endpoint
+                    // is ogmios). A declared budget below the node's number
+                    // is a phase-2 rejection the local check cannot see.
+                    let node = crate::sundaev4::submit::evaluate_ogmios(&exec.submit_url, &final_tx.cbor)
+                        .await
+                        .unwrap_or_default();
+                    // The contexts our evaluator built for this tx, one file
+                    // per redeemer, to diff against the node's.
+                    let ctx_paths = crate::sundaev4::evaluator::dump_script_contexts(
+                        &final_tx.tx_body,
+                        &final_tx.redeemers,
+                        &final_tx.resolved_inputs,
+                        &final_tx.resolved_ref_inputs,
+                        final_tx.tx_hash,
+                        &exec.slot_config,
+                    );
+                    warn!(tx_hash = %final_tx.tx_hash_hex, contexts = ?ctx_paths, "submit-fail local script contexts dumped");
+                    for (k, declared) in &padded_budgets {
+                        let local = final_raw.iter().find(|(fk, _)| fk == k).map(|(_, eu)| *eu);
+                        let purpose = match k.tag {
+                            pallas_primitives::conway::RedeemerTag::Spend => "spend",
+                            pallas_primitives::conway::RedeemerTag::Mint => "mint",
+                            pallas_primitives::conway::RedeemerTag::Cert => "publish",
+                            pallas_primitives::conway::RedeemerTag::Reward => "withdraw",
+                            _ => "other",
+                        };
+                        let measured = node
+                            .iter()
+                            .find(|(p, i, _, _)| p == purpose && *i == u64::from(k.index))
+                            .map(|(_, _, m, c)| (*m, *c));
+                        let short = measured.is_some_and(|(m, c)| m > declared.mem || c > declared.steps);
+                        warn!(
+                            tx_hash = %final_tx.tx_hash_hex,
+                            redeemer = format!("{purpose}#{}", k.index),
+                            declared_mem = declared.mem,
+                            declared_steps = declared.steps,
+                            local_mem = local.map(|e| e.mem),
+                            local_steps = local.map(|e| e.steps),
+                            node_mem = measured.map(|m| m.0),
+                            node_steps = measured.map(|m| m.1),
+                            short,
+                            "submit-fail budget",
+                        );
+                    }
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);

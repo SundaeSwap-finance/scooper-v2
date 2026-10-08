@@ -323,6 +323,44 @@ pub fn evaluate_scoop_tx(
 }
 
 /// Determine which script hash to evaluate and build the ScriptPurpose.
+
+/// Write the V3 ScriptContext this evaluator builds for every redeemer of a
+/// tx to `/tmp/ctx-<tx>-<purpose><index>.cbor`, for diffing against the
+/// context the node builds for the same tx. Returns the paths written.
+#[allow(clippy::too_many_arguments)]
+pub fn dump_script_contexts(
+    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
+    resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    tx_hash: Hash<32>,
+    slot_config: &crate::sundaev4::types::SlotConfig,
+) -> Vec<String> {
+    let redeemer_pairs: Vec<(RedeemersKey, PlutusData)> =
+        redeemers.iter().map(|(k, d, _)| (k.clone(), d.clone())).collect();
+    let mut paths = Vec::new();
+    for (key, redeemer_data, _) in redeemers {
+        let Ok((_, purpose)) = resolve_script_and_purpose(key, tx_body, resolved_inputs) else {
+            continue;
+        };
+        let cbor = script_context::build_script_context(
+            tx_body,
+            &redeemer_pairs,
+            resolved_inputs,
+            resolved_ref_inputs,
+            tx_hash,
+            &purpose,
+            redeemer_data,
+            slot_config,
+        );
+        let path = format!("/tmp/ctx-{}-{:?}{}.cbor", hex::encode(tx_hash), key.tag, key.index);
+        if std::fs::write(&path, &cbor).is_ok() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 pub(crate) fn resolve_script_and_purpose(
     key: &RedeemersKey,
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,

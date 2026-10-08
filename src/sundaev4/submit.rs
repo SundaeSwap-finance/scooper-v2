@@ -123,6 +123,40 @@ async fn submit_ogmios(url: &str, cbor: &[u8]) -> Result<String> {
     }
 }
 
+
+/// Ask an ogmios endpoint to MEASURE a tx's scripts (`evaluateTransaction`)
+/// and return `(purpose, index, mem, steps)` per redeemer. The node's
+/// numbers are the ones a submit is judged against, so after a phase-2
+/// rejection they say which redeemer's declared budget was short.
+/// `Err` when the endpoint is not ogmios or the evaluation itself fails.
+pub async fn evaluate_ogmios(url: &str, cbor: &[u8]) -> Result<Vec<(String, u64, u64, u64)>> {
+    let client = submit_client();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "evaluateTransaction",
+        "params": { "transaction": { "cbor": hex::encode(cbor) } },
+        "id": 1
+    });
+    let resp = client.post(url).json(&body).send().await.context("ogmios evaluate request failed")?;
+    let json: serde_json::Value = resp.json().await.context("ogmios evaluate response not valid JSON")?;
+    let Some(result) = json.get("result").and_then(|r| r.as_array()) else {
+        bail!("ogmios evaluate failed: {}", json.get("error").map(|e| e.to_string()).unwrap_or_default());
+    };
+    Ok(result
+        .iter()
+        .filter_map(|e| {
+            let v = e.get("validator")?;
+            let budget = e.get("budget")?;
+            Some((
+                v.get("purpose")?.as_str()?.to_string(),
+                v.get("index")?.as_u64()?,
+                budget.get("memory")?.as_u64()?,
+                budget.get("cpu")?.as_u64()?,
+            ))
+        })
+        .collect())
+}
+
 /// Encode PlutusV3 cost model parameters as CBOR language views: `{2: [params...]}`.
 pub fn encode_language_views(v3_params: &[i64]) -> Vec<u8> {
     encode_language_views_multi(v3_params, None)
