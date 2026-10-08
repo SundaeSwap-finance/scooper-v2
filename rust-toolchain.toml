@@ -1,0 +1,6 @@
+# amaru-uplc (the evaluator) builds only on the nightly its workspace pins;
+# stable 1.98 fails inside amaru-kernel with E0506. CI, cargo-dist and the
+# Docker image read this file; the Nix dev shell carries its own nightly.
+[toolchain]
+channel = "nightly-2026-09-04"
+components = ["rustfmt", "clippy"]

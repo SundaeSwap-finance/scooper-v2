@@ -47,7 +47,8 @@ thiserror = "2"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-util = "0.7"
-uplc-turbo = { version = "0.1.0", git = "https://github.com/pragma-org/uplc.git", rev = "6152616" }
+uplc-turbo = { package = "amaru-uplc", version = "0.4", git = "https://github.com/pragma-org/amaru.git", rev = "34a453005bcaaf837ee73bd996b99eab8ef92961" }
+amaru-kernel = { git = "https://github.com/pragma-org/amaru.git", rev = "34a453005bcaaf837ee73bd996b99eab8ef92961" }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = [
   "env-filter",

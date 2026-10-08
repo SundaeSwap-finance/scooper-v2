@@ -2132,6 +2132,9 @@ async fn bootstrap_v4(
                 Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
                         input,
+                        address: pallas_addresses::Address::from_bech32(&utxo.address)
+                            .map(|a| a.to_vec())
+                            .unwrap_or_default(),
                         value: utxo.value.clone(),
                         datum,
                         constraint,

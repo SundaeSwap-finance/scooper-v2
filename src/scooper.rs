@@ -990,6 +990,7 @@ impl Scooper {
                     }
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
                         input: order.input.clone(),
+                        address: order.address.clone(),
                         value: order.value.clone(),
                         datum: order.datum.clone(),
                         constraint,
@@ -2203,6 +2204,20 @@ impl Scooper {
         // adding an input shifts the spend redeemer indices, so budgets from a
         // funding-less first pass do not carry over.
         let mut funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> = None;
+        // Budgets the FINAL tx measured above the first pass's declaration.
+        // The first pass is built without budgets or fee, and a script's
+        // cost can move with the values the final build writes (mainnet
+        // 2026-10-08: a deposit's module withdraw +402 mem / +165,208 steps,
+        // 0.05%). With no pad that was an abort. Instead the loop runs once
+        // more declaring the final measurement, which is what the node
+        // charges.
+        let mut redeclared: Option<
+            Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )>,
+        > = None;
+        let mut redeclare_rounds = 0u32;
         let (padded_budgets, final_tx) = loop {
             let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
@@ -2313,6 +2328,26 @@ impl Scooper {
                 }
             };
 
+            // A previous round measured the final tx above these: declare at
+            // least that.
+            let padded_budgets: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = match &redeclared {
+                None => padded_budgets,
+                Some(prev) => padded_budgets
+                    .into_iter()
+                    .map(|(k, eu)| {
+                        let floor = prev.iter().find(|(pk, _)| *pk == k).map(|(_, p)| *p);
+                        let mut eu = eu;
+                        if let Some(f) = floor {
+                            eu.mem = eu.mem.max(f.mem);
+                            eu.steps = eu.steps.max(f.steps);
+                        }
+                        (k, eu)
+                    })
+                    .collect(),
+            };
             // Compute the exact protocol fee from the first-pass size and the
             // evaluated ex_units. The final rebuild changes per-order fee share
             // (and therefore output ADA values), but those values stay in the
@@ -2369,6 +2404,10 @@ impl Scooper {
             // can shift a script's cost. The node rejects any script that runs
             // past its declared budget, and that rejection is indistinguishable
             // from a lost race at submit time.
+            let mut final_raw: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = Vec::new();
             let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &final_tx.tx_body,
                 &final_tx.redeemers,
@@ -2384,6 +2423,7 @@ impl Scooper {
                 Ok(r) => r
                     .budgets
                     .iter()
+                    .inspect(|(k, raw)| final_raw.push((k.clone(), *raw)))
                     .filter_map(|(k, raw)| {
                         let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
                         (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
@@ -2402,10 +2442,32 @@ impl Scooper {
                 }
             };
             if !over_budget.is_empty() {
+                if redeclare_rounds < 2 {
+                    redeclare_rounds += 1;
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        over_budget = ?over_budget,
+                        round = redeclare_rounds,
+                        "final tx measured above the declared budgets; rebuilding with the final measurement declared",
+                    );
+                    let (pad_num, pad_den) = exec.budget_padding;
+                    redeclared = Some(
+                        final_raw
+                            .iter()
+                            .map(|(k, eu)| {
+                                let mut p = *eu;
+                                p.mem = eu.mem * pad_num / pad_den;
+                                p.steps = eu.steps * pad_num / pad_den;
+                                (k.clone(), p)
+                            })
+                            .collect(),
+                    );
+                    continue;
+                }
                 warn!(
                     tx_hash = %final_tx.tx_hash_hex,
                     over_budget = ?over_budget,
-                    "final tx exceeds declared budgets — aborting scoop cycle",
+                    "final tx exceeds declared budgets after re-declaring — aborting scoop cycle",
                 );
                 self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                 return false;

@@ -1199,9 +1199,10 @@ pub struct ScooperExecution {
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
-    /// Budgets are evaluated on the first-pass tx; the final rebuild shifts
-    /// output values (~0.2% on a redeemer) and uplc-turbo's step accounting
-    /// differs from cardano-node's (~0.04%). Default: (21, 20), 5%.
+    /// Default: (1, 1), no padding. The declared budget is what our
+    /// evaluator measures, and the evaluator matches the node to the unit
+    /// (amaru-uplc main; the previous revision priced divideInteger short).
+    /// Every padded unit is fee the protocol pays for nothing.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
     /// Pool idents (hex) to exclude from scooping; see
@@ -1265,7 +1266,7 @@ fn default_max_tx_size() -> usize {
     16_384
 }
 pub(crate) fn default_budget_padding() -> (u64, u64) {
-    (21, 20)
+    (1, 1)
 }
 
 impl ScooperExecution {
@@ -1438,6 +1439,15 @@ impl PartialOrd for SundaeV4Pool {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV4Order {
     pub input: TransactionInput,
+    /// The order UTxO's address as the chain holds it, stake part included.
+    /// The ScriptContext we evaluate against carries this for the order
+    /// input, and scripts compare it with `equalsData` (fee_lib: the
+    /// fulfilment output's address against the order's). A rebuilt
+    /// script-only address lost the stake part — 16 memory units of Data
+    /// per comparison, 436,464 steps of cpu the node charged and we did
+    /// not (preview, 2026-10-08). Empty only for test and provisional
+    /// orders, where the resolver falls back to the script address.
+    pub address: Vec<u8>,
     pub value: Value,
     pub datum: OrderDatum,
     /// Decoded constraint, computed once at index time so consumers don't re-parse.
@@ -1518,6 +1528,7 @@ impl SundaeV4Order {
             .expect("test_swap_order: constraint should decode");
         SundaeV4Order {
             input,
+            address: Vec::new(),
             value,
             datum,
             constraint,
