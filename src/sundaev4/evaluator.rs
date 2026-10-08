@@ -156,6 +156,7 @@ pub struct FailedScriptContext {
 const PROTOCOL_VERSION: amaru_kernel::cardano::protocol_version::ProtocolVersion =
     amaru_kernel::cardano::protocol_version::PROTOCOL_VERSION_11;
 
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
