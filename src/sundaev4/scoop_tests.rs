@@ -625,11 +625,28 @@ mod tests {
         pool_map
     }
 
-    fn branch_first_pool_bytes(blend: &crate::sundaev4::router::BlendedRoute) -> Vec<u8> {
-        blend.branches.iter().map(|b| b.hops[0].splits[0].pool.ident.to_bytes()[0]).collect()
+    /// The route the router picks for `order` on `pool_map`, with no routing limits.
+    fn route_for(
+        pool_map: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        order: &crate::sundaev4::types::SundaeV4Order,
+    ) -> Option<crate::sundaev4::router::BlendedRoute> {
+        use crate::sundaev4::router;
+        let (input, amount) = order.swap_offered();
+        let (output, _) = order.swap_min_received();
+        router::find_blended_route(
+            pool_map,
+            &[],
+            input,
+            output,
+            amount,
+            router::RoutingLimits::unlimited(),
+        )
     }
 
-    fn assert_blend_fills(
+    fn assert_route_fills_order(
         env: &TestEnv,
         pool_map: &std::collections::BTreeMap<
             crate::sundaev3::Ident,
@@ -680,19 +697,9 @@ mod tests {
             .is_none(),
             "fixture: no single path may absorb the whole order"
         );
-        let blend = router::find_blended_route(
-            &pool_map,
-            &[],
-            &token_a(),
-            &token_b(),
-            order.swap_offered().1,
-            limits,
-        )
-        .expect("the two capped paths together can fill the order");
-        let mut firsts = branch_first_pool_bytes(&blend);
-        firsts.sort();
-        assert_eq!(firsts, vec![0x21, 0x22], "must use both paths");
-        assert_blend_fills(&env, &pool_map, &order, &blend);
+        let route_through_both_paths =
+            route_for(&pool_map, &order).expect("the two capped paths together can fill the order");
+        assert_route_fills_order(&env, &pool_map, &order, &route_through_both_paths);
     }
 
     /// The direct band can take the whole order, the A→E→Z path (~30G of Z)
@@ -716,31 +723,218 @@ mod tests {
             limits,
         )
         .expect("the direct band can absorb the order alone");
-        let blend = router::find_blended_route(
-            &pool_map,
-            &[],
-            &token_a(),
-            &token_b(),
-            order.swap_offered().1,
-            limits,
-        )
-        .expect("route exists");
+        let route_through_both_paths = route_for(&pool_map, &order).expect("route exists");
         assert!(
-            blend.total_output >= single.total_output,
-            "blend never worse than single"
-        );
-        let mut firsts = branch_first_pool_bytes(&blend);
-        firsts.sort();
-        assert_eq!(
-            firsts,
-            vec![0x21, 0x22],
-            "capped path must join as a partial branch"
-        );
-        assert!(
-            blend.total_output > single.total_output,
+            route_through_both_paths.total_output > single.total_output,
             "partial branch must improve output"
         );
-        assert_blend_fills(&env, &pool_map, &order, &blend);
+        assert_route_fills_order(&env, &pool_map, &order, &route_through_both_paths);
+    }
+
+    /// A pool ident byte that, like the byte after it, no pool of `pool_map`
+    /// uses yet: path helpers name their pools with it, so tests don't have to.
+    fn next_pool_id(
+        pool_map: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+    ) -> u8 {
+        0x80 + u8::try_from(pool_map.len()).expect("fewer than 127 pools")
+    }
+
+    /// A deep `from`→`via`→`to` path through constant-product pools that
+    /// absorbs any order, but at a poor rate: via/to is priced at 1 `via` for
+    /// 0.03 `to`, so the path pays out ~3 % of its input.
+    fn add_poor_full_path(
+        env: &TestEnv,
+        pool_map: &mut std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        from: crate::cardano_types::AssetClass,
+        via: crate::cardano_types::AssetClass,
+        to: crate::cardano_types::AssetClass,
+    ) {
+        let deep = 1_000_000_000_000_000i64;
+        let id = next_pool_id(pool_map);
+        for p in [
+            make_pool(env, id, from, deep, via.clone(), deep),
+            make_pool(env, id + 1, via, deep, to, deep / 100 * 3),
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+    }
+
+    /// Two paths share their last pool, E/Z, so a blend can use only one:
+    /// - A→E→Z is partial (it cannot absorb the whole order) but cheap;
+    /// - A→F→E→Z is full (it can absorb the whole order) but expensive.
+    ///
+    /// Adding A→F→E→Z to the market must not make the trade worse.
+    #[test]
+    fn poor_full_path_does_not_evict_better_partial_path() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = two_capped_cl_paths(&env, 200_000_000_000, 30_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+
+        let trade_without_poor_path = route_for(&pool_map, &order).expect("route exists");
+        add_poor_full_path(&env, &mut pool_map, token_a(), token_f(), token_e());
+        let trade_with_poor_path = route_for(&pool_map, &order).expect("route exists");
+
+        assert!(
+            trade_with_poor_path.total_output >= trade_without_poor_path.total_output,
+            "an expensive path must not make the trade worse: {} < {}",
+            trade_with_poor_path.total_output,
+            trade_without_poor_path.total_output
+        );
+        assert_route_fills_order(&env, &pool_map, &order, &trade_with_poor_path);
+    }
+
+    /// A blend has at most 4 branches. The direct band and three full but
+    /// expensive A→Gᵢ→Z paths could fill them all, leaving no slot for the
+    /// partial but cheap A→E→Z path. Adding the A→Gᵢ→Z paths to the market
+    /// must not make the trade worse.
+    #[test]
+    fn poor_full_paths_do_not_take_every_branch_slot() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = two_capped_cl_paths(&env, 200_000_000_000, 30_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+
+        let trade_without_poor_paths = route_for(&pool_map, &order).expect("route exists");
+        for i in 0..3u8 {
+            let g = token(0x11 + i, 0x12 + i);
+            add_poor_full_path(&env, &mut pool_map, token_a(), g, token_b());
+        }
+        let trade_with_poor_paths = route_for(&pool_map, &order).expect("route exists");
+
+        assert!(
+            trade_with_poor_paths.total_output >= trade_without_poor_paths.total_output,
+            "expensive paths must not make the trade worse: {} < {}",
+            trade_with_poor_paths.total_output,
+            trade_without_poor_paths.total_output
+        );
+        assert_route_fills_order(&env, &pool_map, &order, &trade_with_poor_paths);
+    }
+
+    /// A `from`→`via`→`to` path through two CL bands, priced in the buyer's
+    /// favour (via/to sits at the top of its band): cheaper than the market,
+    /// but it cannot deliver more than about `capacity` of `to`.
+    fn add_cheap_capped_path(
+        env: &TestEnv,
+        pool_map: &mut std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        from: crate::cardano_types::AssetClass,
+        via: crate::cardano_types::AssetClass,
+        to: crate::cardano_types::AssetClass,
+        capacity: i64,
+    ) {
+        let id = next_pool_id(pool_map);
+        for p in [
+            on_curve_cl_pool(env, id, from, capacity, via.clone(), capacity),
+            on_curve_cl_pool(env, id + 1, via, capacity / 25, to, capacity),
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+    }
+
+    /// A blend has at most 4 branches. Four A→Hᵢ→Z paths are cheaper than the
+    /// direct band, but even together (4 × 5G) they cannot absorb the 100G
+    /// order. If they take every branch slot, the direct band, the only path
+    /// that can absorb the order, is left out. Adding the A→Hᵢ→Z paths to the
+    /// market must improve the trade.
+    #[test]
+    fn cheap_shallow_paths_do_not_crowd_out_the_full_path() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = two_capped_cl_paths(&env, 200_000_000_000, 30_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+
+        let trade_without_shallow_paths = route_for(&pool_map, &order).expect("route exists");
+
+        for i in 0..4u8 {
+            let h = token(0x41 + i, 0x42 + i);
+            add_cheap_capped_path(&env, &mut pool_map, token_a(), h, token_b(), 5_000_000_000);
+        }
+        let trade_with_shallow_paths = route_for(&pool_map, &order).expect("route exists");
+
+        assert!(
+            trade_with_shallow_paths.total_output > trade_without_shallow_paths.total_output,
+            "cheap paths must improve the trade: {} <= {}",
+            trade_with_shallow_paths.total_output,
+            trade_without_shallow_paths.total_output
+        );
+        assert_route_fills_order(&env, &pool_map, &order, &trade_with_shallow_paths);
+    }
+
+    /// Four A→Hᵢ→Z paths are cheap, and each is too small for the 100G order,
+    /// but together (4 × 30G) they can absorb it. A→G→Z is the only
+    /// path that can absorb the whole order alone, but it is expensive.
+    /// Adding A→G→Z to the market must not make the trade worse: the router
+    /// must keep the four cheap paths rather than fall back on A→G→Z.
+    #[test]
+    fn expensive_full_path_does_not_displace_cheap_partial_paths() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = std::collections::BTreeMap::new();
+        for i in 0..4u8 {
+            let h = token(0x61 + i, 0x62 + i);
+            add_cheap_capped_path(&env, &mut pool_map, token_a(), h, token_b(), 30_000_000_000);
+        }
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+
+        let trade_without_expensive_path =
+            route_for(&pool_map, &order).expect("the four cheap paths together can fill the order");
+        let g = token(0x91, 0x92);
+        add_poor_full_path(&env, &mut pool_map, token_a(), g, token_b());
+        let trade_with_expensive_path = route_for(&pool_map, &order).expect("route exists");
+
+        assert!(
+            trade_with_expensive_path.total_output >= trade_without_expensive_path.total_output,
+            "an expensive path must not make the trade worse: {} < {}",
+            trade_with_expensive_path.total_output,
+            trade_without_expensive_path.total_output
+        );
+        assert_route_fills_order(&env, &pool_map, &order, &trade_with_expensive_path);
+    }
+
+    /// A→E→F→Z, through deep constant-product pools, is the only path that can
+    /// absorb the whole order. Four cheap paths, A→E→Z and three A→Hᵢ→Z, each
+    /// capped at 5G, lack the depth for the 100G order together. A→E→Z shares
+    /// the A→E hop with A→E→F→Z: two branches through it would each count its
+    /// depth, and the route would announce more than it delivers. The route
+    /// must deliver the output it announces.
+    #[test]
+    fn route_delivers_its_announced_output() {
+        use num_traits::ToPrimitive;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let mut pool_map = std::collections::BTreeMap::new();
+        let deep = 1_000_000_000_000i64;
+        for (x, y) in [
+            (token_a(), token_e()),
+            (token_e(), token_f()),
+            (token_f(), token_b()),
+        ] {
+            let p = make_pool(&env, next_pool_id(&pool_map), x, deep, y, deep);
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+        add_cheap_capped_path(
+            &env,
+            &mut pool_map,
+            token_a(),
+            token_e(),
+            token_b(),
+            5_000_000_000,
+        );
+        for i in 0..3u8 {
+            let h = token(0x41 + i, 0x42 + i);
+            add_cheap_capped_path(&env, &mut pool_map, token_a(), h, token_b(), 5_000_000_000);
+        }
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+
+        let route = route_for(&pool_map, &order).expect("A→E→F→Z can fill the order");
+        let announced = route.total_output.clone().unwrap().to_i64().expect("output fits i64");
+        let order_for_announced = make_order(token_a(), 100_000_000_000, token_b(), announced, 1);
+
+        assert_route_fills_order(&env, &pool_map, &order_for_announced, &route);
     }
 
     use proptest::prelude::*;
