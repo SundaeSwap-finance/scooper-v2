@@ -8,12 +8,15 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis_common = { version = "0.3.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
+# acropolis fork, branch `leios-musashi`: upstream 2c0a32c + pallas 1.x migration
+# (same pallas fork as below) + Era::try_from era >= 6 → Conway stopgap, so that
+# chain-sync survives Dijkstra-era blocks.
+acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
 anyhow = "1"
 bech32 = "0.11"
 async-trait = "0.1"
@@ -89,6 +92,10 @@ tokio = { version = "1.46.1", features = ["full", "test-util"] }
 # one PlutusData type in the build.
 [patch.crates-io]
 pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+# pallas-utxorpc (pulled in by acropolis through `pallas`) needs the Dijkstra
+# fields of SundaeSwap's utxorpc-spec fork; the pallas workspace patches it the
+# same way, and [patch] does not propagate to dependents (dolos repeats it too).
+utxorpc-spec = { git = "https://github.com/SundaeSwap-finance/utxorpc-spec", rev = "f2d528e6d05d1a2fe82bcf241fc72c45b342fa71" }
 
 # The profile that 'dist' will build with
 [profile.dist]
