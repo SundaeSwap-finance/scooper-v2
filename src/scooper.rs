@@ -93,6 +93,14 @@ pub struct Scooper {
     /// (tx hash, consecutive node-reject count) — a tx rejected repeatedly
     /// is structurally stuck, not transiently contested.
     last_node_reject: Option<(String, u32)>,
+    /// Stableswap pools guarded against a stale keeper-maintained rate;
+    /// see [`crate::sundaev4::rate_guard`]. Resolved once from config.
+    v4_rate_guards: Vec<crate::sundaev4::rate_guard::RateGuard>,
+    /// Pools the guards withheld in the previous cycle, so a block is
+    /// logged when it starts and when it clears rather than every cycle.
+    rate_guard_blocked: BTreeSet<crate::sundaev3::Ident>,
+    /// Last time each blocked pool was reported, for a periodic reminder.
+    rate_guard_last_warn: BTreeMap<crate::sundaev3::Ident, std::time::Instant>,
 }
 
 /// Where a node-rejected tx is kept for offline re-evaluation, and how many
@@ -160,6 +168,22 @@ impl Scooper {
         }
         let v4_butane =
             v4_execution.as_ref().and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
+        // A guard that does not resolve is a config error, and the pool it
+        // meant to protect would run unguarded: refuse to start instead.
+        let mut v4_rate_guards = Vec::new();
+        if let Some(exec) = &v4_execution {
+            for cfg in &exec.rate_guards {
+                let guard = crate::sundaev4::rate_guard::RateGuard::resolve(cfg)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                info!(
+                    pool = %guard.pool,
+                    vault = %guard.vault_address_bech32,
+                    refuse_at = guard.refuse_at,
+                    "v4: rate guard armed"
+                );
+                v4_rate_guards.push(guard);
+            }
+        }
         Ok(Self {
             event_rx,
             v3_state,
@@ -182,7 +206,68 @@ impl Scooper {
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
             access_config_logged: false,
+            v4_rate_guards,
+            rate_guard_blocked: BTreeSet::new(),
+            rate_guard_last_warn: BTreeMap::new(),
         })
+    }
+
+    /// Judge every rate guard against the current state and return the
+    /// pools to withhold this cycle. Exports the verdicts and logs a block
+    /// when it starts, every five minutes while it lasts, and when it
+    /// clears.
+    fn apply_rate_guards(
+        &mut self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+    ) -> BTreeSet<crate::sundaev3::Ident> {
+        if self.v4_rate_guards.is_empty() {
+            return BTreeSet::new();
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut blocked = BTreeSet::new();
+        let mut samples = Vec::with_capacity(self.v4_rate_guards.len());
+        const REMIND_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+        // Cloned so the loop can write the reminder map; a handful of guards.
+        let guards = self.v4_rate_guards.clone();
+        for guard in &guards {
+            let verdict = crate::sundaev4::rate_guard::evaluate(
+                guard,
+                v4_state.pools.get(&guard.pool).map(|p| p.as_ref()),
+                &v4_state.vault_utxos,
+                now_ms,
+            );
+            samples.push(crate::metrics::RateGuardSample {
+                pool: verdict.pool.to_string(),
+                drift_bp: verdict.drift_bp,
+                refuse_bp: verdict.refuse_bp,
+                blocked: verdict.blocked,
+            });
+            let was_blocked = self.rate_guard_blocked.contains(&verdict.pool);
+            if verdict.blocked {
+                blocked.insert(verdict.pool.clone());
+                let remind = self
+                    .rate_guard_last_warn
+                    .get(&verdict.pool)
+                    .map(|t| t.elapsed() >= REMIND_EVERY)
+                    .unwrap_or(true);
+                if !was_blocked || remind {
+                    warn!("v4: rate guard withholds {verdict}; orders on this pool wait");
+                    self.rate_guard_last_warn
+                        .insert(verdict.pool.clone(), std::time::Instant::now());
+                }
+            } else if was_blocked {
+                info!("v4: rate guard clears {verdict}");
+                self.rate_guard_last_warn.remove(&verdict.pool);
+            } else {
+                trace!("v4: rate guard holds {verdict}");
+            }
+        }
+        self.rate_guard_blocked = blocked.clone();
+        self.metrics.update_rate_guards(samples);
+        blocked
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) {
@@ -694,6 +779,10 @@ impl Scooper {
             crate::sundaev4::access::log_blacklist(&exec.blacklisted_pools, &v4_state.pools);
             self.access_config_logged = true;
         }
+
+        // Judged up front, before anything below borrows the scooper: the
+        // verdicts only need the state snapshot.
+        let rate_guarded = self.apply_rate_guards(&v4_state);
 
         // The network tip (actual chain tip, falling back to the last block we
         // processed) anchors the validity interval's *start*; wall clock
@@ -1265,10 +1354,13 @@ impl Scooper {
         // prediction when it IS the tip (it spends our latest predicted
         // output — someone chained on us) or when we have no chain.
         let mut foreign_pool_parent: BTreeMap<crate::sundaev3::Ident, Vec<u8>> = BTreeMap::new();
+        // Pools whose keeper-maintained rate is stale, or whose vault cannot
+        // be read, are withheld like a blacklisted pool: their orders wait.
         let pools_filtered: std::collections::BTreeMap<_, _> = v4_state
             .pools
             .iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
+            .filter(|(ident, _)| !rate_guarded.contains(ident))
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);

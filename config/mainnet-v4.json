@@ -23,6 +23,16 @@
         "max-tx-ex-mem": 16500000,
         "cost-per-pool-lovelace": 1000000,
         "cost-per-step-lovelace": 500000,
+        "rate-guards": [
+          {
+            "pool": "10aceb43bb0127e40b4696bb0e06174c830bec3f7ee6063b1d104546",
+            "vault-address": "addr1wyh04daelcpkgahkuz2ld885w2y3wa27r7w82gzdeagsazgtwduhf",
+            "backing-asset": "7d9e4a0ee1a3f5d5ff8159ea91a83310cf2795ee7a87170c7aea05ae.55534472",
+            "share-asset-index": 1,
+            "base-asset-index": 0,
+            "refuse-at": 1.0
+          }
+        ],
         "submit-url": "https://cardano-mainnet.blockfrost.io/api/v0/tx/submit?project_id=REPLACE_WITH_YOUR_MAINNET_BLOCKFROST_PROJECT_ID",
         "fee": [
           25,

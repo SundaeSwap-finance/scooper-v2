@@ -58,6 +58,11 @@ pub struct SundaeV4State {
     /// `None` until the upstream node reports it (Dolos may not always provide this).
     pub network_tip_slot: Option<u64>,
     pub wallet_utxos: BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::Value>,
+    /// UTxOs at the vault addresses the rate guards name (see
+    /// [`crate::sundaev4::rate_guard`]): the backing and the datum a
+    /// guarded pool's true rate derives from. Tracked by payment credential.
+    pub vault_utxos:
+        BTreeMap<crate::cardano_types::TransactionInput, crate::sundaev4::rate_guard::VaultUtxo>,
     pub ref_utxo_outputs:
         BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub scoop_stats: ScoopStats,
@@ -95,6 +100,8 @@ pub struct SundaeV4Indexer {
     rollback_limit: u64,
     dao: Box<dyn IndexerDao>,
     scooper_keyhash: Option<pallas_primitives::Hash<28>>,
+    /// Payment credentials of the rate guards' vaults.
+    vault_payment_hashes: Vec<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
     tip_event_counter: u64,
     /// The slot of the latest block loaded from DB. Blocks at or before this
@@ -145,6 +152,27 @@ impl SundaeV4Indexer {
             .as_ref()
             .map(|exec| module_ref_utxos(&exec.module_scripts))
             .unwrap_or_default();
+        // A guard that does not resolve is reported here and enforced in the
+        // scooper, which blocks the pool it names; the indexer only needs the
+        // vaults it can track.
+        let vault_payment_hashes = protocol
+            .execution
+            .as_ref()
+            .map(|exec| {
+                exec.rate_guards
+                    .iter()
+                    .filter_map(
+                        |cfg| match crate::sundaev4::rate_guard::RateGuard::resolve(cfg) {
+                            Ok(guard) => Some(guard.vault_payment_hash),
+                            Err(e) => {
+                                warn!("v4: {e}");
+                                None
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Self {
             state,
             event_tx,
@@ -152,6 +180,7 @@ impl SundaeV4Indexer {
             rollback_limit,
             dao,
             scooper_keyhash,
+            vault_payment_hashes,
             ref_utxo_inputs,
             tip_event_counter: 0,
             loaded_slot: 0,
@@ -494,6 +523,17 @@ impl SundaeV4Indexer {
                 }
                 "wallet" => {
                     state.wallet_utxos.insert(txo.txo_id, output.value);
+                }
+                "vault" => {
+                    let datum = output.datum.parse(&datums);
+                    state.vault_utxos.insert(
+                        txo.txo_id,
+                        crate::sundaev4::rate_guard::VaultUtxo {
+                            address: output.address.to_vec(),
+                            value: output.value,
+                            datum,
+                        },
+                    );
                 }
                 "ref" => {
                     state.ref_utxo_outputs.insert(txo.txo_id, output);
@@ -1538,6 +1578,34 @@ impl ChainIndex for SundaeV4Indexer {
                 state.wallet_utxos.insert(this_input, tx_out.value);
             }
 
+            // Track the rate guards' vault UTxOs: the backing asset and the
+            // datum a guarded pool's true rate derives from. Matched by
+            // payment credential like the wallet, so the vault's stake part
+            // is irrelevant.
+            if self.vault_payment_hashes.iter().any(|hash| payment_hash_equals(&address, hash)) {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                let datum = tx_out.datum.parse(&datums);
+                trace!(slot, utxo = %this_input, has_datum = datum.is_some(), "v4: vault UTxO spotted");
+                changes.created_txos.push(PersistedTxo {
+                    txo_id: this_input.clone(),
+                    txo_type: "vault".to_string(),
+                    created_slot: slot,
+                    era: output.era().into(),
+                    txo: output.encode(),
+                    address: tx_out.address.to_vec(),
+                    datum: tx_out.hashed_datum(&datums),
+                });
+                state.vault_utxos.insert(
+                    this_input,
+                    crate::sundaev4::rate_guard::VaultUtxo {
+                        address: tx_out.address.to_vec(),
+                        value: tx_out.value,
+                        datum,
+                    },
+                );
+            }
+
             // Track reference UTxO outputs (for ScriptContext building)
             {
                 let this_input = TransactionInput::new(this_tx_hash, ix as u64);
@@ -1565,9 +1633,16 @@ impl ChainIndex for SundaeV4Indexer {
             .collect::<Vec<_>>();
         spent_inputs.sort();
 
-        // Remove spent wallet UTxOs
+        // Remove spent wallet and vault UTxOs
         for input in &spent_inputs {
             if state.wallet_utxos.remove(input).is_some() {
+                changes.spent_txos.push(SpentTxo {
+                    input: input.clone(),
+                    spending_tx_id: this_tx_hash.to_vec(),
+                });
+            }
+            if state.vault_utxos.remove(input).is_some() {
+                trace!(slot, utxo = %input, "v4: vault UTxO spent");
                 changes.spent_txos.push(SpentTxo {
                     input: input.clone(),
                     spending_tx_id: this_tx_hash.to_vec(),

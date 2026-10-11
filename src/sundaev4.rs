@@ -8,6 +8,7 @@ pub mod conversions;
 pub mod evaluator;
 mod indexer;
 pub mod intents;
+pub mod rate_guard;
 pub mod router;
 pub mod script_context;
 pub mod ss_math;

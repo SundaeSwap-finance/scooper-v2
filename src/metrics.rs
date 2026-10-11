@@ -176,6 +176,20 @@ pub struct Metrics {
     start_instant: Instant,
     in_flight_snapshot: std::sync::Mutex<InFlightSnapshot>,
     quarantine_snapshot: std::sync::Mutex<QuarantineSnapshot>,
+    /// The rate guards' latest verdicts, one per guarded pool, refreshed
+    /// each batch cycle. See [`crate::sundaev4::rate_guard`].
+    rate_guards: std::sync::Mutex<Vec<RateGuardSample>>,
+}
+
+/// One rate guard's reading, as exported.
+#[derive(Clone, Debug)]
+pub struct RateGuardSample {
+    /// Pool ident, hex.
+    pub pool: String,
+    /// None when the rate could not be derived.
+    pub drift_bp: Option<f64>,
+    pub refuse_bp: f64,
+    pub blocked: bool,
 }
 
 const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
@@ -259,6 +273,7 @@ impl Metrics {
             start_instant: Instant::now(),
             in_flight_snapshot: std::sync::Mutex::new(InFlightSnapshot::default()),
             quarantine_snapshot: std::sync::Mutex::new(QuarantineSnapshot::default()),
+            rate_guards: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -353,6 +368,16 @@ impl Metrics {
     }
 }
 
+impl Metrics {
+    pub fn update_rate_guards(&self, samples: Vec<RateGuardSample>) {
+        *self.rate_guards.lock().unwrap() = samples;
+    }
+
+    pub fn rate_guards_snapshot(&self) -> Vec<RateGuardSample> {
+        self.rate_guards.lock().unwrap().clone()
+    }
+}
+
 fn write_gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} gauge");
@@ -410,6 +435,66 @@ pub async fn render_metrics(
             "Slots between our last processed block and the network tip",
             sync_lag,
         );
+
+        // Rate guards: one sample per guarded pool. `blocked` is the alarm
+        // target; `drift_bp` shows how close a live keeper is running to
+        // its line. A pool whose rate could not be derived reports blocked
+        // with `readable` 0, which is a vault or indexing problem rather
+        // than a keeper problem.
+        let guards = metrics.rate_guards_snapshot();
+        if !guards.is_empty() {
+            let _ = writeln!(
+                out,
+                "# HELP scooper_v4_rate_guard_blocked 1 while the rate guard withholds the pool from scooping"
+            );
+            let _ = writeln!(out, "# TYPE scooper_v4_rate_guard_blocked gauge");
+            for g in &guards {
+                let _ = writeln!(
+                    out,
+                    "scooper_v4_rate_guard_blocked{{pool=\"{}\"}} {}",
+                    g.pool, g.blocked as u8
+                );
+            }
+            let _ = writeln!(
+                out,
+                "# HELP scooper_v4_rate_guard_readable 1 when the vault could be read and a drift computed"
+            );
+            let _ = writeln!(out, "# TYPE scooper_v4_rate_guard_readable gauge");
+            for g in &guards {
+                let _ = writeln!(
+                    out,
+                    "scooper_v4_rate_guard_readable{{pool=\"{}\"}} {}",
+                    g.pool,
+                    g.drift_bp.is_some() as u8
+                );
+            }
+            let _ = writeln!(
+                out,
+                "# HELP scooper_v4_rate_guard_drift_bp True rate over on-chain rate minus one, in basis points"
+            );
+            let _ = writeln!(out, "# TYPE scooper_v4_rate_guard_drift_bp gauge");
+            for g in &guards {
+                if let Some(d) = g.drift_bp {
+                    let _ = writeln!(
+                        out,
+                        "scooper_v4_rate_guard_drift_bp{{pool=\"{}\"}} {d:.4}",
+                        g.pool
+                    );
+                }
+            }
+            let _ = writeln!(
+                out,
+                "# HELP scooper_v4_rate_guard_refuse_bp The drift at which the guard withholds the pool, in basis points"
+            );
+            let _ = writeln!(out, "# TYPE scooper_v4_rate_guard_refuse_bp gauge");
+            for g in &guards {
+                let _ = writeln!(
+                    out,
+                    "scooper_v4_rate_guard_refuse_bp{{pool=\"{}\"}} {:.4}",
+                    g.pool, g.refuse_bp
+                );
+            }
+        }
 
         let sync_pct = if network_tip > 0 {
             state.tip_slot as f64 / network_tip as f64 * 100.0
