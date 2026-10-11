@@ -122,6 +122,27 @@ mod tests {
     /// on a host that also runs a node for another network, a peer that refuses
     /// the handshake on a network-magic mismatch. `config/default.json` turns it
     /// off; this test keeps it off for every environment config.
+    /// The mainnet config guards the USDr/sUSDr stableswap pool against a
+    /// stale keeper-maintained rate. The guard must resolve, or the scooper
+    /// refuses to start, so a typo here is caught by the suite rather than
+    /// by a deploy.
+    #[test]
+    fn mainnet_rate_guard_resolves() {
+        let config = load_config(["config/mainnet-v4.json"]).expect("config loads");
+        let exec = config.protocol.v4.expect("v4").execution.expect("execution");
+        assert_eq!(exec.rate_guards.len(), 1);
+        let guard = crate::sundaev4::rate_guard::RateGuard::resolve(&exec.rate_guards[0])
+            .expect("the mainnet guard resolves");
+        assert_eq!(
+            guard.pool.to_string(),
+            "10aceb43bb0127e40b4696bb0e06174c830bec3f7ee6063b1d104546"
+        );
+        assert_eq!(guard.share_asset_index, 1);
+        assert_eq!(guard.base_asset_index, 0);
+        assert_eq!(guard.refuse_at, 1.0);
+        assert_eq!(hex::encode(&guard.backing.token), "55534472");
+    }
+
     #[test]
     fn peer_sharing_is_disabled_for_every_environment() {
         for file in [
