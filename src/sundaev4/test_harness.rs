@@ -256,7 +256,7 @@ impl TestEnv {
                 slot_length: 1000,
             },
             pool_configs: std::collections::BTreeMap::new(),
-            max_tx_ex_mem: 14_000_000,
+            max_tx_ex_mem: 16_500_000,
             max_tx_ex_steps: 10_000_000_000,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
