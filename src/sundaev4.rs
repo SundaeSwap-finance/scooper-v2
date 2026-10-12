@@ -21,9 +21,9 @@ pub use types::*;
 
 #[cfg(test)]
 mod scoop_tests;
-// Not actually dead: feature `route-bench` uses it. But features are
+// Not actually dead: feature `bench` uses it. But features are
 // crate-wide, so the scooper binary compiles it too, never calls it,
 // and would trip `clippy --all-features -D warnings` in CI.
-#[cfg(any(test, feature = "route-bench"))]
+#[cfg(any(test, feature = "bench"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod test_harness;

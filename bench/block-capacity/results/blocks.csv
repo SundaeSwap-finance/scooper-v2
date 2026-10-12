@@ -1,0 +1,7 @@
+block,bytes,mem,steps,full_blocks,orders_mean,orders_median,orders_min,orders_max,scoops_mean,limited_by
+RB,90112,72000000,20000000000,885,22.6,22,15,33,3.2,"block script CPU steps"
+EB,750000,437500000,125000000000,118,168.9,169,155,182,23.9,"block script CPU steps"
+EB,1500000,875000000,250000000000,58,340.9,340,329,363,48.3,"block script CPU steps"
+EB,3000000,1750000000,500000000000,29,684.8,685,667,703,97.1,"block script CPU steps"
+EB,6000000,3500000000,1000000000000,14,1374.9,1379,1354,1397,194.7,"block script CPU steps"
+EB,12000000,7000000000,2000000000000,7,2754.1,2754,2730,2786,390.0,"block script CPU steps"

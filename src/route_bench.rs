@@ -1,4 +1,4 @@
-//! Crate root of the `route-bench` example (feature `route-bench`), the
+//! Crate root of the `route-bench` example (feature `bench`), the
 //! route-quality benchmark in `bench/route-quality/`.
 //!
 //! The scooper is a binary-only crate (no `lib.rs`), so the benchmark cannot
@@ -9,7 +9,7 @@
 //! sync. CI's `cargo clippy --all-targets --all-features` builds this target,
 //! so a missing module shows up there.
 //!
-//!   cargo run --release --features route-bench --example route-bench -- --help
+//!   cargo run --release --features bench --example route-bench -- --help
 
 // Everything only `main.rs` uses is dead code here.
 #![allow(dead_code)]
@@ -32,6 +32,9 @@ mod scooper;
 mod server;
 mod sundaev3;
 mod sundaev4;
+
+#[path = "../bench/common/bench_common.rs"]
+mod bench_common;
 
 #[path = "../bench/route-quality/route_quality.rs"]
 mod route_quality;
