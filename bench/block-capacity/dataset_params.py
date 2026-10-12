@@ -60,7 +60,7 @@ OUT = HERE / "data" / "dataset-params.json"
 MARKETS = HERE.parent / "cache" / "float-markets.json"
 LIVE_SHARE = 0.02
 # One order alone in a sundae-v4 scoop fits ~4 pool legs under mainnet's per-tx limits
-# (14M mem / 10G steps, steps bind: see bench/route-quality). An order touching more pools
+# (16.5M mem / 10G steps, steps bind: see bench/route-quality). An order touching more pools
 # could never execute and the scooper would quarantine it; the bench measures block
 # capacity, not the scooper, so such orders are capped: they keep their first 4 pools.
 MAX_POOLS_PER_ORDER = 4
