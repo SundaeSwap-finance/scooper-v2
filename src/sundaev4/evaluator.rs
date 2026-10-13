@@ -299,8 +299,16 @@ pub fn evaluate_scoop_tx(
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
                 }
+                // The traces name the failing check when the validator kept
+                // them (Indigo's orderbook does); carry them in the error so
+                // tests and operators see the reason, not just the fact.
+                let traces = if result.info.logs.is_empty() {
+                    String::new()
+                } else {
+                    format!("; traces: {:?}", result.info.logs)
+                };
                 let err_msg = format!(
-                    "script {} ({:?}[{}]) evaluation failed: {e:?}",
+                    "script {} ({:?}[{}]) evaluation failed: {e:?}{traces}",
                     hex::encode(script_hash),
                     key.tag,
                     key.index,
