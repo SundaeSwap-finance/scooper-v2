@@ -35,6 +35,9 @@ pallas-crypto = "0.34"
 pallas-primitives = "0.34"
 pallas-network = "0.34"
 pallas-traverse = "0.34"
+# Only for feature `bench` (queue generation of the block-capacity bench).
+rand = { version = "0.9", optional = true }
+rand_distr = { version = "0.5", optional = true }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 rustls-pemfile = "2"
 url = "2"
@@ -63,14 +66,20 @@ path = "src/router_bench.rs"
 harness = false
 
 [features]
-# Route-quality benchmark (bench/route-quality/README.md). Not part of the
-# scooper: only builds the `route-bench` example.
-route-bench = []
+# Benchmarks in bench/: route quality (`route-bench` example,
+# bench/route-quality/README.md) and block capacity (`block-bench` example). Not part of the
+# scooper: only builds those examples.
+bench = ["dep:rand", "dep:rand_distr"]
 
 [[example]]
 name = "route-bench"
 path = "src/route_bench.rs"
-required-features = ["route-bench"]
+required-features = ["bench"]
+
+[[example]]
+name = "block-bench"
+path = "src/block_bench.rs"
+required-features = ["bench"]
 
 [dev-dependencies]
 criterion = "0.8"

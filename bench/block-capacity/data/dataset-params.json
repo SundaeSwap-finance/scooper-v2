@@ -1,0 +1,22 @@
+{
+  "source": {
+    "tape": "tape.csv",
+    "txs": 159426,
+    "arbitrage_txs_dropped": 593,
+    "orders": 165815,
+    "pools": 1380,
+    "live_share": 0.02,
+    "max_pools_per_order": 4
+  },
+  "pools_per_order": {
+    "1": 0.9408557730000302,
+    "2": 0.04275246509664385,
+    "3": 0.013852787745378885,
+    "4": 0.0025389741579471096
+  },
+  "pool_reuse_distance": {
+    "median": 25,
+    "p25": 7,
+    "p75": 104
+  }
+}

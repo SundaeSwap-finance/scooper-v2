@@ -299,6 +299,116 @@ impl Default for BatchLimits {
     }
 }
 
+/// Size and ExUnits of a built and evaluated scoop tx, the ExUnits summed over
+/// its scripts and padded with `budget_padding`.
+#[derive(Clone, Copy, Debug)]
+pub struct ScoopTxCost {
+    pub bytes: usize,
+    pub mem: u64,
+    pub steps: u64,
+}
+
+impl ScoopTxCost {
+    pub fn new(
+        tx_size: usize,
+        eval: &crate::sundaev4::evaluator::EvalResult,
+        exec: &ScooperExecution,
+    ) -> Self {
+        let total_mem: u64 = eval.budgets.iter().map(|(_, eu)| eu.mem).sum();
+        let total_steps: u64 = eval.budgets.iter().map(|(_, eu)| eu.steps).sum();
+        let (pad_num, pad_den) = exec.budget_padding;
+        Self {
+            bytes: tx_size,
+            mem: total_mem * pad_num / pad_den,
+            steps: total_steps * pad_num / pad_den,
+        }
+    }
+
+    /// `Fits` within the per-tx limits of `exec`, `Overbudget` otherwise.
+    pub fn fitness(&self, exec: &ScooperExecution) -> Fitness {
+        let fits = self.mem <= exec.max_tx_ex_mem
+            && self.steps <= exec.max_tx_ex_steps
+            && self.bytes <= exec.max_tx_size;
+        if fits { Fitness::Fits } else { Fitness::Overbudget }
+    }
+}
+
+/// Three-state result of testing whether a candidate accumulator
+/// produces a viable tx. We never submit txs we can't evaluate, so
+/// eval failure is treated as a hard bail — not a "fall back to
+/// worst-case budget" hint. See the failure taxonomy in scoop().
+#[derive(Debug)]
+pub enum Fitness {
+    Fits,
+    Overbudget,
+    Bail(String),
+}
+
+/// Find the largest checkpoint (prefix of accumulated orders) that builds
+/// and evaluates within limits, among `checkpoint_count` checkpoints:
+/// checkpoint `i` has `i + 1` orders, `probe(i)` tests it.
+///
+/// The full batch is probed first (common case), then the smaller prefixes
+/// by binary search. Outcome handling per probe:
+/// - Fits        → best = this index; try larger
+/// - Overbudget  → too many ex-units / too big; try smaller
+/// - Bail        → a build/eval failure was introduced by some order.
+///   Rather than abort the whole cycle (which lets one bad
+///   order wedge the queue for everyone), treat it like
+///   Overbudget and search downward: this still scoops the
+///   valid prefix and isolates the failing suffix. If even
+///   the smallest (1-order) batch bails, the caller
+///   quarantines that order so it stops blocking the queue.
+///
+/// Returns the largest fitting checkpoint, if any, and the reason of the
+/// last `Bail` seen, if any.
+pub fn largest_fitting_checkpoint(
+    checkpoint_count: usize,
+    mut probe: impl FnMut(usize) -> Fitness,
+) -> (Option<usize>, Option<String>) {
+    let mut best: Option<usize> = None;
+    let mut last_bail: Option<String> = None;
+    let Some(top) = checkpoint_count.checked_sub(1) else {
+        return (best, last_bail);
+    };
+    match probe(top) {
+        Fitness::Fits => best = Some(top),
+        outcome => {
+            if let Fitness::Bail(reason) = outcome {
+                last_bail = Some(reason);
+            }
+            // Full batch failed — binary search the smaller prefixes,
+            // treating Overbudget and Bail alike as "go smaller".
+            if top > 0 {
+                let (mut lo, mut hi) = (0usize, top - 1);
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    match probe(mid) {
+                        Fitness::Fits => {
+                            best = Some(mid);
+                            lo = mid + 1;
+                        }
+                        Fitness::Overbudget => {
+                            if mid == 0 {
+                                break;
+                            }
+                            hi = mid - 1;
+                        }
+                        Fitness::Bail(reason) => {
+                            last_bail = Some(reason);
+                            if mid == 0 {
+                                break;
+                            }
+                            hi = mid - 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (best, last_bail)
+}
+
 /// Group pending orders by their target pool.
 ///
 /// Orders are matched by finding a pool whose assets include both the order's

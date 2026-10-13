@@ -1770,16 +1770,7 @@ impl Scooper {
 
         // ── Phase 2: Binary search for largest batch within limits ────────
 
-        /// Three-state result of testing whether a candidate accumulator
-        /// produces a viable tx. We never submit txs we can't evaluate, so
-        /// eval failure is treated as a hard bail — not a "fall back to
-        /// worst-case budget" hint. See the failure taxonomy in scoop().
-        #[derive(Debug)]
-        enum Fitness {
-            Fits,
-            Overbudget,
-            Bail(String),
-        }
+        use batch::{Fitness, ScoopTxCost};
 
         let within_limits = |accum: &Accumulator| -> Fitness {
             let plan = accum.clone().into_plan();
@@ -1853,79 +1844,13 @@ impl Scooper {
                 }
             };
 
-            let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
-            let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
-            let tx_size = build.cbor.len();
-
-            let (pad_num, pad_den) = exec.budget_padding;
-            let padded_mem = total_mem * pad_num / pad_den;
-            let padded_steps = total_steps * pad_num / pad_den;
-
-            let fits = padded_mem <= exec.max_tx_ex_mem
-                && padded_steps <= exec.max_tx_ex_steps
-                && tx_size <= exec.max_tx_size;
-            if fits {
-                Fitness::Fits
-            } else {
-                Fitness::Overbudget
-            }
+            ScoopTxCost::new(build.cbor.len(), &r, &exec).fitness(&exec)
         };
 
-        // Find the largest checkpoint (prefix of accumulated orders) that builds
-        // and evaluates within limits. checkpoints[i] has (i+1) orders.
-        //
-        // Outcome handling per probe:
-        // - Fits        → best = this index; try larger
-        // - Overbudget  → too many ex-units / too big; try smaller
-        // - Bail        → a build/eval failure was introduced by some order.
-        //                 Rather than abort the whole cycle (which lets one bad
-        //                 order wedge the queue for everyone), treat it like
-        //                 Overbudget and search downward: this still scoops the
-        //                 valid prefix and isolates the failing suffix. If even
-        //                 the smallest (1-order) batch bails, that order is
-        //                 quarantined below so it stops blocking the queue.
-        let mut best: Option<usize> = None;
-        let mut last_bail: Option<String> = None;
-
-        let probe = |idx: usize| -> Fitness { within_limits(&checkpoints[idx]) };
-
-        let top = checkpoints.len() - 1;
-        // Quick check: try the full batch first (common case).
-        match probe(top) {
-            Fitness::Fits => best = Some(top),
-            outcome => {
-                if let Fitness::Bail(reason) = outcome {
-                    last_bail = Some(reason);
-                }
-                // Full batch failed — binary search the smaller prefixes,
-                // treating Overbudget and Bail alike as "go smaller".
-                if top > 0 {
-                    let (mut lo, mut hi) = (0usize, top - 1);
-                    while lo <= hi {
-                        let mid = lo + (hi - lo) / 2;
-                        match probe(mid) {
-                            Fitness::Fits => {
-                                best = Some(mid);
-                                lo = mid + 1;
-                            }
-                            Fitness::Overbudget => {
-                                if mid == 0 {
-                                    break;
-                                }
-                                hi = mid - 1;
-                            }
-                            Fitness::Bail(reason) => {
-                                last_bail = Some(reason);
-                                if mid == 0 {
-                                    break;
-                                }
-                                hi = mid - 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // checkpoints[i] has (i+1) orders.
+        let (best, last_bail) = batch::largest_fitting_checkpoint(checkpoints.len(), |idx| {
+            within_limits(&checkpoints[idx])
+        });
 
         // If we found a valid prefix but had to drop a failing suffix, note it.
         if let (Some(idx), Some(reason)) = (best, &last_bail)

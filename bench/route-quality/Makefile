@@ -38,12 +38,12 @@ CL_ARGS ?=
 
 SNAPSHOT := data/market-mainnet-selected.json
 CL := data/market-v4-extrapolated.json
-BLUEPRINT := data/devnet-blueprint-without-traces.json
+BLUEPRINT := ../common/devnet-blueprint-without-traces.json
 RESULTS := results
 
 # cargo runs against the repo's manifest; the bench gets absolute paths.
 ROUTE_BENCH := cargo run --release --manifest-path $(CURDIR)/../../Cargo.toml \
-	--features route-bench --example route-bench --
+	--features bench --example route-bench --
 BENCH_ARGS = --blueprint $(CURDIR)/$(BLUEPRINT) \
 	$(if $(PAIRS),--pairs $(PAIRS)) $(if $(SIZES),--sizes $(SIZES)) \
 	$(if $(SHOW),--show) \
