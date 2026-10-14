@@ -2140,6 +2140,10 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_mempool_tx_dropped",
             serde_json::json!({ "tx_hash": hex::encode(tx_hash) }).to_string(),
         ),
+        IndexEvent::CardanoSwapsOrderbookChanged { tx_id } => (
+            "cardano_swaps_orderbook_changed",
+            serde_json::json!({ "tx_id": tx_id }).to_string(),
+        ),
         IndexEvent::V3PoolCreated { id, .. } => (
             "v3_pool_created",
             serde_json::json!({ "id": id.to_string() }).to_string(),

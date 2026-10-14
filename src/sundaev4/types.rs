@@ -1465,6 +1465,10 @@ pub struct ScooperExecution {
     /// router conversion edges). Absent/broken config degrades to disabled.
     #[serde(default)]
     pub butane: Option<crate::sundaev4::butane::ButaneConfig>,
+    /// Cardano-Swaps one-way order fills as router edges
+    /// (`execution.cardano-swaps`). Absent/broken config = disabled.
+    #[serde(default)]
+    pub cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsConfig>,
     /// Enable partial fills with this profitability margin (num, den): a
     /// partial fill must cover at least margin × the scooper's per-order fee
     /// share in pro-rata allowance. None (default) = partial fills disabled.

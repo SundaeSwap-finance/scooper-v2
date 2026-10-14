@@ -1404,11 +1404,15 @@ impl Accumulator {
     }
 
     /// Total number of orders across all pools (swaps + deposits + withdraws).
+    /// Orders in the batch: pool ops plus orders owned by a conversion
+    /// leg (routes with no pool split at all, e.g. a pure external fill).
     pub fn order_count(&self) -> usize {
-        self.pools
+        let pool_ops: usize = self
+            .pools
             .values()
             .map(|a| a.swaps.len() + a.deposits.len() + a.withdraws.len() + a.zaps.len())
-            .sum()
+            .sum();
+        pool_ops + self.conversions.iter().filter(|c| c.primary).count()
     }
 
     /// Collect all order inputs across all accumulated pools.
@@ -1427,7 +1431,7 @@ impl Accumulator {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() || self.order_count() == 0
+        self.order_count() == 0
     }
 
     /// Convert accumulated state into a `ScoopPlan` for the tx builder.

@@ -78,6 +78,12 @@ pub struct Scooper {
     quarantine: BTreeMap<TransactionInput, Quarantine>,
     /// Loaded + verified Butane runtime (None = integration disabled).
     v4_butane: Option<crate::sundaev4::butane::ButaneRuntime>,
+    /// Loaded Cardano-Swaps runtime (None = integration disabled).
+    v4_cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsRuntime>,
+    /// Cardano-Swaps orders our in-flight scoops already fill, with the
+    /// time we submitted; withheld from routing until the chain shows them
+    /// spent or the entry ages out.
+    cswaps_inflight: BTreeMap<TransactionInput, std::time::Instant>,
     /// Posted strategy intents (shared with the admin server's ingest).
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
@@ -198,6 +204,12 @@ impl Scooper {
         }
         let v4_butane =
             v4_execution.as_ref().and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
+        let v4_cardano_swaps = v4_execution
+            .as_ref()
+            .and_then(|e| crate::sundaev4::cardano_swaps::load_runtime(&e.cardano_swaps));
+        if v4_cardano_swaps.is_some() {
+            info!("cardano-swaps: order-book edges enabled");
+        }
         Ok(Self {
             event_rx,
             v3_state,
@@ -219,6 +231,8 @@ impl Scooper {
             pool_reject_streak: BTreeMap::new(),
             reported_stale_pools: BTreeSet::new(),
             v4_butane,
+            v4_cardano_swaps,
+            cswaps_inflight: BTreeMap::new(),
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
             access_config_logged: false,
@@ -625,6 +639,9 @@ impl Scooper {
                     // The provisional store already holds it — receipt of
                     // this event is what wakes the dispatch loop.
                     trace!(slot, order = %order.input, "provisional order seen in mempool");
+                }
+                IndexEvent::CardanoSwapsOrderbookChanged { tx_id } => {
+                    trace!(slot, tx = %tx_id, "cardano-swaps order book changed");
                 }
                 IndexEvent::V4MempoolTxDropped { tx_hash } => {
                     let n = self.v4_chain_tracker.discard_by_provisional_parent(&tx_hash);
@@ -1248,6 +1265,7 @@ impl Scooper {
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     funding_is_predicted,
+                    None,
                 )
                 .await;
         }
@@ -1351,7 +1369,23 @@ impl Scooper {
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
 
+        // In-flight exclusions age out well after any validity window, or
+        // as soon as the chain shows the order spent.
+        {
+            let ttl = std::time::Duration::from_secs(600);
+            self.cswaps_inflight.retain(|oref, t| {
+                t.elapsed() < ttl && v4_state.cardano_swaps.orders.contains_key(oref)
+            });
+        }
+        let cswaps_snapshot = self.cardano_swaps_snapshot(&v4_state, &exec);
         let mut conversion_edges = crate::sundaev4::conversions::routable_edges(&exec.conversions);
+        if let Some(snap) = &cswaps_snapshot {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            conversion_edges.extend(snap.edges(now_ms));
+        }
         if let Some(rt) = &self.v4_butane {
             if exec.plutus_v2_cost_model.is_some() {
                 conversion_edges.extend(rt.edges());
@@ -1935,7 +1969,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
-                None,
+                cswaps_snapshot.as_ref().map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2114,7 +2148,7 @@ impl Scooper {
                         v4_state.fee_settings.as_deref(),
                         funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                         self.v4_butane.as_ref(),
-                        None,
+                        cswaps_snapshot.as_ref().map(|s| s.context()).as_ref(),
                     ) {
                         // A missing funding input is a wallet condition, not
                         // a defect of the order: take the temporary-quarantine
@@ -2281,6 +2315,7 @@ impl Scooper {
             &provisional_parent,
             &foreign_pool_parent,
             funding_is_predicted,
+            cswaps_snapshot.as_ref(),
         )
         .await
     }
@@ -2355,6 +2390,49 @@ impl Scooper {
         }
     }
 
+    /// Price every fillable Cardano-Swaps order into the snapshot the
+    /// router's edges and the builder's fill context both come from. None
+    /// when the integration is off or the swap script's reference UTxO has
+    /// not been indexed (without it the transaction cannot be witnessed).
+    fn cardano_swaps_snapshot(
+        &self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+    ) -> Option<crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot> {
+        let rt = self.v4_cardano_swaps.as_ref()?;
+        for r in rt.static_ref_utxos() {
+            if !v4_state.ref_utxo_outputs.contains_key(&r) {
+                tracing::debug!(
+                    utxo = %r,
+                    "cardano-swaps: swap script ref UTxO not indexed — edges closed",
+                );
+                return None;
+            }
+        }
+        let mut state = v4_state.cardano_swaps.clone();
+        for oref in self.cswaps_inflight.keys() {
+            state.orders.remove(oref);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let (edges, legs) = rt.edges(&state, now_ms);
+        if !edges.is_empty() {
+            tracing::debug!(
+                edges = edges.len(),
+                orders = state.orders.len(),
+                "cardano-swaps: order-book edges priced",
+            );
+        }
+        Some(crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
+            runtime: rt.clone(),
+            state,
+            legs,
+            slot_config: exec.slot_config.clone(),
+        })
+    }
+
     async fn build_and_submit_plan(
         &mut self,
         final_plan: crate::sundaev4::batch::ScoopPlan,
@@ -2369,6 +2447,7 @@ impl Scooper {
         provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
         foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
         funding_is_predicted: bool,
+        cardano_swaps: Option<&crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot>,
     ) -> bool {
         // A movement's two legs serve one order; count distinct orders.
         let n_orders: usize = final_plan
@@ -2440,7 +2519,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
-                None,
+                cardano_swaps.map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e)
@@ -2635,7 +2714,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
-                None,
+                cardano_swaps.map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e)
@@ -2856,6 +2935,11 @@ impl Scooper {
         match submit_result {
             Ok(submitted_hash) => {
                 info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
+                for c in &final_plan.conversions {
+                    if let Some(oref) = crate::sundaev4::cardano_swaps::order_from_key(&c.key) {
+                        self.cswaps_inflight.insert(oref, std::time::Instant::now());
+                    }
+                }
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 

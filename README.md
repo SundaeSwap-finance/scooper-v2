@@ -29,6 +29,7 @@ A v4 execution config needs these additional settings
 | Config key | Needs |
 | --- | --- |
 | `protocol.v4.execution.butane.deployment-file` | A named Butane deployment file |
+| `protocol.v4.execution.cardano-swaps` | Hashes + the swap script's ref UTxO, to fill Cardano-Swaps orders ([docs/cardano-swaps.md](./docs/cardano-swaps.md)) |
 | `protocol.v4.mempool.socket-path` | A node's IPC socket (to read the mempool) |
 | `protocol.v4.execution.scooper-secret-key-file` | The key file (prefer this over the inline key) |
 | `server.tls_cert` / `tls_key` | Cert and key, if TLS is enabled |

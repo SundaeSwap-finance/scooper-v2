@@ -40,7 +40,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::{PlutusData, conway};
 use serde::Deserialize;
@@ -262,7 +262,7 @@ fn as_u64(d: &PlutusData) -> Option<u64> {
 }
 
 /// `Option<T>`: `Constr 0 [x]` = Some, `Constr 1 []` = None.
-fn as_option<'a>(d: &'a PlutusData) -> Option<Option<&'a PlutusData>> {
+fn as_option(d: &PlutusData) -> Option<Option<&PlutusData>> {
     match as_constr(d)? {
         (0, f) => Some(Some(f.first()?)),
         (1, _) => Some(None),
@@ -1111,7 +1111,7 @@ pub(crate) mod replay_tests {
         }
     }
 
-    fn swap_output<'a>(body: &'a mut conway::TransactionBody) -> &'a mut conway::TransactionOutput {
+    fn swap_output(body: &mut conway::TransactionBody) -> &mut conway::TransactionOutput {
         let hash = hex::decode(SWAP_HASH).unwrap();
         body.outputs
             .iter_mut()

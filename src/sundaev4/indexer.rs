@@ -61,6 +61,9 @@ pub struct SundaeV4State {
     pub ref_utxo_outputs:
         BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub scoop_stats: ScoopStats,
+    /// Open Cardano-Swaps one-way orders (tracked only when
+    /// `execution.cardano-swaps` is enabled).
+    pub cardano_swaps: crate::sundaev4::cardano_swaps::CardanoSwapsState,
     datums: DatumLookup,
 }
 
@@ -96,6 +99,8 @@ pub struct SundaeV4Indexer {
     dao: Box<dyn IndexerDao>,
     scooper_keyhash: Option<pallas_primitives::Hash<28>>,
     ref_utxo_inputs: BTreeSet<crate::cardano_types::TransactionInput>,
+    /// Loaded Cardano-Swaps runtime: which credential to track.
+    cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsRuntime>,
     tip_event_counter: u64,
     /// The slot of the latest block loaded from DB. Blocks STRICTLY before
     /// this slot are skipped in handle_block/handle_onchain_tx_bytes to
@@ -161,11 +166,20 @@ impl SundaeV4Indexer {
             .execution
             .as_ref()
             .and_then(|exec| derive_scooper_keyhash(&exec.scooper_secret_key).ok());
-        let ref_utxo_inputs = protocol
+        let mut ref_utxo_inputs = protocol
             .execution
             .as_ref()
             .map(|exec| module_ref_utxos(&exec.module_scripts))
             .unwrap_or_default();
+        let cardano_swaps = protocol
+            .execution
+            .as_ref()
+            .and_then(|exec| crate::sundaev4::cardano_swaps::load_runtime(&exec.cardano_swaps));
+        if let Some(rt) = &cardano_swaps {
+            // The swap script's reference UTxO rides the generic ref-UTxO
+            // tracking, so the evaluator resolves it like any module script.
+            ref_utxo_inputs.extend(rt.static_ref_utxos());
+        }
         Self {
             state,
             event_tx,
@@ -174,6 +188,7 @@ impl SundaeV4Indexer {
             dao,
             scooper_keyhash,
             ref_utxo_inputs,
+            cardano_swaps,
             tip_event_counter: 0,
             loaded_slot: 0,
             module_configs: Mutex::new(PoolModuleConfigCache::default()),
@@ -518,6 +533,19 @@ impl SundaeV4Indexer {
                 }
                 "ref" => {
                     state.ref_utxo_outputs.insert(txo.txo_id, output);
+                }
+                "cswaps_order" => {
+                    match crate::sundaev4::cardano_swaps::SwapOrder::from_output(
+                        txo.txo_id.clone(),
+                        &output,
+                    ) {
+                        Some(order) => {
+                            state.cardano_swaps.orders.insert(txo.txo_id, order);
+                        }
+                        None => {
+                            warn!(input = %txo.txo_id, "v4: cardano-swaps order txo could not be reparsed on load")
+                        }
+                    }
                 }
                 other => bail!("unrecognized txo type \"{other}\""),
             }
@@ -1224,6 +1252,7 @@ impl ChainIndex for SundaeV4Indexer {
         let mut new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)> = vec![];
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
+        let mut cswaps_changed = false;
 
         // handle_block already called update_slot for this slot;
         // this just retrieves the existing mutable reference.
@@ -1631,6 +1660,38 @@ impl ChainIndex for SundaeV4Indexer {
                 }
             }
 
+            // Cardano-Swaps orders: every owner has their own address, but
+            // they all share the swap script as payment credential.
+            if let Some(rt) = &self.cardano_swaps {
+                let swap_hash: ScriptHash = rt.swap_hash.as_slice().into();
+                if payment_hash_equals(&address, &swap_hash) {
+                    let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                    let tx_out = cardano_types::convert_txo(output);
+                    match crate::sundaev4::cardano_swaps::SwapOrder::from_output(
+                        this_input.clone(),
+                        &tx_out,
+                    ) {
+                        Some(order) => {
+                            trace!(slot, utxo = %this_input, "v4: cardano-swaps order spotted");
+                            changes.created_txos.push(PersistedTxo {
+                                txo_id: this_input.clone(),
+                                txo_type: "cswaps_order".to_string(),
+                                created_slot: slot,
+                                era: output.era().into(),
+                                txo: output.encode(),
+                                address: tx_out.address.to_vec(),
+                                datum: tx_out.hashed_datum(&datums),
+                            });
+                            state.cardano_swaps.orders.insert(this_input, order);
+                            cswaps_changed = true;
+                        }
+                        None => {
+                            debug!(slot, utxo = %this_input, "v4: cardano-swaps address output with an unparseable datum");
+                        }
+                    }
+                }
+            }
+
             // Track wallet UTxOs by payment credential — CIP-1852 wallets use
             // base addresses (payment + stake) but the scooper might be
             // configured with an enterprise address. Matching by payment
@@ -1689,6 +1750,25 @@ impl ChainIndex for SundaeV4Indexer {
                     spending_tx_id: this_tx_hash.to_vec(),
                 });
             }
+        }
+
+        // Remove spent Cardano-Swaps orders. A fill spends the order and
+        // recreates it, so both halves fire in the same transaction.
+        if self.cardano_swaps.is_some() {
+            for input in &spent_inputs {
+                if state.cardano_swaps.orders.remove(input).is_some() {
+                    cswaps_changed = true;
+                    changes.spent_txos.push(SpentTxo {
+                        input: input.clone(),
+                        spending_tx_id: this_tx_hash.to_vec(),
+                    });
+                }
+            }
+        }
+        if cswaps_changed {
+            events.push(IndexEvent::CardanoSwapsOrderbookChanged {
+                tx_id: hex::encode(this_tx_hash),
+            });
         }
 
         let mut scooped_orders = BTreeSet::new();

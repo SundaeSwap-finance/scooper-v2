@@ -271,6 +271,7 @@ impl TestEnv {
             strategy_peers: Vec::new(),
             conversions: Vec::new(),
             butane: None,
+            cardano_swaps: None,
             plutus_v2_cost_model: None,
             partial_fill_margin: None,
             partial_fill_fee_estimate: 2_500_000,
