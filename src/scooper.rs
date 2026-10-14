@@ -1216,6 +1216,27 @@ impl Scooper {
                     "\u{23f3} all orders in-flight or quarantined, waiting"
                 );
             }
+            // Nothing of ours to scoop: see whether a resting foreign order
+            // is worth filling against one of our pools for the protocol.
+            if let Some(plan) = self.plan_foreign_fill(&v4_state, &exec, &in_flight_pools) {
+                return self
+                    .build_and_submit_plan(
+                        plan,
+                        &settings,
+                        &exec,
+                        &v4_state,
+                        &language_views,
+                        &collateral_input,
+                        &collateral_value,
+                        &funding_owned,
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        false,
+                        self.cardano_swaps_snapshot(&v4_state, &exec).as_ref(),
+                    )
+                    .await;
+            }
             return false;
         }
 
@@ -2433,6 +2454,65 @@ impl Scooper {
         })
     }
 
+    /// The most valuable fill of a resting Cardano-Swaps order against one
+    /// of our pools, as a plan with no Sundae order in it. None when the
+    /// integration or its foreign-fill mode is off, or nothing clears the
+    /// projected floor. Pools already in flight are skipped: the fill would
+    /// contend with our own chain for the UTxO.
+    fn plan_foreign_fill(
+        &self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+        in_flight_pools: &[crate::sundaev3::Ident],
+    ) -> Option<crate::sundaev4::batch::ScoopPlan> {
+        let snap = self.cardano_swaps_snapshot(v4_state, exec)?;
+        snap.runtime.foreign_fills.as_ref()?;
+        let mut best: Option<(
+            u64,
+            std::sync::Arc<crate::sundaev4::SundaeV4Pool>,
+            crate::sundaev4::batch::ResolvedForeign,
+        )> = None;
+        for leg in snap.legs.values() {
+            for (ident, pool) in &v4_state.pools {
+                if in_flight_pools.contains(ident) || exec.pool_allowlists.is_restricted(ident) {
+                    continue;
+                }
+                if let Some(plan) = snap.runtime.plan_foreign_fill(pool, leg)
+                    && best.as_ref().is_none_or(|(g, _, _)| plan.gross_surplus > *g)
+                {
+                    best = Some((plan.gross_surplus, pool.clone(), plan.resolved));
+                }
+            }
+        }
+        let (gross, pool, resolved) = best?;
+        info!(
+            order = %resolved.attribution,
+            pool = %pool.pool_datum.identifier,
+            dx = %resolved.dx,
+            projected_gross_surplus = gross,
+            "foreign fill planned",
+        );
+        Some(crate::sundaev4::batch::ScoopPlan {
+            batches: vec![crate::sundaev4::batch::Batch {
+                pool: pool.clone(),
+                pool_ident: pool.pool_datum.identifier.clone(),
+                swaps: Vec::new(),
+                continuations: Vec::new(),
+                deposits: Vec::new(),
+                withdraws: Vec::new(),
+                zaps: Vec::new(),
+                claims: Vec::new(),
+                foreign: vec![resolved],
+                ops_order: vec![crate::sundaev4::batch::BatchOp::Foreign(0)],
+                final_assets: pool.pool_datum.assets.clone(),
+                final_total_lp: pool.pool_datum.total_lp.clone(),
+            }],
+            routes: Vec::new(),
+            global_seq: Vec::new(),
+            conversions: Vec::new(),
+        })
+    }
+
     async fn build_and_submit_plan(
         &mut self,
         final_plan: crate::sundaev4::batch::ScoopPlan,
@@ -2841,6 +2921,42 @@ impl Scooper {
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
 
+        // A foreign-order fill is made for the protocol's revenue and nothing
+        // else: the exact residual the rebuilt transaction lands, net of its
+        // real fee, must clear the configured floor.
+        let has_foreign = final_plan.batches.iter().any(|b| !b.foreign.is_empty());
+        if has_foreign {
+            let floor = cardano_swaps
+                .and_then(|s| s.runtime.foreign_fills.as_ref())
+                .map(|f| f.min_revenue_lovelace)
+                .unwrap_or(u64::MAX);
+            match final_tx.foreign_surplus {
+                Some(landed) if landed >= floor => {
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        landed_surplus = landed,
+                        fee = final_tx.tx_body.fee,
+                        floor,
+                        "foreign fill clears the revenue floor",
+                    );
+                }
+                Some(landed) => {
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        landed_surplus = landed,
+                        fee = final_tx.tx_body.fee,
+                        floor,
+                        "foreign fill under the revenue floor after the real fee — not submitting",
+                    );
+                    return false;
+                }
+                None => {
+                    warn!(tx_hash = %final_tx.tx_hash_hex, "foreign fill built without a landed surplus — not submitting");
+                    return false;
+                }
+            }
+        }
+
         let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
         let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
         let final_size = final_tx.cbor.len();
@@ -2935,8 +3051,12 @@ impl Scooper {
         match submit_result {
             Ok(submitted_hash) => {
                 info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
-                for c in &final_plan.conversions {
-                    if let Some(oref) = crate::sundaev4::cardano_swaps::order_from_key(&c.key) {
+                for key in
+                    final_plan.conversions.iter().map(|c| &c.key).chain(
+                        final_plan.batches.iter().flat_map(|b| b.foreign.iter().map(|f| &f.key)),
+                    )
+                {
+                    if let Some(oref) = crate::sundaev4::cardano_swaps::order_from_key(key) {
                         self.cswaps_inflight.insert(oref, std::time::Instant::now());
                     }
                 }

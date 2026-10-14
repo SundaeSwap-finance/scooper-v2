@@ -106,6 +106,52 @@ would remove the dependency.
 traded amounts, but a continuing output whose offer is ADA still has to clear
 the ledger's own min-UTxO floor.
 
+## Filling a resting order against our own pool
+
+With `foreign-fills` enabled, a cycle that has nothing of ours to scoop looks
+for a resting order whose price is inside one of our pools' and fills it for
+the protocol. The transaction has no Sundae order in it — the order it serves
+is simply held at a different order contract:
+
+```
+inputs      our pool, the resting swap order
+outputs     pool continuation (reserves + landed surplus), order continuation
+redeemers   pool Action with one swap entry; the order's public Swap
+withdrawals the pool's own modules, fee_split, fairness — no order validator,
+            no fee constraint
+```
+
+The pool's emission goes into the order; the asset the order releases goes
+into the pool; whichever side is ADA carries the difference. Exactly one side
+must be ADA, because only lovelace above a pool's declared reserve is surplus
+the treasury can sweep. Value conservation fixes the split, so the builder
+lands the residual of `inputs − outputs − fee` on the pool output, and the
+transaction pays for itself: the scooper fronts nothing.
+
+Two gates decide whether a fill happens. The planner sizes the pool step to
+maximize the lovelace released, skips pools in flight or carrying an
+allowlist, and screens against `fee-estimate-lovelace + min-revenue-lovelace`
+before anything is built. Then, after the transaction is rebuilt with its
+exact fee, the landed residual must still clear `min-revenue-lovelace` or the
+transaction is not submitted. The second check is the one that decides; the
+first only avoids building losers.
+
+Foreign fills never share a transaction with Sundae orders. A fee-bearing
+scoop pins the designated pool's surplus delta exactly, so a fill's surplus
+could not land there; keeping the shapes apart avoids depending on the
+`==` → `>=` relaxation in `fee.ak`.
+
+```json
+"cardano-swaps": {
+  "...": "...",
+  "foreign-fills": {
+    "enabled": true,
+    "min-revenue-lovelace": 1000000,
+    "fee-estimate-lovelace": 1000000
+  }
+}
+```
+
 ## Scope today
 
 Only **one-way** swaps. The two-way (liquidity swap) protocol quotes both
