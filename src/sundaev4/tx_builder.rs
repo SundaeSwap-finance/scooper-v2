@@ -533,6 +533,9 @@ pub fn build_multi_pool_scoop_tx(
     // butane legs. None + butane legs = build error (the router must not
     // offer edges the builder can't compose; this is the backstop).
     butane: Option<&crate::sundaev4::butane::ButaneRuntime>,
+    // Cardano-Swaps fill context — required iff plan.conversions contains
+    // `cswaps:` legs (same backstop as butane).
+    cardano_swaps: Option<&crate::sundaev4::cardano_swaps::FillContext<'_>>,
 ) -> Result<MultiPoolBuildResult> {
     // First-pass builds use the settings base_fee (see `first_pass_fee`);
     // the rebuild passes the exact fee from `compute_tx_fee(size, mem, cpu)`.
@@ -582,11 +585,30 @@ pub fn build_multi_pool_scoop_tx(
         &plan.global_seq
     };
 
-    // ── Butane conversion legs → deposit pieces ────────────────────────────
+    // ── Conversion legs → mechanism pieces ─────────────────────────────────
+    let mut cswaps_pieces: Vec<crate::sundaev4::cardano_swaps::FillPieces> = Vec::new();
     let butane_pieces: Vec<crate::sundaev4::butane::DepositPieces> = {
         use num_traits::ToPrimitive;
         let mut pieces = Vec::new();
         for leg in &plan.conversions {
+            if leg.key.starts_with("cswaps:") {
+                let ctx = cardano_swaps.with_context(|| {
+                    format!(
+                        "plan contains a cardano-swaps leg {} but no fill context is loaded",
+                        leg.key
+                    )
+                })?;
+                let dx =
+                    leg.dx.clone().unwrap().to_u128().context("conversion dx doesn't fit u128")?;
+                let out = leg
+                    .out
+                    .clone()
+                    .unwrap()
+                    .to_u128()
+                    .context("conversion out doesn't fit u128")?;
+                cswaps_pieces.push(ctx.fill_pieces(&leg.key, dx, out)?);
+                continue;
+            }
             let Some(name) = leg.key.strip_prefix("butane:").and_then(|s| s.strip_suffix(":mint"))
             else {
                 bail!("unknown conversion mechanism for leg {}", leg.key);
@@ -1509,10 +1531,13 @@ pub fn build_multi_pool_scoop_tx(
     let funding_oref_opt = funding_input.as_ref().map(|(o, _)| o.clone());
     let funding_value_opt = funding_input.as_ref().map(|(_, v)| *v);
 
+    let cswaps_orefs: Vec<TransactionInput> =
+        cswaps_pieces.iter().map(|p| p.order_input.0.clone()).collect();
     let mut sorted_inputs: Vec<TransactionInput> = pool_orefs
         .iter()
         .chain(all_order_orefs.iter())
         .chain(funding_oref_opt.iter())
+        .chain(cswaps_orefs.iter())
         .cloned()
         .collect();
     sorted_inputs
@@ -2078,6 +2103,9 @@ pub fn build_multi_pool_scoop_tx(
     // order makes the body, the on-chain ScriptContext, and every ref_index
     // we put in redeemers agree by construction.
     for p in &butane_pieces {
+        all_ref_inputs.extend(p.ref_inputs.iter().map(|i| i.0.clone()));
+    }
+    for p in &cswaps_pieces {
         all_ref_inputs.extend(p.ref_inputs.iter().map(|i| i.0.clone()));
     }
     all_ref_inputs
@@ -2978,6 +3006,27 @@ pub fn build_multi_pool_scoop_tx(
         outputs.push(p.pot_output.clone());
     }
 
+    // ── Step 8.36: Cardano-Swaps continuing outputs + fill redeemers ───────
+    // The validator finds its output by matching the datum, which names the
+    // input it came from, so index assignment is free: it only needs a
+    // spend redeemer at the order's position in the sorted inputs.
+    for p in &cswaps_pieces {
+        outputs.push(p.continuing_output.clone());
+        let own_idx = sorted_inputs
+            .iter()
+            .position(|i| i == &p.order_input.0)
+            .context("cardano-swaps order input missing from sorted inputs")?;
+        let key = RedeemersKey {
+            tag: RedeemerTag::Spend,
+            index: own_idx as u32,
+        };
+        redeemer_info.push((
+            key.clone(),
+            crate::sundaev4::cardano_swaps::FillPieces::spend_redeemer(),
+            lookup_eu(&key),
+        ));
+    }
+
     // ── Step 8.4: Scooper change output for the funding UTxO ───────────────
     //
     // Only emitted when a `funding_input` was provided. Its ada covers any
@@ -3301,6 +3350,30 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 11: Assemble TransactionBody ──────────────────────────────────
 
+    // An expiring Cardano-Swaps order requires the transaction's upper
+    // bound to be set and at or below its expiration.
+    let validity = match (
+        cardano_swaps,
+        cswaps_pieces.iter().filter_map(|p| p.expiration_ms).min(),
+    ) {
+        (Some(ctx), Some(expiry_ms)) => {
+            let sc = &ctx.slot_config;
+            let expiry_slot =
+                expiry_ms.saturating_sub(sc.zero_time) / sc.slot_length + sc.zero_slot;
+            if validity.start >= expiry_slot {
+                bail!(
+                    "cardano-swaps: an order expires at slot {expiry_slot}, before this \
+                     transaction's validity start {}",
+                    validity.start
+                );
+            }
+            ValidityWindow {
+                start: validity.start,
+                ttl: validity.ttl.min(expiry_slot),
+            }
+        }
+        _ => validity,
+    };
     let ttl = validity.ttl;
 
     let body = conway::PseudoTransactionBody {
@@ -3389,6 +3462,17 @@ pub fn build_multi_pool_scoop_tx(
                     address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
+                    script_ref: None,
+                },
+            );
+        }
+        for p in &cswaps_pieces {
+            resolved_inputs.insert(
+                p.order_input.clone(),
+                ResolvedTxOut {
+                    address: p.order_address.clone(),
+                    value: p.order_value.clone(),
+                    datum: DatumOption::InlineDatum(p.order_datum.clone()),
                     script_ref: None,
                 },
             );

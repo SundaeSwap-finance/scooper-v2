@@ -792,6 +792,146 @@ mod unit_tests {
 }
 
 #[cfg(test)]
+mod composition_tests {
+    //! Build a scoop that fills a Cardano-Swaps order from a Sundae order
+    //! and run every validator — ours and theirs — through the evaluator.
+
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::sundaev4::accumulator::Accumulator;
+    use crate::sundaev4::router;
+    use crate::sundaev4::test_harness::{TestEnv, ada, make_basic_swap_order, make_settings};
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+
+    fn usdm() -> AssetClass {
+        AssetClass {
+            policy: hex::decode("c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad")
+                .unwrap(),
+            token: hex::decode("0014df105553444d").unwrap(),
+        }
+    }
+    fn usdcx() -> AssetClass {
+        AssetClass {
+            policy: hex::decode("1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34")
+                .unwrap(),
+            token: hex::decode("5553444378").unwrap(),
+        }
+    }
+
+    #[test]
+    fn fixture_offers_both_directions_as_edges() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let edges = snap.edges(0);
+        assert_eq!(edges.len(), 2, "{edges:?}");
+        for e in &edges {
+            assert_eq!(e.fee_bps, 0, "the datum price is the whole limit");
+            // One order offers ADA for USDM; the other offers USDCx for ADA.
+            if e.to == ada() {
+                assert_eq!(e.from, usdm());
+                // The order holds 1002.788570 ADA and keeps 2.78, so
+                // 1000.008570 ADA is takeable; at 23/100 the largest
+                // useful deposit is 230.001971 USDM, and one more unit
+                // would buy nothing.
+                let cap = max_ask_given(1_000_008_570, 23, 100);
+                assert_eq!(cap, 230_001_971);
+                assert_eq!(e.max_input, Some(BigInt::from(cap as i128)));
+            } else {
+                assert_eq!((e.from.clone(), e.to.clone()), (ada(), usdcx()));
+            }
+        }
+    }
+
+    /// A Sundae order sells USDM for ADA; the ADA comes out of a resting
+    /// Cardano-Swaps limit order rather than a pool.
+    #[test]
+    fn sundae_order_buys_ada_from_a_resting_swap() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let edges: Vec<ConversionEdge> =
+            snap.edges(0).into_iter().filter(|e| e.to == ada()).collect();
+        assert_eq!(edges.len(), 1);
+
+        let pool_map: BTreeMap<_, _> = BTreeMap::new();
+        // Offer 23 USDM, want at least 99 ADA (the price gives 100).
+        let order = make_basic_swap_order(usdm(), 23_000_000, ada(), 99_000_000, 1);
+        let blend = router::find_blended_route(
+            &pool_map,
+            &edges,
+            &usdm(),
+            &ada(),
+            order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("a route through the resting swap exists");
+        assert_eq!(blend.branches.len(), 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_blended_order(&order, &blend, &pool_map).expect("order accumulates");
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 0, "no pool is involved");
+        assert_eq!(plan.conversions.len(), 1);
+        assert!(plan.conversions[0].primary, "the fill owns the order");
+        assert_eq!(
+            plan.conversions[0].out,
+            BigInt::from(offer_taken(23_000_000, 23, 100) as i128),
+            "the router priced it exactly as the validator will check it"
+        );
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 200_000_000)
+            .expect("the fill builds and both validators accept it");
+        // Our order's spend plus the swap's spend; no mint, no withdrawal
+        // beyond our own constraint ones.
+        let spends =
+            eval.budgets.iter().filter(|(k, _)| k.tag == conway::RedeemerTag::Spend).count();
+        assert_eq!(spends, 2, "{:?}", eval.budgets);
+        assert!(build.tx_body.mint.is_none(), "a fill mints nothing");
+        // The 3473-byte swap script joins the tiered reference-script fee.
+        assert!(build.total_ref_script_bytes >= 3473);
+    }
+
+    /// The other direction: a Sundae order sells ADA for USDCx, taking it
+    /// out of the order that offers USDCx and asks ADA.
+    #[test]
+    fn sundae_order_buys_a_token_from_a_resting_swap() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let edges: Vec<ConversionEdge> =
+            snap.edges(0).into_iter().filter(|e| e.to == usdcx()).collect();
+        assert_eq!(edges.len(), 1);
+
+        let pool_map: BTreeMap<_, _> = BTreeMap::new();
+        // Offer 3 ADA, want at least 1.9 USDCx (3/1.5 = 2 USDCx at the price).
+        let order = make_basic_swap_order(ada(), 3_000_000, usdcx(), 1_900_000, 1);
+        let blend = router::find_blended_route(
+            &pool_map,
+            &edges,
+            &ada(),
+            &usdcx(),
+            order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("a route through the resting swap exists");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_blended_order(&order, &blend, &pool_map).expect("order accumulates");
+        let plan = accum.into_plan();
+        assert_eq!(plan.conversions[0].out, BigInt::from(2_000_000i64));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_, eval) = env
+            .build_and_eval_plan(&plan, &settings, 200_000_000)
+            .expect("the token-side fill builds and validates");
+        let spends =
+            eval.budgets.iter().filter(|(k, _)| k.tag == conway::RedeemerTag::Spend).count();
+        assert_eq!(spends, 2, "{:?}", eval.budgets);
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod replay_tests {
     //! Replay the real mainnet fills through the local evaluator, then
     //! mutate them to pin each rule. These are the ground truth the

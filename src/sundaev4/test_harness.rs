@@ -81,6 +81,8 @@ pub struct TestEnv {
     pub scripts: ScriptStore,
     /// Loaded Butane runtime for conversion-leg tests (repo config).
     pub butane: Option<crate::sundaev4::butane::ButaneRuntime>,
+    /// Cardano-Swaps order-book fixture (runtime + orders).
+    pub cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot>,
     pub ref_utxo_outputs:
         BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub language_views: Vec<u8>,
@@ -292,6 +294,7 @@ impl TestEnv {
         funding_value.insert(&ada(), BigInt::from(50_000_000i64));
 
         TestEnv {
+            cardano_swaps: None,
             exec,
             scripts,
             butane: None,
@@ -326,6 +329,59 @@ impl TestEnv {
     }
 
     /// Build + eval from a full ScoopPlan (with routes + global_seq).
+    /// Load the Cardano-Swaps fixture: the mainnet runtime constants and
+    /// the orders from the replay fixtures, with the swap script admitted
+    /// to the eval store and its reference UTxO to `ref_utxo_outputs`.
+    pub fn enable_cardano_swaps(
+        &mut self,
+    ) -> &crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
+        use crate::sundaev4::cardano_swaps::{self as cs, replay_tests as rt};
+        let config = cs::CardanoSwapsConfig {
+            enabled: true,
+            swap_script_hash: rt::SWAP_HASH.into(),
+            swap_ref_utxo: "e7ab2e2e12b5ae51110758e3b668b31cfa215187d24c388bb5e736b6338d2a07#0"
+                .into(),
+            beacon_policy: rt::BEACON_POLICY.into(),
+            // The live orders sit right on their own min-UTxO floor, so the
+            // fixture keeps exactly what the chain kept.
+            min_keep_lovelace: 2_780_000,
+        };
+        let runtime = cs::CardanoSwapsRuntime::load(&config).expect("fixture config loads");
+        let utxos = rt::utxo_set();
+        let mut state = cs::CardanoSwapsState::default();
+        for (k, out) in &utxos {
+            if out.address.to_vec().get(1..29) != Some(&runtime.swap_hash[..]) {
+                continue;
+            }
+            // Only the orders the real fills consumed, not their
+            // continuations (which the fixtures also contain).
+            if let Some(o) = cs::SwapOrder::from_output(k.clone(), out)
+                && o.datum.prev_input.is_none()
+            {
+                state.orders.insert(k.clone(), o);
+            }
+        }
+        for r in runtime.static_ref_utxos() {
+            let out = utxos.get(&r).expect("swap script ref UTxO in the fixtures");
+            let Some(crate::cardano_types::ScriptRef::PlutusV3(script)) = &out.script_ref else {
+                panic!("the swap ref UTxO carries no V3 script");
+            };
+            self.scripts
+                .insert_with_version(script.as_ref(), 3)
+                .expect("cardano-swaps script inserts");
+            self.ref_utxo_outputs.insert(r, out.clone());
+        }
+        self.exec.slot_config = rt::mainnet_slots();
+        let (_, legs) = runtime.edges(&state, 0);
+        self.cardano_swaps = Some(cs::CardanoSwapsSnapshot {
+            runtime,
+            state,
+            legs,
+            slot_config: rt::mainnet_slots(),
+        });
+        self.cardano_swaps.as_ref().unwrap()
+    }
+
     /// Use this when testing routed orders via the accumulator.
     /// Load the Butane runtime from the committed preview config and
     /// admit its scripts to the eval store. Returns false (test should
@@ -401,6 +457,7 @@ impl TestEnv {
             None,                               // fee_settings (harness configs are fee-less)
             self.funding.as_ref().map(|(i, v)| (i.clone(), v)),
             self.butane.as_ref(),
+            self.cardano_swaps.as_ref().map(|s| s.context()).as_ref(),
         )?;
 
         let eval = evaluate_scoop_tx(

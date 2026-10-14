@@ -1935,6 +1935,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                None,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2113,6 +2114,7 @@ impl Scooper {
                         v4_state.fee_settings.as_deref(),
                         funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                         self.v4_butane.as_ref(),
+                        None,
                     ) {
                         // A missing funding input is a wallet condition, not
                         // a defect of the order: take the temporary-quarantine
@@ -2438,6 +2440,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                None,
             ) {
                 Ok(r) => r,
                 Err(e)
@@ -2632,6 +2635,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                None,
             ) {
                 Ok(r) => r,
                 Err(e)
