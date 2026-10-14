@@ -346,6 +346,11 @@ impl TestEnv {
             // The live orders sit right on their own min-UTxO floor, so the
             // fixture keeps exactly what the chain kept.
             min_keep_lovelace: 2_780_000,
+            foreign_fills: Some(cs::ForeignFillConfig {
+                enabled: true,
+                min_revenue_lovelace: 0,
+                fee_estimate_lovelace: 0,
+            }),
         };
         let runtime = cs::CardanoSwapsRuntime::load(&config).expect("fixture config loads");
         let utxos = rt::utxo_set();

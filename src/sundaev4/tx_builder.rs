@@ -480,6 +480,9 @@ pub struct MultiPoolBuildResult {
     /// next chained tx fund itself off this one instead of double-spending
     /// the confirmed funding UTxO an in-flight tx already consumed.
     pub wallet_change: Option<(u64, crate::cardano_types::Value)>,
+    /// Lovelace a foreign-only fill landed on pool output 0 as protocol
+    /// surplus, net of the transaction fee. None for every other shape.
+    pub foreign_surplus: Option<u64>,
 }
 
 /// Build a signed scoop transaction for M pools + N orders.
@@ -558,10 +561,21 @@ pub fn build_multi_pool_scoop_tx(
         + n_claim_orders
         + n_conversion_orders
         - plan.moves.iter().map(|m| m.legs() - 1).sum::<usize>();
+    // Pool swaps serving foreign orders (Cardano-Swaps limit orders): no
+    // Sundae order, no fulfillment, the pool's emission goes into the
+    // foreign order's continuing output.
+    let n_foreign: usize = batches.iter().map(|b| b.foreign.len()).sum();
+    let foreign_only = n_orders == 0 && n_foreign > 0;
     // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
     // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
-    if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
+    if (n_orders == 0 && n_foreign == 0) || (m_pools == 0 && plan.conversions.is_empty()) {
         bail!("no orders (or no batches and no conversions)");
+    }
+    if n_foreign > 0 && !foreign_only {
+        bail!(
+            "foreign fills must be the only ops in a transaction: a fee-bearing scoop pins \
+             the designated pool's surplus delta exactly, so the fill's surplus could not land"
+        );
     }
 
     // Synthesize a global_seq if the caller passed an empty one (legacy paths
@@ -704,6 +718,8 @@ pub fn build_multi_pool_scoop_tx(
     let mut per_pool_cum_gross_fb: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_cum_protocol_lp: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_transcripts: Vec<Vec<TranscriptEntry>> = vec![Vec::new(); m_pools];
+    let mut per_pool_foreign_dys: Vec<Vec<BigInt>> =
+        batches.iter().map(|b| vec![BigInt::from(0); b.foreign.len()]).collect();
     let mut per_pool_effective_swap_dys: Vec<Vec<BigInt>> =
         batches.iter().map(|b| b.swaps.iter().map(|s| s.dy.clone()).collect()).collect();
 
@@ -888,6 +904,45 @@ pub fn build_multi_pool_scoop_tx(
                     "streaming walk: claim op",
                 );
                 (BigInt::from(crate::sundaev4::types::TAG_CLAIM), fb)
+            }
+            crate::sundaev4::batch::BatchOp::Foreign(i) => {
+                let f = &batch.foreign[*i];
+                // Attribution: the foreign order's own output reference, so
+                // the indexer can tell this step served a Cardano-Swaps order.
+                op_data_override = Some(order_ref_to_plutus(&f.attribution));
+                let dx = f.dx.clone();
+                let dy = crate::sundaev4::batch::compute_swap_result(
+                    &pool_type,
+                    running_assets,
+                    running_total_lp,
+                    f.input_idx,
+                    f.output_idx,
+                    &dx,
+                );
+                if !num_traits::Signed::is_positive(&dy) {
+                    bail!(
+                        "foreign fill {}: the pool yields nothing for dx={dx}",
+                        f.key
+                    );
+                }
+                per_pool_foreign_dys[batch_idx][*i] = dy.clone();
+                running_assets[f.input_idx].1 = &running_assets[f.input_idx].1 + &dx;
+                running_assets[f.output_idx].1 = &running_assets[f.output_idx].1 - &dy;
+                tracing::debug!(
+                    walk = "op-foreign",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    key = %f.key,
+                    dx = %dx, dy = %dy,
+                    "streaming walk: foreign-order fill",
+                );
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type,
+                    &prev_assets,
+                    running_assets,
+                    running_total_lp,
+                );
+                (per_pool_swap_tag[batch_idx].clone(), fb)
             }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
                 let s = &batch.swaps[*i];
@@ -1213,6 +1268,7 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::Deposit(i) => Some(&batch.deposits[*i].order.input),
                 BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
                 BatchOp::Claim(i) => Some(&batch.claims[*i].order.input),
+                BatchOp::Foreign(i) => Some(&batch.foreign[*i].attribution),
             };
             let attribution = served_order.map(order_ref_to_plutus).unwrap_or_else(|| {
                 pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
@@ -1222,15 +1278,16 @@ pub fn build_multi_pool_scoop_tx(
                 })
             });
             op_data_override = Some(match op {
-                BatchOp::Swap(_) | BatchOp::Continuation(_) | BatchOp::ZapSwap(_) => {
-                    ss_swap_op_data(
-                        config,
-                        &prev_assets,
-                        running_assets,
-                        &lp_before,
-                        attribution,
-                    )?
-                }
+                BatchOp::Swap(_)
+                | BatchOp::Continuation(_)
+                | BatchOp::ZapSwap(_)
+                | BatchOp::Foreign(_) => ss_swap_op_data(
+                    config,
+                    &prev_assets,
+                    running_assets,
+                    &lp_before,
+                    attribution,
+                )?,
                 BatchOp::Deposit(i) => {
                     let t = batch.deposits[*i].target_delta_v.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("stableswap deposit without a declared target delta")
@@ -1423,6 +1480,45 @@ pub fn build_multi_pool_scoop_tx(
             effective_swap_dys: std::mem::take(&mut per_pool_effective_swap_dys[i]),
             final_assets_actual,
         });
+    }
+
+    // ── Step 1.5: Foreign-order fills → continuing outputs ──────────────────
+    // The pool step's emission is now known exactly; derive the foreign
+    // order's amounts from it and compose its continuing output.
+    for (bi, b) in batches.iter().enumerate() {
+        for (fi, f) in b.foreign.iter().enumerate() {
+            use num_traits::ToPrimitive;
+            let ctx = cardano_swaps.with_context(|| {
+                format!(
+                    "plan contains foreign fill {} but no fill context is loaded",
+                    f.key
+                )
+            })?;
+            let leg = ctx
+                .legs
+                .get(&f.key)
+                .with_context(|| format!("no cardano-swaps leg for foreign fill {}", f.key))?;
+            let dx = f.dx.clone().unwrap().to_u128().context("foreign dx doesn't fit u128")?;
+            let dy = per_pool_foreign_dys[bi][fi]
+                .clone()
+                .unwrap()
+                .to_u128()
+                .context("foreign dy doesn't fit u128")?;
+            let available = ctx.runtime.available_offer(&leg.order);
+            let (take, deposit) = crate::sundaev4::cardano_swaps::foreign_amounts(
+                &leg.order.datum,
+                available,
+                dx,
+                dy,
+            )
+            .with_context(|| format!("foreign fill {}", f.key))?;
+            tracing::debug!(
+                key = %f.key, pool = %b.pool_ident,
+                pool_in = dx, pool_out = dy, take, deposit,
+                "foreign fill amounts",
+            );
+            cswaps_pieces.push(ctx.fill_pieces(&f.key, deposit, take)?);
+        }
     }
 
     // ── Step 2: Collect all inputs and sort ─────────────────────────────────
@@ -2180,11 +2276,15 @@ pub fn build_multi_pool_scoop_tx(
 
     let reward_account = |script_hash: &Hash<28>| script_reward_account(exec.network, script_hash);
 
-    // Always present: order, fee_split, fairness
-    let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![(
-        reward_account(&exec.module_scripts.order.hash),
-        order_validator_redeemer.to_plutus(),
-    )];
+    // The order validator runs only when a Sundae order is spent; a
+    // foreign-only fill spends none. fee_split and fairness follow the pool.
+    let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = Vec::new();
+    if n_orders > 0 {
+        withdrawals.push((
+            reward_account(&exec.module_scripts.order.hash),
+            order_validator_redeemer.to_plutus(),
+        ));
+    }
     // fee_split and fairness are POOL action modules — the pool datum's
     // action entry demands them. A pool-less scoop (pure-conversion orders)
     // spends no pool, so nothing requires them and their empty-entry
@@ -3062,6 +3162,60 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
 
+    // ── Foreign-fill surplus landing ───────────────────────────────────────
+    // No Sundae order means no fee pot and no fulfillment: whatever lovelace
+    // the foreign order released beyond the pool's price and the tx fee is
+    // the protocol's, and it lands on pool output 0 as surplus (raising a
+    // pool's surplus is always legal; only the fee constraint pins it, and
+    // the fee constraint does not run here). Computed as the exact residual
+    // so value conservation holds by construction.
+    let mut foreign_surplus: Option<u64> = None;
+    if foreign_only {
+        use num_traits::ToPrimitive;
+        if total_pool_bump > 0 {
+            bail!("foreign fill: a pool output needs a min-ada bump, which this shape cannot fund");
+        }
+        let ada_local = AssetClass {
+            policy: vec![],
+            token: vec![],
+        };
+        let lovelace_in: u128 = batches
+            .iter()
+            .map(|b| b.pool.value.get(&ada_local).unwrap().to_u128().unwrap_or(0))
+            .chain(
+                cswaps_pieces
+                    .iter()
+                    .map(|p| p.order_value.get(&ada_local).unwrap().to_u128().unwrap_or(0)),
+            )
+            .sum();
+        let lovelace_out: u128 = outputs
+            .iter()
+            .map(|o| match o {
+                TransactionOutput::PostAlonzo(b) => match &b.value {
+                    ConwayValue::Coin(c) => *c as u128,
+                    ConwayValue::Multiasset(c, _) => *c as u128,
+                },
+                TransactionOutput::Legacy(_) => 0,
+            })
+            .sum();
+        let residual =
+            lovelace_in.checked_sub(lovelace_out + tx_fee as u128).with_context(|| {
+                format!(
+                    "foreign fill does not cover its own fee: inputs {lovelace_in} < outputs \
+                     {lovelace_out} + fee {tx_fee}"
+                )
+            })?;
+        let residual = u64::try_from(residual).context("foreign surplus doesn't fit u64")?;
+        let out = outputs.get_mut(0).context("foreign fill: no pool output at index 0")?;
+        if let TransactionOutput::PostAlonzo(b) = out {
+            b.value = match &b.value {
+                ConwayValue::Coin(c) => ConwayValue::Coin(c + residual),
+                ConwayValue::Multiasset(c, ma) => ConwayValue::Multiasset(c + residual, ma.clone()),
+            };
+        }
+        foreign_surplus = Some(residual);
+    }
+
     let total_funding_draw = total_pool_bump + total_fulfillment_subsidy;
     let mut wallet_change: Option<(u64, crate::cardano_types::Value)> = None;
     if funding_value_opt.is_none() && total_funding_draw > 0 {
@@ -3072,7 +3226,14 @@ pub fn build_multi_pool_scoop_tx(
         ))
         .into());
     }
-    if funding_value_opt.is_none() && total_fee_deducted != tx_fee + designated_required {
+    // The network fee is paid from the deduction pot — except in a foreign-
+    // only fill, where the landed residual already covers it and a funding
+    // UTxO, if one rode along, must return untouched.
+    let fee_from_pot: u64 = if foreign_only { 0 } else { tx_fee };
+    if !foreign_only
+        && funding_value_opt.is_none()
+        && total_fee_deducted != fee_from_pot + designated_required
+    {
         // Without a change output there is nowhere for the deduction pot's
         // surplus (or shortfall) vs the tx fee to go — the ledger would
         // reject the tx as ValueNotConservedUTxO.
@@ -3098,11 +3259,11 @@ pub fn build_multi_pool_scoop_tx(
         // deductions (SUNDAE-2587) pay the network fee and the remainder is
         // the scooper's compensation, landing here.
         let change_ada = (funding_ada + total_fee_deducted)
-            .checked_sub(total_funding_draw + tx_fee + designated_required)
+            .checked_sub(total_funding_draw + fee_from_pot + designated_required)
             .with_context(|| {
                 format!(
                     "funding UTxO ada ({funding_ada}) + fee deductions ({total_fee_deducted}) \
-                 insufficient for min-ada support ({total_funding_draw}) + tx fee ({tx_fee})"
+                 insufficient for min-ada support ({total_funding_draw}) + tx fee ({fee_from_pot})"
                 )
             })?;
         if change_ada < SCOOPER_CHANGE_MIN_ADA {
@@ -3881,7 +4042,13 @@ pub fn build_multi_pool_scoop_tx(
             use num_traits::ToPrimitive;
             let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
             // outputs[0] is the designated pool; batch_idx IS the output index.
-            let surplus = if batch_idx == 0 { designated_required as i128 } else { 0 };
+            // It carries the fee constraint's pinned surplus in a fee-bearing
+            // scoop, or a foreign fill's landed residual — never both.
+            let surplus = if batch_idx == 0 {
+                designated_required as i128 + foreign_surplus.unwrap_or(0) as i128
+            } else {
+                0
+            };
             let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128 + surplus)
                 .max(POOL_MIN_ADA as i128) as u64;
             predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));
@@ -4007,6 +4174,7 @@ pub fn build_multi_pool_scoop_tx(
         predicted_pools,
         ttl,
         wallet_change,
+        foreign_surplus,
     })
 }
 

@@ -76,10 +76,42 @@ pub struct CardanoSwapsConfig {
     /// needs the output to clear its own min-UTxO floor.
     #[serde(default = "default_min_keep")]
     pub min_keep_lovelace: u64,
+    /// Filling resting orders against our own pools when no Sundae order
+    /// is involved. Off unless present and enabled.
+    #[serde(default)]
+    pub foreign_fills: Option<ForeignFillConfig>,
 }
 
 fn default_min_keep() -> u64 {
     3_000_000
+}
+
+/// `execution.cardano-swaps.foreign-fills`: a pool swap whose counterparty
+/// is a resting Cardano-Swaps order. The lovelace the order releases beyond
+/// the pool's price lands on the pool as protocol surplus; the fill is only
+/// made when that surplus, net of the transaction fee, clears a floor.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ForeignFillConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Net protocol revenue a fill must land (lovelace) after the exact
+    /// transaction fee. Checked against the rebuilt transaction, not a
+    /// projection. A fill that clears by one lovelace still costs a build,
+    /// an evaluation and a race, so keep this above zero.
+    #[serde(default = "default_min_revenue")]
+    pub min_revenue_lovelace: u64,
+    /// Fee projection used only to size and pre-screen a fill before it is
+    /// built. The real fee replaces it for the floor check.
+    #[serde(default = "default_fee_estimate")]
+    pub fee_estimate_lovelace: u64,
+}
+
+fn default_min_revenue() -> u64 {
+    1_000_000
+}
+fn default_fee_estimate() -> u64 {
+    1_000_000
 }
 
 // ─── Runtime ────────────────────────────────────────────────────────────────
@@ -91,6 +123,7 @@ pub struct CardanoSwapsRuntime {
     pub swap_ref: TransactionInput,
     pub beacon_policy: Vec<u8>,
     pub min_keep_lovelace: u64,
+    pub foreign_fills: Option<ForeignFillConfig>,
 }
 
 fn parse_outref(s: &str) -> Result<TransactionInput> {
@@ -116,6 +149,7 @@ impl CardanoSwapsRuntime {
             swap_ref: parse_outref(&config.swap_ref_utxo)?,
             beacon_policy: parse_hash("beacon-policy", &config.beacon_policy)?,
             min_keep_lovelace: config.min_keep_lovelace,
+            foreign_fills: config.foreign_fills.clone().filter(|f| f.enabled),
         })
     }
 
@@ -464,7 +498,7 @@ pub fn order_from_key(key: &str) -> Option<TransactionInput> {
 
 impl CardanoSwapsRuntime {
     /// How much of the offered asset a given order can part with.
-    fn available_offer(&self, order: &SwapOrder) -> u128 {
+    pub fn available_offer(&self, order: &SwapOrder) -> u128 {
         use num_traits::ToPrimitive;
         let held = order.value.get(&order.datum.offer).unwrap().to_u128().unwrap_or(0);
         if order.datum.offer == ADA_ASSET_CLASS {
@@ -665,6 +699,168 @@ impl FillContext<'_> {
     }
 }
 
+// ─── Foreign fills: a pool swap serving a resting order ─────────────────────
+//
+// The pool's input asset is the order's offer (we take it from the order and
+// put it in the pool); the pool's emission is the order's ask (we deposit it
+// into the order). Exactly one side is ADA, and the lovelace left over on
+// that side is the protocol's surplus:
+//
+//   offer == ADA: deposit everything the pool emitted; take as much ADA as
+//                 the price allows; surplus = taken − pool dx − fee.
+//   ask   == ADA: take exactly the pool's dx; deposit the least ADA the
+//                 price demands; surplus = pool dy − deposited − fee.
+
+/// The foreign order's exact amounts for a pool step of `dx` in and `dy`
+/// out: `(take, deposit)` in the order's offer and ask assets.
+pub fn foreign_amounts(
+    datum: &SwapDatum,
+    available_offer: u128,
+    dx: u128,
+    dy: u128,
+) -> Result<(u128, u128)> {
+    if datum.offer == ADA_ASSET_CLASS {
+        let deposit = dy;
+        let take = offer_taken(deposit, datum.price_num, datum.price_den).min(available_offer);
+        anyhow::ensure!(
+            take > 0,
+            "the pool's emission buys nothing at the order's price"
+        );
+        Ok((take, deposit))
+    } else if datum.ask == ADA_ASSET_CLASS {
+        let take = dx;
+        anyhow::ensure!(take <= available_offer, "take exceeds the order's offer");
+        // Smallest deposit with take·num <= deposit·den.
+        let deposit = (take * datum.price_num as u128).div_ceil(datum.price_den as u128);
+        Ok((take, deposit))
+    } else {
+        anyhow::bail!("foreign fills need ADA on one side of the order");
+    }
+}
+
+/// Argmax of an integer function on `[lo, hi]` that is unimodal up to
+/// rounding ripple: a ternary search finds the hill, then the top edge
+/// `hi` and a window around the hill are scanned exactly, since ceilings
+/// in the price arithmetic make neighbouring points trade places.
+fn argmax_unimodal(lo: u128, hi: u128, f: impl Fn(u128) -> i128) -> u128 {
+    let (mut a, mut b) = (lo, hi);
+    while b - a > 2 {
+        let m1 = a + (b - a) / 3;
+        let m2 = b - (b - a) / 3;
+        if f(m1) < f(m2) {
+            a = m1 + 1;
+        } else {
+            b = m2;
+        }
+    }
+    let peak = (a..=b).max_by_key(|x| f(*x)).unwrap_or(a);
+    let window = 2_000u128;
+    let scan_lo = peak.saturating_sub(window).max(lo);
+    let scan_hi = (peak + window).min(hi);
+    (scan_lo..=scan_hi).chain(std::iter::once(hi)).max_by_key(|x| f(*x)).unwrap_or(peak)
+}
+
+/// A planned foreign fill: the pool step plus what it is expected to land.
+#[derive(Clone, Debug)]
+pub struct ForeignFillPlan {
+    pub resolved: crate::sundaev4::batch::ResolvedForeign,
+    /// Lovelace the fill releases before the transaction fee.
+    pub gross_surplus: u64,
+}
+
+impl CardanoSwapsRuntime {
+    /// Size a fill of `leg`'s order against `pool`, maximizing the lovelace
+    /// released, and return it only if that clears the configured fee
+    /// estimate plus revenue floor. The real fee is re-checked after the
+    /// transaction is built.
+    pub fn plan_foreign_fill(
+        &self,
+        pool: &crate::sundaev4::types::SundaeV4Pool,
+        leg: &SwapLeg,
+    ) -> Option<ForeignFillPlan> {
+        use num_traits::ToPrimitive;
+        let cfg = self.foreign_fills.as_ref()?;
+        let d = &leg.order.datum;
+        let assets = &pool.pool_datum.assets;
+        if assets.len() != 2 {
+            return None;
+        }
+        let input_idx = assets.iter().position(|(a, _)| *a == d.offer)?;
+        let output_idx = assets.iter().position(|(a, _)| *a == d.ask)?;
+        if d.offer != ADA_ASSET_CLASS && d.ask != ADA_ASSET_CLASS {
+            return None;
+        }
+        let available = self.available_offer(&leg.order);
+        if available == 0 {
+            return None;
+        }
+        let dy_of = |dx: u128| -> u128 {
+            crate::sundaev4::batch::compute_swap_result(
+                &pool.pool_type,
+                assets,
+                &pool.pool_datum.total_lp,
+                input_idx,
+                output_idx,
+                &BigInt::from(dx as i128),
+            )
+            .unwrap()
+            .to_u128()
+            .unwrap_or(0)
+        };
+        // Lovelace released by a pool step of `dx` (negative = a loss).
+        let surplus_of = |dx: u128| -> i128 {
+            if dx == 0 {
+                return i128::MIN / 2;
+            }
+            let dy = dy_of(dx);
+            if dy == 0 {
+                return i128::MIN / 2;
+            }
+            match foreign_amounts(d, available, dx, dy) {
+                Ok((take, deposit)) => {
+                    if d.offer == ADA_ASSET_CLASS {
+                        take as i128 - dx as i128
+                    } else {
+                        dy as i128 - deposit as i128
+                    }
+                }
+                Err(_) => i128::MIN / 2,
+            }
+        };
+        // Search bound: past the point where the order is exhausted, more
+        // dx only costs. For an ADA offer that is the dx buying `available`
+        // at the price; for a token offer it is `available` itself.
+        let hi = if d.offer == ADA_ASSET_CLASS {
+            available * d.price_num as u128 / d.price_den as u128 * 2 + 2
+        } else {
+            available
+        };
+        let dx = argmax_unimodal(1, hi.max(2), surplus_of);
+        let gross = surplus_of(dx);
+        if gross <= 0 {
+            return None;
+        }
+        let gross = gross as u64;
+        if gross < cfg.fee_estimate_lovelace + cfg.min_revenue_lovelace {
+            tracing::debug!(
+                order = %leg.order.input, pool = %pool.pool_datum.identifier,
+                gross, "cardano-swaps: foreign fill below the projected floor",
+            );
+            return None;
+        }
+        Some(ForeignFillPlan {
+            resolved: crate::sundaev4::batch::ResolvedForeign {
+                key: edge_key(&leg.order.input),
+                attribution: leg.order.input.clone(),
+                input_idx,
+                output_idx,
+                dx: BigInt::from(dx as i128),
+            },
+            gross_surplus: gross,
+        })
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -779,6 +975,7 @@ mod unit_tests {
             swap_ref_utxo: format!("{}#0", "ab".repeat(32)),
             beacon_policy: "274765b4c626c28d18752176b59c0ff63db56b8305c1daa49c9879fe".into(),
             min_keep_lovelace: 3_000_000,
+            foreign_fills: None,
         };
         assert!(
             load_runtime(&Some(cfg.clone())).is_none(),
@@ -788,6 +985,285 @@ mod unit_tests {
         assert!(load_runtime(&Some(cfg.clone())).is_some());
         cfg.swap_ref_utxo = "not-an-outref".into();
         assert!(load_runtime(&Some(cfg)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod foreign_fill_tests {
+    //! A resting Cardano-Swaps order filled against one of our pools with
+    //! no Sundae order in the transaction: the pool's emission goes into the
+    //! order, the lovelace the order releases beyond the pool's price lands
+    //! on the pool as surplus, and every validator — ours and theirs — runs.
+
+    use super::*;
+    use crate::sundaev4::batch::{Batch, BatchOp, ScoopPlan};
+    use crate::sundaev4::test_harness::{TestEnv, ada, make_pool, make_settings};
+    use num_traits::ToPrimitive;
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+
+    fn usdm() -> AssetClass {
+        AssetClass {
+            policy: hex::decode("c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad")
+                .unwrap(),
+            token: hex::decode("0014df105553444d").unwrap(),
+        }
+    }
+    fn usdcx() -> AssetClass {
+        AssetClass {
+            policy: hex::decode("1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34")
+                .unwrap(),
+            token: hex::decode("5553444378").unwrap(),
+        }
+    }
+
+    fn leg_for<'a>(snap: &'a CardanoSwapsSnapshot, offer: &AssetClass) -> &'a SwapLeg {
+        snap.legs
+            .values()
+            .find(|l| l.order.datum.offer == *offer)
+            .expect("fixture order with that offer")
+    }
+
+    fn plan_of(
+        pool: &std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        fill: &ForeignFillPlan,
+    ) -> ScoopPlan {
+        ScoopPlan {
+            batches: vec![Batch {
+                pool: pool.clone(),
+                pool_ident: pool.pool_datum.identifier.clone(),
+                swaps: Vec::new(),
+                continuations: Vec::new(),
+                deposits: Vec::new(),
+                withdraws: Vec::new(),
+                zaps: Vec::new(),
+                claims: Vec::new(),
+                foreign: vec![fill.resolved.clone()],
+                ops_order: vec![BatchOp::Foreign(0)],
+                final_assets: pool.pool_datum.assets.clone(),
+                final_total_lp: pool.pool_datum.total_lp.clone(),
+            }],
+            routes: Vec::new(),
+            global_seq: Vec::new(),
+            conversions: Vec::new(),
+        }
+    }
+
+    fn lovelace_of(out: &conway::TransactionOutput) -> u64 {
+        match out {
+            conway::TransactionOutput::PostAlonzo(b) => match &b.value {
+                conway::Value::Coin(c) => *c,
+                conway::Value::Multiasset(c, _) => *c,
+            },
+            _ => 0,
+        }
+    }
+
+    /// The order sells ADA at 0.23 USDM; a pool valuing ADA at 0.25 USDM
+    /// buys it cheaper than it is worth. We take ADA from the order, feed
+    /// the pool, and deposit the pool's USDM into the order.
+    #[test]
+    fn ada_offer_fill_lands_surplus_on_the_pool() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        // 400k ADA / 100k USDM: mid 0.25 USDM per ADA, deep enough that a
+        // few hundred ADA barely moves it.
+        let pool = make_pool(&env, 0xF1, ada(), 400_000_000_000, usdm(), 100_000_000_000);
+        let leg = leg_for(&snap, &ada());
+        let fill = snap
+            .runtime
+            .plan_foreign_fill(&pool, leg)
+            .expect("the price gap makes the fill worth planning");
+        assert!(fill.gross_surplus > 0, "{fill:?}");
+        // The pool buys ADA for USDM; the order sells ADA for USDM.
+        assert_eq!(pool.pool_datum.assets[fill.resolved.input_idx].0, ada());
+        assert_eq!(pool.pool_datum.assets[fill.resolved.output_idx].0, usdm());
+
+        let plan = plan_of(&pool, &fill);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 200_000_000)
+            .expect("pool, modules and the swap validator all accept the fill");
+
+        // Exactly two spends: the pool and the foreign order. No Sundae order
+        // validator ran, so there is no order withdrawal.
+        let spends =
+            eval.budgets.iter().filter(|(k, _)| k.tag == conway::RedeemerTag::Spend).count();
+        assert_eq!(spends, 2, "{:?}", eval.budgets);
+        let order_hash = env.exec.module_scripts.order.hash;
+        assert!(
+            !build
+                .tx_body
+                .withdrawals
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|(acct, _)| acct[1..] == order_hash.as_ref()[..]),
+            "no order-validator withdrawal in a foreign-only fill"
+        );
+
+        // The surplus landed: pool output 0 holds its declared reserve plus
+        // the fee-netted release, and the number the builder reports is the
+        // exact residual of value conservation.
+        let surplus = build.foreign_surplus.expect("foreign-only fills report their surplus");
+        assert!(surplus > 0);
+        let pool_in = pool.value.get(&ada());
+        let pool_out = lovelace_of(&build.tx_body.outputs[0]);
+        let dx = fill.resolved.dx.clone().unwrap();
+        assert_eq!(
+            pool_out as i128,
+            pool_in.unwrap().to_i128().unwrap() + dx.to_i128().unwrap() + surplus as i128,
+            "pool output = reserve in + declared dx + landed surplus"
+        );
+        // Gross minus the real fee is what landed.
+        assert_eq!(surplus + build.tx_body.fee, fill.gross_surplus);
+        // The predicted pool the chain tracker will chain on carries it too.
+        let (_, _, predicted) = &build.predicted_pools[0];
+        assert_eq!(
+            predicted.value.get(&ada()).unwrap().to_u64().unwrap(),
+            pool_out
+        );
+    }
+
+    /// The other direction: the order sells USDCx for 1.5 ADA each; a pool
+    /// valuing USDCx at 10 ADA pays far more. We take USDCx from the order,
+    /// sell it to the pool, and deposit the least ADA the order's price
+    /// demands. (The order holds only 3 USDCx, so the pool's price has to be
+    /// well above the order's for three units to cover a 1.5 ADA fee.)
+    #[test]
+    fn token_offer_fill_lands_surplus_on_the_pool() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let pool = make_pool(
+            &env,
+            0xF2,
+            ada(),
+            1_000_000_000_000,
+            usdcx(),
+            100_000_000_000,
+        );
+        let leg = leg_for(&snap, &usdcx());
+        let fill = snap.runtime.plan_foreign_fill(&pool, leg).expect("worth planning");
+        // Essentially the whole 3 USDCx the order holds is worth taking at
+        // this gap. Not exactly all of it: the deposit is ceil(dx·3/2), so
+        // the last unit can cost a lovelace more than it earns, and the
+        // planner stops a unit short rather than pay it.
+        use num_traits::ToPrimitive;
+        let dx = fill.resolved.dx.clone().unwrap().to_u128().unwrap();
+        assert!((2_999_990..=3_000_000).contains(&dx), "dx {dx}");
+
+        let plan = plan_of(&pool, &fill);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 200_000_000)
+            .expect("the token-side fill builds and validates");
+        assert_eq!(
+            eval.budgets.iter().filter(|(k, _)| k.tag == conway::RedeemerTag::Spend).count(),
+            2
+        );
+        let surplus = build.foreign_surplus.expect("reported");
+        assert_eq!(surplus + build.tx_body.fee, fill.gross_surplus);
+        // The order received exactly ceil(dx · 3/2) lovelace, the least the
+        // price demands.
+        let cont = build
+            .tx_body
+            .outputs
+            .iter()
+            .find(|o| matches!(o, conway::TransactionOutput::PostAlonzo(b) if b.address[1..29] == snap.runtime.swap_hash[..]))
+            .expect("continuing output");
+        let before = leg.order.value.get(&ada()).unwrap().to_u64().unwrap();
+        assert_eq!(
+            lovelace_of(cont) as u128,
+            before as u128 + (dx * 3).div_ceil(2)
+        );
+    }
+
+    /// A fill whose gross release is positive but smaller than the real
+    /// fee is refused by the builder itself, independently of the planner's
+    /// screen: three USDCx at a 0.5 ADA edge cannot pay a 1.5 ADA fee.
+    #[test]
+    fn a_fill_that_cannot_cover_its_fee_is_refused_by_the_builder() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        // 2 ADA per USDCx against the order's 1.5: a positive but tiny edge.
+        let pool = make_pool(&env, 0xF6, ada(), 200_000_000_000, usdcx(), 100_000_000_000);
+        let leg = leg_for(&snap, &usdcx());
+        let fill = snap
+            .runtime
+            .plan_foreign_fill(&pool, leg)
+            .expect("the fixture's zero floor lets it through");
+        assert!(fill.gross_surplus < 1_500_000, "{fill:?}");
+        let plan = plan_of(&pool, &fill);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let err = match env.build_and_eval_plan(&plan, &settings, 200_000_000) {
+            Ok(_) => panic!("a fill that cannot pay its fee must not build"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("does not cover its own fee"),
+            "{err:#}"
+        );
+    }
+
+    /// A pool priced on the wrong side of the order yields nothing to take,
+    /// and the planner says so rather than proposing a losing fill.
+    #[test]
+    fn a_fill_that_loses_is_not_planned() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        // Pool values ADA at 0.20 USDM; the order wants 0.23. Buying ADA at
+        // 0.23 to sell at 0.20 loses.
+        let pool = make_pool(&env, 0xF3, ada(), 500_000_000_000, usdm(), 100_000_000_000);
+        assert!(snap.runtime.plan_foreign_fill(&pool, leg_for(&snap, &ada())).is_none());
+    }
+
+    #[test]
+    fn the_projected_floor_screens_small_fills() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let pool = make_pool(&env, 0xF4, ada(), 400_000_000_000, usdm(), 100_000_000_000);
+        let leg = leg_for(&snap, &ada());
+        let gross = snap.runtime.plan_foreign_fill(&pool, leg).expect("plannable").gross_surplus;
+        let mut strict = snap.runtime.clone();
+        strict.foreign_fills = Some(ForeignFillConfig {
+            enabled: true,
+            fee_estimate_lovelace: gross,
+            min_revenue_lovelace: 1,
+        });
+        assert!(
+            strict.plan_foreign_fill(&pool, leg).is_none(),
+            "fee estimate + floor exceed the gross"
+        );
+    }
+
+    #[test]
+    fn foreign_fills_cannot_share_a_transaction_with_sundae_orders() {
+        use crate::sundaev4::test_harness::make_basic_swap_order;
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let pool = make_pool(&env, 0xF5, ada(), 400_000_000_000, usdm(), 100_000_000_000);
+        let fill = snap.runtime.plan_foreign_fill(&pool, leg_for(&snap, &ada())).unwrap();
+        let mut plan = plan_of(&pool, &fill);
+        // Bolt a Sundae order onto the same pool batch.
+        let order = make_basic_swap_order(usdm(), 1_000_000, ada(), 1_000_000, 1);
+        plan.batches[0].swaps.push(crate::sundaev4::batch::ResolvedSwap {
+            order,
+            input_idx: 1,
+            output_idx: 0,
+            dx: BigInt::from(1_000_000i64),
+            dy: BigInt::from(3_900_000i64),
+            route: None,
+        });
+        plan.batches[0].ops_order.push(BatchOp::Swap(0));
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let err = match env.build_and_eval_plan(&plan, &settings, 200_000_000) {
+            Ok(_) => panic!("a mixed plan must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("foreign fills must be the only ops"),
+            "{err:#}"
+        );
     }
 }
 
@@ -1313,6 +1789,7 @@ pub(crate) mod replay_tests {
             swap_ref: TransactionInput::new([1u8; 32].into(), 0),
             beacon_policy: hex::decode(BEACON_POLICY).unwrap(),
             min_keep_lovelace: 2_780_000,
+            foreign_fills: None,
         };
         // The two orders the real fills consumed.
         let mut state = CardanoSwapsState::default();

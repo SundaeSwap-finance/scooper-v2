@@ -1476,6 +1476,7 @@ impl Accumulator {
                 withdraws: accum.withdraws,
                 zaps: accum.zaps,
                 claims: Vec::new(),
+                foreign: Vec::new(),
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,

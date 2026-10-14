@@ -166,6 +166,13 @@ pub enum BatchOp {
     /// Index into `batch.claims`. Phase 1: a claim is always the only op in
     /// its batch (dedicated single-order batches, no transcript mixing).
     Claim(usize),
+    /// Index into `batch.foreign`: a pool swap that serves an order held at
+    /// a foreign order contract (a Cardano-Swaps limit order), not a Sundae
+    /// order. The pool step is an ordinary swap; what differs is that its
+    /// emission goes into the foreign order's continuing output and the
+    /// lovelace the foreign order releases beyond the pool's price lands on
+    /// the pool as protocol surplus.
+    Foreign(usize),
 }
 
 /// Cross-batch pointer to an op for the global topological walk. `op_idx`
@@ -371,6 +378,24 @@ pub struct PlannedConversion {
     pub hop_idx: usize,
 }
 
+/// A pool swap serving a foreign order: `dx` of the pool asset at
+/// `input_idx` goes into the pool (it is what the foreign order offers and
+/// we take), and the pool's emission of the asset at `output_idx` is what
+/// the foreign order asks and we deposit. The tx builder recomputes the
+/// emission against the live pool state, derives the foreign order's exact
+/// amounts from it, and lands the lovelace left over as pool surplus.
+#[derive(Clone, Debug)]
+pub struct ResolvedForeign {
+    /// Conversion-edge key naming the foreign order ("cswaps:<outref>").
+    pub key: String,
+    /// The foreign order's output reference — stamped into the transcript
+    /// entry's operation_data so the indexer can attribute the step.
+    pub attribution: crate::cardano_types::TransactionInput,
+    pub input_idx: usize,
+    pub output_idx: usize,
+    pub dx: BigInt,
+}
+
 /// A complete batch for one pool, ready for the tx builder.
 #[derive(Clone)]
 pub struct Batch {
@@ -384,6 +409,8 @@ pub struct Batch {
     /// CS rebalance-bounty claims (tag 5, waived mode). Phase 1: at most one,
     /// and never mixed with other ops in the same batch.
     pub claims: Vec<ResolvedClaim>,
+    /// Pool swaps serving foreign orders (see `ResolvedForeign`).
+    pub foreign: Vec<ResolvedForeign>,
     /// The interleaved order of swaps, continuations, and deposits as they
     /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
@@ -431,6 +458,7 @@ pub fn build_claim_batch(
         withdraws: Vec::new(),
         zaps: Vec::new(),
         claims: vec![resolved],
+        foreign: Vec::new(),
         ops_order: vec![BatchOp::Claim(0)],
         final_assets,
         final_total_lp: pool.pool_datum.total_lp.clone(),
@@ -666,6 +694,7 @@ pub fn assemble_batch(
         withdraws: Vec::new(),
         zaps: Vec::new(),
         claims: Vec::new(),
+        foreign: Vec::new(),
         ops_order,
         final_assets: running_assets,
         final_total_lp,
