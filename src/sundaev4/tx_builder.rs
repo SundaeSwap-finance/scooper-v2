@@ -4311,7 +4311,7 @@ fn build_withdraw_fulfillment_value(
 /// fulfillment = order_value - offer - fee + swap_result
 /// Convert an internal Value to a ConwayValue, dropping zero/negative
 /// token quantities and requiring the lovelace to fit u64.
-fn value_to_conway(result: &crate::cardano_types::Value) -> Result<ConwayValue> {
+pub(crate) fn value_to_conway(result: &crate::cardano_types::Value) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
 
@@ -4545,7 +4545,7 @@ fn plutus_address_to_bytes(addr: &PlutusAddress, network: Network) -> Result<Vec
 }
 
 /// Convert a conway ledger Value into the internal Value map form.
-fn conway_value_to_internal(v: &ConwayValue) -> crate::cardano_types::Value {
+pub(crate) fn conway_value_to_internal(v: &ConwayValue) -> crate::cardano_types::Value {
     let mut out = crate::cardano_types::Value::default();
     let ada = AssetClass {
         policy: vec![],

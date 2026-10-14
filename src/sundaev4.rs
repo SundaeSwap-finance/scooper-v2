@@ -3,6 +3,7 @@ pub mod accumulator;
 pub mod banded_math;
 pub mod batch;
 pub mod butane;
+pub mod cardano_swaps;
 pub mod chain_tracker;
 pub mod claims;
 pub mod conversions;
