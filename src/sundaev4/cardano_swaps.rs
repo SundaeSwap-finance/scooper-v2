@@ -809,24 +809,37 @@ impl CardanoSwapsRuntime {
         pool: &crate::sundaev4::types::SundaeV4Pool,
         leg: &SwapLeg,
     ) -> Option<ForeignFillPlan> {
+        self.plan_foreign_fill_explained(pool, leg).ok()
+    }
+
+    /// `plan_foreign_fill`, naming why a pool is not a candidate. The scooper
+    /// reports the reasons once per cycle so an operator can see why a
+    /// resting order is not being filled.
+    pub fn plan_foreign_fill_explained(
+        &self,
+        pool: &crate::sundaev4::types::SundaeV4Pool,
+        leg: &SwapLeg,
+    ) -> Result<ForeignFillPlan, String> {
         use num_traits::ToPrimitive;
-        let cfg = self.foreign_fills.as_ref()?;
+        let cfg = self.foreign_fills.as_ref().ok_or("foreign fills disabled")?;
         // Every family's own math sizes the step. A pool whose config the
         // scooper does not hold yet (a stableswap rate set or a banded ladder
         // whose preimage was never indexed) carries a placeholder the builder
         // would refuse; skip it here rather than plan against it.
         if !pool_config_known(pool) {
-            return None;
+            return Err("pool config unknown".into());
         }
         let d = &leg.order.datum;
         let assets = &pool.pool_datum.assets;
         if assets.len() != 2 {
-            return None;
+            return Err("not a two-asset pool".into());
         }
-        let input_idx = assets.iter().position(|(a, _)| *a == d.offer)?;
-        let output_idx = assets.iter().position(|(a, _)| *a == d.ask)?;
+        let input_idx =
+            assets.iter().position(|(a, _)| *a == d.offer).ok_or("pool lacks the offer asset")?;
+        let output_idx =
+            assets.iter().position(|(a, _)| *a == d.ask).ok_or("pool lacks the ask asset")?;
         if d.offer != ADA_ASSET_CLASS && d.ask != ADA_ASSET_CLASS {
-            return None;
+            return Err("neither side of the order is ADA".into());
         }
         // Constant-product math is unguarded: a pool declaring a few lovelace
         // of ADA quotes half its token reserve for one lovelace. The other
@@ -839,11 +852,11 @@ impl CardanoSwapsRuntime {
         if matches!(pool.pool_type, PoolType::ConstantProduct { .. })
             && assets[ada_idx].1 < BigInt::from(cfg.min_pool_lovelace)
         {
-            return None;
+            return Err("declared ADA reserve under min-pool-lovelace".into());
         }
         let available = self.available_offer(&leg.order);
         if available == 0 {
-            return None;
+            return Err("order has nothing left to offer".into());
         }
         // A banded ladder is walked through the router's cached view with the
         // witness found once; walking it from scratch per probe (and
@@ -851,7 +864,8 @@ impl CardanoSwapsRuntime {
         let ladder = match &pool.pool_type {
             PoolType::BandedConcentratedLiquidity { config } => {
                 let (a, b) = (&assets[0].1, &assets[1].1);
-                let witness = crate::sundaev4::banded_math::find_witness(config, a, b)?;
+                let witness = crate::sundaev4::banded_math::find_witness(config, a, b)
+                    .ok_or("no banded witness for the pool's reserves")?;
                 Some(crate::sundaev4::router::BandedLadder::new(
                     config.clone(),
                     a.clone(),
@@ -913,17 +927,16 @@ impl CardanoSwapsRuntime {
         let dx = argmax_unimodal(1, hi.max(2), surplus_of);
         let gross = surplus_of(dx);
         if gross <= 0 {
-            return None;
+            return Err(format!("no dx releases lovelace (best dx={dx}, dy={})", dy_of(dx)));
         }
         let gross = gross as u64;
         if gross < cfg.fee_estimate_lovelace + cfg.min_revenue_lovelace {
-            tracing::debug!(
-                order = %leg.order.input, pool = %pool.pool_datum.identifier,
-                gross, "cardano-swaps: foreign fill below the projected floor",
-            );
-            return None;
+            return Err(format!(
+                "projected gross {gross} under fee estimate {} + floor {}",
+                cfg.fee_estimate_lovelace, cfg.min_revenue_lovelace
+            ));
         }
-        Some(ForeignFillPlan {
+        Ok(ForeignFillPlan {
             resolved: crate::sundaev4::batch::ResolvedForeign {
                 key: edge_key(&leg.order.input),
                 attribution: leg.order.input.clone(),

@@ -2536,6 +2536,9 @@ impl Scooper {
             std::sync::Arc<crate::sundaev4::SundaeV4Pool>,
             crate::sundaev4::batch::ResolvedForeign,
         )> = None;
+        // Why each pool holding the order's pair was not a candidate, for
+        // the one-line report when nothing is planned.
+        let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
         for leg in snap.legs.values() {
             for (ident, pool) in &v4_state.pools {
                 if in_flight_pools.contains(ident) || exec.pool_allowlists.is_restricted(ident) {
@@ -2548,12 +2551,28 @@ impl Scooper {
                 {
                     continue;
                 }
-                if let Some(plan) = snap.runtime.plan_foreign_fill(pool, leg)
-                    && best.as_ref().is_none_or(|(g, _, _)| plan.gross_surplus > *g)
-                {
-                    best = Some((plan.gross_surplus, pool.clone(), plan.resolved));
+                match snap.runtime.plan_foreign_fill_explained(pool, leg) {
+                    Ok(plan) => {
+                        if best.as_ref().is_none_or(|(g, _, _)| plan.gross_surplus > *g) {
+                            best = Some((plan.gross_surplus, pool.clone(), plan.resolved));
+                        }
+                    }
+                    Err(why) => {
+                        let holds_pair = pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.offer)
+                            && pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.ask);
+                        if holds_pair {
+                            *reasons.entry(why).or_default() += 1;
+                        }
+                    }
                 }
             }
+        }
+        if best.is_none() && !snap.legs.is_empty() {
+            info!(
+                orders = snap.legs.len(),
+                reasons = ?reasons,
+                "no foreign fill this cycle",
+            );
         }
         let (gross, pool, resolved) = best?;
         info!(
