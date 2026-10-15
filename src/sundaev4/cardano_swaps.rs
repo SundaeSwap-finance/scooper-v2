@@ -50,6 +50,7 @@ use crate::cardano_types::{
     ADA_ASSET_CLASS, AssetClass, TransactionInput, TransactionOutput, Value,
 };
 use crate::sundaev4::conversions::ConversionEdge;
+use crate::sundaev4::types::PoolType;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -105,10 +106,11 @@ pub struct ForeignFillConfig {
     /// built. The real fee replaces it for the floor check.
     #[serde(default = "default_fee_estimate")]
     pub fee_estimate_lovelace: u64,
-    /// Smallest declared ADA reserve a pool may have to be a candidate. A
-    /// constant-product pool declaring a few lovelace of ADA quotes a
+    /// Smallest declared ADA reserve a constant-product pool may have to be
+    /// a candidate. Such a pool declaring a few lovelace of ADA quotes a
     /// meaningless price (one lovelace buys half its token reserve), and
-    /// preview has several such pools.
+    /// preview has several such pools. The other families bound a step by
+    /// their own state and are not subject to this floor.
     #[serde(default = "default_min_pool_lovelace")]
     pub min_pool_lovelace: u64,
 }
@@ -763,7 +765,9 @@ fn argmax_unimodal(lo: u128, hi: u128, f: impl Fn(u128) -> i128) -> u128 {
         }
     }
     let peak = (a..=b).max_by_key(|x| f(*x)).unwrap_or(a);
-    let window = 2_000u128;
+    // Ceilings in the price arithmetic make neighbours trade places by a
+    // lovelace or two; a short exact scan around the peak settles it.
+    let window = 64u128;
     let scan_lo = peak.saturating_sub(window).max(lo);
     let scan_hi = (peak + window).min(hi);
     (scan_lo..=scan_hi).chain(std::iter::once(hi)).max_by_key(|x| f(*x)).unwrap_or(peak)
@@ -775,6 +779,24 @@ pub struct ForeignFillPlan {
     pub resolved: crate::sundaev4::batch::ResolvedForeign,
     /// Lovelace the fill releases before the transaction fee.
     pub gross_surplus: u64,
+}
+
+/// Whether the scooper holds the config a pool's module hashes into its
+/// datum. Constant-product and constant-sum carry theirs in the pool type;
+/// stableswap and banded pools pin a preimage by hash, and the indexer
+/// substitutes a placeholder when it has none.
+fn pool_config_known(pool: &crate::sundaev4::types::SundaeV4Pool) -> bool {
+    let slot_holds = |hash: Vec<u8>| pool.pool_datum.module_state.iter().any(|(_, s)| *s == hash);
+    match &pool.pool_type {
+        PoolType::StableSwap { config } => {
+            slot_holds(crate::sundaev4::ss_math::config_hash(config))
+        }
+        PoolType::BandedConcentratedLiquidity { config } => {
+            !config.bands.is_empty()
+                && slot_holds(crate::sundaev4::banded_math::config_hash(config))
+        }
+        PoolType::ConstantProduct { .. } | PoolType::ConstantSum { .. } => true,
+    }
 }
 
 impl CardanoSwapsRuntime {
@@ -789,16 +811,11 @@ impl CardanoSwapsRuntime {
     ) -> Option<ForeignFillPlan> {
         use num_traits::ToPrimitive;
         let cfg = self.foreign_fills.as_ref()?;
-        // Constant-product pools only: their curve is total, so the sizing
-        // search below is sound at every dx. Other families carry state the
-        // search does not model (CL bands, CS prices, stableswap config);
-        // on preview a CL pool with 1 lovelace of declared ADA quoted its
-        // whole token reserve for 1 lovelace, and the pool validator then
-        // refused the transaction the planner had chosen.
-        if !matches!(
-            pool.pool_type,
-            crate::sundaev4::types::PoolType::ConstantProduct { .. }
-        ) {
+        // Every family's own math sizes the step. A pool whose config the
+        // scooper does not hold yet (a stableswap rate set or a banded ladder
+        // whose preimage was never indexed) carries a placeholder the builder
+        // would refuse; skip it here rather than plan against it.
+        if !pool_config_known(pool) {
             return None;
         }
         let d = &leg.order.datum;
@@ -811,27 +828,52 @@ impl CardanoSwapsRuntime {
         if d.offer != ADA_ASSET_CLASS && d.ask != ADA_ASSET_CLASS {
             return None;
         }
+        // Constant-product math is unguarded: a pool declaring a few lovelace
+        // of ADA quotes half its token reserve for one lovelace. The other
+        // families bound a step by their own state.
         let ada_idx = if d.offer == ADA_ASSET_CLASS {
             input_idx
         } else {
             output_idx
         };
-        if assets[ada_idx].1 < BigInt::from(cfg.min_pool_lovelace) {
+        if matches!(pool.pool_type, PoolType::ConstantProduct { .. })
+            && assets[ada_idx].1 < BigInt::from(cfg.min_pool_lovelace)
+        {
             return None;
         }
         let available = self.available_offer(&leg.order);
         if available == 0 {
             return None;
         }
+        // A banded ladder is walked through the router's cached view with the
+        // witness found once; walking it from scratch per probe (and
+        // re-finding the witness each time) made one search take minutes.
+        let ladder = match &pool.pool_type {
+            PoolType::BandedConcentratedLiquidity { config } => {
+                let (a, b) = (&assets[0].1, &assets[1].1);
+                let witness = crate::sundaev4::banded_math::find_witness(config, a, b)?;
+                Some(crate::sundaev4::router::BandedLadder::new(
+                    config.clone(),
+                    a.clone(),
+                    b.clone(),
+                    witness,
+                ))
+            }
+            _ => None,
+        };
         let dy_of = |dx: u128| -> u128 {
-            crate::sundaev4::batch::compute_swap_result(
-                &pool.pool_type,
-                assets,
-                &pool.pool_datum.total_lp,
-                input_idx,
-                output_idx,
-                &BigInt::from(dx as i128),
-            )
+            let dx = BigInt::from(dx as i128);
+            match &ladder {
+                Some(l) => l.output(input_idx == 0, &dx),
+                None => crate::sundaev4::batch::compute_swap_result(
+                    &pool.pool_type,
+                    assets,
+                    &pool.pool_datum.total_lp,
+                    input_idx,
+                    output_idx,
+                    &dx,
+                ),
+            }
             .unwrap()
             .to_u128()
             .unwrap_or(0)
@@ -859,11 +901,15 @@ impl CardanoSwapsRuntime {
         // Search bound: past the point where the order is exhausted, more
         // dx only costs. For an ADA offer that is the dx buying `available`
         // at the price; for a token offer it is `available` itself.
-        let hi = if d.offer == ADA_ASSET_CLASS {
+        let mut hi = if d.offer == ADA_ASSET_CLASS {
             available * d.price_num as u128 / d.price_den as u128 * 2 + 2
         } else {
             available
         };
+        if let Some(l) = &ladder {
+            // Past the ladder's capacity the output is zero.
+            hi = hi.min(l.capacity(input_idx == 0).unwrap().to_u128().unwrap_or(0));
+        }
         let dx = argmax_unimodal(1, hi.max(2), surplus_of);
         let gross = surplus_of(dx);
         if gross <= 0 {
@@ -1027,7 +1073,8 @@ mod foreign_fill_tests {
     use super::*;
     use crate::sundaev4::batch::{Batch, BatchOp, ScoopPlan};
     use crate::sundaev4::test_harness::{
-        TestEnv, ada, bcl_eq8_config, make_bcl_pool, make_pool, make_settings,
+        TestEnv, ada, bcl_eq8_config, make_bcl_pool, make_cs_pool, make_pool, make_settings,
+        make_ss_pool, ss_config,
     };
     use crate::sundaev4::types::Rational;
     use num_traits::ToPrimitive;
@@ -1111,23 +1158,156 @@ mod foreign_fill_tests {
         );
     }
 
-    /// Only constant-product pools are candidates. A banded CL pool's quote
-    /// depends on ladder state the planner's sizing search does not model,
-    /// so it must not plan one even when the price gap looks enormous.
+    /// Plans the ADA-offer fill against `pool`, builds it, runs every
+    /// validator, and checks the landed surplus is the exact residual. The
+    /// same assertions as the constant-product case, for any family.
+    fn fill_lands_surplus(
+        env: &TestEnv,
+        snap: &CardanoSwapsSnapshot,
+        pool: &std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+    ) -> u64 {
+        let leg = leg_for(snap, &ada());
+        let fill = snap
+            .runtime
+            .plan_foreign_fill(pool, leg)
+            .expect("the price gap makes the fill worth planning");
+        assert!(fill.gross_surplus > 0, "{fill:?}");
+        let plan = plan_of(pool, &fill);
+        let settings = make_settings(env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval_plan(&plan, &settings, 200_000_000)
+            .expect("pool, modules and the swap validator all accept the fill");
+        let spends =
+            eval.budgets.iter().filter(|(k, _)| k.tag == conway::RedeemerTag::Spend).count();
+        assert_eq!(spends, 2, "{:?}", eval.budgets);
+        let surplus = build.foreign_surplus.expect("foreign-only fills report their surplus");
+        assert!(surplus > 0);
+        let pool_in = pool.value.get(&ada()).unwrap().to_i128().unwrap();
+        let pool_out = lovelace_of(&build.tx_body.outputs[0]) as i128;
+        let dx = fill.resolved.dx.clone().unwrap().to_i128().unwrap();
+        assert_eq!(
+            pool_out,
+            pool_in + dx + surplus as i128,
+            "pool output = reserve in + dx + surplus"
+        );
+        assert_eq!(surplus + build.tx_body.fee, fill.gross_surplus);
+        surplus
+    }
+
+    /// A banded ladder walks its own steps and witnesses; the fill is one
+    /// more served order to the module.
     #[test]
-    fn concentrated_liquidity_pools_are_not_candidates() {
+    fn banded_pool_fill_lands_surplus() {
         let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let snap = env.enable_cardano_swaps().clone();
-        let cp = make_pool(&env, 0xF1, ada(), 400_000_000_000, usdm(), 100_000_000_000);
-        let cl = make_bcl_pool(
+        // Ladder around 1 USDM per ADA; the order sells ADA at 0.23.
+        let pool = make_bcl_pool(
             &env,
-            0xF2,
-            vec![(ada(), 400_000_000_000), (usdm(), 100_000_000_000)],
-            bcl_eq8_config(Rational { num: BigInt::from(3), den: BigInt::from(1000) }),
+            0xF5,
+            vec![(ada(), 6_161_607_000), (usdm(), 6_469_719_000)],
+            bcl_eq8_config(Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            }),
         );
+        let surplus = fill_lands_surplus(&env, &snap, &pool);
+        assert!(surplus > 1_000_000, "{surplus}");
+    }
+
+    /// Constant-sum prices the pair at a fixed ratio; the step is capped by
+    /// the pool's holding of the ask asset.
+    #[test]
+    fn constant_sum_pool_fill_lands_surplus() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let pool = make_cs_pool(
+            &env,
+            0xF6,
+            vec![(ada(), 400_000_000_000), (usdm(), 100_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+        );
+        let surplus = fill_lands_surplus(&env, &snap, &pool);
+        assert!(surplus > 1_000_000, "{surplus}");
+    }
+
+    /// Stableswap re-sends its config preimage with the step.
+    #[test]
+    fn stableswap_pool_fill_lands_surplus() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let pool = make_ss_pool(
+            &env,
+            0xF7,
+            vec![(ada(), 400_000_000_000), (usdm(), 400_000_000_000)],
+            ss_config(
+                200,
+                Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
+                [1, 1],
+            ),
+        );
+        let surplus = fill_lands_surplus(&env, &snap, &pool);
+        assert!(surplus > 1_000_000, "{surplus}");
+    }
+
+    /// A pool whose hash-pinned config the scooper does not hold carries a
+    /// placeholder the builder refuses; the planner must not pick it.
+    #[test]
+    fn pools_with_an_unknown_config_are_not_candidates() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
         let leg = leg_for(&snap, &ada());
-        assert!(snap.runtime.plan_foreign_fill(&cp, leg).is_some());
-        assert!(snap.runtime.plan_foreign_fill(&cl, leg).is_none());
+        let known = make_ss_pool(
+            &env,
+            0xF8,
+            vec![(ada(), 400_000_000_000), (usdm(), 400_000_000_000)],
+            ss_config(
+                200,
+                Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
+                [1, 1],
+            ),
+        );
+        assert!(snap.runtime.plan_foreign_fill(&known, leg).is_some());
+        let mut stale = (*known).clone();
+        stale.pool_type = PoolType::StableSwap {
+            config: ss_config(
+                200,
+                Rational {
+                    num: BigInt::from(3),
+                    den: BigInt::from(1000),
+                },
+                [1, 2],
+            ),
+        };
+        assert!(
+            snap.runtime.plan_foreign_fill(&stale, leg).is_none(),
+            "rates the datum does not pin"
+        );
+        let mut unknown = (*known).clone();
+        unknown.pool_type = PoolType::BandedConcentratedLiquidity {
+            config: crate::sundaev4::types::BandedCLConfig {
+                bands: vec![],
+                index: vec![],
+                closing: Rational {
+                    num: BigInt::from(1),
+                    den: BigInt::from(1),
+                },
+                weight_total: BigInt::from(0),
+            },
+        };
+        assert!(
+            snap.runtime.plan_foreign_fill(&unknown, leg).is_none(),
+            "the indexer's placeholder"
+        );
     }
 
     /// The order sells ADA at 0.23 USDM; a pool valuing ADA at 0.25 USDM

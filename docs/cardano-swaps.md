@@ -129,6 +129,15 @@ the treasury can sweep. Value conservation fixes the split, so the builder
 lands the residual of `inputs − outputs − fee` on the pool output, and the
 transaction pays for itself: the scooper fronts nothing.
 
+Every pool family is eligible — constant product, constant sum, stableswap,
+and banded concentrated liquidity — each sized by its own curve; a banded
+ladder is walked through the router's cached view. A stableswap or banded
+pool whose hash-pinned config the scooper has not indexed is skipped, as the
+builder would refuse it. `min-pool-lovelace` applies to constant-product
+pools only: their curve quotes a meaningless price when the declared ADA
+reserve is a few lovelace, while the other families bound a step by their
+own state.
+
 Two gates decide whether a fill happens. The planner sizes the pool step to
 maximize the lovelace released, skips pools in flight or carrying an
 allowlist, and screens against `fee-estimate-lovelace + min-revenue-lovelace`
@@ -169,13 +178,8 @@ second independent filler is what makes resting an order there reasonable.
 
 ## Open items
 
-- **Execution-margin gating.** A fill should happen when the ADA realized in
-  the transaction covers its own marginal fee. The accumulator does not gate
-  on that yet.
-- **Arbitrage-only transactions**, with a pool and a fill but no Sundae
-  order, are refused by the builder today ("no orders").
-- **Where surplus lands.** See [docs/fee-system.md](./fee-system.md): a
-  fee-bearing scoop pins the *designated* pool's surplus delta exactly, so
-  surplus from a fill can land on any other pool in the scoop but not on that
-  one. Landing it on a single-pool scoop's designated pool needs the
+- **Mixing a foreign fill into a scoop with Sundae orders.** See
+  [docs/fee-system.md](./fee-system.md): a fee-bearing scoop pins the
+  *designated* pool's surplus delta exactly, so surplus from a fill can land
+  on any other pool in the scoop but not on that one. Landing it on a single-pool scoop's designated pool needs the
   `==` → `>=` relaxation in `fee.ak`.

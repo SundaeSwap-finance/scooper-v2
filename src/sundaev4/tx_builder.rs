@@ -911,14 +911,44 @@ pub fn build_multi_pool_scoop_tx(
                 // the indexer can tell this step served a Cardano-Swaps order.
                 op_data_override = Some(order_ref_to_plutus(&f.attribution));
                 let dx = f.dx.clone();
-                let dy = crate::sundaev4::batch::compute_swap_result(
-                    &pool_type,
-                    running_assets,
-                    running_total_lp,
-                    f.input_idx,
-                    f.output_idx,
-                    &dx,
-                );
+                // Same step as a Sundae swap: the banded ladder walks its own
+                // state and transcript, every other family is one curve call.
+                let mut banded_fb: Option<BigInt> = None;
+                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                    let mut wst = WalkPoolState {
+                        running_assets,
+                        running_total_lp,
+                        running_circ_lp,
+                        running_preminted,
+                        ps: &per_pool_ps[batch_idx],
+                        cum_gross_fb: &mut per_pool_cum_gross_fb[batch_idx],
+                        cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
+                        transcript: &mut per_pool_transcripts[batch_idx],
+                    };
+                    let (dy, fb, after) = walk_banded_swap(
+                        config,
+                        &mut wst,
+                        f.input_idx,
+                        &dx,
+                        &per_pool_swap_tag[batch_idx],
+                        order_ref_to_plutus(&f.attribution),
+                    )?;
+                    banded_fb = Some(fb);
+                    banded_after = Some(after);
+                    dy
+                } else {
+                    let dy = crate::sundaev4::batch::compute_swap_result(
+                        &pool_type,
+                        running_assets,
+                        running_total_lp,
+                        f.input_idx,
+                        f.output_idx,
+                        &dx,
+                    );
+                    running_assets[f.input_idx].1 = &running_assets[f.input_idx].1 + &dx;
+                    running_assets[f.output_idx].1 = &running_assets[f.output_idx].1 - &dy;
+                    dy
+                };
                 if !num_traits::Signed::is_positive(&dy) {
                     bail!(
                         "foreign fill {}: the pool yields nothing for dx={dx}",
@@ -926,8 +956,6 @@ pub fn build_multi_pool_scoop_tx(
                     );
                 }
                 per_pool_foreign_dys[batch_idx][*i] = dy.clone();
-                running_assets[f.input_idx].1 = &running_assets[f.input_idx].1 + &dx;
-                running_assets[f.output_idx].1 = &running_assets[f.output_idx].1 - &dy;
                 tracing::debug!(
                     walk = "op-foreign",
                     batch_idx,
@@ -936,12 +964,14 @@ pub fn build_multi_pool_scoop_tx(
                     dx = %dx, dy = %dy,
                     "streaming walk: foreign-order fill",
                 );
-                let fb = swap_math::compute_fee_budget(
-                    &pool_type,
-                    &prev_assets,
-                    running_assets,
-                    running_total_lp,
-                );
+                let fb = banded_fb.unwrap_or_else(|| {
+                    swap_math::compute_fee_budget(
+                        &pool_type,
+                        &prev_assets,
+                        running_assets,
+                        running_total_lp,
+                    )
+                });
                 (per_pool_swap_tag[batch_idx].clone(), fb)
             }
             crate::sundaev4::batch::BatchOp::Swap(i) => {
