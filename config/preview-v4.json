@@ -812,7 +812,19 @@
      3,
      2
     ],
-    "evaluate-url": "http://localhost:1337"
+    "evaluate-url": "http://localhost:1337",
+    "cardano-swaps": {
+     "enabled": true,
+     "swap-script-hash": "e5a22e4c31db20bce1c8b081f8e4009683990a33157947d75030deb8",
+     "swap-ref-utxo": "e0e3ac1c179e24411758966e4d1dacf902e41fd173e5e94eb89c0fa8ca5e4b7e#0",
+     "beacon-policy": "274765b4c626c28d18752176b59c0ff63db56b8305c1daa49c9879fe",
+     "min-keep-lovelace": 3000000,
+     "foreign-fills": {
+      "enabled": true,
+      "min-revenue-lovelace": 1000000,
+      "fee-estimate-lovelace": 1000000
+     }
+    }
    },
    "fee-settings-token": "007e873372b3f5f3f8c6c70866acdf2644e7c9af64fa6aa4cff3ff094b417264"
   }
