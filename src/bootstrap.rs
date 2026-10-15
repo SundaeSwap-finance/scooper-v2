@@ -1815,6 +1815,29 @@ async fn lookup_pool_module_configs(
             if !still_missing(&out) {
                 break 'pages;
             }
+            // Every Operate entry re-sends the config in force, so the newest
+            // tx that carries the module's withdrawal settles a hash-pinned
+            // config: either it matched above, or its shape is one this build
+            // cannot decode and no older tx will do better. Walking on from
+            // here is one fetch per tx through the pool's whole history.
+            let bears = |h: &Option<ScriptHash>| {
+                h.as_ref()
+                    .is_some_and(|h| sundaev4::withdrawal_index_of_script(&tx, h).is_some())
+            };
+            let ss_settled = want_ss && out.ss.is_none() && bears(&ss_hash);
+            let bcl_settled = want_bcl && out.bcl.is_none() && bears(&bcl_hash);
+            let others_done =
+                !(want_cs && out.cs.is_none()) && !(want_cp && out.cp.is_none()) && out.fee_split.is_some();
+            if (ss_settled || bcl_settled) && others_done {
+                warn!(
+                    pool = %ident,
+                    tx = %tx_hash,
+                    "bootstrap v4: the newest tx bearing the module's withdrawal carries no config \
+                     hashing to the pool's module_state; the config shape is unknown to this build, \
+                     so the walk stops here",
+                );
+                break 'pages;
+            }
         }
         if (n as u32) < page_size {
             break;

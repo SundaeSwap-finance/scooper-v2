@@ -868,7 +868,7 @@ pub fn is_script_reward_account(reward_account: &[u8], script_hash: &ScriptHash)
 
 /// Index of `script_hash`'s withdrawal in the tx's canonical (sorted)
 /// withdrawal set — the index a `Reward` redeemer refers to.
-fn withdrawal_index_of_script(tx: &MultiEraTx, script_hash: &ScriptHash) -> Option<usize> {
+pub fn withdrawal_index_of_script(tx: &MultiEraTx, script_hash: &ScriptHash) -> Option<usize> {
     tx.withdrawals_sorted_set()
         .iter()
         .position(|(account, _)| is_script_reward_account(account, script_hash))
