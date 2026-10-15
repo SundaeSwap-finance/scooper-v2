@@ -1407,7 +1407,7 @@ pub struct ScooperExecution {
     /// Keyed by pool ident (hex string).
     #[serde(default)]
     pub pool_configs: std::collections::BTreeMap<String, PoolConfig>,
-    /// Maximum transaction execution memory units. Default: 14_000_000.
+    /// Maximum transaction execution memory units. Default: 16_500_000.
     #[serde(default = "default_max_tx_ex_mem")]
     pub max_tx_ex_mem: u64,
     /// Maximum transaction execution CPU steps. Default: 10_000_000_000.
@@ -1487,7 +1487,7 @@ fn default_partial_fill_fee_estimate() -> u64 {
 }
 
 fn default_max_tx_ex_mem() -> u64 {
-    14_000_000
+    16_500_000
 }
 fn default_max_tx_ex_steps() -> u64 {
     10_000_000_000

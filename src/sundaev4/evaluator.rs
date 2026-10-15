@@ -227,7 +227,7 @@ pub fn evaluate_scoop_tx(
         // (datum,) redeemer, context as separate arguments.
         let budget = ExBudget {
             cpu: 10_000_000_000,
-            mem: 14_000_000,
+            mem: 16_500_000,
         };
         let (context_cbor, result) = if version == 3 {
             let context_cbor = script_context::build_script_context(
@@ -492,7 +492,7 @@ mod debug_eval {
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {
             cpu: 10_000_000_000,
-            mem: 14_000_000,
+            mem: 16_500_000,
         };
         let cost_model: Vec<i64> = serde_json::from_str(
             &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
@@ -535,7 +535,7 @@ mod builtin_profile_probe {
         let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat, PlutusVersion::V3, super::PROTOCOL_VERSION).unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
-        let budget = ExBudget { cpu: 10_000_000_000, mem: 14_000_000 };
+        let budget = ExBudget { cpu: 10_000_000_000, mem: 16_500_000 };
         let result = applied.eval(&arena, CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model), budget);
         let spent = ExBudget { cpu: budget.cpu - result.info.consumed_budget.cpu, mem: budget.mem - result.info.consumed_budget.mem };
         let _ = spent;
