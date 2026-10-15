@@ -1026,7 +1026,10 @@ mod foreign_fill_tests {
 
     use super::*;
     use crate::sundaev4::batch::{Batch, BatchOp, ScoopPlan};
-    use crate::sundaev4::test_harness::{TestEnv, ada, make_cl_pool, make_pool, make_settings};
+    use crate::sundaev4::test_harness::{
+        TestEnv, ada, bcl_eq8_config, make_bcl_pool, make_pool, make_settings,
+    };
+    use crate::sundaev4::types::Rational;
     use num_traits::ToPrimitive;
 
     const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
@@ -1075,6 +1078,7 @@ mod foreign_fill_tests {
             routes: Vec::new(),
             global_seq: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
         }
     }
 
@@ -1107,29 +1111,19 @@ mod foreign_fill_tests {
         );
     }
 
-    /// Only constant-product pools are candidates. A CL pool at the edge of
-    /// its range can hold almost none of one asset while the curve still
-    /// quotes a swap; the planner's search is not sound there, so it must not
-    /// plan one even when the price gap looks enormous.
+    /// Only constant-product pools are candidates. A banded CL pool's quote
+    /// depends on ladder state the planner's sizing search does not model,
+    /// so it must not plan one even when the price gap looks enormous.
     #[test]
     fn concentrated_liquidity_pools_are_not_candidates() {
         let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let snap = env.enable_cardano_swaps().clone();
         let cp = make_pool(&env, 0xF1, ada(), 400_000_000_000, usdm(), 100_000_000_000);
-        let cl = make_cl_pool(
+        let cl = make_bcl_pool(
             &env,
             0xF2,
-            ada(),
-            400_000_000_000,
-            usdm(),
-            100_000_000_000,
-            200_000_000_000,
-            1,
-            4,
-            3,
-            4,
-            3,
-            1000,
+            vec![(ada(), 400_000_000_000), (usdm(), 100_000_000_000)],
+            bcl_eq8_config(Rational { num: BigInt::from(3), den: BigInt::from(1000) }),
         );
         let leg = leg_for(&snap, &ada());
         assert!(snap.runtime.plan_foreign_fill(&cp, leg).is_some());

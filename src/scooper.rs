@@ -2581,6 +2581,7 @@ impl Scooper {
             routes: Vec::new(),
             global_seq: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
         })
     }
 

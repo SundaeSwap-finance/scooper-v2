@@ -1326,6 +1326,7 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::ZapSwap(i) | BatchOp::ZapDeposit(i) => Some(&batch.zaps[*i].order.input),
                 BatchOp::Deposit(i) => Some(&batch.deposits[*i].order.input),
                 BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
+                BatchOp::Foreign(i) => Some(&batch.foreign[*i].attribution),
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             };
             op_data_override = Some(match &banded_after {
