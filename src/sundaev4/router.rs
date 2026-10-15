@@ -2077,24 +2077,21 @@ fn find_blended_route_inner(
         return single.map(single_plan);
     }
 
-    // Rank paths by standalone output at the full amount, then greedily keep
-    // the strongest pairwise pool-disjoint ones. Disjointness is what makes
-    // branch evaluations independent (a shared pool would let both branches
-    // count the same depth twice). The full-amount evaluation is the one
-    // already made above for the single route; only a path too capped to
-    // take the full amount is evaluated again, at one chunk.
+    // Rank paths by one chunk's output, the marginal the water-fill below
+    // allocates on, then greedily keep the strongest pairwise pool-disjoint
+    // ones. Disjointness is what makes branch evaluations independent (a
+    // shared pool would let both branches count the same depth twice).
+    // Output at the full amount is no rank: it puts a path that absorbs the
+    // whole amount but loses most of it ahead of a better path that only
+    // lacks depth, and the latter is then excluded for sharing a pool, or
+    // for want of a branch slot, while the former gets no allocation
+    // (ported from scooper-v2 PR #102).
     let mut ranked: Vec<(usize, BigInt)> = evals
         .iter()
         .filter_map(|e| {
-            let out = if e.hops.is_empty() {
-                // Too capped for the full amount: still a candidate partial
-                // branch, ranked (below full-amount paths) by one chunk's output.
-                evaluate_path(&paths[e.idx], &(amount / &BigInt::from(CHUNKS)), &limits)
-                    .last()
-                    .map(|h| h.total_output.clone())?
-            } else {
-                e.out.clone()
-            };
+            let out = evaluate_path(&paths[e.idx], &(amount / &BigInt::from(CHUNKS)), &limits)
+                .last()
+                .map(|h| h.total_output.clone())?;
             out.is_positive().then_some((e.idx, out))
         })
         .collect();
