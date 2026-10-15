@@ -84,6 +84,10 @@ pub struct Scooper {
     /// time we submitted; withheld from routing until the chain shows them
     /// spent or the entry ages out.
     cswaps_inflight: BTreeMap<TransactionInput, std::time::Instant>,
+    /// Foreign fills that failed to build, evaluate, or clear the floor,
+    /// keyed by (order, pool) and holding the pool UTxO they were planned
+    /// against. The pair is skipped until that pool UTxO changes.
+    cswaps_failed: BTreeMap<(TransactionInput, crate::sundaev3::Ident), TransactionInput>,
     /// Posted strategy intents (shared with the admin server's ingest).
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
@@ -233,6 +237,7 @@ impl Scooper {
             v4_butane,
             v4_cardano_swaps,
             cswaps_inflight: BTreeMap::new(),
+            cswaps_failed: BTreeMap::new(),
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
             access_config_logged: false,
@@ -1218,24 +1223,20 @@ impl Scooper {
             }
             // Nothing of ours to scoop: see whether a resting foreign order
             // is worth filling against one of our pools for the protocol.
-            if let Some(plan) = self.plan_foreign_fill(&v4_state, &exec, &in_flight_pools) {
-                return self
-                    .build_and_submit_plan(
-                        plan,
-                        &settings,
-                        &exec,
-                        &v4_state,
-                        &language_views,
-                        &collateral_input,
-                        &collateral_value,
-                        &funding_owned,
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        false,
-                        self.cardano_swaps_snapshot(&v4_state, &exec).as_ref(),
-                    )
-                    .await;
+            if self
+                .try_foreign_fill(
+                    &v4_state,
+                    &exec,
+                    &settings,
+                    &language_views,
+                    &collateral_input,
+                    &collateral_value,
+                    &funding_owned,
+                    &in_flight_pools,
+                )
+                .await
+            {
+                return true;
             }
             return false;
         }
@@ -1956,7 +1957,20 @@ impl Scooper {
                 skip_route_failed,
                 "no orders could be added to batch"
             );
-            return false;
+            // Candidates that cannot be batched must not starve foreign fills:
+            // with nothing of ours going out this cycle, try one of those.
+            return self
+                .try_foreign_fill(
+                    &v4_state,
+                    &exec,
+                    &settings,
+                    &language_views,
+                    &collateral_input,
+                    &collateral_value,
+                    &funding_owned,
+                    &in_flight_pools,
+                )
+                .await;
         }
 
         // ── Phase 2: Binary search for largest batch within limits ────────
@@ -2459,14 +2473,64 @@ impl Scooper {
     /// integration or its foreign-fill mode is off, or nothing clears the
     /// projected floor. Pools already in flight are skipped: the fill would
     /// contend with our own chain for the UTxO.
+    /// Plan, build and submit the best foreign fill, if one clears the
+    /// screens. Called wherever a cycle ends with no Sundae order going out.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_foreign_fill(
+        &mut self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+        settings: &std::sync::Arc<crate::sundaev4::SundaeV4Settings>,
+        language_views: &[u8],
+        collateral_input: &TransactionInput,
+        collateral_value: &crate::cardano_types::Value,
+        funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
+        in_flight_pools: &[crate::sundaev3::Ident],
+    ) -> bool {
+        let Some(plan) = self.plan_foreign_fill(v4_state, exec, in_flight_pools) else {
+            return false;
+        };
+        let batch = &plan.batches[0];
+        let key = (
+            batch.foreign[0].attribution.clone(),
+            batch.pool_ident.clone(),
+        );
+        let pool_input = batch.pool.input.clone();
+        let submitted = self
+            .build_and_submit_plan(
+                plan,
+                settings,
+                exec,
+                v4_state,
+                language_views,
+                collateral_input,
+                collateral_value,
+                funding_owned,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                false,
+                self.cardano_swaps_snapshot(v4_state, exec).as_ref(),
+            )
+            .await;
+        if !submitted {
+            // Same order against the same pool UTxO would fail the same way;
+            // retrying every cycle only spams the log and the context dumps.
+            self.cswaps_failed.insert(key, pool_input);
+        }
+        submitted
+    }
+
     fn plan_foreign_fill(
-        &self,
+        &mut self,
         v4_state: &crate::sundaev4::SundaeV4State,
         exec: &ScooperExecution,
         in_flight_pools: &[crate::sundaev3::Ident],
     ) -> Option<crate::sundaev4::batch::ScoopPlan> {
         let snap = self.cardano_swaps_snapshot(v4_state, exec)?;
         snap.runtime.foreign_fills.as_ref()?;
+        self.cswaps_failed
+            .retain(|(order, _), _| v4_state.cardano_swaps.orders.contains_key(order));
         let mut best: Option<(
             u64,
             std::sync::Arc<crate::sundaev4::SundaeV4Pool>,
@@ -2475,6 +2539,13 @@ impl Scooper {
         for leg in snap.legs.values() {
             for (ident, pool) in &v4_state.pools {
                 if in_flight_pools.contains(ident) || exec.pool_allowlists.is_restricted(ident) {
+                    continue;
+                }
+                if self
+                    .cswaps_failed
+                    .get(&(leg.order.input.clone(), ident.clone()))
+                    .is_some_and(|failed_against| *failed_against == pool.input)
+                {
                     continue;
                 }
                 if let Some(plan) = snap.runtime.plan_foreign_fill(pool, leg)

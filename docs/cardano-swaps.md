@@ -108,9 +108,10 @@ the ledger's own min-UTxO floor.
 
 ## Filling a resting order against our own pool
 
-With `foreign-fills` enabled, a cycle that has nothing of ours to scoop looks
-for a resting order whose price is inside one of our pools' and fills it for
-the protocol. The transaction has no Sundae order in it — the order it serves
+With `foreign-fills` enabled, a cycle that sends out no Sundae order — none
+pending, or none that could be batched — looks for a resting order whose price
+is inside one of our pools' and fills it for the protocol. Sundae orders keep
+priority: the attempt runs only after they have had their turn. The transaction has no Sundae order in it — the order it serves
 is simply held at a different order contract:
 
 ```
@@ -147,7 +148,8 @@ could not land there; keeping the shapes apart avoids depending on the
   "foreign-fills": {
     "enabled": true,
     "min-revenue-lovelace": 1000000,
-    "fee-estimate-lovelace": 1000000
+    "fee-estimate-lovelace": 1000000,
+    "min-pool-lovelace": 100000000
   }
 }
 ```
