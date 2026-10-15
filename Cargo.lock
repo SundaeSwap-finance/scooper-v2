@@ -5603,6 +5603,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
+ "criterion",
  "hex",
  "http-body-util",
  "hyper",
