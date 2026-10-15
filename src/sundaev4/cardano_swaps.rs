@@ -105,6 +105,12 @@ pub struct ForeignFillConfig {
     /// built. The real fee replaces it for the floor check.
     #[serde(default = "default_fee_estimate")]
     pub fee_estimate_lovelace: u64,
+    /// Smallest declared ADA reserve a pool may have to be a candidate. A
+    /// constant-product pool declaring a few lovelace of ADA quotes a
+    /// meaningless price (one lovelace buys half its token reserve), and
+    /// preview has several such pools.
+    #[serde(default = "default_min_pool_lovelace")]
+    pub min_pool_lovelace: u64,
 }
 
 fn default_min_revenue() -> u64 {
@@ -112,6 +118,9 @@ fn default_min_revenue() -> u64 {
 }
 fn default_fee_estimate() -> u64 {
     1_000_000
+}
+fn default_min_pool_lovelace() -> u64 {
+    100_000_000
 }
 
 // ─── Runtime ────────────────────────────────────────────────────────────────
@@ -780,6 +789,18 @@ impl CardanoSwapsRuntime {
     ) -> Option<ForeignFillPlan> {
         use num_traits::ToPrimitive;
         let cfg = self.foreign_fills.as_ref()?;
+        // Constant-product pools only: their curve is total, so the sizing
+        // search below is sound at every dx. Other families carry state the
+        // search does not model (CL bands, CS prices, stableswap config);
+        // on preview a CL pool with 1 lovelace of declared ADA quoted its
+        // whole token reserve for 1 lovelace, and the pool validator then
+        // refused the transaction the planner had chosen.
+        if !matches!(
+            pool.pool_type,
+            crate::sundaev4::types::PoolType::ConstantProduct { .. }
+        ) {
+            return None;
+        }
         let d = &leg.order.datum;
         let assets = &pool.pool_datum.assets;
         if assets.len() != 2 {
@@ -788,6 +809,14 @@ impl CardanoSwapsRuntime {
         let input_idx = assets.iter().position(|(a, _)| *a == d.offer)?;
         let output_idx = assets.iter().position(|(a, _)| *a == d.ask)?;
         if d.offer != ADA_ASSET_CLASS && d.ask != ADA_ASSET_CLASS {
+            return None;
+        }
+        let ada_idx = if d.offer == ADA_ASSET_CLASS {
+            input_idx
+        } else {
+            output_idx
+        };
+        if assets[ada_idx].1 < BigInt::from(cfg.min_pool_lovelace) {
             return None;
         }
         let available = self.available_offer(&leg.order);
@@ -997,7 +1026,7 @@ mod foreign_fill_tests {
 
     use super::*;
     use crate::sundaev4::batch::{Batch, BatchOp, ScoopPlan};
-    use crate::sundaev4::test_harness::{TestEnv, ada, make_pool, make_settings};
+    use crate::sundaev4::test_harness::{TestEnv, ada, make_cl_pool, make_pool, make_settings};
     use num_traits::ToPrimitive;
 
     const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
@@ -1057,6 +1086,54 @@ mod foreign_fill_tests {
             },
             _ => 0,
         }
+    }
+
+    /// A pool declaring 1 lovelace of ADA while holding 260 ADA (preview pool
+    /// 1f256c00…) quoted half its USDM reserve for one lovelace and the
+    /// planner read that as a 97 ADA fill. Dust reserves are not a market.
+    #[test]
+    fn pools_with_a_dust_ada_reserve_are_not_candidates() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let dust = make_pool(&env, 0xF3, ada(), 1, usdm(), 588_449_794);
+        let leg = leg_for(&snap, &ada());
+        let mut rt = snap.runtime.clone();
+        rt.foreign_fills.as_mut().unwrap().min_pool_lovelace = 100_000_000;
+        assert!(rt.plan_foreign_fill(&dust, leg).is_none());
+        rt.foreign_fills.as_mut().unwrap().min_pool_lovelace = 0;
+        assert!(
+            rt.plan_foreign_fill(&dust, leg).is_some(),
+            "the guard is what excludes it"
+        );
+    }
+
+    /// Only constant-product pools are candidates. A CL pool at the edge of
+    /// its range can hold almost none of one asset while the curve still
+    /// quotes a swap; the planner's search is not sound there, so it must not
+    /// plan one even when the price gap looks enormous.
+    #[test]
+    fn concentrated_liquidity_pools_are_not_candidates() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let snap = env.enable_cardano_swaps().clone();
+        let cp = make_pool(&env, 0xF1, ada(), 400_000_000_000, usdm(), 100_000_000_000);
+        let cl = make_cl_pool(
+            &env,
+            0xF2,
+            ada(),
+            400_000_000_000,
+            usdm(),
+            100_000_000_000,
+            200_000_000_000,
+            1,
+            4,
+            3,
+            4,
+            3,
+            1000,
+        );
+        let leg = leg_for(&snap, &ada());
+        assert!(snap.runtime.plan_foreign_fill(&cp, leg).is_some());
+        assert!(snap.runtime.plan_foreign_fill(&cl, leg).is_none());
     }
 
     /// The order sells ADA at 0.23 USDM; a pool valuing ADA at 0.25 USDM
@@ -1229,6 +1306,7 @@ mod foreign_fill_tests {
             enabled: true,
             fee_estimate_lovelace: gross,
             min_revenue_lovelace: 1,
+            min_pool_lovelace: 0,
         });
         assert!(
             strict.plan_foreign_fill(&pool, leg).is_none(),

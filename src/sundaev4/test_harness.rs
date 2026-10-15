@@ -350,6 +350,7 @@ impl TestEnv {
                 enabled: true,
                 min_revenue_lovelace: 0,
                 fee_estimate_lovelace: 0,
+                min_pool_lovelace: 0,
             }),
         };
         let runtime = cs::CardanoSwapsRuntime::load(&config).expect("fixture config loads");
