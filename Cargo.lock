@@ -204,7 +204,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "amaru-deps"
 version = "0.0.0"
-source = "git+https://github.com/pragma-org/amaru.git?rev=34a453005bcaaf837ee73bd996b99eab8ef92961#34a453005bcaaf837ee73bd996b99eab8ef92961"
+source = "git+https://github.com/pragma-org/amaru.git?rev=0714c21f66fa89b1ff9c6c4477eb50868e089722#0714c21f66fa89b1ff9c6c4477eb50868e089722"
 dependencies = [
  "bitflags 2.13.2",
  "blst",
@@ -308,7 +308,7 @@ dependencies = [
 [[package]]
 name = "amaru-kernel"
 version = "0.1.2"
-source = "git+https://github.com/pragma-org/amaru.git?rev=34a453005bcaaf837ee73bd996b99eab8ef92961#34a453005bcaaf837ee73bd996b99eab8ef92961"
+source = "git+https://github.com/pragma-org/amaru.git?rev=0714c21f66fa89b1ff9c6c4477eb50868e089722#0714c21f66fa89b1ff9c6c4477eb50868e089722"
 dependencies = [
  "amaru-deps",
  "amaru-minicbor-extra",
@@ -338,7 +338,7 @@ dependencies = [
 [[package]]
 name = "amaru-minicbor-extra"
 version = "0.1.2"
-source = "git+https://github.com/pragma-org/amaru.git?rev=34a453005bcaaf837ee73bd996b99eab8ef92961#34a453005bcaaf837ee73bd996b99eab8ef92961"
+source = "git+https://github.com/pragma-org/amaru.git?rev=0714c21f66fa89b1ff9c6c4477eb50868e089722#0714c21f66fa89b1ff9c6c4477eb50868e089722"
 dependencies = [
  "amaru-deps",
  "anyhow",
@@ -352,7 +352,7 @@ dependencies = [
 [[package]]
 name = "amaru-uplc"
 version = "0.4.0"
-source = "git+https://github.com/pragma-org/amaru.git?rev=34a453005bcaaf837ee73bd996b99eab8ef92961#34a453005bcaaf837ee73bd996b99eab8ef92961"
+source = "git+https://github.com/pragma-org/amaru.git?rev=0714c21f66fa89b1ff9c6c4477eb50868e089722#0714c21f66fa89b1ff9c6c4477eb50868e089722"
 dependencies = [
  "amaru-deps",
  "amaru-kernel",
