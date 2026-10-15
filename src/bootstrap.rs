@@ -2488,6 +2488,88 @@ async fn bootstrap_v4(
         );
     }
 
+    // Cardano-Swaps: the swap script's reference UTxO rides the ref set, and
+    // the orders resting at the swap script are seeded like our own orders.
+    // Both are persisted so a restart reloads them; the indexer then keeps
+    // them current from the bootstrap tip on.
+    let mut cswaps_orders = std::collections::BTreeMap::new();
+    let mut cswaps_persisted: Vec<PersistedTxo> = Vec::new();
+    if let Some(rt) = protocol
+        .execution
+        .as_ref()
+        .and_then(|e| crate::sundaev4::cardano_swaps::load_runtime(&e.cardano_swaps))
+    {
+        let hash_hex = hex::encode(&rt.swap_hash);
+        match provider.fetch_script_cbor(&hash_hex).await {
+            Ok(script_cbor) => {
+                let script = pallas_primitives::PlutusScript::<3>(script_cbor.into());
+                let dummy_addr =
+                    pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
+                        protocol.network.pallas(),
+                        pallas_addresses::ShelleyPaymentPart::Key(pallas_primitives::Hash::new(
+                            [0u8; 28],
+                        )),
+                        pallas_addresses::ShelleyDelegationPart::Null,
+                    ));
+                ref_utxo_outputs.insert(
+                    rt.swap_ref.clone(),
+                    crate::cardano_types::TransactionOutput {
+                        address: dummy_addr,
+                        value: crate::cardano_types::Value::default(),
+                        datum: crate::cardano_types::RawDatum::None,
+                        script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(script)),
+                    },
+                );
+            }
+            Err(e) => {
+                warn!(hash = %hash_hex, "bootstrap v4: could not fetch cardano-swaps script CBOR: {e:#}")
+            }
+        }
+        let swap_hash: [u8; 28] = rt.swap_hash.as_slice().try_into().expect("28-byte script hash");
+        match provider.fetch_script_utxos(&ScriptHash::from(swap_hash)).await {
+            Ok(utxos) => {
+                for utxo in &utxos {
+                    let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                    let addr_bytes = pallas_addresses::Address::from_bech32(&utxo.address)
+                        .map(|a| a.to_vec())
+                        .unwrap_or_default();
+                    let bytes =
+                        encode_bootstrap_utxo(&addr_bytes, &utxo.value, utxo.datum_cbor.as_deref());
+                    let Ok(parsed) = pallas_traverse::MultiEraOutput::decode(
+                        pallas_traverse::Era::Conway,
+                        &bytes,
+                    ) else {
+                        continue;
+                    };
+                    let tx_out = crate::cardano_types::convert_txo(&parsed);
+                    let Some(order) = crate::sundaev4::cardano_swaps::SwapOrder::from_output(
+                        input.clone(),
+                        &tx_out,
+                    ) else {
+                        debug!(input = %input, "bootstrap v4: cardano-swaps UTxO with an unparseable datum");
+                        continue;
+                    };
+                    cswaps_persisted.push(PersistedTxo {
+                        txo_id: input.clone(),
+                        txo_type: "cswaps_order".to_string(),
+                        created_slot: tip_slot,
+                        era: 7,
+                        txo: bytes,
+                        address: addr_bytes,
+                        datum: None,
+                    });
+                    cswaps_orders.insert(input, order);
+                }
+                info!(
+                    utxos = utxos.len(),
+                    orders = cswaps_orders.len(),
+                    "bootstrap: fetched cardano-swaps orders"
+                );
+            }
+            Err(e) => warn!("bootstrap v4: could not fetch cardano-swaps order UTxOs: {e:#}"),
+        }
+    }
+
     let n_pools = pools.len();
     let n_orders = orders.len();
     let n_wallet = wallet_utxos.len();
@@ -2650,6 +2732,8 @@ async fn bootstrap_v4(
             });
         }
 
+        persisted_txos.extend(cswaps_persisted);
+
         if !persisted_txos.is_empty() {
             let n = persisted_txos.len();
             dao.apply_tx_changes(TxChanges {
@@ -2690,6 +2774,7 @@ async fn bootstrap_v4(
         s.order_configs = order_configs;
         s.wallet_utxos = wallet_utxos;
         s.ref_utxo_outputs = ref_utxo_outputs;
+        s.cardano_swaps.orders = cswaps_orders;
         s.network_tip_slot = Some(tip_slot);
         s.tip_slot = tip_slot;
     }
