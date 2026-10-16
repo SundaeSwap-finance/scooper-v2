@@ -1572,6 +1572,50 @@ mod tests {
         assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
     }
 
+    /// The banded case of `cs_swap_draining_the_output_reserve_builds`: a
+    /// swap sized to the ladder's whole capacity takes every band's B, so the
+    /// pool output must hold no B at all. The witness search places the
+    /// drained reserves on the ladder's end, and every validator accepts the
+    /// step sequence.
+    #[test]
+    fn bcl_swap_draining_the_ladder_builds() {
+        use crate::sundaev4::banded_math::{ladder_capacity, swap_steps};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let pool = make_bcl_pool(
+            &env,
+            0x6E,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let cap = ladder_capacity(&cfg, &a, &b, true);
+        let steps = swap_steps(&cfg, &a, &b, true, &cap).expect("the ladder absorbs its capacity");
+        let dy = steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy);
+        assert_eq!(dy, b, "the ladder's capacity takes all of B: paid {dy} of {b}");
+
+        let dx: i64 = cap.to_string().parse().unwrap();
+        let orders = vec![make_order(token_a(), dx, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("draining swap should assemble");
+        assert_eq!(batch.swaps[0].dy, b);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("a scoop draining the ladder must conserve value and evaluate");
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[1].1, BigInt::from(0));
+        assert_eq!(after.value.get(&token_b()), BigInt::from(0), "no B copied from the input");
+    }
+
     /// A banded pool that also lists the oracle module: the scoop carries the
     /// oracle Operate entry and rewrites the accumulator slot from the
     /// transcript. Two scoops in a row exercise initialise and advance.
