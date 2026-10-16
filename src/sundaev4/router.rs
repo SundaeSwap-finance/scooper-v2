@@ -3319,3 +3319,150 @@ mod split_cost {
         }
     }
 }
+
+/// The depth fallback of PR #102, on the market of the router bench's
+/// `crowded` case (`benches/router/find_blended_route.rs`).
+#[cfg(test)]
+mod depth_fallback {
+    use super::*;
+    use crate::cardano_types::{TransactionInput, Value};
+    use crate::sundaev4::banded_math::{build_index, check_shape, find_witness};
+    use crate::sundaev4::types::{
+        BandSpec, BandedCLConfig, PoolDatum, PoolType, Rational, plutus_void,
+    };
+
+    /// One pair's pool, as the bench's `MarketShape` describes it.
+    struct PairShape {
+        value: f64,
+        fee_ppm: u64,
+        sigma: f64,
+    }
+
+    const BANDS_PER_SIDE: i32 = 6;
+    const BAND_WIDTH: f64 = 0.02;
+    const SQRT_DEN: u64 = 1_000_000_000_000;
+
+    fn token(i: usize) -> AssetClass {
+        AssetClass {
+            policy: vec![0xa0 + i as u8; 28],
+            token: format!("T{i}").into_bytes(),
+        }
+    }
+
+    fn sqrt_price(s: f64) -> Rational {
+        Rational {
+            num: BigInt::from((s * SQRT_DEN as f64).round() as u64),
+            den: BigInt::from(SQRT_DEN),
+        }
+    }
+
+    /// The bench's `ladder`: 2·n + 1 bands of geometric width around price 1,
+    /// weighted by the Gaussian mass of their log-price.
+    fn ladder(shape: &PairShape) -> BandedCLConfig {
+        let h = BAND_WIDTH.ln_1p();
+        let ks: Vec<i32> = (-BANDS_PER_SIDE..=BANDS_PER_SIDE).collect();
+        let mass = |k: i32| (-(k as f64 * h).powi(2) / (2.0 * shape.sigma.powi(2))).exp();
+        let fee = Rational {
+            num: BigInt::from(shape.fee_ppm),
+            den: BigInt::from(1_000_000u64),
+        };
+        let bands: Vec<BandSpec> = ks
+            .iter()
+            .map(|&k| BandSpec {
+                start: sqrt_price(((k as f64 - 0.5) * h).exp().sqrt()),
+                weight: BigInt::from(((mass(k) * 1000.0) as u64).max(1)),
+                curve: BigInt::from(0),
+                fee_buy: fee.clone(),
+                fee_sell: fee.clone(),
+            })
+            .collect();
+        let weight_total = bands.iter().fold(BigInt::from(0), |sum, band| &sum + &band.weight);
+        let mut config = BandedCLConfig {
+            bands,
+            index: vec![],
+            closing: sqrt_price(((BANDS_PER_SIDE as f64 + 0.5) * h).exp().sqrt()),
+            weight_total,
+        };
+        config.index = build_index(&config);
+        check_shape(&config).expect("the ladder passes the module's shape checks");
+        config
+    }
+
+    /// The bench's `banded_pool`: the pair's `value` split evenly at price 1.
+    /// Idents use their own prefix: the router caches ladders by (ident,
+    /// reserves), not by config, so they must not collide with other tests'.
+    fn banded_pool(index: u16, a: &AssetClass, b: &AssetClass, shape: &PairShape) -> Arc<SundaeV4Pool> {
+        let config = ladder(shape);
+        let half = BigInt::from((shape.value / 2.0) as u64);
+        find_witness(&config, &half, &half).expect("balanced reserves sit on the ladder");
+        let mut ident = vec![0xcd; 26];
+        ident.extend_from_slice(&index.to_be_bytes());
+        let mut tx_hash = [0u8; 32];
+        tx_hash[..28].copy_from_slice(&ident);
+        let lp = &half + &half;
+        Arc::new(SundaeV4Pool {
+            input: TransactionInput::new(tx_hash.into(), 0),
+            address: vec![],
+            value: Value::default(),
+            pool_datum: PoolDatum {
+                assets: vec![(a.clone(), half.clone()), (b.clone(), half)],
+                total_lp: lp.clone(),
+                circulating_lp: BigInt::from(0),
+                preminted_lp: lp,
+                identifier: Ident::new(&ident),
+                actions: vec![],
+                module_state: vec![],
+                min_surplus: BigInt::from(0),
+                extension: plutus_void(),
+            },
+            pool_type: PoolType::BandedConcentratedLiquidity { config },
+            slot: 100,
+            fee_split_config: None,
+        })
+    }
+
+    fn route_output(pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>, amount: &BigInt) -> BigInt {
+        find_blended_route(pools, &[], &token(0), &token(1), amount, RoutingLimits::unlimited())
+            .expect("the deep pool can absorb the order")
+            .total_output
+    }
+
+    /// Fee tiers only, every pool at price 1: a deep T0/T1 pool on the 1 %
+    /// tier, and four T0→Tᵢ→T1 paths through thin pools on the 0.05 % tier.
+    /// On one chunk the four thin paths outrank the deep one and take every
+    /// branch slot, yet together they absorb only about 0.62e12 of the 1e12
+    /// order. The router must give the deep path a slot back rather than
+    /// fall back on it alone: adding the thin paths must improve the trade.
+    #[test]
+    fn thin_cheap_paths_do_not_crowd_out_the_deep_path() {
+        let deep = PairShape {
+            value: 10e12,
+            fee_ppm: 10_000,
+            sigma: 0.10,
+        };
+        let thin = PairShape {
+            value: 0.3e12,
+            fee_ppm: 500,
+            sigma: 0.05,
+        };
+        let order_amount = BigInt::from(1_000_000_000_000u64);
+
+        let deep_pool = banded_pool(0, &token(0), &token(1), &deep);
+        let mut market = BTreeMap::from([(deep_pool.pool_datum.identifier.clone(), deep_pool)]);
+        let output_without_thin_paths = route_output(&market, &order_amount);
+
+        for intermediate in 2..6 {
+            for (a, b) in [(0, intermediate), (intermediate, 1)] {
+                let index = u16::try_from(market.len()).expect("a few pools");
+                let pool = banded_pool(index, &token(a), &token(b), &thin);
+                market.insert(pool.pool_datum.identifier.clone(), pool);
+            }
+        }
+        let output_with_thin_paths = route_output(&market, &order_amount);
+
+        assert!(
+            output_with_thin_paths > output_without_thin_paths,
+            "thin cheap paths must improve the trade: {output_with_thin_paths} <= {output_without_thin_paths}"
+        );
+    }
+}
