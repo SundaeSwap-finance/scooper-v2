@@ -2128,12 +2128,43 @@ fn find_blended_route_inner(
     // (map) pools are prunable; conversion edges are not, so they are
     // skipped. Each repair round removes one pool, so the loop is bounded
     // by the number of pools the first allocation touched.
+    // The single route's path: the one that absorbs the whole amount on
+    // its own. Ranked by one chunk's output it may have lost its slot to
+    // cheaper paths that, together, lack the depth for the order.
+    let single_idx = evals
+        .iter()
+        .filter(|e| e.within_limits)
+        .max_by(|a, b| a.out.cmp(&b.out))
+        .map(|e| e.idx);
     let mut paths = paths;
-    let mut chosen = chosen;
     let mut branches: Vec<RoutingPlan>;
+    let mut gave_single_a_slot = false;
     loop {
-        let Some(filled) = water_fill(&paths, &chosen, amount, &chunk, CHUNKS, &limits) else {
-            return single.map(single_plan);
+        let filled = match water_fill(&paths, &chosen, amount, &chunk, CHUNKS, &limits) {
+            Some(filled) => filled,
+            None => {
+                // The chosen paths cannot absorb the amount together. Rather
+                // than fall back on the single route alone, give it a slot:
+                // drop the chosen paths it shares a pool with (branches must
+                // stay disjoint), append it, and fill again. Once; a second
+                // failure falls back as before. (PR #102's depth fallback.)
+                if let Some(si) = single_idx
+                    && !gave_single_a_slot
+                    && !chosen.contains(&si)
+                {
+                    gave_single_a_slot = true;
+                    let single_idents = path_ident_set(&paths[si]);
+                    chosen.retain(|i| path_ident_set(&paths[*i]).is_disjoint(&single_idents));
+                    if chosen.len() >= MAX_BRANCHES {
+                        chosen.pop();
+                    }
+                    chosen.push(si);
+                    if chosen.len() >= 2 {
+                        continue;
+                    }
+                }
+                return single.map(single_plan);
+            }
         };
         branches = filled;
 
