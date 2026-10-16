@@ -613,6 +613,41 @@ mod tests {
         );
     }
 
+    /// A swap that takes the pool's whole reserve of its output asset (as a
+    /// one-sided band bought out does): the pool output must hold none of it.
+    /// Keeping the input quantity there mints it from nothing, and the build
+    /// fails value conservation.
+    #[test]
+    fn cs_swap_draining_the_output_reserve_builds() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xCD,
+            vec![(token_a(), 1_000_000_000), (token_b(), 997_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], // 1:1 price
+            fee,
+        );
+        // dy = 1_000_000_000 * 997 / 1000 = 997_000_000: all of token B.
+        let orders = vec![make_order(token_a(), 1_000_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
+        assert_eq!(batch.swaps[0].dy, BigInt::from(997_000_000));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        env.build_and_eval(&[batch], &settings, 1000)
+            .expect("a scoop draining a reserve must conserve value");
+    }
+
     #[test]
     fn scoop_ref_inputs_omit_settings_validator() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
@@ -1535,6 +1570,50 @@ mod tests {
         let after = &result.predicted_pools[0].2;
         assert_eq!(after.pool_datum.assets[1].1, &b + &BigInt::from(dx));
         assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
+    }
+
+    /// The banded case of `cs_swap_draining_the_output_reserve_builds`: a
+    /// swap sized to the ladder's whole capacity takes every band's B, so the
+    /// pool output must hold no B at all. The witness search places the
+    /// drained reserves on the ladder's end, and every validator accepts the
+    /// step sequence.
+    #[test]
+    fn bcl_swap_draining_the_ladder_builds() {
+        use crate::sundaev4::banded_math::{ladder_capacity, swap_steps};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = bcl_eq8_config(ss_fee_3());
+        let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
+        let pool = make_bcl_pool(
+            &env,
+            0x6E,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let cap = ladder_capacity(&cfg, &a, &b, true);
+        let steps = swap_steps(&cfg, &a, &b, true, &cap).expect("the ladder absorbs its capacity");
+        let dy = steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy);
+        assert_eq!(dy, b, "the ladder's capacity takes all of B: paid {dy} of {b}");
+
+        let dx: i64 = cap.to_string().parse().unwrap();
+        let orders = vec![make_order(token_a(), dx, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("draining swap should assemble");
+        assert_eq!(batch.swaps[0].dy, b);
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("a scoop draining the ladder must conserve value and evaluate");
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[1].1, BigInt::from(0));
+        assert_eq!(after.value.get(&token_b()), BigInt::from(0), "no B copied from the input");
     }
 
     /// A banded pool that also lists the oracle module: the scoop carries the
