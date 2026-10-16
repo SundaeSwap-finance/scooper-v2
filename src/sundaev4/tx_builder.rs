@@ -4355,8 +4355,13 @@ fn build_pool_output_value(
         }
         use num_traits::ToPrimitive;
         let amt = amount.clone().unwrap().to_u64().unwrap_or(0);
+        let tokens = policy_map.entry(asset.policy.clone()).or_default();
         if amt > 0 {
-            policy_map.entry(asset.policy.clone()).or_default().insert(asset.token.clone(), amt);
+            tokens.insert(asset.token.clone(), amt);
+        } else {
+            // A drained reserve (e.g. a one-sided band): drop the quantity
+            // copied from the input, or it is minted from nothing.
+            tokens.remove(&asset.token);
         }
     }
 
