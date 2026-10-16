@@ -18,7 +18,7 @@ use crate::cardano_types::{AssetClass, Value};
 use crate::multisig::Multisig;
 use crate::sundaev3::Ident;
 use crate::sundaev4::batch::{Batch, ScoopPlan};
-use crate::sundaev4::evaluator::{EvalResult, ScriptStore, evaluate_scoop_tx};
+use crate::sundaev4::evaluator::{EvalResult, SCRIPT_BUDGET, ScriptStore, evaluate_scoop_tx};
 use crate::sundaev4::submit::encode_language_views;
 use crate::sundaev4::tx_builder::{MultiPoolBuildResult, build_multi_pool_scoop_tx};
 use crate::sundaev4::types::*;
@@ -92,6 +92,8 @@ pub struct TestEnv {
     /// one, and tests may point it at the collateral UTxO.
     pub funding: Option<(TransactionInput, Value)>,
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
+    /// Budget every script is evaluated under (default: `SCRIPT_BUDGET`).
+    pub script_budget: pallas_primitives::ExUnits,
 }
 
 impl TestEnv {
@@ -259,8 +261,8 @@ impl TestEnv {
                 slot_length: 1000,
             },
             pool_configs: std::collections::BTreeMap::new(),
-            max_tx_ex_mem: 16_500_000,
-            max_tx_ex_steps: 10_000_000_000,
+            max_tx_ex_mem: SCRIPT_BUDGET.mem,
+            max_tx_ex_steps: SCRIPT_BUDGET.steps,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
             evaluate_url: crate::sundaev4::types::default_evaluate_url(),
@@ -305,6 +307,7 @@ impl TestEnv {
             collateral_value,
             funding: Some((funding_utxo, funding_value)),
             order_configs,
+            script_budget: SCRIPT_BUDGET,
         }
     }
 
@@ -478,6 +481,7 @@ impl TestEnv {
             build.tx_hash,
             &self.exec.slot_config,
             None,
+            self.script_budget,
         )?;
 
         // Lovelace conservation: inputs == outputs + fee. Phase-2 eval
