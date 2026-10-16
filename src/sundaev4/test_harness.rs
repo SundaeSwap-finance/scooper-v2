@@ -18,7 +18,7 @@ use crate::cardano_types::{AssetClass, Value};
 use crate::multisig::Multisig;
 use crate::sundaev3::Ident;
 use crate::sundaev4::batch::{Batch, ScoopPlan};
-use crate::sundaev4::evaluator::{EvalResult, ScriptStore, evaluate_scoop_tx};
+use crate::sundaev4::evaluator::{EvalResult, SCRIPT_BUDGET, ScriptStore, evaluate_scoop_tx};
 use crate::sundaev4::submit::encode_language_views;
 use crate::sundaev4::tx_builder::{MultiPoolBuildResult, build_multi_pool_scoop_tx};
 use crate::sundaev4::types::*;
@@ -92,6 +92,8 @@ pub struct TestEnv {
     /// one, and tests may point it at the collateral UTxO.
     pub funding: Option<(TransactionInput, Value)>,
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
+    /// Budget every script is evaluated under (default: `SCRIPT_BUDGET`).
+    pub script_budget: pallas_primitives::ExUnits,
 }
 
 impl TestEnv {
@@ -259,8 +261,8 @@ impl TestEnv {
                 slot_length: 1000,
             },
             pool_configs: std::collections::BTreeMap::new(),
-            max_tx_ex_mem: 16_500_000,
-            max_tx_ex_steps: 10_000_000_000,
+            max_tx_ex_mem: SCRIPT_BUDGET.mem,
+            max_tx_ex_steps: SCRIPT_BUDGET.steps,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
             evaluate_url: crate::sundaev4::types::default_evaluate_url(),
@@ -305,6 +307,7 @@ impl TestEnv {
             collateral_value,
             funding: Some((funding_utxo, funding_value)),
             order_configs,
+            script_budget: SCRIPT_BUDGET,
         }
     }
 
@@ -333,6 +336,12 @@ impl TestEnv {
     /// Load the Cardano-Swaps fixture: the mainnet runtime constants and
     /// the orders from the replay fixtures, with the swap script admitted
     /// to the eval store and its reference UTxO to `ref_utxo_outputs`.
+    // `cfg(test)` although the rest of this harness is also built for feature
+    // `route-bench`: this method imports `cardano_swaps::replay_tests`, which
+    // only exists under `cfg(test)`. Without it, any build with
+    // `--features route-bench` (the bench, CI's `clippy --all-features`) fails
+    // on that import. The bench does not use this method.
+    #[cfg(test)]
     pub fn enable_cardano_swaps(
         &mut self,
     ) -> &crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
@@ -478,6 +487,7 @@ impl TestEnv {
             build.tx_hash,
             &self.exec.slot_config,
             None,
+            self.script_budget,
         )?;
 
         // Lovelace conservation: inputs == outputs + fee. Phase-2 eval

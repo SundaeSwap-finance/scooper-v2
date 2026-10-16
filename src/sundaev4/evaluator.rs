@@ -90,7 +90,11 @@ impl ScriptStore {
     /// computes the PlutusV3 hash, and CBOR-unwraps to FLAT bytes.
     /// This bypasses the need to index reference UTxOs from the chain.
     /// Build from blueprint compiled code. Used by test harness.
-    #[cfg(test)]
+    // Not actually dead: feature `route-bench` uses it. But features are
+    // crate-wide, so the scooper binary compiles it too, never calls it,
+    // and would trip `clippy --all-features -D warnings` in CI.
+    #[cfg(any(test, feature = "route-bench"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_blueprint(blueprint: &crate::blueprint::Blueprint) -> Result<Self> {
         let mut store = BTreeMap::new();
         for validator in &blueprint.validators {
@@ -159,10 +163,19 @@ pub struct FailedScriptContext {
     pub error: String,
 }
 
+/// Mainnet's per-tx execution limits (protocol parameters): the default
+/// tx limits and script budget (production passes
+/// `ScooperExecution::script_budget`).
+pub const SCRIPT_BUDGET: ExUnits = ExUnits {
+    mem: 16_500_000,
+    steps: 10_000_000_000,
+};
+
 /// Evaluate all scripts in a scoop transaction locally.
 ///
 /// For each redeemer, builds the appropriate ScriptContext, looks up the script,
-/// applies CIP-0069 convention (single argument for V3), and evaluates.
+/// applies CIP-0069 convention (single argument for V3), and evaluates it
+/// under `script_budget`.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
@@ -177,6 +190,7 @@ pub fn evaluate_scoop_tx(
     tx_hash: Hash<32>,
     slot_config: &crate::sundaev4::types::SlotConfig,
     failure_capture: Option<&mut Option<FailedScriptContext>>,
+    script_budget: ExUnits,
 ) -> Result<EvalResult> {
     use uplc_turbo::arena::Arena;
     use uplc_turbo::binder::DeBruijn;
@@ -226,8 +240,8 @@ pub fn evaluate_scoop_tx(
         // one argument (the full ScriptContext, redeemer embedded); V2 takes
         // (datum,) redeemer, context as separate arguments.
         let budget = ExBudget {
-            cpu: 10_000_000_000,
-            mem: 16_500_000,
+            cpu: script_budget.steps as i64,
+            mem: script_budget.mem as i64,
         };
         let (context_cbor, result) = if version == 3 {
             let context_cbor = script_context::build_script_context(
@@ -491,8 +505,8 @@ mod debug_eval {
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {
-            cpu: 10_000_000_000,
-            mem: 16_500_000,
+            cpu: super::SCRIPT_BUDGET.steps as i64,
+            mem: super::SCRIPT_BUDGET.mem as i64,
         };
         let cost_model: Vec<i64> = serde_json::from_str(
             &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
@@ -535,7 +549,7 @@ mod builtin_profile_probe {
         let (program, _) = uplc_turbo::flat::decode::<DeBruijn>(&arena, &flat, PlutusVersion::V3, super::PROTOCOL_VERSION).unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
-        let budget = ExBudget { cpu: 10_000_000_000, mem: 16_500_000 };
+        let budget = ExBudget { cpu: super::SCRIPT_BUDGET.steps as i64, mem: super::SCRIPT_BUDGET.mem as i64 };
         let result = applied.eval(&arena, CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model), budget);
         let spent = ExBudget { cpu: budget.cpu - result.info.consumed_budget.cpu, mem: budget.mem - result.info.consumed_budget.mem };
         let _ = spent;
