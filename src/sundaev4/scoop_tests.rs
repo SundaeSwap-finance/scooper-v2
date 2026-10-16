@@ -613,6 +613,41 @@ mod tests {
         );
     }
 
+    /// A swap that takes the pool's whole reserve of its output asset (as a
+    /// one-sided band bought out does): the pool output must hold none of it.
+    /// Keeping the input quantity there mints it from nothing, and the build
+    /// fails value conservation.
+    #[test]
+    fn cs_swap_draining_the_output_reserve_builds() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xCD,
+            vec![(token_a(), 1_000_000_000), (token_b(), 997_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], // 1:1 price
+            fee,
+        );
+        // dy = 1_000_000_000 * 997 / 1000 = 997_000_000: all of token B.
+        let orders = vec![make_order(token_a(), 1_000_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("CS batch assembly should succeed");
+        assert_eq!(batch.swaps[0].dy, BigInt::from(997_000_000));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        env.build_and_eval(&[batch], &settings, 1000)
+            .expect("a scoop draining a reserve must conserve value");
+    }
+
     #[test]
     fn scoop_ref_inputs_omit_settings_validator() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
