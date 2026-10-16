@@ -151,11 +151,24 @@ fn add_pool(
     pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
 }
 
+/// The order `crowded` routes: 1e12 of T0 for T1, about 1.6 times what the
+/// four thin paths can absorb together.
+const CROWDED_AMOUNT: u64 = 1_000_000_000_000;
+
+/// First pool index of `crowded_market`. The router caches a banded pool's
+/// ladder by (ident, reserves), not by config: a `crowded` pool with the
+/// ident and reserves of a pool of the main market, routed first, would be
+/// priced with that pool's ladder (its 0.3 % fee instead of the deep pool's).
+const CROWDED_FIRST_INDEX: usize = 1000;
+
 /// A market where the best paths on a small amount lack the depth for the
-/// order: four T0→Tᵢ→T1 paths through small, cheap pools outrank the deep but
-/// costly T0/T1 pool (3 % fee) and take every branch slot, though together
-/// they hold far less than the order. The ranking must not let the deep
-/// pool's full-amount output hide them (PR #102).
+/// order. Fee tiers only, every pool at price 1: a deep T0/T1 pool on the 1 %
+/// tier, and four T0→Tᵢ→T1 paths through thin pools on the 0.05 % tier. On one
+/// chunk the four thin paths outrank the deep one (rate 0.9927 vs 0.9899) and
+/// take every branch slot, yet together they absorb only 0.62e12 of the 1e12
+/// order: the router must give the deep path a slot back and water-fill a
+/// second time (PR #102), the case this times. With the thin pools' sigma at
+/// 0.10 instead of 0.05, the deep path keeps its slot and the case is gone.
 fn crowded_market() -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
     let deep = MarketShape {
         tokens: 2,
@@ -163,26 +176,25 @@ fn crowded_market() -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
         width: 0.02,
         sigma: 0.10,
         pair_value: 10e12,
-        fee_ppm: 30_000,
+        fee_ppm: 10_000,
     };
-    let shallow = |pair_value: f64, fee_ppm: u64, bands_per_side: i32, sigma: f64| MarketShape {
+    let thin = MarketShape {
         tokens: 2,
-        bands_per_side,
+        bands_per_side: 6,
         width: 0.02,
-        sigma,
-        pair_value,
-        fee_ppm,
+        sigma: 0.05,
+        pair_value: 0.3e12,
+        fee_ppm: 500,
     };
-    let shallows = [
-        shallow(0.5e12, 500, 6, 0.05),
-        shallow(0.4e12, 1_000, 5, 0.10),
-        shallow(0.3e12, 2_000, 6, 0.15),
-        shallow(0.2e12, 3_000, 4, 0.08),
-    ];
-    let mut pools = market(&deep);
-    for (i, shape) in (2..).zip(&shallows) {
-        add_pool(&mut pools, &token(0), &token(i), shape);
-        add_pool(&mut pools, &token(i), &token(1), shape);
+    let mut pairs = vec![(token(0), token(1), &deep)];
+    for intermediate in 2..6 {
+        pairs.push((token(0), token(intermediate), &thin));
+        pairs.push((token(intermediate), token(1), &thin));
+    }
+    let mut pools = BTreeMap::new();
+    for (a, b, shape) in pairs {
+        let pool = banded_pool(CROWDED_FIRST_INDEX + pools.len(), &a, &b, shape);
+        pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
     }
     pools
 }
@@ -228,8 +240,11 @@ fn bench_find_blended_route(c: &mut Criterion) {
         eprintln!("  {name:<9} {:>8.2?}  {}", t0.elapsed(), summary(&blend));
     }
     let crowded = crowded_market();
+    let crowded_amount = BigInt::from(CROWDED_AMOUNT);
+    eprintln!("{} pools, T0 → T1, amount {crowded_amount}", crowded.len());
     let t0 = std::time::Instant::now();
-    let blend = find_blended_route(&crowded, &[], &token(0), &token(1), &amount, RoutingLimits::unlimited());
+    let blend =
+        find_blended_route(&crowded, &[], &token(0), &token(1), &crowded_amount, RoutingLimits::unlimited());
     eprintln!("  {:<9} {:>8.2?}  {}", "crowded", t0.elapsed(), summary(&blend));
 
     let mut group = c.benchmark_group("find_blended_route");
@@ -249,7 +264,7 @@ fn bench_find_blended_route(c: &mut Criterion) {
                 &[],
                 &token(0),
                 &token(1),
-                black_box(&amount),
+                black_box(&crowded_amount),
                 RoutingLimits::unlimited(),
             )
         })
