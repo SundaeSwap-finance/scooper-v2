@@ -11,12 +11,12 @@ publish = false
 # acropolis fork, branch `leios-musashi`: upstream 2c0a32c + pallas 1.x migration
 # (same pallas fork as below) + Era::try_from era >= 6 → Conway stopgap, so that
 # chain-sync survives Dijkstra-era blocks.
-acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
-acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
-acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
-acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
-acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
-acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "b33c78ac553a21c37a79597f0e88e0dec0c76add" }
+acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
+acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
+acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
+acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
+acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
+acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis", rev = "f8ddd8366597989b78cc59024cabd2f1f4720cbf" }
 anyhow = "1"
 bech32 = "0.11"
 async-trait = "0.1"
@@ -32,14 +32,14 @@ hyper-util = { version = "0.1", features = ["full"] }
 minicbor = { version = "0.26", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
-pallas-codec = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
-pallas-crypto = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
-pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112", features = [
+pallas-addresses = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b" }
+pallas-codec = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b" }
+pallas-crypto = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b" }
+pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b", features = [
   "unstable",
 ] }
-pallas-network = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
-pallas-traverse = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112", features = [
+pallas-network = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b" }
+pallas-traverse = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b", features = [
   "unstable",
 ] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
@@ -91,11 +91,11 @@ tokio = { version = "1.46.1", features = ["full", "test-util"] }
 # crates.io (1.0.0-alpha.3): redirect it to the same fork so there is exactly
 # one PlutusData type in the build.
 [patch.crates-io]
-pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "4c294e632fa5159bc65e82dec5007a62cf6f5112" }
+pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas", rev = "58617d4d9ec01c54ac84ac853e57b7d5ae9be38b" }
 # pallas-utxorpc (pulled in by acropolis through `pallas`) needs the Dijkstra
 # fields of SundaeSwap's utxorpc-spec fork; the pallas workspace patches it the
 # same way, and [patch] does not propagate to dependents (dolos repeats it too).
-utxorpc-spec = { git = "https://github.com/SundaeSwap-finance/utxorpc-spec", rev = "f2d528e6d05d1a2fe82bcf241fc72c45b342fa71" }
+utxorpc-spec = { git = "https://github.com/SundaeSwap-finance/utxorpc-spec", rev = "4bef71401bae7e9fc80b9d24379be0f9078b0ff5" }
 
 # The profile that 'dist' will build with
 [profile.dist]
