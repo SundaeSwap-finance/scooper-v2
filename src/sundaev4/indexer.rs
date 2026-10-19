@@ -2382,6 +2382,7 @@ mod mainnet_create_tx_tests {
         };
         let scripts = ModuleScripts {
             constant_product: Some(next(CS_HASH)),
+            constant_product_legacy: Vec::new(),
             fee_split: next(FEE_SPLIT_HASH),
             fairness: next(CS_HASH),
             pool: next(CS_HASH),
