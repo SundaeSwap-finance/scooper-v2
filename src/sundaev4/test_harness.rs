@@ -458,6 +458,59 @@ impl TestEnv {
             );
         }
 
+        // Native assets likewise: inputs + mint == outputs, per asset.
+        {
+            use num_traits::ToPrimitive;
+            use pallas_primitives::conway::{PseudoTransactionOutput, Value as TxValue};
+            let mut net: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), i128> =
+                std::collections::BTreeMap::new();
+            for i in &build.tx_body.inputs {
+                let key = crate::cardano_types::TransactionInput::new(i.transaction_id, i.index);
+                let Some(r) = build.resolved_inputs.get(&key) else {
+                    continue;
+                };
+                for (policy, assets) in &r.value.0 {
+                    if policy.is_empty() {
+                        continue;
+                    }
+                    for (name, qty) in assets {
+                        *net.entry((policy.to_vec(), name.to_vec())).or_default() +=
+                            qty.clone().unwrap().to_i128().unwrap();
+                    }
+                }
+            }
+            if let Some(mint) = &build.tx_body.mint {
+                for (policy, assets) in mint.iter() {
+                    for (name, qty) in assets.iter() {
+                        *net.entry((policy.to_vec(), name.to_vec())).or_default() +=
+                            i64::from(qty) as i128;
+                    }
+                }
+            }
+            for o in &build.tx_body.outputs {
+                if let PseudoTransactionOutput::PostAlonzo(b) = o
+                    && let TxValue::Multiasset(_, ma) = &b.value
+                {
+                    for (policy, assets) in ma.iter() {
+                        for (name, qty) in assets.iter() {
+                            *net.entry((policy.to_vec(), name.to_vec())).or_default() -=
+                                u64::from(qty) as i128;
+                        }
+                    }
+                }
+            }
+            let unbalanced: Vec<String> = net
+                .iter()
+                .filter(|(_, d)| **d != 0)
+                .map(|((p, n), d)| format!("{}.{}: {d}", hex::encode(p), hex::encode(n)))
+                .collect();
+            anyhow::ensure!(
+                unbalanced.is_empty(),
+                "native assets not conserved (inputs + mint - outputs): {}",
+                unbalanced.join(", "),
+            );
+        }
+
         Ok((build, eval))
     }
 

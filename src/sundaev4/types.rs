@@ -1535,6 +1535,20 @@ impl SundaeV4Order {
             slot,
         }
     }
+
+    /// How much of the offered asset a fill can spend: `remaining_offered`
+    /// capped by what the order UTxO holds. The swap constraint bounds
+    /// consumption only from above, so an order holding less still fills;
+    /// a fill spending all of this is terminal and owes the full
+    /// `min_received`. Lovelace is not capped: an ADA order's lovelace also
+    /// pays its fee and the fulfilment output's min-UTxO.
+    pub fn swap_executable(&self) -> BigInt {
+        let (offered, remaining) = self.swap_offered();
+        if offered.policy.is_empty() {
+            return remaining.clone();
+        }
+        self.value.get(offered).min(remaining.clone())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]

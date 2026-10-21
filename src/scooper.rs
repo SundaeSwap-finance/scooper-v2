@@ -1465,7 +1465,8 @@ impl Scooper {
                     // depletion is visible. The router then naturally splits
                     // across CL+non-CL pools when an earlier order has
                     // drained the optimal CL pool.
-                    let (offer_asset, offer_amount) = order.swap_offered();
+                    let (offer_asset, _) = order.swap_offered();
+                    let offer_amount = &order.swap_executable();
                     let (ask_asset, _) = order.swap_min_received();
                     if offer_asset == ask_asset {
                         continue;
@@ -3039,6 +3040,7 @@ impl Scooper {
             return None;
         };
         let (offer_asset, remaining) = order.swap_offered();
+        let executable = order.swap_executable();
         let (ask_asset, min_qty) = order.swap_min_received();
 
         // Economic floor under the fee redesign (SUNDAE-2587): a partial
@@ -3054,7 +3056,7 @@ impl Scooper {
         }
         let floor_dx = &(&(remaining * &BigInt::from(margin_num)) * &fee_est)
             / &(&budget * &BigInt::from(margin_den));
-        if &floor_dx >= remaining {
+        if floor_dx >= executable {
             return None; // even the minimum viable fill exceeds what's left
         }
 
@@ -3075,7 +3077,7 @@ impl Scooper {
         if !meets(&lo) {
             return None; // pools can't clear the floor even at the minimum
         }
-        let mut hi = remaining.clone();
+        let mut hi = executable;
         // hi (full fill) is known to fail; bisect the largest passing dx.
         for _ in 0..12 {
             let mid = &(&lo + &hi) / &BigInt::from(2u64);

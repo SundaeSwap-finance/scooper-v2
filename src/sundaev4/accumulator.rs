@@ -577,14 +577,14 @@ impl Accumulator {
             let (ask_asset, min_qty) = order.swap_min_received();
             let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
             if final_asset.as_ref() == Some(ask_asset) {
-                let (_, remaining) = order.swap_offered();
+                let executable = order.swap_executable();
                 let total_in =
                     blend.branches.iter().fold(crate::bigint::BigInt::from(0), |acc, b| {
                         &acc + &b.total_input
                     });
                 // Partial fills: the contract's exact pro-rata check,
                 // received·original ≥ min·fill.
-                let ok = if &total_in < remaining {
+                let ok = if total_in < executable {
                     if let crate::sundaev4::Constraint::Swap {
                         original_offered, ..
                     } = &order.constraint
@@ -599,7 +599,7 @@ impl Accumulator {
                 if !ok {
                     result = Err(format!(
                         "blended output {total_out} below min_received {min_qty} \
-                         (fill {total_in} of {remaining})"
+                         (fill {total_in} of {executable})"
                     ));
                 }
             }
@@ -891,14 +891,14 @@ impl Accumulator {
 
         // Check min_received against the final routed output. Blended
         // branches are checked as a sum by the caller instead. Partial fills
-        // (route input below remaining_offered) use the contract's exact
+        // (route input below what the order can spend) use the contract's exact
         // pro-rata cross-multiplication:
         //   received · original_offered ≥ min · offered_this_fill
         if enforce_min {
             let (ask_asset, min_qty) = order.swap_min_received();
             if final_output_asset.as_ref() == Some(ask_asset) {
-                let (_, remaining) = order.swap_offered();
-                let ok = if &route.total_input < remaining {
+                let executable = order.swap_executable();
+                let ok = if route.total_input < executable {
                     if let crate::sundaev4::Constraint::Swap {
                         original_offered, ..
                     } = &order.constraint
@@ -913,7 +913,7 @@ impl Accumulator {
                 if !ok {
                     return Err(format!(
                         "routed output {} below min_received {} (fill {} of {})",
-                        final_output_amount, min_qty, route.total_input, remaining
+                        final_output_amount, min_qty, route.total_input, executable
                     ));
                 }
             }
