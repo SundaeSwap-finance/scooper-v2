@@ -595,14 +595,14 @@ pub fn build_multi_pool_scoop_tx(
         })
         .collect();
 
-    // Initialize per-route state. hop_input[0] = order's offered amount
+    // Initialize per-route state. hop_input[0] = order's executable amount
     // (entry-hop incoming). Subsequent hops start at 0 and accumulate dys.
     let mut route_states: Vec<RouteState> = routes
         .iter()
         .map(|r| {
             let n_hops = r.hops.len();
             let mut hop_input = vec![BigInt::from(0); n_hops];
-            hop_input[0] = r.order.swap_offered().1.clone();
+            hop_input[0] = r.order.swap_executable();
             RouteState {
                 hop_input,
                 hop_allocated: vec![BigInt::from(0); n_hops],
@@ -644,7 +644,7 @@ pub fn build_multi_pool_scoop_tx(
             route_idx = r_idx,
             order = %r.order.input,
             n_hops = r.hops.len(),
-            offered = %r.order.swap_offered().1,
+            executable = %r.order.swap_executable(),
             final_output_asset = %short_asset(&r.final_output_asset),
             "streaming walk: route init",
         );
@@ -2247,7 +2247,7 @@ pub fn build_multi_pool_scoop_tx(
         };
         // Partial fill detection (swap-module orders only): the fill size
         // is the route's hop-0 input (routed) or the resolved swap's dx
-        // (direct). Below remaining_offered → continuation at the order
+        // (direct). Below what the order can spend → continuation at the order
         // address with remaining decremented (swap.ak's continuation arm);
         // the received tokens accumulate ON the continuation.
         let swap_fill: Option<crate::bigint::BigInt> = match &fo_meta.kind {
@@ -2292,7 +2292,7 @@ pub fn build_multi_pool_scoop_tx(
         // terminal fills settle terminal_settlement as before. The inclusion
         // gate (base_fee <= max_per_execution) is enforced on-chain; bail
         // here so the plan fails with a diagnosable error instead.
-        let is_partial = matches!(&swap_fill, Some(fill) if fill < order.swap_offered().1);
+        let is_partial = matches!(&swap_fill, Some(fill) if *fill < order.swap_executable());
         let is_continuation = is_partial
             || matches!(
                 &order.datum.destination,
@@ -2317,7 +2317,7 @@ pub fn build_multi_pool_scoop_tx(
                 bf_big
             } else {
                 match &swap_fill {
-                    Some(fill) if fill < order.swap_offered().1 => {
+                    Some(fill) if *fill < order.swap_executable() => {
                         let (_, remaining) = order.swap_offered();
                         let prorata = &(fill * &order.datum.service_budget) / remaining;
                         prorata.min(order.datum.max_per_execution.clone())
@@ -2340,7 +2340,7 @@ pub fn build_multi_pool_scoop_tx(
         total_fee_deducted += actual_fee;
 
         let partial_continuation: Option<pallas_primitives::PlutusData> = match &swap_fill {
-            Some(fill) if fill < order.swap_offered().1 => {
+            Some(fill) if *fill < order.swap_executable() => {
                 let (_, remaining) = order.swap_offered();
                 let new_remaining = remaining - fill;
                 let swap_hash = exec
@@ -2430,8 +2430,9 @@ pub fn build_multi_pool_scoop_tx(
                         (&output_asset, &dy_owned)
                     }
                 };
-                let (offer_asset, offer_amount) = swap.order.swap_offered();
-                let spend_amount = swap_fill.as_ref().unwrap_or(offer_amount);
+                let (offer_asset, _) = swap.order.swap_offered();
+                let executable = swap.order.swap_executable();
+                let spend_amount = swap_fill.as_ref().unwrap_or(&executable);
                 // (The pro-rata anti-micro-fill cap is applied when
                 // actual_fee is computed above — vs REMAINING offered,
                 // per the redesigned swap constraint.)

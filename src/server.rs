@@ -1896,8 +1896,8 @@ impl AdminServer {
                 ) {
                     Ok(swap) => {
                         executable += 1;
-                        let (offered, dx) = order.swap_offered();
-                        add_to(&mut executable_volume, offered, dx.clone());
+                        let (offered, _) = order.swap_offered();
+                        add_to(&mut executable_volume, offered, swap.dx.clone());
                         add_to(
                             &mut executable_output,
                             &pool.pool_datum.assets[swap.output_idx].0,

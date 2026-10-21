@@ -4019,6 +4019,106 @@ mod tests {
             "k-value decreased: k0={k0}, k1={k1} (a0={a0}, b0={b0}, a1={a1}, b1={b1})"
         );
     }
+
+    fn with_holding(
+        order: std::sync::Arc<crate::sundaev4::SundaeV4Order>,
+        asset: &crate::cardano_types::AssetClass,
+        held: i64,
+    ) -> std::sync::Arc<crate::sundaev4::SundaeV4Order> {
+        let mut order = std::sync::Arc::try_unwrap(order).expect("fresh order");
+        order.value.insert(asset, BigInt::from(held));
+        std::sync::Arc::new(order)
+    }
+
+    #[test]
+    fn swap_executable_caps_offered_tokens_at_the_holding() {
+        let order = |held| {
+            with_holding(
+                make_order(token_e(), 10_000, token_b(), 1, 1),
+                &token_e(),
+                held,
+            )
+        };
+        assert_eq!(order(9_000).swap_executable(), BigInt::from(9_000));
+        assert_eq!(order(10_000).swap_executable(), BigInt::from(10_000));
+        assert_eq!(order(12_000).swap_executable(), BigInt::from(10_000));
+
+        let ada_order = with_holding(
+            make_order(ada(), 10_000_000, token_b(), 1, 1),
+            &ada(),
+            4_000_000,
+        );
+        assert_eq!(ada_order.swap_executable(), BigInt::from(10_000_000));
+    }
+
+    /// An order holding less of its offered token than its swap constraint
+    /// offers fills with what it holds, routed through CS then CP, and
+    /// settles terminally: no output returns to the order address.
+    #[test]
+    fn underfunded_routed_order_settles_terminally() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let cs_pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            crate::sundaev4::types::Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+        );
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(cp_pool.pool_datum.identifier.clone(), cp_pool.clone());
+        pool_map.insert(cs_pool.pool_datum.identifier.clone(), cs_pool.clone());
+
+        let held = 10_000_000 - 24_540;
+        let order = with_holding(
+            make_order(token_e(), 10_000_000, token_b(), 1, 1),
+            &token_e(),
+            held,
+        );
+        assert_eq!(order.swap_executable(), BigInt::from(held));
+
+        let route = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_e(),
+            &token_b(),
+            &order.swap_executable(),
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("router should find E→A→B path");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("routed order should execute");
+        let plan = accum.into_plan();
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("underfunded order should build, evaluate and conserve value");
+
+        let order_address = &result.resolved_inputs[&order.input].address;
+        let continues = result.tx_body.outputs.iter().any(|o| {
+            matches!(o, pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b)
+                if b.address.as_slice() == order_address.as_slice())
+        });
+        assert!(
+            !continues,
+            "a fill spending all the order holds must be terminal"
+        );
+    }
 }
 
 // ─── Property-based tests ────────────────────────────────────────────────

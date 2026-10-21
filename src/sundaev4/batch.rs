@@ -522,8 +522,7 @@ pub fn try_execute_order(
     let (input_idx, output_idx) = detect_swap_direction(order, running_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
-    // dx comes from the order's remaining_offered amount (partial fills not yet supported).
-    let dx = order.swap_offered().1.clone();
+    let dx = order.swap_executable();
     if !dx.is_positive() {
         return Err(format!("offered amount not positive: {dx}"));
     }
@@ -702,8 +701,7 @@ pub fn check_order_executability(
     let (input_idx, output_idx) = detect_swap_direction(order, pool_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
-    // dx comes from the order's remaining_offered amount.
-    let dx = order.swap_offered().1.clone();
+    let dx = order.swap_executable();
     if !dx.is_positive() {
         return Err("offered amount not positive".to_string());
     }
