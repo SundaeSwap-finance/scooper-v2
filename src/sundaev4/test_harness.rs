@@ -66,6 +66,7 @@ pub struct TestConstraintCtx {
     pub fairness_order: Vec<u8>,
     pub strategy_order: Vec<u8>,
     pub settings_mint: Vec<u8>,
+    pub fee_constraint: Vec<u8>,
 }
 pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync::OnceLock::new();
 
@@ -73,6 +74,16 @@ pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync:
 pub const CFG_SWAP: &[u8] = b"cfg-swap";
 pub const CFG_BASIC: &[u8] = b"cfg-basic";
 pub const CFG_STRATEGY: &[u8] = b"cfg-strategy";
+/// CFG_SWAP plus the fee constraint (docs/fee-system.md).
+pub const CFG_SWAP_FEE: &[u8] = b"cfg-swap-fee";
+
+/// The `fee_token_name` the fixture's fee constraint was applied with.
+pub const FEE_SETTINGS_TOKEN: &[u8] = b"fee0";
+/// `base_fee` of the FeeSettings node passed to every build. The first-pass
+/// tx fee is `min(base_fee, TX_FEE)`, so `base_fee >= TX_FEE` leaves fee-less
+/// tests unchanged.
+pub const FEE_SETTINGS_BASE_FEE: u64 = 2_000_000;
+const _: () = assert!(FEE_SETTINGS_BASE_FEE >= crate::sundaev4::tx_builder::TX_FEE);
 
 /// Complete test environment for building and evaluating scoop transactions.
 pub struct TestEnv {
@@ -170,8 +181,9 @@ impl TestEnv {
             &module_scripts.fairness_order,
             &module_scripts.strategy_order,
             settings_mint,
+            &module_scripts.fee_constraint,
         ) {
-            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
+            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm), Some(fc)) => {
                 Some(TestConstraintCtx {
                     swap_order: sw.hash.as_ref().to_vec(),
                     basic_order: ba.hash.as_ref().to_vec(),
@@ -179,6 +191,7 @@ impl TestEnv {
                     fairness_order: fo.hash.as_ref().to_vec(),
                     strategy_order: st.hash.as_ref().to_vec(),
                     settings_mint: sm,
+                    fee_constraint: fc.hash.as_ref().to_vec(),
                 })
             }
             _ => None,
@@ -187,7 +200,7 @@ impl TestEnv {
             BTreeMap::new();
         if let Some(ctx) = &ctx {
             // Mirrors the CLI's mint-order-config presets.
-            let entries: [(&[u8], Vec<Vec<u8>>); 3] = [
+            let entries: [(&[u8], Vec<Vec<u8>>); 4] = [
                 (
                     CFG_SWAP,
                     vec![
@@ -206,6 +219,15 @@ impl TestEnv {
                         ctx.strategy_order.clone(),
                         ctx.route_order.clone(),
                         ctx.fairness_order.clone(),
+                    ],
+                ),
+                (
+                    CFG_SWAP_FEE,
+                    vec![
+                        ctx.swap_order.clone(),
+                        ctx.route_order.clone(),
+                        ctx.fairness_order.clone(),
+                        ctx.fee_constraint.clone(),
                     ],
                 ),
             ];
@@ -395,7 +417,7 @@ impl TestEnv {
             None, // fee_override
             &self.order_configs,
             &std::collections::BTreeMap::new(), // strategy_executions
-            None,                               // fee_settings (harness configs are fee-less)
+            Some(&fee_settings_node()),
             self.funding.as_ref().map(|(i, v)| (i.clone(), v)),
             self.butane.as_ref(),
         )?;
@@ -1214,7 +1236,7 @@ pub fn make_basic_swap_order(
 /// Rewrite a test order's datum to the PR#11 modular shape using the
 /// real constraint hashes from the loaded blueprint (when available):
 /// the module-specific payload keeps its slot, route gets an empty pool
-/// whitelist, fairness gets void — mirroring the CLI's constraint list
+/// whitelist, fairness and fee get void — mirroring the CLI's constraint list
 /// builders. No-op on pre-PR#11 fixtures.
 pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> SundaeV4Order {
     let Some(Some(ctx)) = TEST_CTX.get() else {
@@ -1244,6 +1266,12 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
             ctx.route_order.clone(),
             ctx.fairness_order.clone(),
         ],
+        t if t == CFG_SWAP_FEE => &[
+            ctx.swap_order.clone(),
+            ctx.route_order.clone(),
+            ctx.fairness_order.clone(),
+            ctx.fee_constraint.clone(),
+        ],
         _ => panic!("unknown cfg token"),
     };
     order.datum.config_token = cfg_token.to_vec();
@@ -1252,7 +1280,7 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
         .map(|h| {
             let data = if *h == ctx.route_order {
                 empty_list.clone()
-            } else if *h == ctx.fairness_order {
+            } else if *h == ctx.fairness_order || *h == ctx.fee_constraint {
                 void.clone()
             } else {
                 payload.clone()
@@ -1432,6 +1460,16 @@ pub fn with_real_constraints_payload(
         }
     }
     order
+}
+
+/// The fixture deployment's FeeSettings node, needed by `CFG_SWAP_FEE` orders.
+pub fn fee_settings_node() -> SundaeV4FeeSettings {
+    SundaeV4FeeSettings {
+        input: crate::cardano_types::TransactionInput::new([0xF5; 32].into(), 0),
+        token: FEE_SETTINGS_TOKEN.to_vec(),
+        base_fee: FEE_SETTINGS_BASE_FEE,
+        slot: 1,
+    }
 }
 
 pub fn make_settings(_env: &TestEnv, scooper_keyhash: &[u8]) -> SundaeV4Settings {
