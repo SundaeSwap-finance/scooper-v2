@@ -235,7 +235,10 @@ impl SundaeV3Indexer {
         }
 
         self.loaded_slot = slot;
-        *self.state.lock().await.update_slot(slot)? = state.clone();
+        let mut history = self.state.lock().await;
+        history.rollback_to_origin();
+        *history.update_slot(slot)? = state.clone();
+        drop(history);
         self.broadcaster.send_replace(SundaeV3Update {
             slot,
             tip_slot: None,
@@ -756,6 +759,7 @@ impl ChainIndex for SundaeV3Indexer {
         warn!("clearing all state and resetting to {point}");
         self.dao.rollback(0).await?;
         self.state.lock().await.rollback_to_origin();
+        self.loaded_slot = 0;
         Ok(point.clone())
     }
 }
@@ -897,6 +901,75 @@ mod tests {
             BigInt::from(6397550387i128)
         );
         assert_eq!(index.orders.len(), 0);
+    }
+
+    /// What `manager_loop` does on every (re)start: a fresh indexer on the
+    /// shared state, loaded from the DB.
+    async fn start(
+        state: &Arc<Mutex<SundaeV3HistoricalState>>,
+        persistence: &dyn crate::persistence::Persistence,
+    ) -> Result<SundaeV3Indexer> {
+        let protocol_file = fs::File::open("testdata/protocol.json").unwrap();
+        let protocol = serde_json::from_reader(protocol_file).unwrap();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut indexer = SundaeV3Indexer::new(
+            state.clone(),
+            watch::Sender::default(),
+            event_tx,
+            protocol,
+            2160,
+            persistence.indexer_dao("sundae_v3"),
+        );
+        indexer.load().await?;
+        Ok(indexer)
+    }
+
+    fn block_info(slot: u64) -> BlockInfo {
+        BlockInfo {
+            status: BlockStatus::Volatile,
+            intent: BlockIntent::none(),
+            slot,
+            number: slot,
+            hash: BlockHash::new([0; 32]),
+            epoch: 0,
+            epoch_slot: 0,
+            new_epoch: false,
+            tip_slot: None,
+            timestamp: 0,
+            era: Era::Conway,
+            is_new_era: false,
+        }
+    }
+
+    /// `/resync-from-acropolis` rebuilds the indexer from the DB, then
+    /// reindexes from the starting point. A node that has followed the chain
+    /// past its last pool must survive it and still know that pool afterwards.
+    #[tokio::test]
+    async fn test_resync_reloads_what_the_node_had_indexed() {
+        let block_bytes = std::fs::read("testdata/scoop-pool.block").unwrap();
+        let block = pallas_traverse::MultiEraBlock::decode(&block_bytes).unwrap();
+        let txs = block.txs();
+        // tx0 touches nothing of the protocol: replayed one slot later, it
+        // moves the history forward while the DB records nothing.
+        let unrelated = txs[0].encode();
+        // tx1 scoops the pool, which the DB then holds.
+        let scoop = txs[1].encode();
+        let scoop_block = block_info(block.slot());
+        let persistence = crate::persistence::connect(&Default::default()).await.unwrap();
+        let state = Arc::new(Mutex::new(SundaeV3HistoricalState::new()));
+        let mut node = start(&state, &*persistence).await.unwrap();
+        node.handle_onchain_tx_bytes(&scoop_block, &scoop).await.unwrap();
+        node.handle_onchain_tx_bytes(&block_info(block.slot() + 1), &unrelated).await.unwrap();
+
+        let mut node = start(&state, &*persistence).await.expect("resync must not crash the node");
+        node.reset(&Point::Origin).await.unwrap();
+        node.handle_onchain_tx_bytes(&scoop_block, &scoop).await.unwrap();
+
+        assert_eq!(
+            state.lock().await.latest().pools.len(),
+            1,
+            "the resync lost the pool the node had indexed"
+        );
     }
 
     #[tokio::test]
