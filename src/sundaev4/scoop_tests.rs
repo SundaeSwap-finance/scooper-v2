@@ -1392,6 +1392,95 @@ mod tests {
         assert!(!eval.budgets.is_empty());
     }
 
+    // ─── Fee constraint tests ─────────────────────────────────────────────────
+
+    /// The designated pool (outputs[0]) receives the fee surplus; its
+    /// predicted UTxO must include it, or the next chained scoop fails with
+    /// ValueNotConservedUTxO.
+    #[test]
+    fn fee_surplus_is_in_the_predicted_designated_pool() {
+        use num_traits::ToPrimitive;
+        use pallas_primitives::conway::{TransactionOutput, Value as ConwayValue};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        // The fee constraint requires a treasury (tag 200) action on the pool.
+        let mut eligible = (*make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        ))
+        .clone();
+        eligible.pool_datum.actions.push(crate::sundaev4::types::ActionEntry {
+            tag: BigInt::from(200),
+            enabled: true,
+            modules: vec![],
+        });
+        let pool = std::sync::Arc::new(eligible);
+        // A terminal fill is charged its whole 3 ADA budget, above the tx fee.
+        let order = std::sync::Arc::try_unwrap(make_order_with_budget(
+            token_a(),
+            10_000_000,
+            token_b(),
+            1,
+            1,
+            3_000_000,
+        ))
+        .expect("a fresh order has a single owner");
+        let orders = vec![std::sync::Arc::new(with_real_constraints(
+            order,
+            CFG_SWAP_FEE,
+        ))];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
+        let plan = crate::sundaev4::batch::ScoopPlan {
+            batches: vec![batch],
+            routes: Vec::new(),
+            global_seq: Vec::new(),
+            conversions: Vec::new(),
+        };
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("fee-bearing scoop should build and evaluate");
+        assert!(!eval.budgets.is_empty());
+
+        let TransactionOutput::PostAlonzo(designated) = &result.tx_body.outputs[0] else {
+            panic!("legacy pool output")
+        };
+        let built_ada = match &designated.value {
+            ConwayValue::Coin(c) => *c,
+            ConwayValue::Multiasset(c, _) => *c,
+        };
+        let input_ada = pool.value.get(&ada()).clone().unwrap().to_u64().unwrap();
+        assert!(
+            built_ada > input_ada,
+            "precondition: the designated pool receives a fee surplus \
+             (built {built_ada}, input {input_ada})"
+        );
+
+        let (_, predicted_input, predicted) = &result.predicted_pools[0];
+        assert_eq!(
+            predicted_input.0.index, 0,
+            "outputs[0] is the designated pool"
+        );
+        let predicted_ada = predicted.value.get(&ada()).clone().unwrap().to_u64().unwrap();
+        assert_eq!(
+            predicted_ada,
+            built_ada,
+            "predicted designated pool ADA misses {} lovelace of the built output",
+            built_ada as i128 - predicted_ada as i128
+        );
+    }
+
     // ─── Fee split tests ──────────────────────────────────────────────────────
 
     #[test]
