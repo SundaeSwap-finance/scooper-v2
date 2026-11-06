@@ -575,7 +575,9 @@ impl SundaeV4Indexer {
 
         state.tip_slot = slot;
         self.loaded_slot = slot;
-        *self.state.lock().await.update_slot(slot)? = state;
+        let mut history = self.state.lock().await;
+        history.rollback_to_origin();
+        *history.update_slot(slot)? = state;
         Ok(())
     }
 
@@ -1900,6 +1902,7 @@ impl ChainIndex for SundaeV4Indexer {
         warn!("v4: clearing all state and resetting to {point}");
         self.dao.rollback(0).await?;
         self.state.lock().await.rollback_to_origin();
+        self.loaded_slot = 0;
         Ok(point.clone())
     }
 }
@@ -2400,6 +2403,102 @@ mod mainnet_create_tx_tests {
         assert!(
             tracked.contains(&fee_constraint_ref),
             "fee_constraint is invoked by every scoop and must be in the store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+    use crate::persistence::{PersistenceConfig, connect};
+
+    /// The mainnet pool script and pool NFT policy, so the SPRINKLES/JIMMIES
+    /// Create transaction fixture is recognised as a pool creation.
+    fn protocol() -> SundaeV4Protocol {
+        let hash = ScriptHash::from([0u8; 28]);
+        SundaeV4Protocol {
+            pool_script_hash: "21c9b7b965646069f9becebf8b4c3cedaf84c19b109eaa5980a14a26"
+                .parse()
+                .unwrap(),
+            order_script_hashes: vec![],
+            settings_script_hash: hash,
+            settings_nft: AssetClass::from_pair((vec![], vec![])),
+            pool_nft_policy: "d9d5985e0657933005d6eb953aeadad29aa8c36f17e493e2962584ec"
+                .parse()
+                .unwrap(),
+            fee_settings_token: None,
+            starting_point: Point::Origin,
+            execution: None,
+            mempool: None,
+            blueprint: None,
+            network: Default::default(),
+        }
+    }
+
+    /// What `manager_loop` does on every (re)start: a fresh indexer on the
+    /// shared state, loaded from the DB.
+    async fn start(
+        state: &Arc<Mutex<SundaeV4HistoricalState>>,
+        persistence: &dyn crate::persistence::Persistence,
+    ) -> Result<SundaeV4Indexer> {
+        let (event_tx, _) = broadcast::channel(16);
+        let mut indexer = SundaeV4Indexer::new(
+            state.clone(),
+            event_tx,
+            protocol(),
+            2160,
+            persistence.indexer_dao("sundae_v4"),
+        );
+        indexer.load().await?;
+        Ok(indexer)
+    }
+
+    /// A block with no protocol transaction: the node moves forward, the DB
+    /// records nothing.
+    fn empty_block(slot: u64) -> BlockInfo {
+        BlockInfo {
+            status: acropolis_common::BlockStatus::Volatile,
+            intent: acropolis_common::BlockIntent::none(),
+            slot,
+            number: slot,
+            hash: acropolis_common::BlockHash::new([0; 32]),
+            epoch: 0,
+            epoch_slot: 0,
+            new_epoch: false,
+            tip_slot: None,
+            timestamp: 0,
+            era: acropolis_common::Era::Conway,
+            is_new_era: false,
+        }
+    }
+
+    /// `/resync-from-acropolis` rebuilds the indexer from the DB, then
+    /// reindexes from the starting point. A node that has followed the chain
+    /// past its last pool must survive it and still know that pool afterwards.
+    #[tokio::test]
+    async fn resync_reloads_what_the_node_had_indexed() {
+        // The block holding the mainnet SPRINKLES/JIMMIES pool creation.
+        let pool_creation = hex::decode(
+            include_str!("../../test/fixtures/mainnet-pool-create-4b814760.hex").trim(),
+        )
+        .unwrap();
+        let block = empty_block(198130613);
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+        let state = Arc::new(Mutex::new(SundaeV4HistoricalState::new()));
+        let mut node = start(&state, &*persistence).await.unwrap();
+        node.handle_block(&block).await.unwrap();
+        node.handle_onchain_tx_bytes(&block, &pool_creation).await.unwrap();
+        node.handle_block(&empty_block(198130614)).await.unwrap();
+
+        let mut node = start(&state, &*persistence).await.expect("resync must not crash the node");
+        node.reset(&Point::Origin).await.unwrap();
+        node.handle_block(&block).await.unwrap();
+        node.handle_onchain_tx_bytes(&block, &pool_creation).await.unwrap();
+
+        assert_eq!(
+            state.lock().await.latest().pools.len(),
+            1,
+            "the resync lost the pool the node had indexed"
         );
     }
 }
