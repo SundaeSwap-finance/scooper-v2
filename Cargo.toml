@@ -8,12 +8,12 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis_common = { version = "0.3.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
+acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
 anyhow = "1"
 bech32 = "0.11"
 async-trait = "0.1"
