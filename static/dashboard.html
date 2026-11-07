@@ -805,6 +805,26 @@
       '</div><div class="value">' + value + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>';
   }
 
+  // A USD stat card that sums several named [{asset, amount}] lists and
+  // shows each part's USD figure in a smaller line underneath. parts is
+  // [{label, list}]; the hover lists the raw token amounts of every part.
+  function usdSumCard(label, parts) {
+    var usd = 0, priced = 0, unpriced = {}, any = false, subs = [], raws = [];
+    parts.forEach(function(p) {
+      var v = usdOf(p.list);
+      usd += v.usd; priced += v.priced; any = any || !!(p.list && p.list.length);
+      v.unpriced.forEach(function(a) { unpriced[assetGqlId(a)] = true; });
+      subs.push(p.label + ' ' + (v.priced > 0 ? fmtUsd(v.usd) : (p.list && p.list.length ? 'unpriced' : '—')));
+      if (p.list && p.list.length) raws.push(p.label + ':\n' + rawTitle(p.list));
+    });
+    var n = Object.keys(unpriced).length;
+    var value = priced > 0 ? fmtUsd(usd) : (any ? 'unpriced' : '—');
+    var html = '<div class="stat-card" title="' + escapeHtml(raws.join('\n')) + '"><div class="label">' + label +
+      '</div><div class="value">' + value + '</div><div class="sub">' + escapeHtml(subs.join(' · ')) + '</div>';
+    if (n) html += '<div class="sub">+' + n + ' unpriced asset' + (n > 1 ? 's' : '') + '</div>';
+    return html + '</div>';
+  }
+
   function usdCell(list) {
     var v = usdOf(list);
     var text = v.priced > 0 ? fmtUsd(v.usd) : '—';
@@ -854,8 +874,10 @@
       statCard('Executable Now', (swaps.executable || 0) + ' <span class="sub">of ' + (swaps.matched || 0) + ' swaps</span>') +
       statCard('Executed 24h', (w24.orders != null ? w24.orders : '—') + ' <span class="sub">in ' + (w24.scoop_txs != null ? w24.scoop_txs : '—') + ' scoops</span>') +
       usdCard('Liquidity (TVL)', pools.tvl) +
-      usdCard('LP Fee Equity', eq.total) +
-      usdCard('Base-Fee Surplus', eq.surplus_lovelace != null ? [{ asset: 'lovelace', amount: eq.surplus_lovelace }] : []) +
+      usdSumCard('Protocol Equity', [
+        { label: 'LP fees', list: eq.total },
+        { label: 'base-fee surplus', list: eq.surplus_lovelace != null ? [{ asset: 'lovelace', amount: eq.surplus_lovelace }] : [] }
+      ]) +
       usdCard('Executable Volume', swaps.executable_volume) +
       '<div class="stat-card"' + (oldestTitle ? ' title="' + escapeHtml(oldestTitle) + '"' : '') + '><div class="label">Oldest Order</div><div class="value">' + oldest + '</div></div>' +
       statCard('Protocol Share', shareText) +
