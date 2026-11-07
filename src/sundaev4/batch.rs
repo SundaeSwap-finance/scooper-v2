@@ -1286,6 +1286,21 @@ pub fn resolve_proportional_withdraw(
     // and confirm it belongs to this pool.
     const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
     let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
+    // The basic-order constraint refuses any min_received entry that is not
+    // positive (basic.ak: `expect list.all(min_received, fn((_, amount)) {
+    // amount > 0 })`), so such an order can never be scooped. Say so here,
+    // by name, instead of building a scoop that fails evaluation and gets
+    // quarantined as a suspected scooper bug: that is what a 3-asset
+    // withdraw with three zero minimums looked like on preview, 2026-11-07.
+    if let Constraint::Withdraw { min_received, .. } = &order.constraint {
+        if let Some((asset, amount)) = min_received.iter().find(|(_, amount)| !amount.is_positive()) {
+            return Err(format!(
+                "withdraw min_received for {} is {}; the basic-order constraint requires every minimum to be positive, so this order cannot be scooped (the order was built wrong; its owner must cancel it)",
+                hex::encode(&asset.token),
+                amount
+            ));
+        }
+    }
     let lp_burned = offered
         .iter()
         .find_map(|(a, q)| {
@@ -1918,5 +1933,38 @@ mod tests {
         let groups = group_orders_by_pool(&orders, &pools);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[&ident].len(), 2);
+    }
+
+    /// A withdraw whose min_received carries a zero can never be scooped: the
+    /// basic-order constraint requires every minimum to be positive. The
+    /// scooper refuses it up front, by name, instead of building a scoop that
+    /// fails evaluation and quarantining the order as its own bug (preview,
+    /// 2026-11-07, a three-asset withdraw with three zero minimums).
+    #[test]
+    fn withdraw_with_a_zero_minimum_is_refused_by_name() {
+        let pool = make_pool(1_000_000, 1_000_000);
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(2_000_000i64));
+        value.insert(&token_a(), BigInt::from(100));
+        let mut order = SundaeV4Order::test_swap_order(
+            TransactionInput::new([7u8; 32].into(), 0),
+            value,
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (token_a(), BigInt::from(100)),
+            (ada(), BigInt::from(1)),
+            BigInt::from(1_500_000i64),
+            7,
+        );
+        order.constraint = Constraint::Withdraw {
+            offered: vec![(token_a(), BigInt::from(100))],
+            min_received: vec![(ada(), BigInt::from(0)), (token_a(), BigInt::from(5))],
+        };
+        let err = match resolve_proportional_withdraw(&pool, &Arc::new(order)) {
+            Err(e) => e,
+            Ok(_) => panic!("a zero minimum must be refused"),
+        };
+        assert!(err.contains("requires every minimum to be positive"), "{err}");
+        assert!(err.contains("cancel"), "{err}");
     }
 }
