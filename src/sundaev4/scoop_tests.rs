@@ -1700,6 +1700,96 @@ mod tests {
             .expect("emptying the output reserve should build, evaluate and conserve value");
     }
 
+    /// The pool a reserve-emptying fill leaves behind still serves a swap
+    /// back into the empty asset, a deposit and a withdraw, each evaluated
+    /// against the real validators.
+    #[test]
+    fn cs_pool_with_an_empty_reserve_keeps_working() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xCE,
+            vec![(token_a(), 1_000_000_000), (token_b(), 9_970_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            fee,
+        );
+        let ident = pool.pool_datum.identifier.clone();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("drain batch");
+        let (result, _) = env.build_and_eval(&[batch], &settings, 1000).expect("drain scoop");
+        let drained = std::sync::Arc::new(result.predicted_pools[0].2.clone());
+        assert_eq!(drained.value.get(&token_b()), BigInt::from(0));
+        assert_eq!(drained.pool_datum.assets[1].1, BigInt::from(0));
+
+        // Swap back into the empty asset.
+        let back = vec![make_order(token_b(), 5_000_000, token_a(), 1, 2)];
+        let batch = assemble_batch(
+            &drained,
+            &back,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("swap into the empty asset should be admitted");
+        let (result, _) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("swap into the empty asset should evaluate");
+        assert_eq!(
+            result.predicted_pools[0].2.value.get(&token_b()),
+            BigInt::from(5_000_000)
+        );
+
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xCE; 28]);
+                t
+            },
+        };
+
+        // Deposit: the empty reserve's proportional share is zero.
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_000)], lp_asset.clone(), 1, 3);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_deposit(&order, &ident, &drained)
+            .expect("deposit into a pool with an empty reserve should resolve");
+        env.build_and_eval_plan(&accum.into_plan(), &settings, 1000)
+            .expect("deposit into a pool with an empty reserve should evaluate");
+
+        // Withdraw: move LP out of the premint, as if a depositor holds it.
+        let held = {
+            let mut p = (*drained).clone();
+            let circ = BigInt::from(50_000_000i64);
+            p.pool_datum.circulating_lp = &p.pool_datum.circulating_lp + &circ;
+            p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &circ;
+            let lp = p.value.get(&lp_asset);
+            p.value.insert(&lp_asset, &lp - &circ);
+            std::sync::Arc::new(p)
+        };
+        let order = make_basic_withdraw_order(lp_asset, 5_000_017, vec![(token_a(), 1)], 4);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_withdraw(&order, &ident, &held)
+            .expect("withdraw from a pool with an empty reserve should resolve");
+        env.build_and_eval_plan(&accum.into_plan(), &settings, 1000)
+            .expect("withdraw from a pool with an empty reserve should evaluate");
+    }
+
     #[test]
     fn cs_multiple_orders() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
