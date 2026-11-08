@@ -2026,6 +2026,7 @@ impl Scooper {
                 build.tx_hash,
                 &exec.slot_config,
                 Some(&mut failure),
+                exec.script_budget(),
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2133,6 +2134,7 @@ impl Scooper {
                                 build.tx_hash,
                                 &exec.slot_config,
                                 Some(&mut failure),
+                                exec.script_budget(),
                             ) {
                                 Err(e) => {
                                     // Eval failure on the minimal batch — definitely a
@@ -2668,6 +2670,7 @@ impl Scooper {
                 first_pass.tx_hash,
                 &exec.slot_config,
                 Some(&mut failure),
+                exec.script_budget(),
             ) {
                 Ok(r) => {
                     // `budget_padding`'s doc says what the margin covers; the
@@ -2848,6 +2851,7 @@ impl Scooper {
                 final_tx.tx_hash,
                 &exec.slot_config,
                 None,
+                exec.script_budget(),
             ) {
                 Ok(r) => r
                     .budgets

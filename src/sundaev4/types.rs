@@ -1407,10 +1407,12 @@ pub struct ScooperExecution {
     /// Keyed by pool ident (hex string).
     #[serde(default)]
     pub pool_configs: std::collections::BTreeMap<String, PoolConfig>,
-    /// Maximum transaction execution memory units. Default: 16_500_000.
+    /// Maximum transaction execution memory units. Default:
+    /// `evaluator::SCRIPT_BUDGET`.
     #[serde(default = "default_max_tx_ex_mem")]
     pub max_tx_ex_mem: u64,
-    /// Maximum transaction execution CPU steps. Default: 10_000_000_000.
+    /// Maximum transaction execution CPU steps. Default:
+    /// `evaluator::SCRIPT_BUDGET`.
     #[serde(default = "default_max_tx_ex_steps")]
     pub max_tx_ex_steps: u64,
     /// Maximum transaction size in bytes. Default: 16_384.
@@ -1487,10 +1489,10 @@ fn default_partial_fill_fee_estimate() -> u64 {
 }
 
 fn default_max_tx_ex_mem() -> u64 {
-    16_500_000
+    crate::sundaev4::evaluator::SCRIPT_BUDGET.mem
 }
 fn default_max_tx_ex_steps() -> u64 {
-    10_000_000_000
+    crate::sundaev4::evaluator::SCRIPT_BUDGET.steps
 }
 fn default_max_tx_size() -> usize {
     16_384
@@ -1503,6 +1505,14 @@ pub(crate) fn default_budget_padding() -> (u64, u64) {
 }
 
 impl ScooperExecution {
+    /// Budget each script is evaluated under: the whole tx limit.
+    pub fn script_budget(&self) -> pallas_primitives::ExUnits {
+        pallas_primitives::ExUnits {
+            mem: self.max_tx_ex_mem,
+            steps: self.max_tx_ex_steps,
+        }
+    }
+
     /// If `scooper_secret_key_file` is set, read the file and populate
     /// `scooper_secret_key`. Either source is normalized to raw hex of a
     /// 32-byte or 64-byte key — the two forms every downstream key reader
