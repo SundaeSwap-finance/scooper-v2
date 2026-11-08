@@ -1665,6 +1665,42 @@ mod tests {
     }
 
     #[test]
+    fn cs_fill_that_empties_the_output_reserve_conserves_value() {
+        // Mainnet order 826b1955…#3 (2026-11-08): 375_275_955 USDM into a 30bp
+        // constant-sum pool holding 374_150_128 USDCx. The fill takes every
+        // USDCx unit. The pool output kept the old USDCx amount because a
+        // zero reserve did not override it, and the node rejected the scoop
+        // with ValueNotConserved on every retry.
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xCE,
+            vec![(token_a(), 1_000_000_000), (token_b(), 9_970_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            fee,
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("a fill of the whole output reserve should be admitted");
+        assert_eq!(batch.swaps.len(), 1);
+        assert_eq!(batch.swaps[0].dy, BigInt::from(9_970_000));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        env.build_and_eval(&[batch], &settings, 1000)
+            .expect("emptying the output reserve should build, evaluate and conserve value");
+    }
+
+    #[test]
     fn cs_multiple_orders() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let fee = crate::sundaev4::types::Rational {

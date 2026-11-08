@@ -3542,6 +3542,13 @@ fn build_pool_output_value(
         let amt = amount.clone().unwrap().to_u64().unwrap_or(0);
         if amt > 0 {
             policy_map.entry(asset.policy.clone()).or_default().insert(asset.token.clone(), amt);
+        } else if let Some(tokens) = policy_map.get_mut(&asset.policy) {
+            // A fill that empties a reserve must drop the copied amount, or
+            // the output keeps tokens the order also receives.
+            tokens.remove(&asset.token);
+            if tokens.is_empty() {
+                policy_map.remove(&asset.policy);
+            }
         }
     }
 
