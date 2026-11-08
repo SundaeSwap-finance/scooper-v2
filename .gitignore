@@ -8,3 +8,5 @@ config/*.bak
 
 /bench/cache/
 /bench/route-quality/results/
+/bench/block-capacity/data/tape.csv
+/bench/block-capacity/results/
