@@ -60,7 +60,7 @@ pub enum Credential {
 /// The ScriptContext is: `Constr(0, [tx_info, redeemer, script_info])`
 #[allow(clippy::too_many_arguments)]
 pub fn build_script_context(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -98,7 +98,7 @@ pub fn build_script_context(
 /// - TxId is newtyped: `Constr 0 [bytes]` — in `id` AND inside every outref
 /// - wdrl keys / Rewarding purpose wrap creds in StakingCredential (Constr 0)
 pub fn build_script_context_v2(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -191,7 +191,7 @@ fn encode_purpose_v2(purpose: &ScriptPurpose) -> PlutusData {
 ///   mint(Value with ada-0), dcert, wdrl(Map<StakingCredential, Int>),
 ///   valid_range, signatories, redeemers(Map), data(Map), id(TxId)]
 fn build_tx_info_v2(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -223,7 +223,7 @@ fn build_tx_info_v2(
     // mint: Value INCLUDING the zero-ada stub entry (V2 quirk).
     let mint = {
         let inner = encode_mint(tx_body.mint.as_ref());
-        let PlutusData::Map(pairs) = inner else {
+        let Ok(pairs) = inner.into_map() else {
             unreachable!("encode_mint returns a map")
         };
         let mut all: Vec<(PlutusData, PlutusData)> = vec![(
@@ -307,7 +307,7 @@ fn build_tx_info_v2(
 ///   wdrl, valid_range, signatories, redeemers, data, id,
 ///   votes, proposal_procedures, current_treasury, treasury_donation])
 fn build_tx_info(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -592,12 +592,12 @@ fn encode_tx_out(output: &TransactionOutput) -> PlutusData {
         TransactionOutput::PostAlonzo(o) => {
             let address = encode_address_bytes(&o.address);
             let value = encode_conway_value(&o.value);
-            let datum_option = match &o.datum_option {
+            let datum_option = match o.datum_option.as_deref() {
                 None => constr(0, vec![]), // NoOutputDatum
-                Some(conway::PseudoDatumOption::Hash(h)) => {
+                Some(conway::DatumOption::Hash(h)) => {
                     constr(1, vec![PlutusData::BoundedBytes(h.to_vec().into())])
                 }
-                Some(conway::PseudoDatumOption::Data(d)) => constr(2, vec![d.0.clone()]),
+                Some(conway::DatumOption::Data(d)) => constr(2, vec![d.0.clone().unwrap()]),
             };
             let script_ref = constr(1, vec![]); // None (we don't encode script_ref in outputs)
             constr(0, vec![address, value, datum_option, script_ref])
@@ -800,7 +800,7 @@ fn encode_validity_range(
 /// then by index, matching the Cardano node's canonical ordering.
 fn encode_redeemers_map(
     redeemers: &[(RedeemersKey, PlutusData)],
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
 ) -> PlutusData {
     let mut sorted: Vec<_> = redeemers.to_vec();
     sorted.sort_by(|(a, _), (b, _)| {
@@ -829,7 +829,7 @@ fn encode_redeemers_map(
 /// Map a RedeemersKey to its ScriptPurpose PlutusData.
 fn encode_redeemer_purpose(
     key: &RedeemersKey,
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
 ) -> PlutusData {
     match key.tag {
         RedeemerTag::Spend => {
@@ -857,7 +857,7 @@ fn encode_redeemer_purpose(
         RedeemerTag::Reward => {
             // Look up the withdrawal at this index
             if let Some(withdrawals) = &tx_body.withdrawals {
-                let sorted_accounts: Vec<_> = withdrawals.iter().map(|(a, _)| a.clone()).collect();
+                let sorted_accounts: Vec<_> = withdrawals.keys().cloned().collect();
                 if let Some(account) = sorted_accounts.get(key.index as usize) {
                     let cred = encode_reward_account_credential(account);
                     constr(2, vec![cred]) // Rewarding
@@ -878,7 +878,7 @@ fn encode_redeemer_purpose(
             // Mint redeemers are indexed by policy id in canonical (sorted)
             // order over the tx's mint multiasset.
             if let Some(mint) = &tx_body.mint {
-                let mut policies: Vec<_> = mint.iter().map(|(p, _)| *p).collect();
+                let mut policies: Vec<_> = mint.keys().copied().collect();
                 policies.sort();
                 if let Some(policy) = policies.get(key.index as usize) {
                     constr(0, vec![PlutusData::BoundedBytes(policy.to_vec().into())])

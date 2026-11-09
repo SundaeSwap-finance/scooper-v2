@@ -94,9 +94,11 @@ const REQUIRED_ROLES: &[&str] = &[
 pub struct DeployedScript {
     pub hash: Vec<u8>,
     pub ref_input: TransactionInput,
-    /// The resolved ref UTxO output (address/value/script), needed so the
-    /// evaluator can resolve the ref input without a chain query.
-    pub ref_output: conway::TransactionOutput,
+    /// CBOR of the resolved ref UTxO output (address/value/script), needed so
+    /// the evaluator can resolve the ref input without a chain query. Kept as
+    /// bytes because a decoded pallas output borrows its source buffer; decoded
+    /// on demand by [`ButaneRuntime::resolved_ref_outputs`], validated at load.
+    ref_output_cbor: Vec<u8>,
     /// Plutus language version (1/2/3) — drives the hash preimage prefix,
     /// the redeemer cost model, and the script_data_hash language views.
     pub plutus_version: u8,
@@ -111,8 +113,14 @@ pub struct ButaneRuntime {
     pub scripts: BTreeMap<String, DeployedScript>,
     pub registry_utxo: TransactionInput,
     pub synthetics: Vec<ButaneSyntheticConfig>,
-    /// Registry + params UTxOs resolved from config CBOR (for local eval).
-    extra_resolved: Vec<(TransactionInput, conway::TransactionOutput)>,
+    /// Registry + params UTxOs resolved from config CBOR (for local eval), as
+    /// output CBOR validated at load (see `DeployedScript::ref_output_cbor`).
+    extra_resolved: Vec<(TransactionInput, Vec<u8>)>,
+}
+
+/// Decode output CBOR that `ButaneRuntime::load` already decoded successfully.
+fn decode_validated_output(cbor: &[u8]) -> conway::TransactionOutput<'_> {
+    minicbor::decode(cbor).expect("output CBOR validated at load")
 }
 
 fn parse_outref(s: &str) -> Result<TransactionInput> {
@@ -176,10 +184,10 @@ impl ButaneRuntime {
                 bail!("deployment {role}: output carries no reference script");
             };
             let (plutus_version, script_bytes): (u8, Vec<u8>) = match &script_ref.0 {
-                conway::PseudoScript::PlutusV1Script(s) => (1, s.0.to_vec()),
-                conway::PseudoScript::PlutusV2Script(s) => (2, s.0.to_vec()),
-                conway::PseudoScript::PlutusV3Script(s) => (3, s.0.to_vec()),
-                conway::PseudoScript::NativeScript(_) => {
+                conway::ScriptRef::PlutusV1Script(s) => (1, s.0.to_vec()),
+                conway::ScriptRef::PlutusV2Script(s) => (2, s.0.to_vec()),
+                conway::ScriptRef::PlutusV3Script(s) => (3, s.0.to_vec()),
+                conway::ScriptRef::NativeScript(_) => {
                     bail!("deployment {role}: native scripts unsupported")
                 }
             };
@@ -202,7 +210,8 @@ impl ButaneRuntime {
                 DeployedScript {
                     hash: expected,
                     ref_input,
-                    ref_output: ref_output.clone(),
+                    // Re-encoding a decoded output writes back its original bytes.
+                    ref_output_cbor: minicbor::to_vec(&ref_output).expect("infallible encoding"),
                     plutus_version,
                     script_bytes,
                 },
@@ -211,10 +220,13 @@ impl ButaneRuntime {
 
         let registry_utxo = parse_outref(&config.registry_utxo)?;
         let mut extra_resolved = Vec::new();
-        let decode_output = |label: &str, hex_cbor: &str| -> Result<conway::TransactionOutput> {
+        let decode_output = |label: &str, hex_cbor: &str| -> Result<Vec<u8>> {
             let bytes =
                 hex::decode(hex_cbor).with_context(|| format!("{label} output cbor not hex"))?;
-            minicbor::decode(&bytes).map_err(|e| anyhow::anyhow!("decode {label} output: {e}"))
+            // Validate now; `resolved_ref_outputs` decodes the bytes again on demand.
+            minicbor::decode::<conway::TransactionOutput>(&bytes)
+                .map_err(|e| anyhow::anyhow!("decode {label} output: {e}"))?;
+            Ok(bytes)
         };
         if let Some(cbor) = &config.registry_utxo_cbor {
             extra_resolved.push((registry_utxo.clone(), decode_output("registry", cbor)?));
@@ -279,10 +291,22 @@ impl ButaneRuntime {
     /// config CBOR). Synthetics without params CBOR are skipped — their
     /// deposits fail eval with a missing-resolution error rather than a
     /// wrong context.
-    pub fn resolved_ref_outputs(&self) -> Vec<(TransactionInput, conway::TransactionOutput)> {
-        let mut out: Vec<(TransactionInput, conway::TransactionOutput)> =
-            self.scripts.values().map(|ds| (ds.ref_input.clone(), ds.ref_output.clone())).collect();
-        out.extend(self.extra_resolved.iter().cloned());
+    pub fn resolved_ref_outputs(&self) -> Vec<(TransactionInput, conway::TransactionOutput<'_>)> {
+        let mut out: Vec<(TransactionInput, conway::TransactionOutput<'_>)> = self
+            .scripts
+            .values()
+            .map(|ds| {
+                (
+                    ds.ref_input.clone(),
+                    decode_validated_output(&ds.ref_output_cbor),
+                )
+            })
+            .collect();
+        out.extend(
+            self.extra_resolved
+                .iter()
+                .map(|(input, cbor)| (input.clone(), decode_validated_output(cbor))),
+        );
         out
     }
 }
@@ -295,7 +319,14 @@ impl ButaneRuntime {
 /// language views), the mint redeemer, and the reference inputs.
 #[derive(Clone, Debug)]
 pub struct DepositPieces {
-    pub pot_output: conway::TransactionOutput,
+    /// The pot output, built by `deposit_pieces`.
+    ///
+    /// A pallas `TransactionOutput<'b>` decoded from CBOR keeps pointers into the
+    /// bytes it was decoded from, and `'b` is how long those bytes stay alive. This
+    /// output is not decoded: `deposit_pieces` builds it field by field, so it owns
+    /// all its data and points into no buffer. Nothing can expire under it, hence
+    /// `'static`.
+    pub pot_output: conway::TransactionOutput<'static>,
     /// (asset name, amount) under the butane mint policy.
     pub mint_assets: Vec<(Vec<u8>, i64)>,
     pub mint_policy: Vec<u8>,
@@ -355,9 +386,9 @@ impl ButaneRuntime {
         let treas: (Vec<u8>, i64) = (b"treas".to_vec(), 1);
         let pot_value = conway::Value::Multiasset(
             deposit_lovelace,
-            pallas_primitives::NonEmptyKeyValuePairs::Def(vec![(
+            BTreeMap::from([(
                 pallas_crypto::hash::Hash::<28>::from(mint.hash.as_slice()),
-                pallas_primitives::NonEmptyKeyValuePairs::Def(vec![(
+                BTreeMap::from([(
                     pallas_primitives::Bytes::from(treas.0.clone()),
                     pallas_primitives::PositiveCoin::try_from(1i64 as u64).unwrap(),
                 )]),
@@ -372,12 +403,13 @@ impl ButaneRuntime {
             ],
         );
         let pot_output = conway::TransactionOutput::PostAlonzo(
-            pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+            pallas_primitives::babbage::GenPostAlonzoTransactionOutput {
                 address: pallas_primitives::Bytes::from(addr),
                 value: pot_value,
-                datum_option: Some(conway::PseudoDatumOption::Data(CborWrap(datum))),
+                datum_option: Some(conway::DatumOption::Data(CborWrap(datum.into())).into()),
                 script_ref: None,
-            },
+            }
+            .into(),
         );
 
         // Withdraw redeemers (fixture dissection, seq 16):

@@ -1,9 +1,10 @@
 use anyhow::bail;
 use num_traits::{ConstZero, Zero};
 use pallas_addresses::Address;
-use pallas_primitives::conway::{MintedDatumOption, NativeScript};
+use pallas_primitives::conway::{self, DatumOption, NativeScript};
+use pallas_primitives::dijkstra;
 use pallas_primitives::{DatumHash, Hash, PlutusData, PlutusScript};
-use pallas_traverse::MultiEraOutput;
+use pallas_traverse::{MultiEraOutput, MultiEraScriptRef};
 use serde::Serializer;
 use serde::ser::SerializeMap;
 
@@ -335,11 +336,11 @@ impl FromStr for TransactionInput {
     }
 }
 
-fn convert_datum(datum: Option<MintedDatumOption>) -> RawDatum {
+fn convert_datum(datum: Option<DatumOption>) -> RawDatum {
     match datum {
         None => RawDatum::None,
-        Some(MintedDatumOption::Data(d)) => RawDatum::Inline(d.0.unwrap()),
-        Some(MintedDatumOption::Hash(h)) => RawDatum::Hash(h),
+        Some(DatumOption::Data(d)) => RawDatum::Inline(d.0.unwrap()),
+        Some(DatumOption::Hash(h)) => RawDatum::Hash(h),
     }
 }
 
@@ -360,14 +361,24 @@ fn convert_value<'b>(value: pallas_traverse::MultiEraValue<'b>) -> Value {
     Value(result)
 }
 
-fn convert_script_ref(script_ref: pallas_primitives::conway::MintedScriptRef) -> ScriptRef {
+fn convert_script_ref(script_ref: MultiEraScriptRef) -> Option<ScriptRef> {
     match script_ref {
-        pallas_primitives::conway::MintedScriptRef::NativeScript(n) => {
-            ScriptRef::Native(n.unwrap())
-        }
-        pallas_primitives::conway::MintedScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1(s),
-        pallas_primitives::conway::MintedScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2(s),
-        pallas_primitives::conway::MintedScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3(s),
+        MultiEraScriptRef::Conway(script_ref) => Some(match script_ref.into_owned() {
+            conway::ScriptRef::NativeScript(n) => ScriptRef::Native(n.unwrap()),
+            conway::ScriptRef::PlutusV1Script(s) => ScriptRef::PlutusV1(s),
+            conway::ScriptRef::PlutusV2Script(s) => ScriptRef::PlutusV2(s),
+            conway::ScriptRef::PlutusV3Script(s) => ScriptRef::PlutusV3(s),
+        }),
+        MultiEraScriptRef::Dijkstra(script_ref) => match script_ref.into_owned() {
+            dijkstra::ScriptRef::PlutusV1Script(s) => Some(ScriptRef::PlutusV1(s)),
+            dijkstra::ScriptRef::PlutusV2Script(s) => Some(ScriptRef::PlutusV2(s)),
+            dijkstra::ScriptRef::PlutusV3Script(s) => Some(ScriptRef::PlutusV3(s)),
+            // The scooper neither evaluates PlutusV4 nor uses native reference scripts, and
+            // a Dijkstra native script (guard clause) has no Conway equivalent.
+            dijkstra::ScriptRef::NativeScript(_) | dijkstra::ScriptRef::PlutusV4Script(_) => None,
+        },
+        // `MultiEraScriptRef` is `#[non_exhaustive]`: eras after Dijkstra.
+        _ => None,
     }
 }
 
@@ -375,7 +386,7 @@ pub fn convert_txo(output: &MultiEraOutput) -> TransactionOutput {
     let address = output.address().unwrap();
     let datum = convert_datum(output.datum());
     let value = convert_value(output.value());
-    let script_ref = output.script_ref().map(convert_script_ref);
+    let script_ref = output.multi_era_script_ref().and_then(convert_script_ref);
     TransactionOutput {
         address,
         datum,

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use pallas_crypto::hash::Hasher;
-use pallas_primitives::conway::{self, RedeemerTag, RedeemersKey, TransactionOutput};
+use pallas_primitives::conway::{self, RedeemerTag, RedeemersKey};
 use pallas_primitives::{ExUnits, Hash, PlutusData};
 use tracing::warn;
 
@@ -158,7 +158,7 @@ const PROTOCOL_VERSION: amaru_kernel::cardano::protocol_version::ProtocolVersion
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
     resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
@@ -322,7 +322,7 @@ pub fn evaluate_scoop_tx(
 /// Determine which script hash to evaluate and build the ScriptPurpose.
 pub(crate) fn resolve_script_and_purpose(
     key: &RedeemersKey,
-    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    tx_body: &conway::TransactionBody<'_>,
     resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
 ) -> Result<(Hash<28>, ScriptPurpose)> {
     match key.tag {
@@ -359,7 +359,7 @@ pub(crate) fn resolve_script_and_purpose(
         }
         RedeemerTag::Mint => {
             let mint = tx_body.mint.as_ref().context("mint redeemer but no mint in tx body")?;
-            let mut policies: Vec<Hash<28>> = mint.iter().map(|(p, _)| *p).collect();
+            let mut policies: Vec<Hash<28>> = mint.keys().copied().collect();
             policies.sort();
             let policy = policies
                 .get(key.index as usize)
@@ -371,7 +371,7 @@ pub(crate) fn resolve_script_and_purpose(
             // Find the withdrawal at this sorted index
             let withdrawals =
                 tx_body.withdrawals.as_ref().context("reward redeemer but no withdrawals")?;
-            let sorted_accounts: Vec<_> = withdrawals.iter().map(|(a, _)| a.clone()).collect();
+            let sorted_accounts: Vec<_> = withdrawals.keys().cloned().collect();
             let account = sorted_accounts
                 .get(key.index as usize)
                 .context("reward redeemer index out of bounds")?;

@@ -3602,8 +3602,8 @@ mod tests {
                 _ => None,
             })
             .expect("continuation output at the order address");
-        let datum_cbor = match &cont.datum_option {
-            Some(pallas_primitives::conway::PseudoDatumOption::Data(d)) => {
+        let datum_cbor = match cont.datum_option.as_deref() {
+            Some(pallas_primitives::conway::DatumOption::Data(d)) => {
                 minicbor::to_vec(&d.0).unwrap()
             }
             _ => panic!("continuation must carry an inline datum"),
@@ -4200,7 +4200,7 @@ mod tests {
 
         let order_address = &result.resolved_inputs[&order.input].address;
         let continues = result.tx_body.outputs.iter().any(|o| {
-            matches!(o, pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b)
+            matches!(o, pallas_primitives::conway::TransactionOutput::PostAlonzo(b)
                 if b.address.as_slice() == order_address.as_slice())
         });
         assert!(

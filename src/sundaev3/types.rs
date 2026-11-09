@@ -96,7 +96,7 @@ pub enum PoolRedeemer {
 }
 
 #[derive(AsPlutus, Debug, PartialEq)]
-#[variant = 1]
+#[plutus(constr = 1)]
 pub struct WrappedRedeemer<T: AsPlutus>(pub T);
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
