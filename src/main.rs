@@ -52,8 +52,27 @@ struct Args {
     config: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack size of the tokio worker threads.
+///
+/// Block decoding (pallas, driven by acropolis) recurses once per level of
+/// nested CBOR. A transaction's metadata can nest about 16,000 levels inside
+/// the 16 KB transaction limit, and on 2026-11-03 preview block 4,821,137
+/// (slot 127,055,999) did: decoding it overflowed tokio's default 2 MiB
+/// worker stack, and this scooper crash-looped on that block for three days
+/// (8,863 restarts). 8 MiB decodes it; 64 MiB leaves an eightfold margin
+/// over the deepest nesting a transaction can carry. The stack is reserved,
+/// not committed, so idle workers cost nothing extra.
+pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_SIZE)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
     instrumentation::init(&config.log)?;
@@ -594,5 +613,41 @@ async fn manager_loop(
         };
 
         warn!("restarting indexer — resync requested or connection lost");
+    }
+}
+
+#[cfg(test)]
+mod decode_stack_tests {
+    use super::WORKER_STACK_SIZE;
+
+    /// Preview block 4,821,137 as sync-v2 archives it: `[era, block]`, the
+    /// shape the peer network interface hands to pallas. Its eighth
+    /// transaction carries 16 KB of metadata nested ~16,000 levels deep.
+    const BLOCK: &[u8] = include_bytes!("../tests/fixtures/preview-block-4821137.cbor");
+
+    fn decodes_on_stack(stack: usize) -> bool {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(|| {
+                let block = pallas_traverse::MultiEraBlock::decode(BLOCK).expect("decode");
+                assert_eq!(block.slot(), 127_055_999);
+                assert_eq!(block.txs().len(), 9);
+            })
+            .unwrap()
+            .join()
+            .is_ok()
+    }
+
+    #[test]
+    fn deeply_nested_metadata_block_decodes_on_the_worker_stack() {
+        assert!(decodes_on_stack(WORKER_STACK_SIZE));
+    }
+
+    #[test]
+    fn worker_stack_is_well_above_what_the_block_needs() {
+        // 8 MiB is enough; the worker gets 64. If pallas ever needs more per
+        // level, this is the test that says so before an operator does.
+        assert!(decodes_on_stack(8 * 1024 * 1024));
+        assert!(WORKER_STACK_SIZE >= 4 * 8 * 1024 * 1024);
     }
 }
