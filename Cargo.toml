@@ -8,12 +8,12 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis_common = { version = "0.3.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
+acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
+acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", rev = "f190e70cd4a8dedd0a76f576ff02029159ef0899" }
 anyhow = "1"
 bech32 = "0.11"
 async-trait = "0.1"
@@ -26,19 +26,20 @@ hex = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
+minicbor = { version = "0.26", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = "0.34"
-pallas-codec = "0.34"
-pallas-crypto = "0.34"
-pallas-primitives = "0.34"
-pallas-network = "0.34"
-pallas-traverse = "0.34"
+pallas-addresses = "1.5.0-rc.1"
+pallas-codec = "1.5.0-rc.1"
+pallas-crypto = "1.5.0-rc.1"
+pallas-primitives = { version = "1.5.0-rc.1", features = ["unstable"] }
+pallas-network = "1.5.0-rc.1"
+pallas-traverse = { version = "1.5.0-rc.1", features = ["unstable"] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 rustls-pemfile = "2"
 url = "2"
-plutus-parser = { version = "0.6", features = ["derive"] }
+# SundaeSwap-finance/plutus-parser#12 (pallas 1.5 support), until it is released.
+plutus-parser = { git = "https://github.com/SundaeSwap-finance/plutus-parser.git", rev = "f1558044fc9ef5eba29c52a47bd16f888a48e8b8", default-features = false, features = ["derive", "pallas-v1_5"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3"
@@ -55,6 +56,14 @@ tracing-subscriber = { version = "0.3", features = [
   "std",
   "json",
 ] }
+
+# plutus-parser takes pallas-primitives 1.5.0-rc.1 from the txpipe git tag (crates.io 1.x
+# and 1.5 cannot coexist, txpipe/pallas#850): pull the crates.io copies used by acropolis
+# and scooper from the same tag, so that everyone shares a single `PlutusData` type.
+[patch.crates-io]
+pallas-codec = { git = "https://github.com/txpipe/pallas", tag = "v1.5.0-rc.1" }
+pallas-crypto = { git = "https://github.com/txpipe/pallas", tag = "v1.5.0-rc.1" }
+pallas-primitives = { git = "https://github.com/txpipe/pallas", tag = "v1.5.0-rc.1" }
 
 [dev-dependencies]
 proptest = "1"

@@ -6,7 +6,7 @@ use num_traits::Signed;
 use pallas_addresses::{ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway;
-use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
+use pallas_primitives::{Bytes as PallasBytes, Hash, PositiveCoin};
 use plutus_parser::{AsPlutus, PlutusData};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -95,11 +95,11 @@ fn value_to_conway(value: &Value) -> conway::Value {
         return conway::Value::Coin(lovelace);
     }
 
-    let multiasset_pairs: Vec<_> = policy_map
+    let multiasset_pairs: std::collections::BTreeMap<_, _> = policy_map
         .into_iter()
         .filter_map(|(policy, tokens)| {
             let policy_hash: Hash<28> = Hash::from(policy.as_slice());
-            let token_pairs: Vec<_> = tokens
+            let token_pairs: std::collections::BTreeMap<_, _> = tokens
                 .into_iter()
                 .filter_map(|(name, qty)| {
                     PositiveCoin::try_from(qty).ok().map(|pc| (PallasBytes::from(name), pc))
@@ -108,7 +108,7 @@ fn value_to_conway(value: &Value) -> conway::Value {
             if token_pairs.is_empty() {
                 None
             } else {
-                Some((policy_hash, NonEmptyKeyValuePairs::Def(token_pairs)))
+                Some((policy_hash, token_pairs))
             }
         })
         .collect();
@@ -116,7 +116,7 @@ fn value_to_conway(value: &Value) -> conway::Value {
     if multiasset_pairs.is_empty() {
         conway::Value::Coin(lovelace)
     } else {
-        conway::Value::Multiasset(lovelace, NonEmptyKeyValuePairs::Def(multiasset_pairs))
+        conway::Value::Multiasset(lovelace, multiasset_pairs)
     }
 }
 
@@ -130,15 +130,16 @@ fn encode_bootstrap_utxo(
     let datum_option = datum_cbor.map(|cbor| {
         let pd: conway::PlutusData =
             minicbor::decode(cbor).expect("invalid datum CBOR in bootstrap");
-        conway::PseudoDatumOption::Data(CborWrap(pd))
+        conway::DatumOption::Data(CborWrap(pd.into())).into()
     });
     let txo = conway::TransactionOutput::PostAlonzo(
-        pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+        pallas_primitives::babbage::GenPostAlonzoTransactionOutput {
             address: PallasBytes::from(address_bytes.to_vec()),
             value: pallas_value,
             datum_option,
             script_ref: None,
-        },
+        }
+        .into(),
     );
     minicbor::to_vec(&txo).expect("infallible encoding")
 }
@@ -2522,14 +2523,15 @@ async fn bootstrap_v4(
             let txo_bytes = match &output.script_ref {
                 Some(crate::cardano_types::ScriptRef::PlutusV3(script)) => {
                     let txo = conway::TransactionOutput::PostAlonzo(
-                        pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
+                        pallas_primitives::babbage::GenPostAlonzoTransactionOutput {
                             address: PallasBytes::from(dummy_addr.clone()),
                             value: conway::Value::Coin(2_000_000),
                             datum_option: None,
-                            script_ref: Some(CborWrap(conway::PseudoScript::PlutusV3Script(
+                            script_ref: Some(CborWrap(conway::ScriptRef::PlutusV3Script(
                                 script.clone(),
                             ))),
-                        },
+                        }
+                        .into(),
                     );
                     minicbor::to_vec(&txo).expect("infallible encoding")
                 }
