@@ -1836,6 +1836,15 @@ async fn lookup_pool_module_configs(
     // Step 2: walk back from the latest tx.
     let page_size: u32 = 100;
     let mut walked = 0usize;
+    #[derive(Default)]
+    struct Settled {
+        cs: bool,
+        cp: bool,
+        ss: bool,
+        bcl: bool,
+        fs: bool,
+    }
+    let mut settled = Settled::default();
     'pages: for page in 1u32.. {
         let tx_hashes = provider.fetch_asset_tx_hashes_desc(&asset_unit, page, page_size).await?;
         if tx_hashes.is_empty() {
@@ -1856,26 +1865,42 @@ async fn lookup_pool_module_configs(
                 break 'pages;
             }
             // Every Operate entry re-sends the config in force, so the newest
-            // tx that carries the module's withdrawal settles a hash-pinned
-            // config: either it matched above, or its shape is one this build
-            // cannot decode and no older tx will do better. Walking on from
-            // here is one fetch per tx through the pool's whole history.
-            let bears = |h: &Option<ScriptHash>| {
-                h.as_ref()
-                    .is_some_and(|h| sundaev4::withdrawal_index_of_script(&tx, h).is_some())
+            // tx that carries a withdrawal of the module's kind (under any
+            // registered hash) settles that config: either it matched above,
+            // or no candidate hashes to the slot and no older tx will do
+            // better. Walking on from here is one fetch per tx through the
+            // pool's whole history (7050069).
+            let bears = |kind: ModuleKind| {
+                scripts.modules.of_kind(kind).any(|e| {
+                    sundaev4::withdrawal_index_of_script(&tx, &e.hash).is_some()
+                })
             };
-            let ss_settled = want_ss && out.ss.is_none() && bears(&ss_hash);
-            let bcl_settled = want_bcl && out.bcl.is_none() && bears(&bcl_hash);
-            let others_done =
-                !(want_cs && out.cs.is_none()) && !(want_cp && out.cp.is_none()) && out.fee_split.is_some();
-            if (ss_settled || bcl_settled) && others_done {
-                warn!(
-                    pool = %ident,
-                    tx = %tx_hash,
-                    "bootstrap v4: the newest tx bearing the module's withdrawal carries no config \
-                     hashing to the pool's module_state; the config shape is unknown to this build, \
-                     so the walk stops here",
-                );
+            for (kind, want, found, flag) in [
+                (ModuleKind::ConstantSum, wanted.cs.is_some(), out.cs.is_some(), &mut settled.cs),
+                (ModuleKind::ConstantProduct, wanted.cp.is_some(), out.cp.is_some(), &mut settled.cp),
+                (ModuleKind::Stableswap, wanted.ss.is_some(), out.ss.is_some(), &mut settled.ss),
+                (ModuleKind::ConcentratedLiquidity, wanted.bcl.is_some(), out.bcl.is_some(), &mut settled.bcl),
+                (ModuleKind::FeeSplit, wanted.fs.is_some(), out.fee_split.is_some(), &mut settled.fs),
+            ] {
+                if want && !found && !*flag && bears(kind) {
+                    *flag = true;
+                    warn!(
+                        asset = %asset_unit,
+                        tx = %tx_hash,
+                        ?kind,
+                        "bootstrap v4: the newest tx bearing the module's withdrawal carries no config \
+                         hashing to the pool's module_state; no older tx will, so this config is \
+                         given up",
+                    );
+                }
+            }
+            let done = |want: bool, found: bool, flag: bool| !want || found || flag;
+            if done(wanted.cs.is_some(), out.cs.is_some(), settled.cs)
+                && done(wanted.cp.is_some(), out.cp.is_some(), settled.cp)
+                && done(wanted.ss.is_some(), out.ss.is_some(), settled.ss)
+                && done(wanted.bcl.is_some(), out.bcl.is_some(), settled.bcl)
+                && done(wanted.fs.is_some(), out.fee_split.is_some(), settled.fs)
+            {
                 break 'pages;
             }
         }
