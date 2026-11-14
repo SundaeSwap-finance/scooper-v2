@@ -783,6 +783,93 @@ mod tests {
         assert!(err.contains("exactly one"), "{err}");
     }
 
+    #[test]
+    fn an_entry_without_a_revision_is_revision_1() {
+        let ms = parse(&base(&format!(
+            r#", "fee-split": {}, "concentrated-liquidity": {}, "oracle": {}"#,
+            entry(6),
+            entry(9),
+            entry(12)
+        )))
+        .unwrap();
+        for h in [6u8, 9, 12, 5] {
+            assert_eq!(ms.revision_of(&[h; 28]), Some(Revision(1)), "hash {h}");
+        }
+    }
+
+    #[test]
+    fn a_revision_key_sets_the_revision() {
+        let with_rev = |n: u8, rev: u16| {
+            format!(
+                r#"{{"hash": "{}", "ref-utxo": "{}#{n}", "revision": {rev}}}"#,
+                h(n),
+                hex::encode([n; 32])
+            )
+        };
+        let ms = parse(&base(&format!(
+            r#", "fee-split": {}, "banded-concentrated-liquidity": [{}, {}], "oracle": [{}, {}]"#,
+            entry(6),
+            entry(9),
+            with_rev(10, 2),
+            with_rev(12, 1),
+            with_rev(13, 2)
+        )))
+        .unwrap();
+        assert_eq!(ms.revision_of(&[9; 28]), Some(Revision(1)));
+        assert_eq!(ms.revision_of(&[10; 28]), Some(Revision(2)));
+        assert_eq!(ms.revision_of(&[12; 28]), Some(Revision(1)));
+        assert_eq!(ms.revision_of(&[13; 28]), Some(Revision(2)));
+        assert_eq!(
+            ms.kind_of(&[10; 28]),
+            Some(ModuleKind::ConcentratedLiquidity)
+        );
+        assert_eq!(ms.get(&[10; 28]).unwrap().ref_utxo.0.index, 10);
+    }
+
+    #[test]
+    fn an_unimplemented_revision_is_rejected() {
+        let with_rev = |n: u8, rev: u16| {
+            format!(
+                r#"{{"hash": "{}", "ref-utxo": "{}#{n}", "revision": {rev}}}"#,
+                h(n),
+                hex::encode([n; 32])
+            )
+        };
+        for (key, rev) in [
+            ("concentrated-liquidity", 3),
+            ("fee-split", 2),
+            ("oracle", 0),
+        ] {
+            let extra = if key == "fee-split" {
+                format!(r#", "fee-split": {}"#, with_rev(6, rev))
+            } else {
+                format!(
+                    r#", "fee-split": {}, "{key}": {}"#,
+                    entry(6),
+                    with_rev(9, rev)
+                )
+            };
+            let err = parse(&base(&extra)).unwrap_err();
+            assert!(err.contains("not implemented"), "{key} {rev}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_boot_fixed_role_rejects_a_revision() {
+        let json = format!(
+            r#"{{"pool": {{"hash": "{}", "ref-utxo": "{}#1", "revision": 1}}, "order": {}, "pool-mint": {}, "settings": {}, "fairness": {}, "fee-split": {}}}"#,
+            h(1),
+            hex::encode([1u8; 32]),
+            entry(2),
+            entry(3),
+            entry(4),
+            entry(5),
+            entry(6)
+        );
+        let err = parse(&json).unwrap_err();
+        assert!(err.contains("takes no revision"), "{err}");
+    }
+
     fn datum_with_actions(actions: Vec<crate::sundaev4::types::ActionEntry>) -> PoolDatum {
         PoolDatum {
             identifier: crate::sundaev3::Ident::new(&[0xaa; 28]),

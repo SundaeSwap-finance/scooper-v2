@@ -185,6 +185,25 @@ mod tests {
         }
     }
 
+    /// Preview's config names only the revision-1 CL and oracle, with no
+    /// revision key, so both mean revision 1: the rules preview runs today.
+    #[test]
+    fn preview_cl_and_oracle_are_revision_1() {
+        use crate::sundaev4::ModuleKind;
+        use crate::sundaev4::module_scripts::Revision;
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string("config/preview-v4.json").unwrap())
+                .unwrap();
+        let ms: crate::sundaev4::ModuleScripts =
+            serde_json::from_value(raw["protocol"]["v4"]["execution"]["module-scripts"].clone())
+                .unwrap();
+        for kind in [ModuleKind::ConcentratedLiquidity, ModuleKind::Oracle] {
+            let hashes = ms.modules.hashes_of_kind(kind);
+            assert_eq!(hashes.len(), 1, "{kind}");
+            assert_eq!(ms.revision_of(&hashes[0]), Some(Revision(1)), "{kind}");
+        }
+    }
+
     /// A role key in array form, overlaid through config-rs, registers every
     /// hash under that role's kind.
     #[test]
@@ -204,7 +223,8 @@ mod tests {
                 ],
                 "concentrated-liquidity": {
                     "hash": "c1".repeat(28),
-                    "ref-utxo": format!("{}#0", "c1".repeat(32))
+                    "ref-utxo": format!("{}#0", "c1".repeat(32)),
+                    "revision": 2
                 }
             } } } }
         });
@@ -227,6 +247,11 @@ mod tests {
             ms.of_kind(ModuleKind::ConstantSum).count(),
             1,
             "base keys are kept"
+        );
+        assert_eq!(
+            ms.revision_of(&[0xc1; 28]),
+            Some(crate::sundaev4::module_scripts::Revision(2)),
+            "a revision key survives config-rs"
         );
     }
 
