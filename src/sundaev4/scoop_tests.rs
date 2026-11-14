@@ -4820,3 +4820,376 @@ mod blend_cost {
         }
     }
 }
+
+// ─── Module scripts by hash ──────────────────────────────────────────────────
+//
+// Two hashes of one module kind can be live at once (for example the
+// constant-sum pools' fee_split and a newer fee_split for CL pools). The
+// harness has one compiled script per kind, so these tests serve the same
+// script under a second hash: the ScriptStore aliases it, the registry lists
+// it, and a synthetic reference UTxO carries it.
+#[cfg(test)]
+mod module_hash_tests {
+    use crate::bigint::BigInt;
+    use crate::sundaev4::batch::{BatchLimits, assemble_batch};
+    use crate::sundaev4::test_harness::*;
+    use crate::sundaev4::types::*;
+    use plutus_parser::AsPlutus;
+    use std::sync::Arc;
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+
+    /// Register a second script of `kind` at `alias`, served by the same
+    /// compiled code as the first script of that kind. Returns the alias's
+    /// reference UTxO.
+    fn add_second_version(
+        env: &mut TestEnv,
+        kind: ModuleKind,
+        alias: pallas_addresses::ScriptHash,
+    ) -> crate::cardano_types::TransactionInput {
+        let first = env.exec.module_scripts.first_of(kind).expect("harness has the kind").clone();
+        let ref_utxo =
+            crate::cardano_types::TransactionInput::new([alias.as_ref()[0]; 32].into(), 7);
+        let out = env
+            .ref_utxo_outputs
+            .get(&first.ref_utxo)
+            .expect("first version has a ref UTxO")
+            .clone();
+        env.ref_utxo_outputs.insert(ref_utxo.clone(), out);
+        env.scripts.alias(&first.hash, alias).unwrap();
+        env.exec
+            .module_scripts
+            .modules
+            .insert(
+                kind,
+                ScriptRefInfo {
+                    hash: alias,
+                    ref_utxo: ref_utxo.clone(),
+                    script_cbor: None,
+                },
+            )
+            .unwrap();
+        ref_utxo
+    }
+
+    /// Replace one module hash in a pool's action list and module_state.
+    fn repoint_module(pool: &Arc<SundaeV4Pool>, from: &[u8], to: &[u8]) -> Arc<SundaeV4Pool> {
+        let mut p = (**pool).clone();
+        for a in &mut p.pool_datum.actions {
+            for m in &mut a.modules {
+                if m.as_slice() == from {
+                    *m = to.to_vec();
+                }
+            }
+        }
+        for (k, _) in &mut p.pool_datum.module_state {
+            if k.as_slice() == from {
+                *k = to.to_vec();
+            }
+        }
+        Arc::new(p)
+    }
+
+    fn cs_fee() -> Rational {
+        Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        }
+    }
+
+    fn reward_redeemer_of(
+        build: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
+        hash: &[u8],
+    ) -> Option<pallas_primitives::PlutusData> {
+        let withdrawals = build.tx_body.withdrawals.as_ref()?;
+        let idx = withdrawals.iter().position(|(acct, _)| &acct[1..] == hash)?;
+        build
+            .redeemers
+            .iter()
+            .find(|(k, _, _)| {
+                k.tag == pallas_primitives::conway::RedeemerTag::Reward && k.index == idx as u32
+            })
+            .map(|(_, d, _)| d.clone())
+    }
+
+    fn fee_split_entry_orefs(data: pallas_primitives::PlutusData) -> Vec<OutputRef> {
+        match FeeSplitRedeemer::from_plutus(data).expect("fee_split redeemer decodes") {
+            FeeSplitRedeemer::Operate { entries } => {
+                entries.into_iter().map(|e| e.pool_oref).collect()
+            }
+            other => panic!("expected Operate, got {other:?}"),
+        }
+    }
+
+    fn oref(p: &SundaeV4Pool) -> OutputRef {
+        OutputRef {
+            transaction_id: p.input.0.transaction_id.to_vec(),
+            output_index: p.input.0.index,
+        }
+    }
+
+    #[test]
+    fn two_fee_split_versions_get_two_withdrawals_with_their_own_entries() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fs_v1 = env.exec.module_scripts.first_of(ModuleKind::FeeSplit).unwrap().clone();
+        let fs_v2_hash = pallas_addresses::ScriptHash::new([0xF2; 28]);
+        let fs_v2_ref = add_second_version(&mut env, ModuleKind::FeeSplit, fs_v2_hash);
+
+        let tok_c = token(0x05, 0x06);
+        let tok_d = token(0x07, 0x08);
+        let prices = vec![BigInt::from(1_000_000), BigInt::from(1_000_000)];
+        let pool_1 = make_cs_pool(
+            &env,
+            0xC1,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            prices.clone(),
+            cs_fee(),
+        );
+        let pool_2 = repoint_module(
+            &make_cs_pool(
+                &env,
+                0xC2,
+                vec![
+                    (tok_c.clone(), 1_000_000_000),
+                    (tok_d.clone(), 1_000_000_000),
+                ],
+                prices,
+                cs_fee(),
+            ),
+            fs_v1.hash.as_ref(),
+            fs_v2_hash.as_ref(),
+        );
+        assert_eq!(
+            env.exec.module_scripts.pool_modules(&pool_2.pool_datum).unwrap().fee_split(),
+            Some(&fs_v2_hash)
+        );
+
+        let b1 = assemble_batch(
+            &pool_1,
+            &[make_order(token_a(), 10_000_000, token_b(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let b2 = assemble_batch(
+            &pool_2,
+            &[make_order(tok_c, 10_000_000, tok_d, 1, 2)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval(&[b1, b2], &settings, 1000)
+            .expect("a batch over two fee_split versions builds and evaluates");
+        assert!(!eval.budgets.is_empty());
+
+        let v1 = reward_redeemer_of(&build, fs_v1.hash.as_ref()).expect("fee_split v1 withdraws");
+        let v2 = reward_redeemer_of(&build, fs_v2_hash.as_ref()).expect("fee_split v2 withdraws");
+        assert_eq!(fee_split_entry_orefs(v1), vec![oref(&pool_1)]);
+        assert_eq!(fee_split_entry_orefs(v2), vec![oref(&pool_2)]);
+
+        // The shared fairness and constant_sum hashes stay one withdrawal
+        // each, with an entry for both pools.
+        let fairness = env.exec.module_scripts.first_of(ModuleKind::Fairness).unwrap().hash;
+        match FairnessRedeemer::from_plutus(reward_redeemer_of(&build, fairness.as_ref()).unwrap())
+            .unwrap()
+        {
+            FairnessRedeemer::Operate { entries } => assert_eq!(entries.len(), 2),
+            other => panic!("expected Operate, got {other:?}"),
+        }
+        let withdrawals = build.tx_body.withdrawals.as_ref().unwrap();
+        let fee_split_withdrawals = withdrawals
+            .iter()
+            .filter(|(acct, _)| {
+                env.exec.module_scripts.kind_of(&acct[1..]) == Some(ModuleKind::FeeSplit)
+            })
+            .count();
+        assert_eq!(fee_split_withdrawals, 2);
+
+        let ref_inputs = build.tx_body.reference_inputs.as_ref().unwrap();
+        assert!(
+            ref_inputs.contains(&fs_v1.ref_utxo.0),
+            "fee_split v1 ref script"
+        );
+        assert!(ref_inputs.contains(&fs_v2_ref.0), "fee_split v2 ref script");
+    }
+
+    #[test]
+    fn a_single_fee_split_version_is_not_given_a_second_withdrawal() {
+        // A registered but unused second version adds no withdrawal and no
+        // reference input.
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fs_v2_hash = pallas_addresses::ScriptHash::new([0xF2; 28]);
+        let fs_v2_ref = add_second_version(&mut env, ModuleKind::FeeSplit, fs_v2_hash);
+        let pool = make_cs_pool(
+            &env,
+            0xC1,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee(),
+        );
+        let batch = assemble_batch(
+            &pool,
+            &[make_order(token_a(), 10_000_000, token_b(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, _) = env.build_and_eval(&[batch], &settings, 1000).expect("builds");
+        assert!(reward_redeemer_of(&build, fs_v2_hash.as_ref()).is_none());
+        assert!(!build.tx_body.reference_inputs.as_ref().unwrap().contains(&fs_v2_ref.0));
+    }
+
+    #[test]
+    fn a_pool_naming_an_unknown_module_hash_is_refused() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let fs = env.exec.module_scripts.first_of(ModuleKind::FeeSplit).unwrap().hash;
+        let pool = repoint_module(
+            &make_cs_pool(
+                &env,
+                0xC3,
+                vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+                vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+                cs_fee(),
+            ),
+            fs.as_ref(),
+            &[0xEE; 28],
+        );
+        let err = env.exec.module_scripts.pool_modules(&pool.pool_datum).unwrap_err();
+        assert!(err.contains("does not know"), "{err}");
+        let batch = assemble_batch(
+            &pool,
+            &[make_order(token_a(), 10_000_000, token_b(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let err = match env.build_and_eval(&[batch], &settings, 1000) {
+            Ok(_) => panic!("a pool naming an unknown module must not build"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("does not know"), "{err}");
+    }
+
+    #[test]
+    fn order_constraint_is_matched_by_the_hash_its_order_config_lists() {
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let Some(Some(ctx)) = TEST_CTX.get() else {
+            eprintln!("skipping: fixture has no modular constraints");
+            return;
+        };
+        let swap_v1 = ctx.swap_order.clone();
+        let swap_v2_hash = pallas_addresses::ScriptHash::new([0x5B; 28]);
+        let swap_v2_ref = add_second_version(&mut env, ModuleKind::SwapOrder, swap_v2_hash);
+        let swap_v2 = swap_v2_hash.as_ref().to_vec();
+
+        // An OrderConfig that requires swap_order v2 in place of v1.
+        let cfg_v1 = env.order_configs.get(CFG_SWAP).unwrap().clone();
+        let token_v2 = b"cfg-swap-v2".to_vec();
+        let mut cfg_v2 = (*cfg_v1).clone();
+        cfg_v2.input = crate::cardano_types::TransactionInput::new([0xE2; 32].into(), 0);
+        cfg_v2.token_name = token_v2.clone();
+        cfg_v2.config.label = token_v2.clone();
+        cfg_v2.config.required_constraints = cfg_v1
+            .config
+            .required_constraints
+            .iter()
+            .map(|h| {
+                if *h == swap_v1 {
+                    swap_v2.clone()
+                } else {
+                    h.clone()
+                }
+            })
+            .collect();
+        let mut value = crate::cardano_types::Value::default();
+        value.insert(&ada(), BigInt::from(2_000_000i64));
+        value.insert(
+            &crate::cardano_types::AssetClass {
+                policy: ctx.settings_mint.clone(),
+                token: token_v2.clone(),
+            },
+            BigInt::from(1i64),
+        );
+        cfg_v2.value = value;
+        env.order_configs.insert(token_v2.clone(), Arc::new(cfg_v2));
+
+        let mut order =
+            Arc::try_unwrap(make_order(token_a(), 10_000_000, token_b(), 1, 1)).unwrap();
+        order.datum.config_token = token_v2;
+        for (h, _) in &mut order.datum.constraints {
+            if *h == swap_v1 {
+                *h = swap_v2.clone();
+            }
+        }
+        // The order decodes as a swap under the v2 hash.
+        let hashes = ConstraintHashes::from_scripts(&env.exec.module_scripts);
+        assert!(matches!(
+            decode_order_constraint(&order.datum, &hashes),
+            Ok(Constraint::Swap { .. })
+        ));
+
+        let pool = make_cs_pool(
+            &env,
+            0xC4,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee(),
+        );
+        let batch = assemble_batch(
+            &pool,
+            &[Arc::new(order)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, _) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("an order on swap_order v2 builds and evaluates");
+        assert!(
+            reward_redeemer_of(&build, &swap_v2).is_some(),
+            "swap_order v2 withdraws"
+        );
+        assert!(
+            reward_redeemer_of(&build, &swap_v1).is_none(),
+            "swap_order v1 is not required"
+        );
+        let ref_inputs = build.tx_body.reference_inputs.as_ref().unwrap();
+        assert!(ref_inputs.contains(&swap_v2_ref.0));
+    }
+
+    #[test]
+    fn constraint_decoding_accepts_every_configured_hash_of_a_kind() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let Some(Some(ctx)) = TEST_CTX.get() else {
+            eprintln!("skipping: fixture has no modular constraints");
+            return;
+        };
+        let mut hashes = ConstraintHashes::from_scripts(&env.exec.module_scripts);
+        let swap_v2 = vec![0x5C; 28];
+        hashes.swap.push(swap_v2.clone());
+        let mut order =
+            Arc::try_unwrap(make_order(token_a(), 10_000_000, token_b(), 1, 1)).unwrap();
+        for (h, _) in &mut order.datum.constraints {
+            if *h == ctx.swap_order {
+                *h = swap_v2.clone();
+            }
+        }
+        assert!(matches!(
+            decode_order_constraint(&order.datum, &hashes),
+            Ok(Constraint::Swap { .. })
+        ));
+        hashes.swap.retain(|h| *h != swap_v2);
+        let err = decode_order_constraint(&order.datum, &hashes).unwrap_err();
+        assert!(err.contains(&hex::encode(&swap_v2)), "{err}");
+    }
+}

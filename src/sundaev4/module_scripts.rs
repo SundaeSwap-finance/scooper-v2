@@ -202,6 +202,12 @@ impl ModuleRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &ModuleEntry> + '_ {
         self.entries.values()
     }
+
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -462,3 +468,232 @@ impl PoolModules {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(n: u8) -> String {
+        hex::encode([n; 28])
+    }
+
+    fn entry(n: u8) -> String {
+        format!(
+            r#"{{"hash": "{}", "ref-utxo": "{}#{n}"}}"#,
+            h(n),
+            hex::encode([n; 32])
+        )
+    }
+
+    fn base(extra: &str) -> String {
+        format!(
+            r#"{{
+                "pool": {}, "order": {}, "pool-mint": {}, "settings": {},
+                "fairness": {} {extra}
+            }}"#,
+            entry(1),
+            entry(2),
+            entry(3),
+            entry(4),
+            entry(5)
+        )
+    }
+
+    fn parse(json: &str) -> Result<ModuleScripts, String> {
+        serde_json::from_str::<ModuleScripts>(json).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn single_object_form_parses() {
+        let ms = parse(&base(&format!(
+            r#", "fee-split": {}, "constant-sum": {}"#,
+            entry(6),
+            entry(7)
+        )))
+        .unwrap();
+        assert_eq!(ms.pool.hash.as_ref(), &[1u8; 28]);
+        assert_eq!(ms.kind_of(&[6; 28]), Some(ModuleKind::FeeSplit));
+        assert_eq!(ms.kind_of(&[7; 28]), Some(ModuleKind::ConstantSum));
+        assert_eq!(ms.kind_of(&[5; 28]), Some(ModuleKind::Fairness));
+        assert_eq!(
+            ms.kind_of(&[1; 28]),
+            None,
+            "boot-fixed scripts are not in the registry"
+        );
+        assert_eq!(ms.modules.len(), 3);
+    }
+
+    #[test]
+    fn array_form_parses_and_mixes_with_single_form() {
+        let ms = parse(&base(&format!(
+            r#", "fee-split": [{}, {}], "constant-sum": {}, "concentrated-liquidity": [{}]"#,
+            entry(6),
+            entry(8),
+            entry(7),
+            entry(9)
+        )))
+        .unwrap();
+        let fs: Vec<_> = ms.of_kind(ModuleKind::FeeSplit).map(|s| s.hash).collect();
+        assert_eq!(fs.len(), 2);
+        assert_eq!(ms.kind_of(&[8; 28]), Some(ModuleKind::FeeSplit));
+        assert_eq!(
+            ms.kind_of(&[9; 28]),
+            Some(ModuleKind::ConcentratedLiquidity)
+        );
+        assert_eq!(ms.get(&[8; 28]).unwrap().ref_utxo.0.index, 8);
+    }
+
+    #[test]
+    fn both_cl_keys_name_the_same_kind() {
+        let ms = parse(&base(&format!(
+            r#", "fee-split": {}, "concentrated-liquidity": {}, "banded-concentrated-liquidity": {}"#,
+            entry(6),
+            entry(9),
+            entry(10)
+        )))
+        .unwrap();
+        assert_eq!(ms.of_kind(ModuleKind::ConcentratedLiquidity).count(), 2);
+    }
+
+    #[test]
+    fn duplicate_hash_under_two_kinds_is_rejected() {
+        let err = parse(&base(&format!(
+            r#", "fee-split": {}, "oracle": {}"#,
+            entry(6),
+            entry(6)
+        )))
+        .unwrap_err();
+        assert!(err.contains("under both"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_hash_under_one_kind_is_rejected() {
+        let err = parse(&base(&format!(
+            r#", "fee-split": [{}, {}]"#,
+            entry(6),
+            entry(6)
+        )))
+        .unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_hash_across_cl_aliases_is_rejected() {
+        let err = parse(&base(&format!(
+            r#", "fee-split": {}, "concentrated-liquidity": {}, "banded-concentrated-liquidity": {}"#,
+            entry(6),
+            entry(9),
+            entry(9)
+        )))
+        .unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn module_hash_equal_to_a_boot_fixed_hash_is_rejected() {
+        let err = parse(&base(&format!(r#", "fee-split": {}"#, entry(1)))).unwrap_err();
+        assert!(err.contains("under both"), "{err}");
+    }
+
+    #[test]
+    fn unknown_role_and_missing_fee_split_are_rejected() {
+        let err = parse(&base(&format!(
+            r#", "fee-split": {}, "fee-splitt": {}"#,
+            entry(6),
+            entry(7)
+        )))
+        .unwrap_err();
+        assert!(err.contains("unknown role"), "{err}");
+        let err = parse(&base("")).unwrap_err();
+        assert!(err.contains("fee-split"), "{err}");
+    }
+
+    #[test]
+    fn boot_fixed_role_rejects_an_array_of_two() {
+        let json = format!(
+            r#"{{"pool": [{}, {}], "order": {}, "pool-mint": {}, "settings": {}, "fairness": {}, "fee-split": {}}}"#,
+            entry(1),
+            entry(11),
+            entry(2),
+            entry(3),
+            entry(4),
+            entry(5),
+            entry(6)
+        );
+        let err = parse(&json).unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    fn datum_with_actions(actions: Vec<crate::sundaev4::types::ActionEntry>) -> PoolDatum {
+        PoolDatum {
+            identifier: crate::sundaev3::Ident::new(&[0xaa; 28]),
+            assets: vec![],
+            total_lp: BigInt::from(0),
+            circulating_lp: BigInt::from(0),
+            preminted_lp: BigInt::from(0),
+            actions,
+            module_state: vec![],
+            min_surplus: BigInt::from(0),
+            extension: pallas_primitives::PlutusData::Array(
+                pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+            ),
+        }
+    }
+
+    fn action(tag: u64, enabled: bool, mods: &[u8]) -> crate::sundaev4::types::ActionEntry {
+        crate::sundaev4::types::ActionEntry {
+            tag: BigInt::from(tag),
+            enabled,
+            modules: mods.iter().map(|n| vec![*n; 28]).collect(),
+        }
+    }
+
+    fn two_fee_split_config() -> ModuleScripts {
+        parse(&base(&format!(
+            r#", "fee-split": [{}, {}], "constant-sum": {}, "concentrated-liquidity": {}, "oracle": {}, "basic-order": {}"#,
+            entry(6),
+            entry(8),
+            entry(7),
+            entry(9),
+            entry(12),
+            entry(13)
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn pool_modules_records_the_hashes_the_pool_names() {
+        let ms = two_fee_split_config();
+        let cs = ms.pool_modules(&datum_with_actions(vec![action(100, true, &[7, 6, 5])])).unwrap();
+        assert_eq!(cs.invariant().0, ModuleKind::ConstantSum);
+        assert_eq!(cs.fee_split().unwrap().as_ref(), &[6; 28]);
+        assert_eq!(cs.fairness().unwrap().as_ref(), &[5; 28]);
+        assert_eq!(cs.oracle(), None);
+        assert_eq!(cs.action_tag, BigInt::from(100));
+
+        let cl = ms
+            .pool_modules(&datum_with_actions(vec![
+                action(3, false, &[7, 6, 5]),
+                action(100, true, &[9, 8, 5, 12]),
+            ]))
+            .unwrap();
+        assert_eq!(cl.invariant().0, ModuleKind::ConcentratedLiquidity);
+        assert_eq!(cl.fee_split().unwrap().as_ref(), &[8; 28]);
+        assert_eq!(cl.oracle().unwrap().as_ref(), &[12; 28]);
+    }
+
+    #[test]
+    fn pool_modules_rejects_unknown_and_misplaced_hashes() {
+        let ms = two_fee_split_config();
+        let unknown_invariant = datum_with_actions(vec![action(100, true, &[99, 6, 5])]);
+        assert!(ms.pool_modules(&unknown_invariant).is_err());
+        let unknown_fee_split = datum_with_actions(vec![action(100, true, &[7, 99, 5])]);
+        let err = ms.pool_modules(&unknown_fee_split).unwrap_err();
+        assert!(err.contains("does not know"), "{err}");
+        let order_module = datum_with_actions(vec![action(100, true, &[7, 6, 5, 13])]);
+        assert!(ms.pool_modules(&order_module).is_err());
+        let two_fee_splits = datum_with_actions(vec![action(100, true, &[7, 6, 8, 5])]);
+        assert!(ms.pool_modules(&two_fee_splits).is_err());
+        let two_invariants = datum_with_actions(vec![action(100, true, &[7, 9, 6, 5])]);
+        assert!(ms.pool_modules(&two_invariants).is_err());
+    }
+}
