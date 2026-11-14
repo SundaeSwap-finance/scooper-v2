@@ -454,6 +454,20 @@ impl ModuleScripts {
         self.modules.revision_of(hash)
     }
 
+    /// Every registered hash of `kind` in hash order, with `first` moved to
+    /// the front when it is one of them. Config recovery reads the
+    /// redeemers of every hash of a kind: a governor can move a pool to a
+    /// new hash of the same kind in place, and then only redeemers under the
+    /// old hash hold the pool's config.
+    pub fn hashes_of_kind_first(&self, kind: ModuleKind, first: &ScriptHash) -> Vec<ScriptHash> {
+        let mut out = vec![];
+        if self.kind_of(first.as_ref()) == Some(kind) {
+            out.push(*first);
+        }
+        out.extend(self.modules.of_kind(kind).map(|s| s.hash).filter(|h| h != first));
+        out
+    }
+
     /// The registered module script for a hash.
     pub fn get(&self, hash: &[u8]) -> Option<&ScriptRefInfo> {
         self.modules.get(hash).map(|e| &e.script)

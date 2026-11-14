@@ -1371,6 +1371,19 @@ impl Scooper {
                     }
                 },
             )
+            // A pool whose module config the scooper does not hold (bootstrap
+            // could not recover it, so `detect_pool_type` guessed) is not
+            // scooped: the module rejects a config that does not hash to the
+            // pool's slot. Bootstrap logs the WARN that names the pool.
+            .filter(|(ident, pool)| {
+                match crate::sundaev4::module_configs_match_datum(pool, &exec) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        debug!(pool = %ident, "skipping pool without a matching module config: {e}");
+                        false
+                    }
+                }
+            })
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);
