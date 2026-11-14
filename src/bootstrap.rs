@@ -344,7 +344,11 @@ fn parse_kupo_value(kv: &KupoValue) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for KupoProvider {
-    async fn fetch_tx_output(&self, _tx_hash: &[u8; 32], _index: u64) -> Result<Option<FetchedUtxo>> {
+    async fn fetch_tx_output(
+        &self,
+        _tx_hash: &[u8; 32],
+        _index: u64,
+    ) -> Result<Option<FetchedUtxo>> {
         Ok(None)
     }
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
@@ -2442,7 +2446,16 @@ async fn bootstrap_v4(
                     // exactly those fields for every module reference
                     // input, and nothing else.
                     let real = match provider
-                        .fetch_tx_output(script_ref.ref_utxo.0.transaction_id.as_ref().try_into().expect("32-byte tx id"), script_ref.ref_utxo.0.index)
+                        .fetch_tx_output(
+                            script_ref
+                                .ref_utxo
+                                .0
+                                .transaction_id
+                                .as_ref()
+                                .try_into()
+                                .expect("32-byte tx id"),
+                            script_ref.ref_utxo.0.index,
+                        )
                         .await
                     {
                         Ok(Some(u)) => Some(u),
@@ -2454,18 +2467,21 @@ async fn bootstrap_v4(
                     };
                     let (address, value) = match &real {
                         Some(u) => (
-                            pallas_addresses::Address::from_bech32(&u.address)
-                                .with_context(|| format!("bootstrap: ref UTxO address {}", u.address))?,
+                            pallas_addresses::Address::from_bech32(&u.address).with_context(
+                                || format!("bootstrap: ref UTxO address {}", u.address),
+                            )?,
                             u.value.clone(),
                         ),
                         None => (
-                            pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
-                                protocol.network.pallas(),
-                                pallas_addresses::ShelleyPaymentPart::Key(
-                                    pallas_primitives::Hash::new([0u8; 28]),
+                            pallas_addresses::Address::Shelley(
+                                pallas_addresses::ShelleyAddress::new(
+                                    protocol.network.pallas(),
+                                    pallas_addresses::ShelleyPaymentPart::Key(
+                                        pallas_primitives::Hash::new([0u8; 28]),
+                                    ),
+                                    pallas_addresses::ShelleyDelegationPart::Null,
                                 ),
-                                pallas_addresses::ShelleyDelegationPart::Null,
-                            )),
+                            ),
                             crate::cardano_types::Value::default(),
                         ),
                     };

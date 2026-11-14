@@ -153,7 +153,10 @@ fn banded_op_data_for(
     w: &crate::sundaev4::banded_math::Witness,
     attribution: Option<pallas_primitives::PlutusData>,
 ) -> pallas_primitives::PlutusData {
-    let mut items = vec![w.x.clone().to_plutus(), BigInt::from(w.k as u64).to_plutus()];
+    let mut items = vec![
+        w.x.clone().to_plutus(),
+        BigInt::from(w.k as u64).to_plutus(),
+    ];
     if let Some(a) = attribution {
         items.push(a);
     }
@@ -203,12 +206,27 @@ fn walk_banded_swap(
     let mut total_dy = BigInt::from(0);
     let mut last: Option<(BigInt, banded_math::Witness)> = None;
     for (i, step) in steps.iter().enumerate() {
-        let (a0, b0) = (st.running_assets[0].1.clone(), st.running_assets[1].1.clone());
-        let (a1, b1) = if is_a_input { (&a0 + &step.dx, &b0 - &step.dy) } else { (&a0 - &step.dy, &b0 + &step.dx) };
+        let (a0, b0) = (
+            st.running_assets[0].1.clone(),
+            st.running_assets[1].1.clone(),
+        );
+        let (a1, b1) = if is_a_input {
+            (&a0 + &step.dx, &b0 - &step.dy)
+        } else {
+            (&a0 - &step.dy, &b0 + &step.dx)
+        };
         // The fee's LP worth at the before witness (sundae-v4 SV4-001b). The
         // module pins `lp_after + fee_budget - lp_before` to it exactly.
-        let gross_fb = banded_math::swap_fee_budget(config, &a0, &b0, &a1, &b1, &step.before, st.running_total_lp)
-            .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
+        let gross_fb = banded_math::swap_fee_budget(
+            config,
+            &a0,
+            &b0,
+            &a1,
+            &b1,
+            &step.before,
+            st.running_total_lp,
+        )
+        .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
         if gross_fb.is_negative() {
             bail!("banded step books a negative fee budget ({gross_fb})");
         }
@@ -278,7 +296,9 @@ fn banded_op_data(
     if let Some(a) = attribution {
         items.push(a);
     }
-    Ok(pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items)))
+    Ok(pallas_primitives::PlutusData::Array(
+        pallas_codec::utils::MaybeIndefArray::Indef(items),
+    ))
 }
 
 /// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
@@ -1156,7 +1176,7 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
-                            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
+                    PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
@@ -1251,7 +1271,11 @@ pub fn build_multi_pool_scoop_tx(
             };
             op_data_override = Some(match &banded_after {
                 Some(w) => banded_op_data_for(w, served_order.map(order_ref_to_plutus)),
-                None => banded_op_data(config, running_assets, served_order.map(order_ref_to_plutus))?,
+                None => banded_op_data(
+                    config,
+                    running_assets,
+                    served_order.map(order_ref_to_plutus),
+                )?,
             });
         }
 
@@ -1350,7 +1374,12 @@ pub fn build_multi_pool_scoop_tx(
         // carry exactly that value.
         let mut module_state = pool.pool_datum.module_state.clone();
         if pool_needs_oracle(exec, pool) {
-            let oracle_hash = exec.module_scripts.oracle.as_ref().map(|o| o.hash.as_ref().to_vec()).unwrap_or_default();
+            let oracle_hash = exec
+                .module_scripts
+                .oracle
+                .as_ref()
+                .map(|o| o.hash.as_ref().to_vec())
+                .unwrap_or_default();
             let Some(slot) = module_state.iter_mut().find(|(h, _)| *h == oracle_hash) else {
                 bail!(
                     "pool {}: lists the oracle module but has no oracle slot in module_state",
@@ -1358,7 +1387,10 @@ pub fn build_multi_pool_scoop_tx(
                 );
             };
             if pool.pool_datum.assets.len() != 2 {
-                bail!("pool {}: the oracle needs a two-asset pool", pool.pool_datum.identifier);
+                bail!(
+                    "pool {}: the oracle needs a two-asset pool",
+                    pool.pool_datum.identifier
+                );
             }
             let now_ms = BigInt::from(exec.slot_config.slot_to_posix_ms(validity.start));
             let states = per_pool_transcripts[i].iter().map(|e| {
@@ -1387,7 +1419,9 @@ pub fn build_multi_pool_scoop_tx(
                 last_price = %next.last_price,
                 "oracle slot after scoop",
             );
-            slot.1 = next.encode_slot().map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
+            slot.1 = next
+                .encode_slot()
+                .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
         }
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
@@ -1736,13 +1770,15 @@ pub fn build_multi_pool_scoop_tx(
                 // in the walk's first step, so refuse to build on a stale or
                 // unknown config rather than fail on chain.
                 let bcl_script =
-                    exec.module_scripts.banded_concentrated_liquidity.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pool {} is banded but no banded_concentrated_liquidity module \
+                    exec.module_scripts.banded_concentrated_liquidity.as_ref().ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "pool {} is banded but no banded_concentrated_liquidity module \
                              script is configured",
-                            batch.pool.pool_datum.identifier
-                        )
-                    })?;
+                                batch.pool.pool_datum.identifier
+                            )
+                        },
+                    )?;
                 let bcl_cred = bcl_script.hash.as_ref();
                 let stored = batch
                     .pool
@@ -1768,15 +1804,16 @@ pub fn build_multi_pool_scoop_tx(
                         batch.pool.pool_datum.identifier
                     );
                 }
-                let w = crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pool {}: no ladder witness for reserves ({}, {})",
-                            batch.pool.pool_datum.identifier,
-                            assets[0].1,
-                            assets[1].1
-                        )
-                    })?;
+                let w =
+                    crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pool {}: no ladder witness for reserves ({}, {})",
+                                batch.pool.pool_datum.identifier,
+                                assets[0].1,
+                                assets[1].1
+                            )
+                        })?;
                 tracing::debug!(
                     pool = %batch.pool.pool_datum.identifier,
                     counter = %w.x,
@@ -2216,7 +2253,10 @@ pub fn build_multi_pool_scoop_tx(
         let oracle_redeemer = crate::sundaev4::types::OracleRedeemer::Operate {
             entries: oracle_entries,
         };
-        withdrawals.push((reward_account(&oracle_script.hash), oracle_redeemer.to_plutus()));
+        withdrawals.push((
+            reward_account(&oracle_script.hash),
+            oracle_redeemer.to_plutus(),
+        ));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in
@@ -2918,10 +2958,9 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 for leg in &m.swaps {
                     *net.entry(leg.from.clone()).or_insert_with(|| BigInt::from(0)) -= &leg.dx;
-                    let received = leg
-                        .route_idxs
-                        .iter()
-                        .fold(BigInt::from(0), |acc, ri| &acc + &route_states[*ri].final_output);
+                    let received = leg.route_idxs.iter().fold(BigInt::from(0), |acc, ri| {
+                        &acc + &route_states[*ri].final_output
+                    });
                     *net.entry(leg.to.clone()).or_insert_with(|| BigInt::from(0)) += &received;
                 }
                 let moves: Vec<(&AssetClass, BigInt)> =
@@ -3394,7 +3433,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3424,7 +3467,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 swap.order.input.clone(),
                 ResolvedTxOut {
-                    address: if swap.order.address.is_empty() { order_addr_bytes.clone() } else { swap.order.address.clone() },
+                    address: if swap.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        swap.order.address.clone()
+                    },
                     value: swap.order.value.clone(),
                     datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3435,7 +3482,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 dep.order.input.clone(),
                 ResolvedTxOut {
-                    address: if dep.order.address.is_empty() { order_addr_bytes.clone() } else { dep.order.address.clone() },
+                    address: if dep.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        dep.order.address.clone()
+                    },
                     value: dep.order.value.clone(),
                     datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3446,7 +3497,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 wd.order.input.clone(),
                 ResolvedTxOut {
-                    address: if wd.order.address.is_empty() { order_addr_bytes.clone() } else { wd.order.address.clone() },
+                    address: if wd.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        wd.order.address.clone()
+                    },
                     value: wd.order.value.clone(),
                     datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3457,7 +3512,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 z.order.input.clone(),
                 ResolvedTxOut {
-                    address: if z.order.address.is_empty() { order_addr_bytes.clone() } else { z.order.address.clone() },
+                    address: if z.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        z.order.address.clone()
+                    },
                     value: z.order.value.clone(),
                     datum: DatumOption::InlineDatum(z.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3468,7 +3527,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3805,7 +3868,11 @@ pub fn build_multi_pool_scoop_tx(
             use num_traits::ToPrimitive;
             let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
             // outputs[0] is the designated pool; batch_idx IS the output index.
-            let surplus = if batch_idx == 0 { designated_required as i128 } else { 0 };
+            let surplus = if batch_idx == 0 {
+                designated_required as i128
+            } else {
+                0
+            };
             let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128 + surplus)
                 .max(POOL_MIN_ADA as i128) as u64;
             predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));

@@ -883,7 +883,12 @@ mod tests {
         let cfg = bcl_eq8_config(ss_fee_3());
         ids.iter()
             .map(|&id| {
-                let p = make_bcl_pool(env, id, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+                let p = make_bcl_pool(
+                    env,
+                    id,
+                    vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+                    cfg.clone(),
+                );
                 let lp = lp_asset_for(env, id);
                 let mut p = (*p).clone();
                 let c = BigInt::from(circulating);
@@ -946,7 +951,10 @@ mod tests {
         assert_eq!(result.predicted_pools.len(), 2);
         for leg in &plan.moves[0].burns {
             let after = &result.predicted_pools.iter().find(|(i, _, _)| i == &leg.pool).unwrap().2;
-            assert_eq!(after.pool_datum.total_lp, &pool_map[&leg.pool].pool_datum.total_lp - &leg.lp_burned);
+            assert_eq!(
+                after.pool_datum.total_lp,
+                &pool_map[&leg.pool].pool_datum.total_lp - &leg.lp_burned
+            );
         }
     }
 
@@ -996,7 +1004,11 @@ mod tests {
         // Equal split: each leg uses about half of each offered asset.
         for leg in &m.mints {
             assert!(leg.deposited[0].1 <= BigInt::from(100_000));
-            assert!(leg.deposited[0].1 >= BigInt::from(90_000), "leg uses {:?}", leg.deposited);
+            assert!(
+                leg.deposited[0].1 >= BigInt::from(90_000),
+                "leg uses {:?}",
+                leg.deposited
+            );
             assert!(leg.lp_minted.is_positive());
         }
         let settings = make_settings(&env, &env.scooper_keyhash());
@@ -1006,7 +1018,10 @@ mod tests {
         assert!(!eval.budgets.is_empty());
         for leg in &m.mints {
             let after = &result.predicted_pools.iter().find(|(i, _, _)| i == &leg.pool).unwrap().2;
-            assert_eq!(after.pool_datum.total_lp, &pool_map[&leg.pool].pool_datum.total_lp + &leg.lp_minted);
+            assert_eq!(
+                after.pool_datum.total_lp,
+                &pool_map[&leg.pool].pool_datum.total_lp + &leg.lp_minted
+            );
         }
     }
 
@@ -1018,11 +1033,32 @@ mod tests {
         use std::collections::BTreeMap;
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cfg = bcl_eq8_config(ss_fee_3());
-        let x = make_bcl_pool(&env, 0x78, vec![(token_a(), 6_161_607), (token_b(), 6_469_719)], cfg.clone());
-        let y = make_bcl_pool(&env, 0x79, vec![(token_a(), 5_952_381), (token_e(), 6_250_000)], cfg);
-        let pool_map: BTreeMap<_, _> = [x, y].into_iter().map(|p| (p.pool_datum.identifier.clone(), p)).collect();
-        let limits = router::RoutingLimits { max_pools: 2, max_steps: 4 };
-        let r = router::find_blended_route(&pool_map, &[], &token_b(), &token_e(), &BigInt::from(312), limits);
+        let x = make_bcl_pool(
+            &env,
+            0x78,
+            vec![(token_a(), 6_161_607), (token_b(), 6_469_719)],
+            cfg.clone(),
+        );
+        let y = make_bcl_pool(
+            &env,
+            0x79,
+            vec![(token_a(), 5_952_381), (token_e(), 6_250_000)],
+            cfg,
+        );
+        let pool_map: BTreeMap<_, _> =
+            [x, y].into_iter().map(|p| (p.pool_datum.identifier.clone(), p)).collect();
+        let limits = router::RoutingLimits {
+            max_pools: 2,
+            max_steps: 4,
+        };
+        let r = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_e(),
+            &BigInt::from(312),
+            limits,
+        );
         assert!(r.is_some(), "312 B should route B->A->E");
     }
 
@@ -1037,7 +1073,9 @@ mod tests {
             let (a, b) = (BigInt::from(a), BigInt::from(b));
             let w = find_witness(&cfg, &a, &b).unwrap();
             let ladder = BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w);
-            for dx in [10_000i64, 300_000, 626_881, 626_882, 1_266_849, 1_759_892, 2_130_380, 2_500_000] {
+            for dx in [
+                10_000i64, 300_000, 626_881, 626_882, 1_266_849, 1_759_892, 2_130_380, 2_500_000,
+            ] {
                 let dx = BigInt::from(dx);
                 let planner = swap_steps(&cfg, &a, &b, false, &dx)
                     .map(|st| st.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy))
@@ -1063,10 +1101,22 @@ mod tests {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let cfg = bcl_eq8_config(ss_fee_3());
         // X at the Aiken vector; Y deeper and further along the ladder.
-        let x = make_bcl_pool(&env, 0x7A, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
-        let y = make_bcl_pool(&env, 0x7B, vec![(token_a(), 12_000_000), (token_b(), 2_400_000)], cfg.clone());
-        let pool_map: BTreeMap<_, _> =
-            [x.clone(), y.clone()].into_iter().map(|p| (p.pool_datum.identifier.clone(), p)).collect();
+        let x = make_bcl_pool(
+            &env,
+            0x7A,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let y = make_bcl_pool(
+            &env,
+            0x7B,
+            vec![(token_a(), 12_000_000), (token_b(), 2_400_000)],
+            cfg.clone(),
+        );
+        let pool_map: BTreeMap<_, _> = [x.clone(), y.clone()]
+            .into_iter()
+            .map(|p| (p.pool_datum.identifier.clone(), p))
+            .collect();
 
         let cap = |p: &std::sync::Arc<crate::sundaev4::SundaeV4Pool>| {
             let (a, b) = (&p.pool_datum.assets[0].1, &p.pool_datum.assets[1].1);
@@ -1081,14 +1131,38 @@ mod tests {
         let order = make_basic_swap_order(token_b(), dx_i, token_a(), 1, 1);
         let t0 = std::time::Instant::now();
         let blend = router::find_blended_route(
-            &pool_map, &[], &token_b(), &token_a(), order.swap_offered().1, router::RoutingLimits::unlimited(),
+            &pool_map,
+            &[],
+            &token_b(),
+            &token_a(),
+            order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
         )
         .expect("a blended route across both pools must exist");
-        eprintln!("router: {:?}; branches {:?}", t0.elapsed(),
-            blend.branches.iter().map(|b| (b.total_input.to_string(), b.hops[0].splits.iter().map(|s| (s.pool.ident.to_string()[..6].to_string(), s.input_amount.to_string())).collect::<Vec<_>>())).collect::<Vec<_>>());
+        eprintln!(
+            "router: {:?}; branches {:?}",
+            t0.elapsed(),
+            blend
+                .branches
+                .iter()
+                .map(|b| (
+                    b.total_input.to_string(),
+                    b.hops[0]
+                        .splits
+                        .iter()
+                        .map(|s| (
+                            s.pool.ident.to_string()[..6].to_string(),
+                            s.input_amount.to_string()
+                        ))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
-        accum.try_add_blended_order(&order, &blend, &pool_map).expect("blended crossing swap should accumulate");
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("blended crossing swap should accumulate");
         let plan = accum.into_plan();
         assert_eq!(plan.batches.len(), 2, "both pools carry flow");
         let settings = make_settings(&env, &env.scooper_keyhash());
@@ -1099,7 +1173,11 @@ mod tests {
 
         // Each pool's transcript has more than one step.
         let mut steps_per_pool = Vec::new();
-        for (_, data, _) in result.redeemers.iter().filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend) {
+        for (_, data, _) in result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+        {
             if let Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) =
                 crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone())
             {
@@ -1107,7 +1185,10 @@ mod tests {
             }
         }
         assert_eq!(steps_per_pool.len(), 2);
-        assert!(steps_per_pool.iter().all(|&n| n >= 2), "steps per pool: {steps_per_pool:?}");
+        assert!(
+            steps_per_pool.iter().all(|&n| n >= 2),
+            "steps per pool: {steps_per_pool:?}"
+        );
 
         // Realised output vs brute force over splits (1% grid).
         let mut got = BigInt::from(0);
@@ -1116,10 +1197,18 @@ mod tests {
             got = &got + &(before - &after.pool_datum.assets[0].1);
         }
         let out_of = |p: &std::sync::Arc<crate::sundaev4::SundaeV4Pool>, d: &BigInt| -> BigInt {
-            if !d.is_positive() { return BigInt::from(0); }
-            swap_steps(&cfg, &p.pool_datum.assets[0].1, &p.pool_datum.assets[1].1, false, d)
-                .map(|st| st.iter().fold(BigInt::from(0), |a, s| &a + &s.dy))
-                .unwrap_or_else(|_| BigInt::from(0))
+            if !d.is_positive() {
+                return BigInt::from(0);
+            }
+            swap_steps(
+                &cfg,
+                &p.pool_datum.assets[0].1,
+                &p.pool_datum.assets[1].1,
+                false,
+                d,
+            )
+            .map(|st| st.iter().fold(BigInt::from(0), |a, s| &a + &s.dy))
+            .unwrap_or_else(|_| BigInt::from(0))
         };
         let mut best = BigInt::from(0);
         let mut best_k = 0;
@@ -1128,11 +1217,20 @@ mod tests {
             let dxx = &dx * &BigInt::from(k) / &BigInt::from(100);
             let dyy = &dx - &dxx;
             let total = &out_of(&x, &dxx) + &out_of(&y, &dyy);
-            if total > best { best = total; best_k = k; }
+            if total > best {
+                best = total;
+                best_k = k;
+            }
         }
-        eprintln!("brute force: {:?}; best split {best_k}% to X of dx={dx}; cx={cx} cy={cy}; got={got}", t1.elapsed());
+        eprintln!(
+            "brute force: {:?}; best split {best_k}% to X of dx={dx}; cx={cx} cy={cy}; got={got}",
+            t1.elapsed()
+        );
         let single = out_of(&x, &dx).max(out_of(&y, &dx));
-        assert!(got > single, "split {got} must beat the best single pool {single}");
+        assert!(
+            got > single,
+            "split {got} must beat the best single pool {single}"
+        );
         // Within 0.05% of the grid optimum.
         assert!(
             (&best - &got) * BigInt::from(2_000) <= best,
@@ -1153,7 +1251,12 @@ mod tests {
         let cfg = bcl_eq8_config(ss_fee_3());
         let burn = 10_000_000i64;
         let pool_x = {
-            let p = make_bcl_pool(&env, 0x76, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
+            let p = make_bcl_pool(
+                &env,
+                0x76,
+                vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+                cfg.clone(),
+            );
             let lp = lp_asset_for(&env, 0x76);
             let mut p = (*p).clone();
             let c = BigInt::from(2 * burn);
@@ -1163,7 +1266,12 @@ mod tests {
             p.value.insert(&lp, &held - &c);
             std::sync::Arc::new(p)
         };
-        let pool_y = make_bcl_pool(&env, 0x77, vec![(token_a(), 8_637_368), (token_e(), 624_999)], cfg);
+        let pool_y = make_bcl_pool(
+            &env,
+            0x77,
+            vec![(token_a(), 8_637_368), (token_e(), 624_999)],
+            cfg,
+        );
         let lp_x = lp_asset_for(&env, 0x76);
         let lp_y = lp_asset_for(&env, 0x77);
         let order = make_basic_swap_order(lp_x.clone(), burn, lp_y.clone(), 1, 1);
@@ -1173,8 +1281,10 @@ mod tests {
             .collect();
         assert!(batch::is_liquidity_op(&order, &pool_map));
         let (burns, mints) = batch::lp_legs(&order, &pool_map);
-        let burn_specs: Vec<_> = burns.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
-        let mint_specs: Vec<_> = mints.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+        let burn_specs: Vec<_> =
+            burns.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
+        let mint_specs: Vec<_> =
+            mints.iter().map(|(p, q)| (p.clone(), q.clone(), pool_map[p].clone())).collect();
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1207,7 +1317,10 @@ mod tests {
         assert!(!eval.budgets.is_empty());
         for (ident, _, after) in &result.predicted_pools {
             let b = plan.batches.iter().find(|b| &b.pool_ident == ident).unwrap();
-            assert_eq!(b.final_assets, after.pool_datum.assets, "accumulator matches the walk for {ident}");
+            assert_eq!(
+                b.final_assets, after.pool_datum.assets,
+                "accumulator matches the walk for {ident}"
+            );
             assert_eq!(b.final_total_lp, after.pool_datum.total_lp);
         }
     }
@@ -1244,10 +1357,12 @@ mod tests {
         let lp_b = lp_asset_for(&env, 0x6D);
 
         let order = make_basic_swap_order(lp_a.clone(), burn, lp_b.clone(), 1, 1);
-        let pools: std::collections::BTreeMap<_, _> =
-            [(a_ident.clone(), pool_a.clone()), (b_ident.clone(), pool_b.clone())]
-                .into_iter()
-                .collect();
+        let pools: std::collections::BTreeMap<_, _> = [
+            (a_ident.clone(), pool_a.clone()),
+            (b_ident.clone(), pool_b.clone()),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             batch::movement_pools(&order, &pools),
             Some((a_ident.clone(), b_ident.clone())),
@@ -1280,8 +1395,14 @@ mod tests {
                 out
             );
         }
-        assert_eq!(plan.batches[bl.batch].pool_ident, a_ident, "withdraw leg sits in pool A's batch");
-        assert_eq!(plan.batches[ml.batch].pool_ident, b_ident, "deposit leg sits in pool B's batch");
+        assert_eq!(
+            plan.batches[bl.batch].pool_ident, a_ident,
+            "withdraw leg sits in pool A's batch"
+        );
+        assert_eq!(
+            plan.batches[ml.batch].pool_ident, b_ident,
+            "deposit leg sits in pool B's batch"
+        );
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -1300,8 +1421,14 @@ mod tests {
             .find(|(i, _, _)| i == &b_ident)
             .expect("pool B predicted")
             .2;
-        assert_eq!(after_a.pool_datum.total_lp, &pool_a.pool_datum.total_lp - &bl.lp_burned);
-        assert_eq!(after_b.pool_datum.total_lp, &pool_b.pool_datum.total_lp + &ml.lp_minted);
+        assert_eq!(
+            after_a.pool_datum.total_lp,
+            &pool_a.pool_datum.total_lp - &bl.lp_burned
+        );
+        assert_eq!(
+            after_b.pool_datum.total_lp,
+            &pool_b.pool_datum.total_lp + &ml.lp_minted
+        );
         assert_eq!(
             after_b.value.get(&lp_b),
             &pool_b.value.get(&lp_b) - &ml.lp_minted,
@@ -1383,7 +1510,10 @@ mod tests {
         let zap = &batch.zaps[0];
         assert!(zap.lp_minted.is_positive());
         let net_b = &zap.swap_deltas[1] + &zap.deposit_dx[1];
-        assert!(net_b <= BigInt::from(2_000), "consumes {net_b} of 2000 B offered");
+        assert!(
+            net_b <= BigInt::from(2_000),
+            "consumes {net_b} of 2000 B offered"
+        );
         assert!(
             (&zap.swap_deltas[0] + &zap.deposit_dx[0]) <= BigInt::from(0),
             "no A is taken from the order"
@@ -1463,9 +1593,17 @@ mod tests {
                 }
             })
             .expect("pool spend redeemer");
-        assert!(transcript.len() >= 3, "expected at least three steps, got {}", transcript.len());
+        assert!(
+            transcript.len() >= 3,
+            "expected at least three steps, got {}",
+            transcript.len()
+        );
         let after = &result.predicted_pools[0].2;
-        assert_eq!(after.pool_datum.assets[1].1, &b + &BigInt::from(dx), "all of the B went in");
+        assert_eq!(
+            after.pool_datum.assets[1].1,
+            &b + &BigInt::from(dx),
+            "all of the B went in"
+        );
         // The accumulator's prediction matches the walk exactly.
         assert_eq!(plan.batches[0].final_assets, after.pool_datum.assets);
         assert_eq!(plan.batches[0].final_total_lp, after.pool_datum.total_lp);
@@ -1502,7 +1640,11 @@ mod tests {
         .expect("crossing swap should assemble");
         assert_eq!(batch.swaps.len(), 1);
         let dy = batch.swaps[0].dy.clone();
-        assert!(dy > v.ra, "crossing pays more than band 0 held ({dy} <= {})", v.ra);
+        assert!(
+            dy > v.ra,
+            "crossing pays more than band 0 held ({dy} <= {})",
+            v.ra
+        );
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -1526,12 +1668,17 @@ mod tests {
         let bands: Vec<BigInt> = transcript
             .iter()
             .map(|e| {
-                let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(e.operation_data.clone())
-                    .unwrap();
+                let pair =
+                    Vec::<pallas_primitives::PlutusData>::from_plutus(e.operation_data.clone())
+                        .unwrap();
                 BigInt::from_plutus(pair[1].clone()).unwrap()
             })
             .collect();
-        assert_eq!(bands, vec![BigInt::from(1), BigInt::from(1)], "both steps end in band 1");
+        assert_eq!(
+            bands,
+            vec![BigInt::from(1), BigInt::from(1)],
+            "both steps end in band 1"
+        );
         let after = &result.predicted_pools[0].2;
         assert_eq!(after.pool_datum.assets[1].1, &b + &BigInt::from(dx));
         assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
@@ -1561,8 +1708,14 @@ mod tests {
 
         // First scoop: initialise.
         let orders = vec![make_order(token_b(), 624, token_a(), 1, 1)];
-        let batch = assemble_batch(&pool, &orders, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("oracle pool batch should assemble");
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("oracle pool batch should assemble");
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
             .build_and_eval(&[batch], &settings, 1000)
@@ -1573,7 +1726,10 @@ mod tests {
             .iter()
             .filter(|(k, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
             .count();
-        assert!(rewards >= 4, "expected banded + fee_split + fairness + oracle withdrawals, got {rewards}");
+        assert!(
+            rewards >= 4,
+            "expected banded + fee_split + fairness + oracle withdrawals, got {rewards}"
+        );
         let after1 = result.predicted_pools[0].2.clone();
         let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
         assert_eq!(s1.volume_b, BigInt::from(624));
@@ -1581,13 +1737,22 @@ mod tests {
         assert_eq!(s1.volume_a, BigInt::from(615));
         assert_eq!(s1.creation_time, s1.last_time);
         assert_eq!(s1.twap_num, BigInt::from(0));
-        assert_eq!(s1.last_price, &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(615));
+        assert_eq!(
+            s1.last_price,
+            &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(615)
+        );
 
         // Second scoop, later: advance.
         let pool2 = std::sync::Arc::new(after1);
         let orders2 = vec![make_order(token_b(), 1_000, token_a(), 1, 2)];
-        let batch2 = assemble_batch(&pool2, &orders2, env.exec.fee, env.exec.protocol_share, &BatchLimits::default())
-            .expect("second oracle pool batch should assemble");
+        let batch2 = assemble_batch(
+            &pool2,
+            &orders2,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("second oracle pool batch should assemble");
         let (result2, eval2) = env
             .build_and_eval(&[batch2], &settings, 2000)
             .expect("second oracle scoop should evaluate");
@@ -1596,7 +1761,10 @@ mod tests {
         assert_eq!(s2.creation_time, s1.creation_time);
         assert!(s2.last_time > s1.last_time);
         assert_eq!(s2.volume_b, &s1.volume_b + &BigInt::from(1_000));
-        assert_eq!(s2.twap_num, &(&s2.last_time - &s1.last_time) * &s1.last_price);
+        assert_eq!(
+            s2.twap_num,
+            &(&s2.last_time - &s1.last_time) * &s1.last_price
+        );
     }
 
     /// Where the memory goes: per-redeemer budgets for a CS scoop, a banded
@@ -1621,14 +1789,38 @@ mod tests {
         };
         let cfg = bcl_eq8_config(ss_fee_3());
         // CS reference.
-        let cs = make_cs_pool(&env, 0x80, vec![(token_a(), 300_000_000), (token_b(), 300_000_000)],
-            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)], ss_fee_3());
-        let b = assemble_batch(&cs, &[make_order(token_a(), 1_000_000, token_b(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let cs = make_cs_pool(
+            &env,
+            0x80,
+            vec![(token_a(), 300_000_000), (token_b(), 300_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            ss_fee_3(),
+        );
+        let b = assemble_batch(
+            &cs,
+            &[make_order(token_a(), 1_000_000, token_b(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
         report("constant sum, one swap", &e);
         // Banded, one step.
-        let p = make_bcl_pool(&env, 0x81, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
-        let b = assemble_batch(&p, &[make_order(token_b(), 624, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let p = make_bcl_pool(
+            &env,
+            0x81,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let b = assemble_batch(
+            &p,
+            &[make_order(token_b(), 624, token_a(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
         report("banded, one in-band step", &e);
         // Banded, crossing (two steps).
@@ -1636,15 +1828,51 @@ mod tests {
         let w = find_witness(&cfg, &a, &bb).unwrap();
         let cap = max_dx_in_band(&band_view(&cfg, &a, &bb, &w).unwrap(), false);
         let dx: i64 = (&cap + &BigInt::from(50_000)).to_string().parse().unwrap();
-        let p2 = make_bcl_pool(&env, 0x82, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
-        let b = assemble_batch(&p2, &[make_order(token_b(), dx, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let p2 = make_bcl_pool(
+            &env,
+            0x82,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let b = assemble_batch(
+            &p2,
+            &[make_order(token_b(), dx, token_a(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
         report("banded, two steps (crossing)", &e);
         // Two banded pools, one order each.
-        let p3 = make_bcl_pool(&env, 0x83, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg.clone());
-        let p4 = make_bcl_pool(&env, 0x84, vec![(token_a(), 8_637_368), (token_b(), 624_999)], cfg);
-        let b3 = assemble_batch(&p3, &[make_order(token_b(), 624, token_a(), 1, 1)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
-        let b4 = assemble_batch(&p4, &[make_order(token_b(), 624, token_a(), 1, 2)], env.exec.fee, env.exec.protocol_share, &BatchLimits::default()).unwrap();
+        let p3 = make_bcl_pool(
+            &env,
+            0x83,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg.clone(),
+        );
+        let p4 = make_bcl_pool(
+            &env,
+            0x84,
+            vec![(token_a(), 8_637_368), (token_b(), 624_999)],
+            cfg,
+        );
+        let b3 = assemble_batch(
+            &p3,
+            &[make_order(token_b(), 624, token_a(), 1, 1)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let b4 = assemble_batch(
+            &p4,
+            &[make_order(token_b(), 624, token_a(), 1, 2)],
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
         let (_, e) = env.build_and_eval(&[b3, b4], &settings, 1000).unwrap();
         report("two banded pools, one step each", &e);
     }
@@ -1708,8 +1936,14 @@ mod tests {
             .remove(0);
         let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(step.operation_data)
             .expect("banded entry carries a list");
-        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(1_000_000_062i64));
-        assert_eq!(BigInt::from_plutus(pair[1].clone()).unwrap(), BigInt::from(0));
+        assert_eq!(
+            BigInt::from_plutus(pair[0].clone()).unwrap(),
+            BigInt::from(1_000_000_062i64)
+        );
+        assert_eq!(
+            BigInt::from_plutus(pair[1].clone()).unwrap(),
+            BigInt::from(0)
+        );
         // The module entry names the INPUT witness.
         let entry = result
             .redeemers
@@ -1734,7 +1968,10 @@ mod tests {
         // fee_budget 213 at the default protocol share grows total_lp, not
         // circulating_lp.
         assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
-        assert_eq!(after.pool_datum.circulating_lp, pool.pool_datum.circulating_lp);
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            pool.pool_datum.circulating_lp
+        );
     }
 
     /// The Aiken fixture vector (`lib/tests/unit/ss_swap.ak`): 1e7 of A into
@@ -4430,9 +4667,9 @@ mod blend_cost {
     //!
     //! Run with --ignored --nocapture.
     use crate::bigint::BigInt;
-    use crate::sundaev4::router::{self, RoutingLimits};
-    use crate::sundaev4::test_harness::{bcl_eq8_config, make_bcl_pool, token, TestEnv};
     use crate::sundaev4::SundaeV4Pool;
+    use crate::sundaev4::router::{self, RoutingLimits};
+    use crate::sundaev4::test_harness::{TestEnv, bcl_eq8_config, make_bcl_pool, token};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -4459,7 +4696,7 @@ mod blend_cost {
         for i in 0..n {
             let g = i / DUP;
             let (a, b) = match g % 3 {
-                0 => (0, 1 + (g / 3) % (TOKENS - 1)),                      // hub spoke
+                0 => (0, 1 + (g / 3) % (TOKENS - 1)), // hub spoke
                 1 => (1 + (g / 3) % (TOKENS - 1), 1 + (g / 3 + 1) % (TOKENS - 1)), // ring
                 _ => (1 + (g / 3) % (TOKENS - 1), 1 + (g / 3 + 3) % (TOKENS - 1)), // chord
             };
@@ -4480,33 +4717,71 @@ mod blend_cost {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let amount = BigInt::from(400_000);
         println!("  find_blended_route, eq8 ladders, 4 pools per pair");
-        println!("  {:>6} {:>7} {:>8} {:>11} {:>6} {:>7} {:>9}", "pools", "order", "depth", "per order", "paths", "evals", "branches");
+        println!(
+            "  {:>6} {:>7} {:>8} {:>11} {:>6} {:>7} {:>9}",
+            "pools", "order", "depth", "per order", "paths", "evals", "branches"
+        );
         for n in [16usize, 48, 100, 200, 400] {
             let pools = graph(&env, n);
             // 0->1 is a direct pair carrying 4 parallel pools (preview's
             // MINT/MNGO shape); 1->5 needs hops.
             for (oname, from, to) in [("0->1", 0usize, 1usize), ("1->5", 1, 5)] {
                 for (label, limits) in [
-                    ("1 hop", RoutingLimits { max_pools: 1, max_steps: 1 }),
-                    ("2 hops", RoutingLimits { max_pools: 2, max_steps: 3 }),
-                    ("4 hops", RoutingLimits { max_pools: 4, max_steps: 8 }),
+                    (
+                        "1 hop",
+                        RoutingLimits {
+                            max_pools: 1,
+                            max_steps: 1,
+                        },
+                    ),
+                    (
+                        "2 hops",
+                        RoutingLimits {
+                            max_pools: 2,
+                            max_steps: 3,
+                        },
+                    ),
+                    (
+                        "4 hops",
+                        RoutingLimits {
+                            max_pools: 4,
+                            max_steps: 8,
+                        },
+                    ),
                 ] {
-                    let _ = router::find_blended_route(&pools, &[], &tok(from), &tok(to), &amount, limits);
+                    let _ = router::find_blended_route(
+                        &pools,
+                        &[],
+                        &tok(from),
+                        &tok(to),
+                        &amount,
+                        limits,
+                    );
                     let _ = router::drain_route_stats();
                     let _ = router::drain_split_profile();
                     let reps = 3;
                     let t = std::time::Instant::now();
                     for _ in 0..reps {
-                        let _ = router::find_blended_route(&pools, &[], &tok(from), &tok(to), &amount, limits);
+                        let _ = router::find_blended_route(
+                            &pools,
+                            &[],
+                            &tok(from),
+                            &tok(to),
+                            &amount,
+                            limits,
+                        );
                     }
                     let per = t.elapsed().as_secs_f64() / reps as f64;
                     let st = router::drain_route_stats();
-                    let (paths, evals, br) = st.last().map(|x| (x.paths, x.evals, x.branches)).unwrap_or((0, 0, 0));
+                    let (paths, evals, br) =
+                        st.last().map(|x| (x.paths, x.evals, x.branches)).unwrap_or((0, 0, 0));
                     let (splits, rounds, outs, ns) = router::drain_split_profile();
                     println!(
                         "  {n:>6} {oname:>7} {label:>8} {:>11} {paths:>6} {evals:>7} {br:>9}   splits {:>5} rounds {:>6} outputs {:>7} in-split {:.0}%",
                         format!("{:.1} ms", per * 1000.0),
-                        splits / reps as u64, rounds / reps as u64, outs / reps as u64,
+                        splits / reps as u64,
+                        rounds / reps as u64,
+                        outs / reps as u64,
                         (ns as f64 / 1e9 / reps as f64) / per * 100.0,
                     );
                 }

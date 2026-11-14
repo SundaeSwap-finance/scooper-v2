@@ -1403,7 +1403,10 @@ impl Scooper {
                         .chain(mint_specs.iter())
                         .map(|(p, _)| p.clone())
                         .collect();
-                    if !idents.iter().all(|p| exec.pool_allowlists.permits(p, order, order_strategy)) {
+                    if !idents
+                        .iter()
+                        .all(|p| exec.pool_allowlists.permits(p, order, order_strategy))
+                    {
                         trace!(order = %order.input, "order dispatch: liquidity op, not on a pool's allowlist");
                         skip_not_allowlisted += 1;
                         continue;
@@ -1419,12 +1422,18 @@ impl Scooper {
                         specs
                             .iter()
                             .map(|(p, q)| {
-                                pick_effective_pool(&candidate, &self.v4_chain_tracker, &v4_state, p)
-                                    .map(|pool| (p.clone(), q.clone(), pool))
+                                pick_effective_pool(
+                                    &candidate,
+                                    &self.v4_chain_tracker,
+                                    &v4_state,
+                                    p,
+                                )
+                                .map(|pool| (p.clone(), q.clone(), pool))
                             })
                             .collect::<Option<Vec<_>>>()
                     };
-                    let (Some(burns), Some(mints)) = (resolve(&burn_specs), resolve(&mint_specs)) else {
+                    let (Some(burns), Some(mints)) = (resolve(&burn_specs), resolve(&mint_specs))
+                    else {
                         skip_no_pool += 1;
                         continue;
                     };
@@ -1432,13 +1441,8 @@ impl Scooper {
                     let plain_floors = batch::plain_floors(order, &pools_filtered);
                     let limits = {
                         use num_traits::ToPrimitive;
-                        let budget = order
-                            .datum
-                            .max_per_execution
-                            .clone()
-                            .unwrap()
-                            .to_u64()
-                            .unwrap_or(0);
+                        let budget =
+                            order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
                         let base_fee_lov =
                             v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
                         // Every burn and mint leg is a pool touch and a
@@ -2297,8 +2301,14 @@ impl Scooper {
     async fn diagnose_rejected_scoop(
         evaluate_url: &str,
         final_tx: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
-        padded_budgets: &[(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)],
-        final_raw: &[(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)],
+        padded_budgets: &[(
+            pallas_primitives::conway::RedeemersKey,
+            pallas_primitives::ExUnits,
+        )],
+        final_raw: &[(
+            pallas_primitives::conway::RedeemersKey,
+            pallas_primitives::ExUnits,
+        )],
         slot_config: &crate::sundaev4::SlotConfig,
     ) {
         // Per redeemer: what we declared, what our evaluator
@@ -2418,7 +2428,10 @@ impl Scooper {
         // more declaring the final measurement, which is what the node
         // charges.
         let mut redeclared: Option<
-            Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)>,
+            Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )>,
         > = None;
         let mut redeclare_rounds = 0u32;
         let (padded_budgets, final_tx, final_raw) = loop {
@@ -2589,9 +2602,7 @@ impl Scooper {
                 self.metrics.route_latency.observe(st.secs);
                 self.metrics.route_evals.observe(st.evals as f64);
                 self.metrics.route_paths.observe(st.paths as f64);
-                self.metrics
-                    .route_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics.route_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
             // Record the budget against the Conway per-tx limits. This is
@@ -2655,8 +2666,10 @@ impl Scooper {
             // can shift a script's cost. The node rejects any script that runs
             // past its declared budget, and that rejection is indistinguishable
             // from a lost race at submit time.
-            let mut final_raw: Vec<(pallas_primitives::conway::RedeemersKey, pallas_primitives::ExUnits)> =
-                Vec::new();
+            let mut final_raw: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = Vec::new();
             let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &final_tx.tx_body,
                 &final_tx.redeemers,
@@ -2700,7 +2713,9 @@ impl Scooper {
             {
                 let (pad_num, pad_den) = exec.budget_padding;
                 for (k, declared) in &padded_budgets {
-                    let Some((_, raw_final)) = final_raw.iter().find(|(fk, _)| fk == k) else { continue };
+                    let Some((_, raw_final)) = final_raw.iter().find(|(fk, _)| fk == k) else {
+                        continue;
+                    };
                     let first_mem = declared.mem * pad_den / pad_num;
                     let first_steps = declared.steps * pad_den / pad_num;
                     let drift_mem = raw_final.mem as f64 / first_mem.max(1) as f64 - 1.0;
@@ -2905,12 +2920,15 @@ impl Scooper {
                     // cycle re-dispatch a spent order.
                     .chain(final_plan.conversions.iter().map(|c| c.order.clone()))
                     // A movement's two legs name the same order once each.
-                    .fold(Vec::new(), |mut acc: Vec<Arc<crate::sundaev4::SundaeV4Order>>, o| {
-                        if !acc.iter().any(|a| a.input == o.input) {
-                            acc.push(o);
-                        }
-                        acc
-                    });
+                    .fold(
+                        Vec::new(),
+                        |mut acc: Vec<Arc<crate::sundaev4::SundaeV4Order>>, o| {
+                            if !acc.iter().any(|a| a.input == o.input) {
+                                acc.push(o);
+                            }
+                            acc
+                        },
+                    );
 
                 // Build predicted pools for chain tracker
                 let predicted_pools: Vec<_> = final_tx
@@ -3039,7 +3057,14 @@ impl Scooper {
                             reason_hex = %hex_reason,
                             "node rejected scoop tx",
                         );
-                        Self::diagnose_rejected_scoop(&exec.evaluate_url, &final_tx, &padded_budgets, &final_raw, &exec.slot_config).await;
+                        Self::diagnose_rejected_scoop(
+                            &exec.evaluate_url,
+                            &final_tx,
+                            &padded_budgets,
+                            &final_raw,
+                            &exec.slot_config,
+                        )
+                        .await;
                     } else {
                         info!(
                             tx_hash = %final_tx.tx_hash_hex,
@@ -3084,8 +3109,7 @@ impl Scooper {
                     if node_reject_hex.is_some() {
                         let implicated: std::collections::BTreeSet<&Ident> =
                             rejected_pools.iter().map(|(i, _)| i).collect();
-                        self.pool_reject_streak
-                            .retain(|(ident, _), _| implicated.contains(ident));
+                        self.pool_reject_streak.retain(|(ident, _), _| implicated.contains(ident));
                     }
                     let until_slot = self.now_slot(tip_slot) + TEMP_QUARANTINE_SLOTS;
                     let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
@@ -3152,7 +3176,14 @@ impl Scooper {
                         dump = %dump_path,
                         "multi-pool scoop tx submit failed — tx CBOR dumped for uplc-turbo diagnosis"
                     );
-                    Self::diagnose_rejected_scoop(&exec.evaluate_url, &final_tx, &padded_budgets, &final_raw, &exec.slot_config).await;
+                    Self::diagnose_rejected_scoop(
+                        &exec.evaluate_url,
+                        &final_tx,
+                        &padded_budgets,
+                        &final_raw,
+                        &exec.slot_config,
+                    )
+                    .await;
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);

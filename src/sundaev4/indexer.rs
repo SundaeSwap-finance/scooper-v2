@@ -662,7 +662,12 @@ impl SundaeV4Indexer {
             .banded_concentrated_liquidity
             .as_ref()?
             .hash;
-        resolve_bcl_config(pool_datum, h.as_ref(), &[], cache.bcl.get(&pool_datum.identifier))
+        resolve_bcl_config(
+            pool_datum,
+            h.as_ref(),
+            &[],
+            cache.bcl.get(&pool_datum.identifier),
+        )
     }
 
     /// The cached stableswap config for a pool, only when its hash is the
@@ -1045,7 +1050,9 @@ pub fn extract_bcl_config_candidates(
             with_index(c.bands, c.closing, c.weight_total)
         };
         match parsed {
-            LegacyBandedCLRedeemer::Create { initial_state, .. } => out.push(rebuild(initial_state)),
+            LegacyBandedCLRedeemer::Create { initial_state, .. } => {
+                out.push(rebuild(initial_state))
+            }
             LegacyBandedCLRedeemer::Operate { entries } => {
                 out.extend(entries.into_iter().map(|e| rebuild(e.config)))
             }
@@ -2520,8 +2527,7 @@ mod preview_banded_recovery_tests {
     /// The banded module the scooper is configured with today.
     const NEW_BCL_HASH: &str = "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18";
     /// The pool datum's banded `module_state` slot after the migration.
-    const MIGRATED_STATE: &str =
-        "361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9";
+    const MIGRATED_STATE: &str = "361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9";
 
     #[test]
     fn recovers_the_migrated_config_from_the_legacy_create_redeemer() {
@@ -2531,7 +2537,10 @@ mod preview_banded_recovery_tests {
             hex::decode(NEW_BCL_HASH).expect("hex").as_slice().try_into().expect("28 bytes");
 
         let candidates = extract_bcl_config_candidates(&tx, &configured);
-        assert!(!candidates.is_empty(), "no banded candidate recovered from the Create tx");
+        assert!(
+            !candidates.is_empty(),
+            "no banded candidate recovered from the Create tx"
+        );
         let want = hex::decode(MIGRATED_STATE).expect("hex");
         assert!(
             candidates.iter().any(|c| config_hash(c) == want),
@@ -2558,16 +2567,14 @@ mod steelswap_quote_dump {
     fn dump_quotes() {
         let cbor = hex::decode(CREATE_TX_HEX.trim()).unwrap();
         let tx = MultiEraTx::decode(&cbor).unwrap();
-        let configured: ScriptHash = hex::decode(
-            "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18",
-        )
-        .unwrap()
-        .as_slice()
-        .try_into()
-        .unwrap();
-        let want =
-            hex::decode("361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9")
+        let configured: ScriptHash =
+            hex::decode("33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18")
+                .unwrap()
+                .as_slice()
+                .try_into()
                 .unwrap();
+        let want = hex::decode("361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9")
+            .unwrap();
         let cfg = extract_bcl_config_candidates(&tx, &configured)
             .into_iter()
             .find(|c| config_hash(c) == want)
@@ -2580,10 +2587,8 @@ mod steelswap_quote_dump {
                 let steps = swap_steps(&cfg, &a, &b, a_in, &BigInt::from(d));
                 match steps {
                     Ok(s) => {
-                        let out: BigInt =
-                            s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dy);
-                        let spent: BigInt =
-                            s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dx);
+                        let out: BigInt = s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dy);
+                        let spent: BigInt = s.iter().fold(BigInt::from(0), |acc, st| &acc + &st.dx);
                         let bands: Vec<usize> = s.iter().map(|st| st.before.k).collect();
                         println!(
                             "{d:>8} {} in -> out={out} spent={spent} steps={} bands={bands:?}",
