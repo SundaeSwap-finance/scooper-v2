@@ -311,24 +311,55 @@ impl Blueprint {
         )
         .ok();
 
+        use crate::sundaev4::ModuleKind;
+        let mut modules = crate::sundaev4::ModuleRegistry::default();
+        let mut add = |kind: ModuleKind, info: Option<ScriptRefInfo>| -> Result<()> {
+            if let Some(info) = info {
+                modules.insert(kind, info).map_err(|e| anyhow::anyhow!(e))?;
+            }
+            Ok(())
+        };
+        add(
+            ModuleKind::ConstantProduct,
+            make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
+        )?;
+        add(
+            ModuleKind::FeeSplit,
+            Some(make_info(
+                self,
+                mappings[1].0,
+                mappings[1].1,
+                mappings[1].2,
+            )?),
+        )?;
+        add(
+            ModuleKind::Fairness,
+            Some(make_info(
+                self,
+                mappings[2].0,
+                mappings[2].1,
+                mappings[2].2,
+            )?),
+        )?;
+        add(ModuleKind::ConstantSum, constant_sum)?;
+        add(ModuleKind::FeeConstraint, fee_constraint)?;
+        add(ModuleKind::Stableswap, stableswap)?;
+        add(
+            ModuleKind::ConcentratedLiquidity,
+            banded_concentrated_liquidity,
+        )?;
+        add(ModuleKind::Oracle, oracle)?;
+        add(ModuleKind::SwapOrder, swap_order)?;
+        add(ModuleKind::BasicOrder, basic_order)?;
+        add(ModuleKind::RouteOrder, route_order)?;
+        add(ModuleKind::FairnessOrder, fairness_order)?;
+        add(ModuleKind::StrategyOrder, strategy_order)?;
         Ok(ModuleScripts {
-            constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
-            fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
-            fairness: make_info(self, mappings[2].0, mappings[2].1, mappings[2].2)?,
             pool: make_info(self, mappings[3].0, mappings[3].1, mappings[3].2)?,
             order: make_info(self, mappings[4].0, mappings[4].1, mappings[4].2)?,
             pool_mint: make_info(self, mappings[5].0, mappings[5].1, mappings[5].2)?,
             settings: make_info(self, mappings[6].0, mappings[6].1, mappings[6].2)?,
-            constant_sum,
-            fee_constraint,
-            stableswap,
-            banded_concentrated_liquidity,
-            oracle,
-            swap_order,
-            basic_order,
-            route_order,
-            fairness_order,
-            strategy_order,
+            modules,
         })
     }
 }
@@ -416,21 +447,23 @@ mod tests {
         assert_eq!(modules.pool_mint.hash.as_slice().len(), 28);
         // The audit-final cs-launch deployment publishes CS + basic/strategy
         // only — CP and the swap constraint are absent by design.
+        use crate::sundaev4::ModuleKind;
+        let cs = modules.of_kind(ModuleKind::ConstantSum).next();
         assert!(
-            modules.constant_sum.is_some(),
+            cs.is_some(),
             "constant_sum must be present in the cs-launch blueprint"
         );
-        assert!(modules.constant_sum.as_ref().unwrap().script_cbor.is_some());
+        assert!(cs.unwrap().script_cbor.is_some());
         assert!(
-            modules.basic_order.is_some(),
+            modules.modules.has_kind(ModuleKind::BasicOrder),
             "basic_order required for order dispatch"
         );
         assert!(
-            modules.strategy_order.is_some(),
+            modules.modules.has_kind(ModuleKind::StrategyOrder),
             "strategy_order required for strategy scoops"
         );
         assert!(
-            modules.constant_product.is_none(),
+            !modules.modules.has_kind(ModuleKind::ConstantProduct),
             "cs-launch scope does not publish CP"
         );
     }

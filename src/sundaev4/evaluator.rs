@@ -84,6 +84,20 @@ impl ScriptStore {
         Ok(hash)
     }
 
+    /// Serve the script stored under `existing` also under `alias`. Tests
+    /// use it to stand up a second version of a module (a second hash of one
+    /// kind) without a second compiled script.
+    #[cfg(test)]
+    pub fn alias(&mut self, existing: &Hash<28>, alias: Hash<28>) -> Result<()> {
+        let script = self
+            .scripts
+            .get(existing)
+            .cloned()
+            .with_context(|| format!("no script {} to alias", hex::encode(existing)))?;
+        self.scripts.insert(alias, script);
+        Ok(())
+    }
+
     /// Build a ScriptStore from a Blueprint's compiled code.
     ///
     /// For each validator with `compiled_code`, hex-decodes the script CBOR,

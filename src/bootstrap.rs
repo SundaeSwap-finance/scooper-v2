@@ -22,6 +22,7 @@ use crate::{
 };
 
 use crate::cardano_types::CIP_67_ASSET_LABEL_222;
+use crate::sundaev4::ModuleKind;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -344,7 +345,11 @@ fn parse_kupo_value(kv: &KupoValue) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for KupoProvider {
-    async fn fetch_tx_output(&self, _tx_hash: &[u8; 32], _index: u64) -> Result<Option<FetchedUtxo>> {
+    async fn fetch_tx_output(
+        &self,
+        _tx_hash: &[u8; 32],
+        _index: u64,
+    ) -> Result<Option<FetchedUtxo>> {
         Ok(None)
     }
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
@@ -1104,7 +1109,8 @@ fn missing_module_configs(
     (
         needs_cs_lookup(pool_datum, execution, cs_configs),
         needs_cp_lookup(pool_datum, execution, cp_configs),
-        !fs_configs.contains_key(&pool_datum.identifier),
+        pool_config_hashes(pool_datum, execution).fs.is_some()
+            && !fs_configs.contains_key(&pool_datum.identifier),
         needs_ss_lookup(pool_datum, execution, ss_configs),
         needs_bcl_lookup(pool_datum, execution, bcl_configs),
     )
@@ -1135,19 +1141,6 @@ pub async fn recover_missing_module_configs(
     };
     let dao = persistence.indexer_dao("sundae_v4");
 
-    let cs_module_hash: Option<Vec<u8>> =
-        exec.module_scripts.constant_sum.as_ref().map(|m| m.hash.as_ref().to_vec());
-    let cp_module_hash: Option<Vec<u8>> =
-        exec.module_scripts.constant_product.as_ref().map(|m| m.hash.as_ref().to_vec());
-    let fs_module_hash: Vec<u8> = exec.module_scripts.fee_split.hash.as_ref().to_vec();
-    let ss_module_hash: Option<Vec<u8>> =
-        exec.module_scripts.stableswap.as_ref().map(|m| m.hash.as_ref().to_vec());
-    let bcl_module_hash: Option<Vec<u8>> = exec
-        .module_scripts
-        .banded_concentrated_liquidity
-        .as_ref()
-        .map(|m| m.hash.as_ref().to_vec());
-
     // What the DB already knows.
     let mut cs_configs = std::collections::BTreeMap::new();
     let mut cp_configs = std::collections::BTreeMap::new();
@@ -1155,19 +1148,29 @@ pub async fn recover_missing_module_configs(
     let mut ss_configs = std::collections::BTreeMap::new();
     let mut bcl_configs = std::collections::BTreeMap::new();
     for cfg in dao.load_module_configs().await.context("recover: load persisted module configs")? {
+        let Some(kind) = exec.module_scripts.kind_of(&cfg.module_hash) else {
+            continue;
+        };
         let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
             .context("recover: persisted module config CBOR malformed")?;
         let ident = Ident::new(&cfg.pool_id);
-        if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
-            cs_configs.insert(ident, sundaev4::ConstantSumConfig::from_plutus(pd)?);
-        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
-            cp_configs.insert(ident, sundaev4::ConstantProductConfig::from_plutus(pd)?);
-        } else if cfg.module_hash == fs_module_hash {
-            fs_configs.insert(ident, sundaev4::FeeSplitConfig::from_plutus(pd)?);
-        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
-            ss_configs.insert(ident, sundaev4::StableSwapConfig::from_plutus(pd)?);
-        } else if Some(&cfg.module_hash) == bcl_module_hash.as_ref() {
-            bcl_configs.insert(ident, sundaev4::BandedCLConfig::from_plutus(pd)?);
+        match kind {
+            ModuleKind::ConstantSum => {
+                cs_configs.insert(ident, sundaev4::ConstantSumConfig::from_plutus(pd)?);
+            }
+            ModuleKind::ConstantProduct => {
+                cp_configs.insert(ident, sundaev4::ConstantProductConfig::from_plutus(pd)?);
+            }
+            ModuleKind::FeeSplit => {
+                fs_configs.insert(ident, sundaev4::FeeSplitConfig::from_plutus(pd)?);
+            }
+            ModuleKind::Stableswap => {
+                ss_configs.insert(ident, sundaev4::StableSwapConfig::from_plutus(pd)?);
+            }
+            ModuleKind::ConcentratedLiquidity => {
+                bcl_configs.insert(ident, sundaev4::BandedCLConfig::from_plutus(pd)?);
+            }
+            _ => {}
         }
     }
 
@@ -1209,6 +1212,12 @@ pub async fn recover_missing_module_configs(
         }
         let ident_hex = hex::encode(ident.to_bytes());
         info!(pool = %ident_hex, need_cs, need_cp, need_fs, need_ss, need_bcl, "v4: pool is missing module config(s); recovering from chain");
+        let hashes = pool_config_hashes(&pool_datum, Some(exec));
+        let cs_module_hash = hashes.cs.map(|h| h.as_ref().to_vec());
+        let cp_module_hash = hashes.cp.map(|h| h.as_ref().to_vec());
+        let ss_module_hash = hashes.ss.map(|h| h.as_ref().to_vec());
+        let bcl_module_hash = hashes.bcl.map(|h| h.as_ref().to_vec());
+        let fs_module_hash = hashes.fs.map(|h| h.as_ref().to_vec());
 
         let ss_expected = if need_ss {
             ss_slot_hash(&pool_datum, Some(exec))
@@ -1225,8 +1234,11 @@ pub async fn recover_missing_module_configs(
             &**provider,
             protocol,
             &ident,
-            need_cs,
-            need_cp,
+            PoolConfigHashes {
+                cs: hashes.cs.filter(|_| need_cs),
+                cp: hashes.cp.filter(|_| need_cp),
+                ..hashes
+            },
             ss_expected.as_deref(),
             bcl_expected.as_deref(),
         )
@@ -1304,10 +1316,10 @@ pub async fn recover_missing_module_configs(
                 }
             }
         }
-        if need_fs {
+        if need_fs && let Some(fs_module_hash) = fs_module_hash {
             match recovered.fee_split {
                 Some(cfg) => {
-                    push(fs_module_hash.clone(), minicbor::to_vec(cfg.to_plutus())?);
+                    push(fs_module_hash, minicbor::to_vec(cfg.to_plutus())?);
                     any = true;
                     info!(pool = %ident_hex, "v4: recovered fee_split config");
                 }
@@ -1529,6 +1541,36 @@ async fn bootstrap_v3(
     Ok(())
 }
 
+/// The module hashes one pool names, for each kind whose per-pool config
+/// the scooper recovers. Two pools can name different hashes of one kind.
+#[derive(Clone, Copy, Debug, Default)]
+struct PoolConfigHashes {
+    cs: Option<pallas_addresses::ScriptHash>,
+    cp: Option<pallas_addresses::ScriptHash>,
+    ss: Option<pallas_addresses::ScriptHash>,
+    bcl: Option<pallas_addresses::ScriptHash>,
+    fs: Option<pallas_addresses::ScriptHash>,
+}
+
+fn pool_config_hashes(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+) -> PoolConfigHashes {
+    let Some(exec) = execution else {
+        return PoolConfigHashes::default();
+    };
+    let ms = &exec.module_scripts;
+    let invariant = ms.pool_invariant(pool_datum);
+    let of = |kind: ModuleKind| invariant.filter(|(k, _)| *k == kind).map(|(_, h)| h);
+    PoolConfigHashes {
+        cs: of(ModuleKind::ConstantSum),
+        cp: of(ModuleKind::ConstantProduct),
+        ss: of(ModuleKind::Stableswap),
+        bcl: of(ModuleKind::ConcentratedLiquidity),
+        fs: ms.pool_module_of_kind(pool_datum, ModuleKind::FeeSplit),
+    }
+}
+
 /// True iff this pool is constant-sum *and* we don't already know its config —
 /// neither from `pool-configs` in the operator file nor from `cs_configs`
 /// (preloaded persisted entries plus any we've recovered earlier in this pass).
@@ -1540,16 +1582,9 @@ fn needs_cs_lookup(
     let Some(exec) = execution else {
         return false;
     };
-    let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() else {
-        return false;
-    };
-    // CS swap actions use tag=3 (cs_check.ak's tag_swap), not tag=100. Match by
-    // module hash across every enabled action instead — the tag isn't a
-    // reliable discriminator between CS and CP.
-    let is_cs = pool_datum.actions.iter().any(|a| {
-        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cs_script.hash.as_ref())
-    });
-    if !is_cs {
+    // CS swap actions use tag=3 (cs_check.ak's tag_swap), not tag=100. The
+    // pool's invariant module hash, not the tag, says it is CS.
+    if pool_config_hashes(pool_datum, execution).cs.is_none() {
         return false;
     }
     // It's CS. Skip lookup if we already have an answer from any source.
@@ -1572,20 +1607,11 @@ fn needs_ss_lookup(
     execution: Option<&sundaev4::ScooperExecution>,
     ss_configs: &std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
+    let Some(ss_hash) = pool_config_hashes(pool_datum, execution).ss else {
         return false;
     };
-    let Some(ss_script) = exec.module_scripts.stableswap.as_ref() else {
-        return false;
-    };
-    let is_ss = pool_datum.actions.iter().any(|a| {
-        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == ss_script.hash.as_ref())
-    });
-    if !is_ss {
-        return false;
-    }
     !ss_configs.get(&pool_datum.identifier).is_some_and(|cfg| {
-        crate::sundaev4::ss_math::config_matches_datum(cfg, pool_datum, ss_script.hash.as_ref())
+        crate::sundaev4::ss_math::config_matches_datum(cfg, pool_datum, ss_hash.as_ref())
     })
 }
 
@@ -1594,7 +1620,7 @@ fn ss_slot_hash(
     pool_datum: &sundaev4::PoolDatum,
     execution: Option<&sundaev4::ScooperExecution>,
 ) -> Option<Vec<u8>> {
-    let ss_hash = execution?.module_scripts.stableswap.as_ref()?.hash;
+    let ss_hash = pool_config_hashes(pool_datum, execution).ss?;
     pool_datum
         .module_state
         .iter()
@@ -1609,20 +1635,11 @@ fn needs_bcl_lookup(
     execution: Option<&sundaev4::ScooperExecution>,
     bcl_configs: &std::collections::BTreeMap<Ident, sundaev4::BandedCLConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
+    let Some(h) = pool_config_hashes(pool_datum, execution).bcl else {
         return false;
     };
-    let Some(script) = exec.module_scripts.banded_concentrated_liquidity.as_ref() else {
-        return false;
-    };
-    let is_bcl = pool_datum.actions.iter().any(|a| {
-        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == script.hash.as_ref())
-    });
-    if !is_bcl {
-        return false;
-    }
     !bcl_configs.get(&pool_datum.identifier).is_some_and(|cfg| {
-        crate::sundaev4::banded_math::config_matches_datum(cfg, pool_datum, script.hash.as_ref())
+        crate::sundaev4::banded_math::config_matches_datum(cfg, pool_datum, h.as_ref())
     })
 }
 
@@ -1631,7 +1648,7 @@ fn bcl_slot_hash(
     pool_datum: &sundaev4::PoolDatum,
     execution: Option<&sundaev4::ScooperExecution>,
 ) -> Option<Vec<u8>> {
-    let h = execution?.module_scripts.banded_concentrated_liquidity.as_ref()?.hash;
+    let h = pool_config_hashes(pool_datum, execution).bcl?;
     pool_datum
         .module_state
         .iter()
@@ -1647,24 +1664,8 @@ fn needs_cp_lookup(
     execution: Option<&sundaev4::ScooperExecution>,
     cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
 ) -> bool {
-    let Some(exec) = execution else {
-        return false;
-    };
-    let Some(cp) = exec.module_scripts.constant_product.as_ref() else {
-        return false;
-    };
-    let cp_hash = cp.hash;
-    let is_cp = pool_datum
-        .actions
-        .iter()
-        .any(|a| a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == cp_hash.as_ref()));
-    if !is_cp {
-        return false;
-    }
-    if cp_configs.contains_key(&pool_datum.identifier) {
-        return false;
-    }
-    true
+    pool_config_hashes(pool_datum, execution).cp.is_some()
+        && !cp_configs.contains_key(&pool_datum.identifier)
 }
 
 /// Per-pool module configs we try to recover during bootstrap. Each field is
@@ -1697,35 +1698,34 @@ async fn lookup_pool_module_configs(
     provider: &(dyn BootstrapProvider + Send + Sync),
     protocol: &SundaeV4Protocol,
     ident: &Ident,
-    need_cs: bool,
-    need_cp: bool,
+    // The module hashes this pool names, for the configs wanted. A `None`
+    // field is not looked up. Configs are read from the withdrawals of these
+    // hashes only.
+    hashes: PoolConfigHashes,
     // `Some(slot hash)` when the stableswap config is wanted: the candidate
     // that hashes to it is the one in force for the pool's current UTxO.
     ss_expected: Option<&[u8]>,
     // Same for the banded ladder.
     bcl_expected: Option<&[u8]>,
 ) -> Result<RecoveredPoolConfigs> {
-    let exec = protocol
-        .execution
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
-    let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
-    let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash);
+    let cs_hash = hashes.cs;
+    let ss_hash = hashes.ss;
     let pick_ss = |tx: &pallas_traverse::MultiEraTx| -> Option<sundaev4::StableSwapConfig> {
         let (h, expected) = (ss_hash.as_ref()?, ss_expected?);
         sundaev4::extract_ss_config_candidates(tx, h)
             .into_iter()
             .find(|c| crate::sundaev4::ss_math::config_hash(c) == expected)
     };
-    let bcl_hash = exec.module_scripts.banded_concentrated_liquidity.as_ref().map(|s| s.hash);
+    let bcl_hash = hashes.bcl;
     let pick_bcl = |tx: &pallas_traverse::MultiEraTx| -> Option<sundaev4::BandedCLConfig> {
         let (h, expected) = (bcl_hash.as_ref()?, bcl_expected?);
         sundaev4::extract_bcl_config_candidates(tx, h)
             .into_iter()
             .find(|c| crate::sundaev4::banded_math::config_hash(c) == expected)
     };
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
-    let fs_hash = exec.module_scripts.fee_split.hash;
+    let cp_hash = hashes.cp;
+    let fs_hash = hashes.fs;
+    let want_fs = fs_hash.is_some();
 
     let mut asset_name = CIP_67_ASSET_LABEL_222.to_vec();
     asset_name.extend_from_slice(ident.to_bytes());
@@ -1736,8 +1736,8 @@ async fn lookup_pool_module_configs(
     );
 
     let mut out = RecoveredPoolConfigs::default();
-    let want_cs = need_cs && cs_hash.is_some();
-    let want_cp = need_cp;
+    let want_cs = cs_hash.is_some();
+    let want_cp = cp_hash.is_some();
     let want_ss = ss_expected.is_some() && ss_hash.is_some();
     let want_bcl = bcl_expected.is_some() && bcl_hash.is_some();
 
@@ -1760,14 +1760,16 @@ async fn lookup_pool_module_configs(
     if want_bcl {
         out.bcl = pick_bcl(&first_tx);
     }
-    out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, &fs_hash);
+    if let Some(h) = fs_hash.as_ref() {
+        out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, h);
+    }
 
     let still_missing = |c: &RecoveredPoolConfigs| {
         (want_cs && c.cs.is_none())
             || (want_cp && c.cp.is_none())
             || (want_ss && c.ss.is_none())
             || (want_bcl && c.bcl.is_none())
-            || c.fee_split.is_none()
+            || (want_fs && c.fee_split.is_none())
     };
     if !still_missing(&out) {
         return Ok(out);
@@ -1809,8 +1811,10 @@ async fn lookup_pool_module_configs(
             if want_bcl && out.bcl.is_none() {
                 out.bcl = pick_bcl(&tx);
             }
-            if out.fee_split.is_none() {
-                out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, &fs_hash);
+            if out.fee_split.is_none()
+                && let Some(h) = fs_hash.as_ref()
+            {
+                out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, h);
             }
             if !still_missing(&out) {
                 break 'pages;
@@ -1841,29 +1845,6 @@ async fn bootstrap_v4(
     // Blockfrost on every bootstrap. New entries discovered in this pass get
     // appended below. We split the flat persisted rows by module_hash into
     // per-module maps so callers can look up by pool ident.
-    let cs_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.constant_sum.as_ref())
-        .map(|cs| cs.hash.as_ref().to_vec());
-    let cp_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.constant_product.as_ref())
-        .map(|cp| cp.hash.as_ref().to_vec());
-    let fs_module_hash: Option<Vec<u8>> =
-        protocol.execution.as_ref().map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
-    let ss_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.stableswap.as_ref())
-        .map(|ss| ss.hash.as_ref().to_vec());
-    let bcl_module_hash: Option<Vec<u8>> = protocol
-        .execution
-        .as_ref()
-        .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
-        .map(|m| m.hash.as_ref().to_vec());
-
     let persisted_configs =
         dao.load_module_configs().await.context("bootstrap v4: load persisted module configs")?;
     let mut cs_configs: std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig> =
@@ -1877,31 +1858,43 @@ async fn bootstrap_v4(
     let mut bcl_configs: std::collections::BTreeMap<Ident, sundaev4::BandedCLConfig> =
         std::collections::BTreeMap::new();
     for cfg in persisted_configs {
-        let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
-            .context("bootstrap v4: persisted module config CBOR malformed")?;
-        if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
-            let parsed = sundaev4::ConstantSumConfig::from_plutus(pd)
-                .context("bootstrap v4: persisted CS config decode failed")?;
-            cs_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
-            let parsed = sundaev4::ConstantProductConfig::from_plutus(pd)
-                .context("bootstrap v4: persisted CP config decode failed")?;
-            cp_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
-            let parsed = sundaev4::FeeSplitConfig::from_plutus(pd)
-                .context("bootstrap v4: persisted FS config decode failed")?;
-            fs_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
-            let parsed = sundaev4::StableSwapConfig::from_plutus(pd)
-                .context("bootstrap v4: persisted SS config decode failed")?;
-            ss_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        } else if Some(&cfg.module_hash) == bcl_module_hash.as_ref() {
-            let parsed = sundaev4::BandedCLConfig::from_plutus(pd)
-                .context("bootstrap v4: persisted banded config decode failed")?;
-            bcl_configs.insert(Ident::new(&cfg.pool_id), parsed);
-        }
         // Unknown module hashes are ignored; they may belong to modules not
         // configured in this protocol.
+        let Some(kind) =
+            protocol.execution.as_ref().and_then(|e| e.module_scripts.kind_of(&cfg.module_hash))
+        else {
+            continue;
+        };
+        let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
+            .context("bootstrap v4: persisted module config CBOR malformed")?;
+        match kind {
+            ModuleKind::ConstantSum => {
+                let parsed = sundaev4::ConstantSumConfig::from_plutus(pd)
+                    .context("bootstrap v4: persisted CS config decode failed")?;
+                cs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+            ModuleKind::ConstantProduct => {
+                let parsed = sundaev4::ConstantProductConfig::from_plutus(pd)
+                    .context("bootstrap v4: persisted CP config decode failed")?;
+                cp_configs.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+            ModuleKind::FeeSplit => {
+                let parsed = sundaev4::FeeSplitConfig::from_plutus(pd)
+                    .context("bootstrap v4: persisted FS config decode failed")?;
+                fs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+            ModuleKind::Stableswap => {
+                let parsed = sundaev4::StableSwapConfig::from_plutus(pd)
+                    .context("bootstrap v4: persisted SS config decode failed")?;
+                ss_configs.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+            ModuleKind::ConcentratedLiquidity => {
+                let parsed = sundaev4::BandedCLConfig::from_plutus(pd)
+                    .context("bootstrap v4: persisted banded config decode failed")?;
+                bcl_configs.insert(Ident::new(&cfg.pool_id), parsed);
+            }
+            _ => {}
+        }
     }
     let preloaded_cs = cs_configs.len();
     let preloaded_cp = cp_configs.len();
@@ -1964,14 +1957,23 @@ async fn bootstrap_v4(
         } else {
             None
         };
-        let need_fs = !fs_configs.contains_key(&pool_datum.identifier);
+        let hashes = pool_config_hashes(&pool_datum, protocol.execution.as_ref());
+        let cs_module_hash = hashes.cs.map(|h| h.as_ref().to_vec());
+        let cp_module_hash = hashes.cp.map(|h| h.as_ref().to_vec());
+        let ss_module_hash = hashes.ss.map(|h| h.as_ref().to_vec());
+        let bcl_module_hash = hashes.bcl.map(|h| h.as_ref().to_vec());
+        let fs_module_hash = hashes.fs.map(|h| h.as_ref().to_vec());
+        let need_fs = fs_module_hash.is_some() && !fs_configs.contains_key(&pool_datum.identifier);
         if need_cs || need_cp || need_ss || need_bcl || need_fs {
             let recovered = lookup_pool_module_configs(
                 provider,
                 protocol,
                 &pool_datum.identifier,
-                need_cs,
-                need_cp,
+                PoolConfigHashes {
+                    cs: hashes.cs.filter(|_| need_cs),
+                    cp: hashes.cp.filter(|_| need_cp),
+                    ..hashes
+                },
                 ss_expected.as_deref(),
                 bcl_expected.as_deref(),
             )
@@ -2088,7 +2090,7 @@ async fn bootstrap_v4(
                         pool_id: pool_datum.identifier.to_bytes().to_vec(),
                         module_hash: fs_module_hash
                             .clone()
-                            .expect("fs_module_hash known when execution present"),
+                            .expect("fs_module_hash known when need_fs"),
                         config_cbor: cbor,
                         created_slot: utxo.slot,
                     });
@@ -2176,23 +2178,10 @@ async fn bootstrap_v4(
                 continue;
             };
             let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
-            let swap_order_hash: Vec<u8> = protocol
+            let constraint_hashes: sundaev4::ConstraintHashes = protocol
                 .execution
                 .as_ref()
-                .and_then(|e| e.module_scripts.swap_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
-                .unwrap_or_default();
-            let basic_order_hash: Vec<u8> = protocol
-                .execution
-                .as_ref()
-                .and_then(|e| e.module_scripts.basic_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
-                .unwrap_or_default();
-            let strategy_order_hash: Vec<u8> = protocol
-                .execution
-                .as_ref()
-                .and_then(|e| e.module_scripts.strategy_order.as_ref())
-                .map(|s| s.hash.as_ref().to_vec())
+                .map(|e| sundaev4::ConstraintHashes::from_scripts(&e.module_scripts))
                 .unwrap_or_default();
             match PlutusData::from_plutus_bytes(cbor)
                 .map_err(|e| format!("{e}"))
@@ -2200,13 +2189,8 @@ async fn bootstrap_v4(
                     sundaev4::OrderDatum::from_plutus(data).map_err(|e| format!("{e}"))
                 })
                 .and_then(|datum| {
-                    sundaev4::decode_order_constraint(
-                        &datum,
-                        &swap_order_hash,
-                        &basic_order_hash,
-                        &strategy_order_hash,
-                    )
-                    .map(|constraint| (datum, constraint))
+                    sundaev4::decode_order_constraint(&datum, &constraint_hashes)
+                        .map(|constraint| (datum, constraint))
                 }) {
                 Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
@@ -2382,47 +2366,7 @@ async fn bootstrap_v4(
     if let Some(ref exec) = protocol.execution {
         info!("bootstrap: fetching V4 reference script UTxOs...");
         let scripts = &exec.module_scripts;
-        let mut all_refs: Vec<&crate::sundaev4::ScriptRefInfo> = vec![
-            &scripts.fee_split,
-            &scripts.fairness,
-            &scripts.pool,
-            &scripts.order,
-            &scripts.pool_mint,
-            &scripts.settings,
-        ];
-        if let Some(ref cp) = scripts.constant_product {
-            all_refs.push(cp);
-        }
-        if let Some(ref cs) = scripts.constant_sum {
-            all_refs.push(cs);
-        }
-        if let Some(ref ss) = scripts.stableswap {
-            all_refs.push(ss);
-        }
-        if let Some(ref so) = scripts.swap_order {
-            all_refs.push(so);
-        }
-        if let Some(ref bo) = scripts.basic_order {
-            all_refs.push(bo);
-        }
-        if let Some(ref ro) = scripts.route_order {
-            all_refs.push(ro);
-        }
-        if let Some(ref fo) = scripts.fairness_order {
-            all_refs.push(fo);
-        }
-        if let Some(ref so) = scripts.strategy_order {
-            all_refs.push(so);
-        }
-        if let Some(ref fc) = scripts.fee_constraint {
-            all_refs.push(fc);
-        }
-        if let Some(ref bcl) = scripts.banded_concentrated_liquidity {
-            all_refs.push(bcl);
-        }
-        if let Some(ref o) = scripts.oracle {
-            all_refs.push(o);
-        }
+        let all_refs: Vec<&crate::sundaev4::ScriptRefInfo> = scripts.all_scripts().collect();
         for script_ref in all_refs {
             let hash_hex = hex::encode(script_ref.hash.as_ref());
             match provider.fetch_script_cbor(&hash_hex).await {
@@ -2442,7 +2386,16 @@ async fn bootstrap_v4(
                     // exactly those fields for every module reference
                     // input, and nothing else.
                     let real = match provider
-                        .fetch_tx_output(script_ref.ref_utxo.0.transaction_id.as_ref().try_into().expect("32-byte tx id"), script_ref.ref_utxo.0.index)
+                        .fetch_tx_output(
+                            script_ref
+                                .ref_utxo
+                                .0
+                                .transaction_id
+                                .as_ref()
+                                .try_into()
+                                .expect("32-byte tx id"),
+                            script_ref.ref_utxo.0.index,
+                        )
                         .await
                     {
                         Ok(Some(u)) => Some(u),
@@ -2454,18 +2407,21 @@ async fn bootstrap_v4(
                     };
                     let (address, value) = match &real {
                         Some(u) => (
-                            pallas_addresses::Address::from_bech32(&u.address)
-                                .with_context(|| format!("bootstrap: ref UTxO address {}", u.address))?,
+                            pallas_addresses::Address::from_bech32(&u.address).with_context(
+                                || format!("bootstrap: ref UTxO address {}", u.address),
+                            )?,
                             u.value.clone(),
                         ),
                         None => (
-                            pallas_addresses::Address::Shelley(pallas_addresses::ShelleyAddress::new(
-                                protocol.network.pallas(),
-                                pallas_addresses::ShelleyPaymentPart::Key(
-                                    pallas_primitives::Hash::new([0u8; 28]),
+                            pallas_addresses::Address::Shelley(
+                                pallas_addresses::ShelleyAddress::new(
+                                    protocol.network.pallas(),
+                                    pallas_addresses::ShelleyPaymentPart::Key(
+                                        pallas_primitives::Hash::new([0u8; 28]),
+                                    ),
+                                    pallas_addresses::ShelleyDelegationPart::Null,
                                 ),
-                                pallas_addresses::ShelleyDelegationPart::Null,
-                            )),
+                            ),
                             crate::cardano_types::Value::default(),
                         ),
                     };

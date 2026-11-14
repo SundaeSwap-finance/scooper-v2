@@ -156,6 +156,80 @@ mod tests {
         assert_eq!(exec.pool_allowlists.0.len(), 1);
     }
 
+    /// Every environment config parses its `module-scripts` unchanged, in the
+    /// one-object-per-role form, through config-rs.
+    #[test]
+    fn every_environment_config_parses_its_module_scripts() {
+        use crate::sundaev4::ModuleKind;
+        for (file, modules) in [
+            ("config/preview-v4.json", 9),
+            ("config/preprod-v4.json", 9),
+            ("config/mainnet-v4.json", 7),
+        ] {
+            let config = load_config([file]).expect("config loads");
+            let exec = config.protocol.v4.and_then(|v4| v4.execution).expect("v4 execution");
+            let ms = &exec.module_scripts;
+            assert_eq!(ms.modules.len(), modules, "{file}");
+            assert_eq!(ms.of_kind(ModuleKind::FeeSplit).count(), 1, "{file}");
+        }
+        // The devnet files are not full scooper configs; parse their
+        // module-scripts section alone. devnet.json names the CL module
+        // under the `concentrated-liquidity` alias.
+        for (file, modules) in [("config/devnet.json", 10), ("config/devnet2.json", 3)] {
+            let raw: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+            let section = raw["protocol"]["v4"]["execution"]["module-scripts"].clone();
+            let ms: crate::sundaev4::ModuleScripts =
+                serde_json::from_value(section).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(ms.modules.len(), modules, "{file}");
+        }
+    }
+
+    /// A role key in array form, overlaid through config-rs, registers every
+    /// hash under that role's kind.
+    #[test]
+    fn a_role_key_in_array_form_registers_two_hashes() {
+        use crate::sundaev4::ModuleKind;
+        let overlay = serde_json::json!({
+            "protocol": { "v4": { "execution": { "module-scripts": {
+                "fee-split": [
+                    {
+                        "hash": "1351c687e6359b0030086fc7ddd6cd389f55f97faba3f531c5535688",
+                        "ref-utxo": "a13a049fe23608b553eaeb61ff85f808315d94e3ff637920e11d86ec6a2dc824#0"
+                    },
+                    {
+                        "hash": "f2".repeat(28),
+                        "ref-utxo": format!("{}#1", "f2".repeat(32))
+                    }
+                ],
+                "concentrated-liquidity": {
+                    "hash": "c1".repeat(28),
+                    "ref-utxo": format!("{}#0", "c1".repeat(32))
+                }
+            } } } }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "scooper-module-scripts-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, overlay.to_string()).unwrap();
+        let config = load_config(["config/mainnet-v4.json", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        let exec = config.expect("config loads").protocol.v4.and_then(|v4| v4.execution).unwrap();
+        let ms = &exec.module_scripts;
+        assert_eq!(ms.of_kind(ModuleKind::FeeSplit).count(), 2);
+        assert_eq!(ms.kind_of(&[0xf2; 28]), Some(ModuleKind::FeeSplit));
+        assert_eq!(
+            ms.kind_of(&[0xc1; 28]),
+            Some(ModuleKind::ConcentratedLiquidity)
+        );
+        assert_eq!(
+            ms.of_kind(ModuleKind::ConstantSum).count(),
+            1,
+            "base keys are kept"
+        );
+    }
+
     /// An uppercase blacklist entry loads through config-rs and still
     /// blacklists the pool.
     #[test]
