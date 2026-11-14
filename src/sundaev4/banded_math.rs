@@ -927,12 +927,9 @@ pub fn swap_steps_from(
                 .or_else(|| find_witness(cfg, &na, &nb))
         }
         .ok_or_else(|| format!("no ladder witness for the after reserves ({na}, {nb})"))?;
-        if after.x < before.x {
-            return Err(format!(
-                "step lowers the ladder counter ({} -> {}); the module requires fee_budget >= 0",
-                before.x, after.x
-            ));
-        }
+        // No check that the counter rises: the module's budget reads the
+        // fee's value and no counter (sundae-v4 SV4-001b), so a step whose
+        // after-counter is lower is still a valid step.
         remaining = &remaining - &step_dx;
         steps.push(SwapStepPlan { dx: step_dx, dy, before, after: after.clone() });
         ca = na;
@@ -981,13 +978,21 @@ pub fn fee_for(v: &BandView, is_a_input: bool) -> &Rational {
     if is_a_input { &v.fee_sell } else { &v.fee_buy }
 }
 
+/// The band fee on a step's real input `dx`, rounded UP:
+/// `cl_check.band_fee`, `(dx * num + den - 1) / den` (sundae-v4 SV4-006).
+/// A floored fee is zero on a step below `den / num` units, so a scooper
+/// could split a trade into such steps and pay no fee. A zero rate charges
+/// nothing. `fee_r` is pinned at Create to `0 <= num < den`.
+pub fn band_fee(dx: &BigInt, fee_r: &Rational) -> BigInt {
+    &(&(&(dx * &fee_r.num) + &fee_r.den) - &BigInt::from(1)) / &fee_r.den
+}
+
 /// The output the active band pays for `dx` of the input asset, before the
 /// band's capacity is considered. `banded_cl_check.banded_swap` step 8:
 /// the CL output pair on the residuals' virtual reserves, or the CS bin's
-/// pair. Both floor in the pool's favour.
+/// pair. Both floor in the pool's favour. The fee rounds up (`band_fee`).
 pub fn band_output(v: &BandView, is_a_input: bool, dx: &BigInt) -> BigInt {
-    let fee = fee_for(v, is_a_input);
-    let fee_amt = &(dx * &fee.num) / &fee.den;
+    let fee_amt = band_fee(dx, fee_for(v, is_a_input));
     let dx_eff = dx - &fee_amt;
     if !dx_eff.is_positive() {
         return BigInt::zero();
@@ -1070,10 +1075,6 @@ pub fn max_dx_in_band(v: &BandView, is_a_input: bool) -> BigInt {
     lo
 }
 
-/// `budget_pair_form3` solved for `bp`: `bp = floor(lp_before * x_after /
-/// x_before)`, and the step's `fee_budget = bp - lp_after`. For a swap
-/// `lp_after == lp_before`, so the budget is the LP the counter's growth is
-/// worth.
 /// The state a swap of `dx` leaves behind: the reserves and the band view
 /// at the final step's after-witness. `None` when the ladder cannot absorb
 /// `dx`.
@@ -1160,8 +1161,68 @@ pub fn ladder_capacity_from(
     total
 }
 
-pub fn fee_budget(lp_before: &BigInt, x_before: &BigInt, x_after: &BigInt, lp_after: &BigInt) -> BigInt {
-    &(&(lp_before * x_after) / x_before) - lp_after
+/// `cl_check.fee_value_pair` solved for its one unknown: the LP worth of a
+/// swap step's fee, `booked = floor(lp_before * fee_value / pool_value)`
+/// (sundae-v4 SV4-001b). The module pins `bp - lp_before == booked` with
+/// `bp = lp_after + fee_budget`, so the step's gross fee budget is `booked`
+/// when the step mints no LP.
+///
+/// `st` is the ladder at the step's BEFORE witness, the one the trade
+/// priced on. `(a1, b1)` are the after reserves, `fee` is the band fee in
+/// the input asset and `fee_in_a` says the input is A (`a1 > a0`).
+///
+/// `pa / pb` is the price of A in B. On a CL arc it is the marginal price
+/// at the after residuals on the before witness's `L_k`; on a CS bin it is
+/// the bin's price. The pool value is the after reserves less the fee.
+/// The operand order is the module's, and every division floors.
+pub fn fee_value_budget(
+    st: &LadderState,
+    a1: &BigInt,
+    b1: &BigInt,
+    fee: &BigInt,
+    fee_in_a: bool,
+    lp_before: &BigInt,
+) -> BigInt {
+    let (pa, pb) = if st.band.curve.is_zero() {
+        let ra1 = a1 - &st.ca;
+        let rb1 = b1 - &st.cb;
+        let va1 = &(&ra1 * &st.hi.num) + &(&st.l_k * &st.hi.den);
+        let vb1 = &(&rb1 * &st.lo.den) + &(&st.l_k * &st.lo.num);
+        (&vb1 * &st.hi.num, &va1 * &st.lo.den)
+    } else {
+        (&st.lo.num * &st.hi.num, &st.lo.den * &st.hi.den)
+    };
+    let (pool_value, fee_value) = if fee_in_a {
+        (&(&(a1 - fee) * &pa) + &(b1 * &pb), fee * &pa)
+    } else {
+        (&(a1 * &pa) + &(&(b1 - fee) * &pb), fee * &pb)
+    };
+    &(lp_before * &fee_value) / &pool_value
+}
+
+/// The gross fee budget of one swap step from `(a0, b0)` to `(a1, b1)`
+/// priced on the before witness `before`: the band fee on the step's real
+/// input, booked at its LP worth (`fee_value_budget`). The after witness
+/// does not enter. `Err` when the step is not a swap or the witness is out
+/// of range.
+pub fn swap_fee_budget(
+    cfg: &BandedCLConfig,
+    a0: &BigInt,
+    b0: &BigInt,
+    a1: &BigInt,
+    b1: &BigInt,
+    before: &Witness,
+    lp_before: &BigInt,
+) -> Result<BigInt, String> {
+    let fee_in_a = a1 > a0;
+    if !((fee_in_a && b1 < b0) || (a1 < a0 && b1 > b0)) {
+        return Err(format!("step ({a0}, {b0}) -> ({a1}, {b1}) is not a swap"));
+    }
+    let st = ladder_at(cfg, &before.x, before.k)?;
+    let dx = if fee_in_a { a1 - a0 } else { b1 - b0 };
+    let fee_r = if fee_in_a { &st.band.fee_sell } else { &st.band.fee_buy };
+    let fee = band_fee(&dx, fee_r);
+    Ok(fee_value_budget(&st, a1, b1, &fee, fee_in_a, lp_before))
 }
 
 /// One in-band swap, fully resolved: the output, the after reserves, the
@@ -1213,13 +1274,7 @@ pub fn swap_step(
     let after = find_witness(cfg, &a_after, &b_after).ok_or_else(|| {
         format!("no ladder witness for the after reserves ({a_after}, {b_after})")
     })?;
-    let fb = fee_budget(lp, &before.x, &after.x, lp);
-    if fb.is_negative() {
-        return Err(format!(
-            "swap lowers the ladder counter ({} -> {}); the module requires fee_budget >= 0",
-            before.x, after.x
-        ));
-    }
+    let fb = swap_fee_budget(cfg, a, b, &a_after, &b_after, &before, lp)?;
     Ok(BandedSwapResult {
         dy,
         a_after,
@@ -1632,8 +1687,8 @@ mod tests {
 
     /// A B-input swap larger than band 0 can pay splits into steps: the
     /// first drains band 0's A, the next continues in band 1. Every step's
-    /// before-witness is the previous step's after-witness, and the counter
-    /// never falls, which is what the module's walk checks.
+    /// before-witness is the previous step's after-witness, which is what
+    /// the module's walk checks.
     #[test]
     fn a_swap_past_the_band_edge_plans_two_steps() {
         let cfg = eq8();
@@ -1651,9 +1706,6 @@ mod tests {
         assert_eq!(steps[1].before.k, 1);
         assert_eq!(steps[1].dx, BigInt::from(50_000));
         assert!(steps[1].dy.is_positive());
-        for st in &steps {
-            assert!(st.after.x >= st.before.x, "counter falls in {st:?}");
-        }
         let total_dx: BigInt = steps.iter().fold(BigInt::zero(), |acc, s| &acc + &s.dx);
         assert_eq!(total_dx, dx);
         // Each step passes the module's own checks on its before state.

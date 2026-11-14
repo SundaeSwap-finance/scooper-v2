@@ -203,14 +203,14 @@ fn walk_banded_swap(
     let mut total_dy = BigInt::from(0);
     let mut last: Option<(BigInt, banded_math::Witness)> = None;
     for (i, step) in steps.iter().enumerate() {
-        let gross_fb = banded_math::fee_budget(
-            st.running_total_lp,
-            &step.before.x,
-            &step.after.x,
-            st.running_total_lp,
-        );
+        let (a0, b0) = (st.running_assets[0].1.clone(), st.running_assets[1].1.clone());
+        let (a1, b1) = if is_a_input { (&a0 + &step.dx, &b0 - &step.dy) } else { (&a0 - &step.dy, &b0 + &step.dx) };
+        // The fee's LP worth at the before witness (sundae-v4 SV4-001b). The
+        // module pins `lp_after + fee_budget - lp_before` to it exactly.
+        let gross_fb = banded_math::swap_fee_budget(config, &a0, &b0, &a1, &b1, &step.before, st.running_total_lp)
+            .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
         if gross_fb.is_negative() {
-            bail!("banded step lowers the ladder counter (fee_budget={gross_fb})");
+            bail!("banded step books a negative fee budget ({gross_fb})");
         }
         if is_a_input {
             st.running_assets[0].1 = &st.running_assets[0].1 + &step.dx;
