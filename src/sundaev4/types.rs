@@ -1171,9 +1171,12 @@ impl OracleSlot {
         &m - &BigInt::from(1)
     }
 
-    /// `oracle_check.spend_price`: a spend's volume-weighted price, scaled.
+    /// `oracle_check.spend_price`: a spend's volume-weighted price, scaled,
+    /// and saturated at `price_max` so that it always fits its 16 bytes.
     pub fn spend_price(volume_a: &BigInt, volume_b: &BigInt) -> BigInt {
-        &(volume_b * &Self::price_scale()) / volume_a
+        let p = &(volume_b * &Self::price_scale()) / volume_a;
+        let max = Self::price_max();
+        if p > max { max } else { p }
     }
 
     /// `oracle_check.unstarted`: every field zero.
@@ -1193,32 +1196,41 @@ impl OracleSlot {
         self.creation_time == BigInt::from(0)
     }
 
-    /// The bytes a spend writes to the slot (`oracle_check.encode_slot`).
+    /// The bytes a spend writes to the slot (`oracle_check.encode_slot`):
+    /// the `0x80` sentinel while no price has existed, the 128-byte state
+    /// after.
     pub fn encode_slot(&self) -> Result<Vec<u8>, String> {
-        self.encode()
+        if self.is_unstarted() { Ok(Self::FRESH.to_vec()) } else { self.encode() }
     }
 
-    /// `oracle_check.initialise`.
+    /// `oracle_check.initialise`. A spend with no swap has no price and
+    /// returns the unstarted state, which `encode_slot` writes as the
+    /// sentinel. The volumes are stored modulo 2^256; the price reads them
+    /// unreduced.
     pub fn initialise(now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Self {
         use num_traits::Signed;
-        let last_price = if volume_a.is_positive() {
-            Self::spend_price(volume_a, volume_b)
-        } else {
-            BigInt::from(0)
-        };
+        if !volume_a.is_positive() {
+            return Self::unstarted();
+        }
+        let m = Self::acc_modulus();
         Self {
             creation_time: now.clone(),
             last_time: now.clone(),
-            last_price,
-            volume_a: volume_a.clone(),
-            volume_b: volume_b.clone(),
+            last_price: Self::spend_price(volume_a, volume_b),
+            volume_a: volume_a % &m,
+            volume_b: volume_b % &m,
             twap_num: BigInt::from(0),
         }
     }
 
-    /// `oracle_check.advance`; `now` must not precede `last_time`.
+    /// `oracle_check.advance`; `now` must not precede `last_time`. An
+    /// unstarted state starts the clock (`initialise`). The accumulators
+    /// count modulo 2^256.
     pub fn advance(&self, now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Result<Self, String> {
         use num_traits::Signed;
+        if self.is_unstarted() {
+            return Ok(Self::initialise(now, volume_a, volume_b));
+        }
         let dt = now - &self.last_time;
         if dt.is_negative() {
             return Err(format!(
@@ -1235,9 +1247,9 @@ impl OracleSlot {
             creation_time: self.creation_time.clone(),
             last_time: now.clone(),
             last_price,
-            volume_a: &self.volume_a + volume_a,
-            volume_b: &self.volume_b + volume_b,
-            twap_num: &self.twap_num + &(&dt * &self.last_price),
+            volume_a: &(&self.volume_a + volume_a) % &Self::acc_modulus(),
+            volume_b: &(&self.volume_b + volume_b) % &Self::acc_modulus(),
+            twap_num: &(&self.twap_num + &(&dt * &self.last_price)) % &Self::acc_modulus(),
         })
     }
 
@@ -1246,20 +1258,41 @@ impl OracleSlot {
     /// |db|; a non-swap step adds nothing. `lp_in` and `lp_out` are the
     /// total_lp of the pool input and output datums. Each transcript state
     /// is `(a, b, total_lp)`.
+    ///
+    /// A swap step whose own total_lp `c` lies outside `[lo, hi]`, the min
+    /// and max of `lp_in` and `lp_out`, counts at the nearer end: `da * hi
+    /// / c` and `db * hi / c` when `c > hi`, `da * lo / c` and `db * lo / c`
+    /// when `c < lo`, each floored (sundae-v4 SV4-008, SV4-009). `Err` for a
+    /// swap step below `lo` at `c <= 0`, which the module rejects.
     pub fn spend_volumes(
         reserves_before: (&BigInt, &BigInt),
-        _lp_in: &BigInt,
-        _lp_out: &BigInt,
+        lp_in: &BigInt,
+        lp_out: &BigInt,
         transcript_states: impl Iterator<Item = (BigInt, BigInt, BigInt)>,
     ) -> Result<(BigInt, BigInt), String> {
+        use num_traits::Signed;
+        let (lo, hi) = if lp_in < lp_out { (lp_in, lp_out) } else { (lp_out, lp_in) };
         let (mut a0, mut b0) = (reserves_before.0.clone(), reserves_before.1.clone());
         let mut va = BigInt::from(0);
         let mut vb = BigInt::from(0);
-        for (a1, b1, _lp1) in transcript_states {
+        for (a1, b1, lp1) in transcript_states {
             let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
             if is_swap {
-                va = &va + &(if a1 > a0 { &a1 - &a0 } else { &a0 - &a1 });
-                vb = &vb + &(if b1 > b0 { &b1 - &b0 } else { &b0 - &b1 });
+                let da = if a1 > a0 { &a1 - &a0 } else { &a0 - &a1 };
+                let db = if b1 > b0 { &b1 - &b0 } else { &b0 - &b1 };
+                if &lp1 > hi {
+                    va = &va + &(&(&da * hi) / &lp1);
+                    vb = &vb + &(&(&db * hi) / &lp1);
+                } else if &lp1 < lo {
+                    if !lp1.is_positive() {
+                        return Err(format!("oracle: a swap step has total_lp {lp1}"));
+                    }
+                    va = &va + &(&(&da * lo) / &lp1);
+                    vb = &vb + &(&(&db * lo) / &lp1);
+                } else {
+                    va = &va + &da;
+                    vb = &vb + &db;
+                }
             }
             a0 = a1;
             b0 = b1;
