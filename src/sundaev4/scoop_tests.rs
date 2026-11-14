@@ -1577,10 +1577,11 @@ mod tests {
         let after1 = result.predicted_pools[0].2.clone();
         let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
         assert_eq!(s1.volume_b, BigInt::from(624));
-        assert_eq!(s1.volume_a, BigInt::from(616));
+        // The band fee rounds up to 2 (sundae-v4 SV4-006), so 624 B pays 615 A.
+        assert_eq!(s1.volume_a, BigInt::from(615));
         assert_eq!(s1.creation_time, s1.last_time);
         assert_eq!(s1.twap_num, BigInt::from(0));
-        assert_eq!(s1.last_price, &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(616));
+        assert_eq!(s1.last_price, &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(615));
 
         // Second scoop, later: advance.
         let pool2 = std::sync::Arc::new(after1);
@@ -1651,8 +1652,9 @@ mod tests {
     /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
     /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_813 in
-    /// band 0; 624 B in pays 616 A out, the counter moves to 999_999_938 and
-    /// the step's fee budget is 125 LP.
+    /// band 0; 624 B in pays 615 A out (the fee rounds up to 2), the counter
+    /// moves to 1_000_000_062 and the step's fee budget is 213 LP, the fee's
+    /// LP worth (sundae-v4 SV4-006, SV4-001b).
     #[test]
     fn bcl_single_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
@@ -1674,7 +1676,7 @@ mod tests {
         )
         .expect("banded batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 1);
-        assert_eq!(batch.swaps[0].dy, BigInt::from(616));
+        assert_eq!(batch.swaps[0].dy, BigInt::from(615));
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -1706,7 +1708,7 @@ mod tests {
             .remove(0);
         let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(step.operation_data)
             .expect("banded entry carries a list");
-        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(999_999_938i64));
+        assert_eq!(BigInt::from_plutus(pair[0].clone()).unwrap(), BigInt::from(1_000_000_062i64));
         assert_eq!(BigInt::from_plutus(pair[1].clone()).unwrap(), BigInt::from(0));
         // The module entry names the INPUT witness.
         let entry = result
@@ -1727,9 +1729,9 @@ mod tests {
         assert_eq!(entry.active_band, BigInt::from(0));
         assert_eq!(entry.config, cfg);
         let after = &result.predicted_pools[0].2;
-        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_752i64));
+        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_753i64));
         assert_eq!(after.pool_datum.assets[1].1, BigInt::from(625_623i64));
-        // fee_budget 125 at the default protocol share grows total_lp, not
+        // fee_budget 213 at the default protocol share grows total_lp, not
         // circulating_lp.
         assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
         assert_eq!(after.pool_datum.circulating_lp, pool.pool_datum.circulating_lp);
