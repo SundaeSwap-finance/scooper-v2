@@ -1553,8 +1553,10 @@ mod tests {
     /// output, after-witness and fee budget, or the module rejects the step.
     #[test]
     fn bench_table_matches_the_aiken_vectors() {
+        /// `(A, B, X, k, A', B', X', booked)`.
+        type Row = (i64, i64, i64, usize, i64, i64, i64, i64);
         #[rustfmt::skip]
-        let rows: [(i64, i64, i64, usize, i64, i64, i64, i64); 32] = [
+        let rows: [Row; 32] = [
             (4925865, 4999999, 999999826, 0, 4920931, 5004998, 1000001381, 1503),
             (2414759, 7500000, 999999999, 1, 2407502, 7507500, 1000002313, 2302),
             (4782629, 5000000, 999999899, 1, 4777791, 5005000, 1000001399, 1510),
