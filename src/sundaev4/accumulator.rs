@@ -191,9 +191,18 @@ pub fn accrue_banded_swap(
     let steps = banded_math::swap_steps(cfg, &assets[0].1, &assets[1].1, is_a_input, dx)?;
     let mut total_dy = BigInt::from(0);
     for st in &steps {
-        let fb = banded_math::fee_budget(total_lp, &st.before.x, &st.after.x, total_lp);
+        let (a0, b0) = (assets[0].1.clone(), assets[1].1.clone());
+        let (a1, b1) = if is_a_input { (&a0 + &st.dx, &b0 - &st.dy) } else { (&a0 - &st.dy, &b0 + &st.dx) };
+        // The same number `tx_builder::walk_banded_swap` declares: the fee's
+        // LP worth from revision 2 (sundae-v4 SV4-001b), the counter ratio
+        // in revision 1.
+        let fb = banded_math::step_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, &st.after, total_lp)?;
         if fb.is_negative() {
-            return Err(format!("banded step lowers the ladder counter (fee_budget={fb})"));
+            return Err(if cfg.rules.fee_budget_is_fee_value {
+                format!("banded step books a negative fee budget ({fb})")
+            } else {
+                format!("banded step lowers the ladder counter (fee_budget={fb})")
+            });
         }
         if is_a_input {
             assets[0].1 = &assets[0].1 + &st.dx;

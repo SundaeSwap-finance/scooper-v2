@@ -148,16 +148,37 @@ fn ss_swap_op_data(
 /// A state with no witness cannot be the after state of a valid step, so
 /// the tx is refused rather than built.
 /// The banded entry's operation_data for a known after-witness: `[X, k]`
-/// plus the attribution.
+/// plus the attribution. From revision 2 (`ClRules::tagged_steps`) the list
+/// is exactly three items, so a step that serves no order writes `Void` in
+/// the third.
 fn banded_op_data_for(
+    rules: &crate::sundaev4::types::ClRules,
     w: &crate::sundaev4::banded_math::Witness,
     attribution: Option<pallas_primitives::PlutusData>,
 ) -> pallas_primitives::PlutusData {
-    let mut items = vec![w.x.clone().to_plutus(), BigInt::from(w.k as u64).to_plutus()];
-    if let Some(a) = attribution {
-        items.push(a);
+    let mut items = vec![
+        w.x.clone().to_plutus(),
+        BigInt::from(w.k as u64).to_plutus(),
+    ];
+    match attribution {
+        Some(a) => items.push(a),
+        None if rules.tagged_steps => {
+            items.push(crate::sundaev4::types::BandedCLConfig::void_data())
+        }
+        None => {}
     }
     pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items))
+}
+
+/// The `operation_tag` of a CL entry. From revision 2 the module requires 3
+/// on a swap step and 6 or 4 on a non-swap step (`cl_check.step_tag_ok`).
+/// Revision 1 reads no tag, and the scooper writes the sentinel 100 there.
+fn cl_operation_tag(rules: &crate::sundaev4::types::ClRules, tag: u64) -> BigInt {
+    if rules.tagged_steps {
+        BigInt::from(tag)
+    } else {
+        BigInt::from(100)
+    }
 }
 
 /// Per-pool running state the streaming walk threads through every op.
@@ -203,13 +224,33 @@ fn walk_banded_swap(
     let mut total_dy = BigInt::from(0);
     let mut last: Option<(BigInt, banded_math::Witness)> = None;
     for (i, step) in steps.iter().enumerate() {
-        let gross_fb = banded_math::fee_budget(
-            st.running_total_lp,
-            &step.before.x,
-            &step.after.x,
-            st.running_total_lp,
+        let (a0, b0) = (
+            st.running_assets[0].1.clone(),
+            st.running_assets[1].1.clone(),
         );
+        let (a1, b1) = if is_a_input {
+            (&a0 + &step.dx, &b0 - &step.dy)
+        } else {
+            (&a0 - &step.dy, &b0 + &step.dx)
+        };
+        // From revision 2, the fee's LP worth at the before witness
+        // (sundae-v4 SV4-001b); the module pins `lp_after + fee_budget -
+        // lp_before` to it exactly. In revision 1, the counter ratio.
+        let gross_fb = banded_math::step_fee_budget(
+            config,
+            &a0,
+            &b0,
+            &a1,
+            &b1,
+            &step.before,
+            &step.after,
+            st.running_total_lp,
+        )
+        .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
         if gross_fb.is_negative() {
+            if config.rules.fee_budget_is_fee_value {
+                bail!("banded step books a negative fee budget ({gross_fb})");
+            }
             bail!("banded step lowers the ladder counter (fee_budget={gross_fb})");
         }
         if is_a_input {
@@ -251,7 +292,11 @@ fn walk_banded_swap(
             },
             fee_budget: submitted_fee_budget,
             operation_tag: swap_tag.clone(),
-            operation_data: banded_op_data_for(&step.after, Some(attribution.clone())),
+            operation_data: banded_op_data_for(
+                &config.rules,
+                &step.after,
+                Some(attribution.clone()),
+            ),
         });
     }
     let (gross_fb, after) = last.expect("swap_steps returns at least one step");
@@ -274,11 +319,7 @@ fn banded_op_data(
                 after[1].1
             )
         })?;
-    let mut items = vec![w.x.to_plutus(), BigInt::from(w.k as u64).to_plutus()];
-    if let Some(a) = attribution {
-        items.push(a);
-    }
-    Ok(pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items)))
+    Ok(banded_op_data_for(&config.rules, &w, attribution))
 }
 
 /// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
@@ -750,7 +791,8 @@ pub fn build_multi_pool_scoop_tx(
         .collect();
 
     // Per-pool operation_tag for swap entries. CS dispatches on tag==3
-    // (`tag_swap` in cs_check.ak); CP and banded infer from asset deltas.
+    // (`tag_swap` in cs_check.ak); CP infers from asset deltas, and so does
+    // CL revision 1. CL from revision 2 requires the tag to agree.
     let per_pool_swap_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -758,12 +800,15 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_SWAP)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
+            PoolType::BandedConcentratedLiquidity { config } => {
+                cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_SWAP)
+            }
         })
         .collect();
 
     // Per-pool operation_tag for deposit entries. CS dispatches on tag==6
-    // (`tag_deposit` in cs_check.ak); CP and banded infer from asset deltas.
+    // (`tag_deposit` in cs_check.ak); CP infers from asset deltas, and so
+    // does CL revision 1.
     let per_pool_deposit_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -771,7 +816,9 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
+            PoolType::BandedConcentratedLiquidity { config } => {
+                cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_DEPOSIT)
+            }
         })
         .collect();
 
@@ -1252,8 +1299,9 @@ pub fn build_multi_pool_scoop_tx(
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
                 *running_preminted = &*running_preminted + &w.lp_burned;
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
-                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP and banded infer
-                // from asset deltas, so any sentinel tag works.
+                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP and CL
+                // revision 1 infer from asset deltas, so any sentinel tag
+                // works. CL from revision 2 requires tag 4 or 6.
                 tracing::debug!(
                     order = %w.order.input,
                     lp_burned = %w.lp_burned,
@@ -1263,7 +1311,9 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
-                            PoolType::BandedConcentratedLiquidity { .. } => BigInt::from(100),
+                    PoolType::BandedConcentratedLiquidity { config } => {
+                        cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_WITHDRAW)
+                    }
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
@@ -1360,8 +1410,14 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             };
             op_data_override = Some(match &banded_after {
-                Some(w) => banded_op_data_for(w, served_order.map(order_ref_to_plutus)),
-                None => banded_op_data(config, running_assets, served_order.map(order_ref_to_plutus))?,
+                Some(w) => {
+                    banded_op_data_for(&config.rules, w, served_order.map(order_ref_to_plutus))
+                }
+                None => banded_op_data(
+                    config,
+                    running_assets,
+                    served_order.map(order_ref_to_plutus),
+                )?,
             });
         }
 
@@ -1459,25 +1515,50 @@ pub fn build_multi_pool_scoop_tx(
         // transcript and the validity lower bound; the output datum must
         // carry exactly that value.
         let mut module_state = pool.pool_datum.module_state.clone();
-        if pool_needs_oracle(exec, pool) {
-            let oracle_hash = exec.module_scripts.oracle.as_ref().map(|o| o.hash.as_ref().to_vec()).unwrap_or_default();
-            let Some(slot) = module_state.iter_mut().find(|(h, _)| *h == oracle_hash) else {
+        if let Some(oracle_hash) = pool_oracle_hash(exec, pool) {
+            let Some(slot) =
+                module_state.iter_mut().find(|(h, _)| h.as_slice() == oracle_hash.as_ref())
+            else {
                 bail!(
                     "pool {}: lists the oracle module but has no oracle slot in module_state",
                     pool.pool_datum.identifier
                 );
             };
             if pool.pool_datum.assets.len() != 2 {
-                bail!("pool {}: the oracle needs a two-asset pool", pool.pool_datum.identifier);
+                bail!(
+                    "pool {}: the oracle needs a two-asset pool",
+                    pool.pool_datum.identifier
+                );
             }
             let now_ms = BigInt::from(exec.slot_config.slot_to_posix_ms(validity.start));
-            let states = per_pool_transcripts[i]
-                .iter()
-                .map(|e| (e.state_after.assets[0].1.clone(), e.state_after.assets[1].1.clone()));
-            let next = crate::sundaev4::types::OracleSlot::after_scoop(
+            let states = per_pool_transcripts[i].iter().map(|e| {
+                (
+                    e.state_after.assets[0].1.clone(),
+                    e.state_after.assets[1].1.clone(),
+                    e.state_after.total_lp.clone(),
+                )
+            });
+            // The rules of the oracle hash this pool names.
+            let rules = exec
+                .module_scripts
+                .revision_of(oracle_hash.as_ref())
+                .and_then(crate::sundaev4::types::OracleRules::of)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pool {}: oracle module {} has no implemented revision",
+                        pool.pool_datum.identifier,
+                        hex::encode(oracle_hash)
+                    )
+                })?;
+            // The module reads total_lp from the pool input datum and from
+            // the pool output datum, which carries `final_total_lp`.
+            let next = crate::sundaev4::types::OracleSlot::after_scoop_with(
+                &rules,
                 &slot.1,
                 &now_ms,
                 (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1),
+                &pool.pool_datum.total_lp,
+                &final_total_lp,
                 states,
             )
             .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
@@ -1489,7 +1570,9 @@ pub fn build_multi_pool_scoop_tx(
                 last_price = %next.last_price,
                 "oracle slot after scoop",
             );
-            slot.1 = next.encode().map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
+            slot.1 = next
+                .encode_for(&rules)
+                .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
         }
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
@@ -1716,13 +1799,13 @@ pub fn build_multi_pool_scoop_tx(
         )
     };
 
-    let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
-    let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
-    let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
-    let mut bcl_entries: Vec<crate::sundaev4::types::BandedOperateEntry> = Vec::new();
-    let mut oracle_entries: Vec<crate::sundaev4::types::OracleEntry> = Vec::new();
-    let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
-    let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
+    // Pool-module withdrawals are grouped per module HASH, not per role.
+    // Each distinct hash that a pool in the batch names gets one reference
+    // input, one withdrawal and one Operate redeemer. The redeemer's entries
+    // are exactly the pools that name that hash, in batch order. Two pools
+    // on two fee_split versions therefore need two fee_split withdrawals.
+    let mut module_groups: BTreeMap<pallas_addresses::ScriptHash, PoolModuleEntries> =
+        BTreeMap::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let pool_oref = &pool_orefs[batch_idx];
@@ -1738,18 +1821,16 @@ pub fn build_multi_pool_scoop_tx(
         // so "first enabled" is brittle for any pool that ever registers
         // multiple actions. Audit feedback should move the catalogue into a
         // settings UTxO referenced from the datum.
-        let action_tag = batch
-            .pool
-            .pool_datum
-            .actions
-            .iter()
-            .find(|a| a.enabled)
-            .map(|a| a.tag.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("pool {} has no enabled action entry", batch.pool_ident)
-            })?;
+        //
+        // The scoop action is the first enabled action that lists a
+        // configured invariant module first. Its module list names the exact
+        // module hashes the pool validator requires to withdraw.
+        let pool_modules = exec
+            .module_scripts
+            .pool_modules(&batch.pool.pool_datum)
+            .map_err(|e| anyhow::anyhow!("pool {}: {e}", batch.pool_ident))?;
         let pool_redeemer = PoolRedeemer::Action {
-            tag: action_tag,
+            tag: pool_modules.action_tag.clone(),
             transcript: per_pool[batch_idx].transcript.clone(),
             pool_input_index: BigInt::from(pool_sorted_idx as u64),
             pool_output_index: BigInt::from(pool_output_idx as u64),
@@ -1770,22 +1851,49 @@ pub fn build_multi_pool_scoop_tx(
             output_index: pool_oref.index,
         };
 
-        // A pool whose enabled action lists the oracle module needs an
-        // oracle Operate entry; the output datum's accumulator slot is
-        // rewritten in the per-pool datum assembly above.
-        if pool_needs_oracle(exec, &batch.pool) {
-            oracle_entries.push(crate::sundaev4::types::OracleEntry {
-                pool_oref: pool_oref_plutus.clone(),
-            });
+        let (invariant_kind, invariant_hash) = pool_modules.invariant();
+        let invariant_hash = *invariant_hash;
+        let kind_of_type = match &batch.pool.pool_type {
+            PoolType::ConstantProduct { .. } => ModuleKind::ConstantProduct,
+            PoolType::ConstantSum { .. } => ModuleKind::ConstantSum,
+            PoolType::StableSwap { .. } => ModuleKind::Stableswap,
+            PoolType::BandedConcentratedLiquidity { .. } => ModuleKind::ConcentratedLiquidity,
+        };
+        if kind_of_type != invariant_kind {
+            bail!(
+                "pool {}: pool type is {kind_of_type} but its scoop action lists a {invariant_kind} module",
+                batch.pool_ident
+            );
+        }
+        let mut push_entry = |hash: pallas_addresses::ScriptHash, entry: PoolModuleEntry| {
+            module_groups
+                .entry(hash)
+                .or_insert_with(|| PoolModuleEntries::empty(entry.kind()))
+                .push(entry)
+        };
+
+        // A pool whose scoop action lists the oracle module needs an oracle
+        // Operate entry; the output datum's accumulator slot is rewritten in
+        // the per-pool datum assembly above.
+        if let Some(oracle_hash) = pool_modules.oracle() {
+            push_entry(
+                *oracle_hash,
+                PoolModuleEntry::Oracle(crate::sundaev4::types::OracleEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                }),
+            )?;
         }
 
         match &batch.pool.pool_type {
             PoolType::ConstantProduct { fee } => {
                 let config = ConstantProductConfig { fee: fee.clone() };
-                cp_entries.push(CPOperateEntry {
-                    pool_oref: pool_oref_plutus.clone(),
-                    config,
-                });
+                push_entry(
+                    invariant_hash,
+                    PoolModuleEntry::Cp(CPOperateEntry {
+                        pool_oref: pool_oref_plutus.clone(),
+                        config,
+                    }),
+                )?;
             }
             PoolType::ConstantSum {
                 prices,
@@ -1799,8 +1907,8 @@ pub fn build_multi_pool_scoop_tx(
                     bounty_k: bounty_k.clone(),
                     balance_fee: balance_fee.clone(),
                 };
-                if let Some(cs_script) = exec.module_scripts.constant_sum.as_ref() {
-                    let cs_cred = cs_script.hash.as_ref();
+                {
+                    let cs_cred = invariant_hash.as_ref();
                     let stored = batch
                         .pool
                         .pool_datum
@@ -1819,10 +1927,13 @@ pub fn build_multi_pool_scoop_tx(
                         "constant_sum hash diagnostic",
                     );
                 }
-                cs_entries.push(CSOperateEntry {
-                    pool_oref: pool_oref_plutus.clone(),
-                    config: cs_cfg,
-                });
+                push_entry(
+                    invariant_hash,
+                    PoolModuleEntry::Cs(CSOperateEntry {
+                        pool_oref: pool_oref_plutus.clone(),
+                        config: cs_cfg,
+                    }),
+                )?;
             }
             PoolType::StableSwap { config } => {
                 // The entry re-sends the config preimage and D for the pool
@@ -1830,13 +1941,7 @@ pub fn build_multi_pool_scoop_tx(
                 // datum's module_state slot, so a stale preimage (a rate
                 // update this scooper has not indexed) can only fail on chain
                 // — refuse to build instead.
-                let ss_script = exec.module_scripts.stableswap.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "pool {} is stableswap but no stableswap module script is configured",
-                        batch.pool.pool_datum.identifier
-                    )
-                })?;
-                let ss_cred = ss_script.hash.as_ref();
+                let ss_cred = invariant_hash.as_ref();
                 let stored = batch
                     .pool
                     .pool_datum
@@ -1867,11 +1972,14 @@ pub fn build_multi_pool_scoop_tx(
                     sum_invariant = %sum_invariant,
                     "stableswap redeemer sum_invariant",
                 );
-                ss_entries.push(crate::sundaev4::types::SSOperateEntry {
-                    pool_oref: pool_oref_plutus.clone(),
-                    config: config.clone(),
-                    sum_invariant,
-                });
+                push_entry(
+                    invariant_hash,
+                    PoolModuleEntry::Ss(crate::sundaev4::types::SSOperateEntry {
+                        pool_oref: pool_oref_plutus.clone(),
+                        config: config.clone(),
+                        sum_invariant,
+                    }),
+                )?;
             }
             PoolType::BandedConcentratedLiquidity { config } => {
                 // The entry re-sends the ladder and the witness pair for the
@@ -1879,15 +1987,7 @@ pub fn build_multi_pool_scoop_tx(
                 // against both datums' module_state and re-derives the pair
                 // in the walk's first step, so refuse to build on a stale or
                 // unknown config rather than fail on chain.
-                let bcl_script =
-                    exec.module_scripts.banded_concentrated_liquidity.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pool {} is banded but no banded_concentrated_liquidity module \
-                             script is configured",
-                            batch.pool.pool_datum.identifier
-                        )
-                    })?;
-                let bcl_cred = bcl_script.hash.as_ref();
+                let bcl_cred = invariant_hash.as_ref();
                 let stored = batch
                     .pool
                     .pool_datum
@@ -1895,6 +1995,20 @@ pub fn build_multi_pool_scoop_tx(
                     .iter()
                     .find(|(cred, _)| cred.as_slice() == bcl_cred)
                     .map(|(_, h)| h.clone());
+                // The rules the config carries must be the rules of the hash
+                // the pool names, or the arithmetic above mirrored the wrong
+                // module.
+                let revision = exec.module_scripts.revision_of(bcl_cred);
+                if revision != Some(config.rules.revision) {
+                    bail!(
+                        "pool {}: banded config carries CL revision {} but the pool's module {} \
+                         is revision {}",
+                        batch.pool.pool_datum.identifier,
+                        config.rules.revision,
+                        hex::encode(bcl_cred),
+                        revision.map(|r| r.to_string()).unwrap_or_else(|| "unknown".into()),
+                    );
+                }
                 let expected = crate::sundaev4::banded_math::config_hash(config);
                 if stored.as_deref() != Some(expected.as_slice()) {
                     bail!(
@@ -1912,27 +2026,31 @@ pub fn build_multi_pool_scoop_tx(
                         batch.pool.pool_datum.identifier
                     );
                 }
-                let w = crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pool {}: no ladder witness for reserves ({}, {})",
-                            batch.pool.pool_datum.identifier,
-                            assets[0].1,
-                            assets[1].1
-                        )
-                    })?;
+                let w =
+                    crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pool {}: no ladder witness for reserves ({}, {})",
+                                batch.pool.pool_datum.identifier,
+                                assets[0].1,
+                                assets[1].1
+                            )
+                        })?;
                 tracing::debug!(
                     pool = %batch.pool.pool_datum.identifier,
                     counter = %w.x,
                     active_band = w.k,
                     "banded redeemer witness",
                 );
-                bcl_entries.push(crate::sundaev4::types::BandedOperateEntry {
-                    pool_oref: pool_oref_plutus.clone(),
-                    config: config.clone(),
-                    counter: w.x,
-                    active_band: BigInt::from(w.k as u64),
-                });
+                push_entry(
+                    invariant_hash,
+                    PoolModuleEntry::Cl(crate::sundaev4::types::BandedOperateEntry {
+                        pool_oref: pool_oref_plutus.clone(),
+                        config: config.clone(),
+                        counter: w.x,
+                        active_band: BigInt::from(w.k as u64),
+                    }),
+                )?;
             }
         }
 
@@ -1941,37 +2059,43 @@ pub fn build_multi_pool_scoop_tx(
         // from the scooper config, which only matches pools created with the
         // same default — non-default pools will fail validation if we hit
         // this branch.
-        let fs_config = match &batch.pool.fee_split_config {
-            Some(cfg) => cfg.clone(),
-            None => {
-                tracing::warn!(
-                    pool = %batch.pool.pool_datum.identifier,
-                    "no per-pool fee_split config; falling back to scooper-config default — \
-                     scoop will fail if the pool was created with a non-default protocol_share",
-                );
-                FeeSplitConfig {
-                    protocol_share: Rational {
-                        num: BigInt::from(exec.protocol_share.0),
-                        den: BigInt::from(exec.protocol_share.1),
-                    },
+        if let Some(fs_hash) = pool_modules.fee_split() {
+            let fs_config = match &batch.pool.fee_split_config {
+                Some(cfg) => cfg.clone(),
+                None => {
+                    tracing::warn!(
+                        pool = %batch.pool.pool_datum.identifier,
+                        "no per-pool fee_split config; falling back to scooper-config default — \
+                         scoop will fail if the pool was created with a non-default protocol_share",
+                    );
+                    FeeSplitConfig {
+                        protocol_share: Rational {
+                            num: BigInt::from(exec.protocol_share.0),
+                            den: BigInt::from(exec.protocol_share.1),
+                        },
+                    }
                 }
-            }
-        };
+            };
+            push_entry(
+                *fs_hash,
+                PoolModuleEntry::FeeSplit(FSOperateEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                    config: fs_config,
+                }),
+            )?;
+        }
 
-        fs_entries.push(FSOperateEntry {
-            pool_oref: pool_oref_plutus,
-            config: fs_config,
-        });
-
-        fairness_entries.push(FairnessOperateEntry {
-            pool_oref: OutputRef {
-                transaction_id: pool_oref.transaction_id.to_vec(),
-                output_index: pool_oref.index,
-            },
-            scooper_idx: BigInt::from(
-                settings.datum.scooper_index(scooper_keyhash.as_ref()).unwrap_or(0),
-            ),
-        });
+        if let Some(fairness_hash) = pool_modules.fairness() {
+            push_entry(
+                *fairness_hash,
+                PoolModuleEntry::Fairness(FairnessOperateEntry {
+                    pool_oref: pool_oref_plutus,
+                    scooper_idx: BigInt::from(
+                        settings.datum.scooper_index(scooper_keyhash.as_ref()).unwrap_or(0),
+                    ),
+                }),
+            )?;
+        }
     }
 
     // ── Step 4: Build order redeemers (N spend redeemers) ──────────────────
@@ -2090,12 +2214,6 @@ pub fn build_multi_pool_scoop_tx(
         entries: order_validator_entries,
     };
 
-    let has_cp = !cp_entries.is_empty();
-    let has_cs = !cs_entries.is_empty();
-    let has_ss = !ss_entries.is_empty();
-    let has_bcl = !bcl_entries.is_empty();
-    let has_oracle = !oracle_entries.is_empty();
-
     // pool_mint is only needed when the preminted reserve couldn't cover a
     // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
     // pure-swap batches grow the protocol_lp gap inside the datum — pool_lib's
@@ -2108,38 +2226,22 @@ pub fn build_multi_pool_scoop_tx(
         per_pool_lp_minted.iter().any(|m| !m.clone().unwrap().is_zero())
     };
 
-    let fs_redeemer = FeeSplitRedeemer::Operate {
-        entries: fs_entries,
-    };
-    let fairness_redeemer = FairnessRedeemer::Operate {
-        entries: fairness_entries,
-    };
-
     // ── Step 6: Reference inputs ───────────────────────────────────────────
 
     let mut all_ref_inputs: Vec<TransactionInput> = vec![
         exec.module_scripts.pool.ref_utxo.0.clone(),
         exec.module_scripts.order.ref_utxo.0.clone(),
-        exec.module_scripts.fee_split.ref_utxo.0.clone(),
-        exec.module_scripts.fairness.ref_utxo.0.clone(),
     ];
     if has_lp_mint {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
-    if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
-        all_ref_inputs.push(cp.ref_utxo.0.clone());
-    }
-    if has_cs && let Some(cs) = &exec.module_scripts.constant_sum {
-        all_ref_inputs.push(cs.ref_utxo.0.clone());
-    }
-    if has_ss && let Some(ss) = &exec.module_scripts.stableswap {
-        all_ref_inputs.push(ss.ref_utxo.0.clone());
-    }
-    if has_bcl && let Some(bcl) = &exec.module_scripts.banded_concentrated_liquidity {
-        all_ref_inputs.push(bcl.ref_utxo.0.clone());
-    }
-    if has_oracle && let Some(o) = &exec.module_scripts.oracle {
-        all_ref_inputs.push(o.ref_utxo.0.clone());
+    // One reference input per pool-module hash the batch names.
+    for hash in module_groups.keys() {
+        let script = exec
+            .module_scripts
+            .get(hash.as_ref())
+            .with_context(|| format!("pool module {hash} has no configured script ref"))?;
+        all_ref_inputs.push(script.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -2171,9 +2273,9 @@ pub fn build_multi_pool_scoop_tx(
     // Fee-constraint mode (docs/fee-system.md): active when any order's
     // OrderConfig requires the fee constraint. Every continuation execution
     // is charged exactly base_fee; terminal fills keep terminal settlement.
-    let fee_sri = exec.module_scripts.fee_constraint.as_ref();
-    let fee_active =
-        fee_sri.map(|sri| required_constraint_hashes.contains(sri.hash.as_ref())).unwrap_or(false);
+    let fee_active = required_constraint_hashes
+        .iter()
+        .any(|h| exec.module_scripts.kind_of(h) == Some(ModuleKind::FeeConstraint));
     let fee_base: Option<u64> = if fee_active {
         if m_pools == 0 {
             bail!("fee-bearing orders need a designated pool but the plan has no pool batches");
@@ -2186,22 +2288,13 @@ pub fn build_multi_pool_scoop_tx(
         None
     };
 
+    // An OrderConfig names its constraint modules by hash; match by hash.
     let constraint_script_refs = |hash: &[u8]| -> Option<&ScriptRefInfo> {
-        for slot in [
-            &exec.module_scripts.swap_order,
-            &exec.module_scripts.basic_order,
-            &exec.module_scripts.route_order,
-            &exec.module_scripts.fairness_order,
-            &exec.module_scripts.strategy_order,
-            &exec.module_scripts.fee_constraint,
-        ] {
-            if let Some(sri) = slot
-                && sri.hash.as_ref() == hash
-            {
-                return Some(sri);
-            }
-        }
-        None
+        exec.module_scripts
+            .modules
+            .get(hash)
+            .filter(|e| e.kind.is_order_constraint())
+            .map(|e| &e.script)
     };
     for h in &required_constraint_hashes {
         if let Some(sri) = constraint_script_refs(h) {
@@ -2308,7 +2401,7 @@ pub fn build_multi_pool_scoop_tx(
     let reward_account = |script_hash: &Hash<28>| script_reward_account(exec.network, script_hash);
 
     // The order validator runs only when a Sundae order is spent; a
-    // foreign-only fill spends none. fee_split and fairness follow the pool.
+    // foreign-only fill spends none.
     let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = Vec::new();
     if n_orders > 0 {
         withdrawals.push((
@@ -2316,58 +2409,12 @@ pub fn build_multi_pool_scoop_tx(
             order_validator_redeemer.to_plutus(),
         ));
     }
-    // fee_split and fairness are POOL action modules — the pool datum's
-    // action entry demands them. A pool-less scoop (pure-conversion orders)
-    // spends no pool, so nothing requires them and their empty-entry
-    // redeemers would just burn budget (or fail).
-    if m_pools > 0 {
-        withdrawals.push((
-            reward_account(&exec.module_scripts.fee_split.hash),
-            fs_redeemer.to_plutus(),
-        ));
-        withdrawals.push((
-            reward_account(&exec.module_scripts.fairness.hash),
-            fairness_redeemer.to_plutus(),
-        ));
-    }
-
-    // Conditionally add CP withdrawal
-    if has_cp && let Some(cp_script) = &exec.module_scripts.constant_product {
-        let cp_redeemer = ConstantProductRedeemer::Operate {
-            entries: cp_entries,
-        };
-        withdrawals.push((reward_account(&cp_script.hash), cp_redeemer.to_plutus()));
-    }
-
-    // Conditionally add CS withdrawal
-    if has_cs && let Some(cs_script) = &exec.module_scripts.constant_sum {
-        let cs_redeemer = ConstantSumRedeemer::Operate {
-            entries: cs_entries,
-        };
-        withdrawals.push((reward_account(&cs_script.hash), cs_redeemer.to_plutus()));
-    }
-
-    // Conditionally add stableswap withdrawal
-    if has_ss && let Some(ss_script) = &exec.module_scripts.stableswap {
-        let ss_redeemer = crate::sundaev4::types::StableSwapRedeemer::Operate {
-            entries: ss_entries,
-        };
-        withdrawals.push((reward_account(&ss_script.hash), ss_redeemer.to_plutus()));
-    }
-
-    // Conditionally add banded concentrated-liquidity withdrawal
-    if has_bcl && let Some(bcl_script) = &exec.module_scripts.banded_concentrated_liquidity {
-        let bcl_redeemer = crate::sundaev4::types::BandedCLRedeemer::Operate {
-            entries: bcl_entries,
-        };
-        withdrawals.push((reward_account(&bcl_script.hash), bcl_redeemer.to_plutus()));
-    }
-    // Conditionally add the oracle withdrawal
-    if has_oracle && let Some(oracle_script) = &exec.module_scripts.oracle {
-        let oracle_redeemer = crate::sundaev4::types::OracleRedeemer::Operate {
-            entries: oracle_entries,
-        };
-        withdrawals.push((reward_account(&oracle_script.hash), oracle_redeemer.to_plutus()));
+    // One withdrawal per pool-module hash, carrying the Operate entries of
+    // exactly the pools that name it. fee_split and fairness are pool action
+    // modules: a pool-less scoop (pure-conversion orders) spends no pool, so
+    // it has no groups and no such withdrawals.
+    for (hash, group) in std::mem::take(&mut module_groups) {
+        withdrawals.push((reward_account(&hash), group.into_redeemer()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in
@@ -2388,24 +2435,9 @@ pub fn build_multi_pool_scoop_tx(
             fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
         })
     };
-    let classify_hash = |h: &[u8]| -> Option<&'static str> {
-        let matches =
-            |s: &Option<ScriptRefInfo>| s.as_ref().is_some_and(|si| si.hash.as_ref() == h);
-        if matches(&exec.module_scripts.swap_order) {
-            Some("swap_order")
-        } else if matches(&exec.module_scripts.basic_order) {
-            Some("basic_order")
-        } else if matches(&exec.module_scripts.route_order) {
-            Some("route_order")
-        } else if matches(&exec.module_scripts.fairness_order) {
-            Some("fairness_order")
-        } else if matches(&exec.module_scripts.strategy_order) {
-            Some("strategy_order")
-        } else if matches(&exec.module_scripts.fee_constraint) {
-            Some("fee_constraint")
-        } else {
-            None
-        }
+    // The kind of a required constraint hash selects its redeemer shape.
+    let classify_hash = |h: &[u8]| -> Option<ModuleKind> {
+        exec.module_scripts.kind_of(h).filter(|k| k.is_order_constraint())
     };
     // Precompute the route_order redeemer if needed. It's a per-order
     // List<List<RouteStep>>, one inner list for EVERY base order entry — in
@@ -2414,8 +2446,6 @@ pub fn build_multi_pool_scoop_tx(
     // entry (see route.ak). Non-route orders get `[]`; a route order gets one
     // RouteStep = (pool_input_index, transcript_step_index) per pool it flows
     // through, in hop (flow) order.
-    let route_order_hash =
-        exec.module_scripts.route_order.as_ref().map(|s| s.hash.as_ref().to_vec());
 
     // Per route (indexed by RouteRef.route_idx), the ordered list of
     // (pool_input_index, transcript_step_index). We gate to serial routes
@@ -2460,43 +2490,50 @@ pub fn build_multi_pool_scoop_tx(
 
     // Steps per order, aligned with `input_sorted_order` (the canonical
     // order-input walk route.ak performs).
-    let route_steps_per_order: Vec<Vec<(u64, u64)>> = input_sorted_order
-        .iter()
-        .map(|&flat_idx| {
-            let is_route = route_order_hash
-                .as_ref()
-                .and_then(|route_hash| {
-                    let oc = order_configs.get(&order_config_token(flat_idx))?;
-                    oc.config.required_constraints.iter().any(|h| h == route_hash).then_some(())
-                })
-                .is_some();
-            if !is_route {
-                Vec::new()
-            } else {
-                let flat = &flat_orders[flat_idx];
-                let bi = flat.batch_idx;
-                match &flat.kind {
-                    FlatOrderKind::Swap(si) => match &batches[bi].swaps[*si].route {
-                        // Routed order: full serial hop chain.
-                        Some(rr) => per_route[rr.route_idx].clone(),
-                        // Direct single-pool swap: one step at its pool.
-                        None => vec![(
-                            pool_sorted_indices[bi] as u64,
-                            *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
-                        )],
-                    },
-                    // Conversion-primary orders touch no pool: no
-                    // steps to attest (and no pool to index — a pool-
-                    // less tx panicked here).
-                    FlatOrderKind::Conversion(_) => Vec::new(),
-                    // Non-swap orders don't carry a route constraint in
-                    // phase 1; emit a single step to stay 1:1 with entries.
-                    _ if m_pools == 0 => Vec::new(),
-                    _ => vec![(pool_sorted_indices[bi] as u64, 0)],
+    // One list per route_order HASH: an order that requires route hash A
+    // gets its steps in A's redeemer and `[]` in the redeemer of any other
+    // route hash B.
+    let route_steps_for = |route_hash: &[u8]| -> Vec<Vec<(u64, u64)>> {
+        input_sorted_order
+            .iter()
+            .map(|&flat_idx| {
+                let is_route = order_configs.get(&order_config_token(flat_idx)).is_some_and(|oc| {
+                    oc.config.required_constraints.iter().any(|h| h.as_slice() == route_hash)
+                });
+                if !is_route {
+                    Vec::new()
+                } else {
+                    let flat = &flat_orders[flat_idx];
+                    let bi = flat.batch_idx;
+                    match &flat.kind {
+                        FlatOrderKind::Swap(si) => match &batches[bi].swaps[*si].route {
+                            // Routed order: full serial hop chain.
+                            Some(rr) => per_route[rr.route_idx].clone(),
+                            // Direct single-pool swap: one step at its pool.
+                            None => vec![(
+                                pool_sorted_indices[bi] as u64,
+                                *swap_op_idx.get(&(bi, *si)).unwrap_or(&0),
+                            )],
+                        },
+                        // Conversion-primary orders touch no pool: no
+                        // steps to attest (and no pool to index — a pool-
+                        // less tx panicked here).
+                        FlatOrderKind::Conversion(_) => Vec::new(),
+                        // Non-swap orders don't carry a route constraint in
+                        // phase 1; emit a single step to stay 1:1 with entries.
+                        _ if m_pools == 0 => Vec::new(),
+                        _ => vec![(pool_sorted_indices[bi] as u64, 0)],
+                    }
                 }
-            }
-        })
+            })
+            .collect()
+    };
+    let route_hashes: Vec<&Vec<u8>> = required_constraint_hashes
+        .iter()
+        .filter(|h| classify_hash(h) == Some(ModuleKind::RouteOrder))
         .collect();
+    let route_steps_by_hash: BTreeMap<Vec<u8>, Vec<Vec<(u64, u64)>>> =
+        route_hashes.iter().map(|h| ((*h).clone(), route_steps_for(h))).collect();
 
     // Pre-flight the route mandate: check_route_uniqueness demands strictly
     // increasing transcript step claims per pool along the canonical walk.
@@ -2504,9 +2541,9 @@ pub fn build_multi_pool_scoop_tx(
     // impossible; failing the build here (instead of shipping a tx the chain
     // rejects) catches any future admission-ordering regression with a
     // diagnosable error.
-    {
+    for route_steps_per_order in route_steps_by_hash.values() {
         let mut last_claim: BTreeMap<u64, u64> = BTreeMap::new();
-        for steps in &route_steps_per_order {
+        for steps in route_steps_per_order {
             for (pin, tsi) in steps {
                 if let Some(last) = last_claim.get(pin)
                     && tsi <= last
@@ -2520,36 +2557,37 @@ pub fn build_multi_pool_scoop_tx(
         }
     }
 
-    let route_redeemer = || -> pallas_primitives::PlutusData {
-        // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
-        let make_step = |pin: u64, tsi: u64| -> pallas_primitives::PlutusData {
-            pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
-                tag: 121,
-                any_constructor: None,
-                fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
-                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
-                        (pin as i128).try_into().unwrap_or_else(|_| 0i64.into()),
-                    )),
-                    pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
-                        (tsi as i128).try_into().unwrap_or_else(|_| 0i64.into()),
-                    )),
-                ]),
-            })
+    let route_redeemer =
+        |route_steps_per_order: &Vec<Vec<(u64, u64)>>| -> pallas_primitives::PlutusData {
+            // RouteStep = Constr 0 [pool_input_idx, transcript_step_idx].
+            let make_step = |pin: u64, tsi: u64| -> pallas_primitives::PlutusData {
+                pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_codec::utils::MaybeIndefArray::Def(vec![
+                        pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                            (pin as i128).try_into().unwrap_or_else(|_| 0i64.into()),
+                        )),
+                        pallas_primitives::PlutusData::BigInt(pallas_primitives::BigInt::Int(
+                            (tsi as i128).try_into().unwrap_or_else(|_| 0i64.into()),
+                        )),
+                    ]),
+                })
+            };
+            let route_lists: Vec<pallas_primitives::PlutusData> = route_steps_per_order
+                .iter()
+                .map(|steps| {
+                    let step_data: Vec<pallas_primitives::PlutusData> =
+                        steps.iter().map(|(pin, tsi)| make_step(*pin, *tsi)).collect();
+                    pallas_primitives::PlutusData::Array(
+                        pallas_codec::utils::MaybeIndefArray::Indef(step_data),
+                    )
+                })
+                .collect();
+            pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(
+                route_lists,
+            ))
         };
-        let route_lists: Vec<pallas_primitives::PlutusData> = route_steps_per_order
-            .iter()
-            .map(|steps| {
-                let step_data: Vec<pallas_primitives::PlutusData> =
-                    steps.iter().map(|(pin, tsi)| make_step(*pin, *tsi)).collect();
-                pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(
-                    step_data,
-                ))
-            })
-            .collect();
-        pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(
-            route_lists,
-        ))
-    };
     for h in required_constraint_hashes.iter() {
         let class = classify_hash(h);
         let raw_hash: Hash<28> = match h.as_slice().try_into() {
@@ -2557,14 +2595,14 @@ pub fn build_multi_pool_scoop_tx(
             Err(_) => continue,
         };
         let redeemer = match class {
-            Some("swap_order") | Some("basic_order") => unit_redeemer(),
-            Some("route_order") => route_redeemer(),
-            Some("fairness_order") => crate::sundaev4::types::FairnessOrderRedeemer {
+            Some(ModuleKind::SwapOrder) | Some(ModuleKind::BasicOrder) => unit_redeemer(),
+            Some(ModuleKind::RouteOrder) => route_redeemer(&route_steps_by_hash[h]),
+            Some(ModuleKind::FairnessOrder) => crate::sundaev4::types::FairnessOrderRedeemer {
                 settings_input_index,
                 authorized_scooper_index,
             }
             .to_plutus(),
-            Some("strategy_order") => {
+            Some(ModuleKind::StrategyOrder) => {
                 // List<SignedStrategyExecution>, consumed positionally by the
                 // validator as it walks order inputs (canonical order) whose
                 // datum carries the strategy constraint — so: one SSE per
@@ -2590,7 +2628,7 @@ pub fn build_multi_pool_scoop_tx(
                     sses,
                 ))
             }
-            Some("fee_constraint") => {
+            Some(ModuleKind::FeeConstraint) => {
                 // The designated pool (ADR-0010): the first pool input in
                 // canonical order. Verified on-chain (NFT + treasury tag),
                 // economically indifferent among eligible pools.
@@ -2599,6 +2637,7 @@ pub fn build_multi_pool_scoop_tx(
                     designated.into(),
                 ))
             }
+            Some(other) => unreachable!("classify_hash returned pool module kind {other}"),
             None => {
                 tracing::warn!(
                     hash = %hex::encode(h),
@@ -2606,7 +2645,6 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 continue;
             }
-            _ => unreachable!(),
         };
         withdrawals.push((reward_account(&raw_hash), redeemer));
     }
@@ -2878,14 +2916,20 @@ pub fn build_multi_pool_scoop_tx(
             Some(fill) if fill < order.swap_offered().1 => {
                 let (_, remaining) = order.swap_offered();
                 let new_remaining = remaining - fill;
-                let swap_hash = exec
-                    .module_scripts
-                    .swap_order
-                    .as_ref()
-                    .context("partial fill requires the swap_order module config")?
-                    .hash;
+                // The continuation rewrites the swap constraint the order
+                // itself names; match by hash, not by a configured role.
+                let swap_hash = order
+                    .datum
+                    .constraints
+                    .iter()
+                    .map(|(h, _)| h)
+                    .find(|h| exec.module_scripts.kind_of(h) == Some(ModuleKind::SwapOrder))
+                    .context(
+                        "partial fill requires a configured swap_order constraint on the order",
+                    )?
+                    .clone();
                 let datum = order.datum.with_swap_continuation(
-                    swap_hash.as_ref(),
+                    &swap_hash,
                     &new_remaining,
                     &BigInt::from(actual_fee),
                 )?;
@@ -3069,10 +3113,9 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 for leg in &m.swaps {
                     *net.entry(leg.from.clone()).or_insert_with(|| BigInt::from(0)) -= &leg.dx;
-                    let received = leg
-                        .route_idxs
-                        .iter()
-                        .fold(BigInt::from(0), |acc, ri| &acc + &route_states[*ri].final_output);
+                    let received = leg.route_idxs.iter().fold(BigInt::from(0), |acc, ri| {
+                        &acc + &route_states[*ri].final_output
+                    });
                     *net.entry(leg.to.clone()).or_insert_with(|| BigInt::from(0)) += &received;
                 }
                 let moves: Vec<(&AssetClass, BigInt)> =
@@ -3651,7 +3694,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3692,7 +3739,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 swap.order.input.clone(),
                 ResolvedTxOut {
-                    address: if swap.order.address.is_empty() { order_addr_bytes.clone() } else { swap.order.address.clone() },
+                    address: if swap.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        swap.order.address.clone()
+                    },
                     value: swap.order.value.clone(),
                     datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3703,7 +3754,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 dep.order.input.clone(),
                 ResolvedTxOut {
-                    address: if dep.order.address.is_empty() { order_addr_bytes.clone() } else { dep.order.address.clone() },
+                    address: if dep.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        dep.order.address.clone()
+                    },
                     value: dep.order.value.clone(),
                     datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3714,7 +3769,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 wd.order.input.clone(),
                 ResolvedTxOut {
-                    address: if wd.order.address.is_empty() { order_addr_bytes.clone() } else { wd.order.address.clone() },
+                    address: if wd.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        wd.order.address.clone()
+                    },
                     value: wd.order.value.clone(),
                     datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3725,7 +3784,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 z.order.input.clone(),
                 ResolvedTxOut {
-                    address: if z.order.address.is_empty() { order_addr_bytes.clone() } else { z.order.address.clone() },
+                    address: if z.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        z.order.address.clone()
+                    },
                     value: z.order.value.clone(),
                     datum: DatumOption::InlineDatum(z.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -3736,7 +3799,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: if c.order.address.is_empty() { order_addr_bytes.clone() } else { c.order.address.clone() },
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -4416,20 +4483,117 @@ fn build_pool_output_value(
     ))
 }
 
+/// One pool's Operate entry for one pool module.
+enum PoolModuleEntry {
+    Cp(CPOperateEntry),
+    Cs(CSOperateEntry),
+    Ss(crate::sundaev4::types::SSOperateEntry),
+    Cl(crate::sundaev4::types::BandedOperateEntry),
+    FeeSplit(FSOperateEntry),
+    Fairness(FairnessOperateEntry),
+    Oracle(crate::sundaev4::types::OracleEntry),
+}
+
+impl PoolModuleEntry {
+    fn kind(&self) -> ModuleKind {
+        match self {
+            PoolModuleEntry::Cp(_) => ModuleKind::ConstantProduct,
+            PoolModuleEntry::Cs(_) => ModuleKind::ConstantSum,
+            PoolModuleEntry::Ss(_) => ModuleKind::Stableswap,
+            PoolModuleEntry::Cl(_) => ModuleKind::ConcentratedLiquidity,
+            PoolModuleEntry::FeeSplit(_) => ModuleKind::FeeSplit,
+            PoolModuleEntry::Fairness(_) => ModuleKind::Fairness,
+            PoolModuleEntry::Oracle(_) => ModuleKind::Oracle,
+        }
+    }
+}
+
+/// The Operate entries of one pool-module hash: one entry per pool in the
+/// batch that names the hash, in batch order. Every entry has one kind.
+struct PoolModuleEntries {
+    kind: ModuleKind,
+    entries: Vec<PoolModuleEntry>,
+}
+
+impl PoolModuleEntries {
+    fn empty(kind: ModuleKind) -> Self {
+        PoolModuleEntries {
+            kind,
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, entry: PoolModuleEntry) -> Result<()> {
+        anyhow::ensure!(
+            entry.kind() == self.kind,
+            "a {} entry cannot join the {} withdrawal of one module hash",
+            entry.kind(),
+            self.kind
+        );
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// The module's `Operate { entries }` redeemer.
+    fn into_redeemer(self) -> pallas_primitives::PlutusData {
+        macro_rules! collect {
+            ($variant:ident) => {
+                self.entries
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        PoolModuleEntry::$variant(x) => Some(x),
+                        _ => None,
+                    })
+                    .collect()
+            };
+        }
+        match self.kind {
+            ModuleKind::ConstantProduct => ConstantProductRedeemer::Operate {
+                entries: collect!(Cp),
+            }
+            .to_plutus(),
+            ModuleKind::ConstantSum => ConstantSumRedeemer::Operate {
+                entries: collect!(Cs),
+            }
+            .to_plutus(),
+            ModuleKind::Stableswap => crate::sundaev4::types::StableSwapRedeemer::Operate {
+                entries: collect!(Ss),
+            }
+            .to_plutus(),
+            ModuleKind::ConcentratedLiquidity => {
+                crate::sundaev4::types::BandedCLRedeemer::Operate {
+                    entries: collect!(Cl),
+                }
+                .to_plutus()
+            }
+            ModuleKind::FeeSplit => FeeSplitRedeemer::Operate {
+                entries: collect!(FeeSplit),
+            }
+            .to_plutus(),
+            ModuleKind::Fairness => FairnessRedeemer::Operate {
+                entries: collect!(Fairness),
+            }
+            .to_plutus(),
+            ModuleKind::Oracle => crate::sundaev4::types::OracleRedeemer::Operate {
+                entries: collect!(Oracle),
+            }
+            .to_plutus(),
+            other => unreachable!("{other} is not a pool module"),
+        }
+    }
+}
+
 /// Resolve a pool's LP-token AssetClass. Sundae's LP asset is minted under
 /// the pool_mint policy with name `0014df10 ++ pool_ident` (CIP-67 label 222
 /// for LP).
-/// True when the pool's enabled trade action lists the oracle module: the
-/// scoop then carries an oracle Operate entry, the module's reference input,
-/// and a recomputed accumulator slot in the output datum.
-pub fn pool_needs_oracle(exec: &ScooperExecution, pool: &SundaeV4Pool) -> bool {
-    let Some(oracle) = exec.module_scripts.oracle.as_ref() else {
-        return false;
-    };
-    pool.pool_datum
-        .actions
-        .iter()
-        .any(|a| a.enabled && a.modules.iter().any(|m| m.as_slice() == oracle.hash.as_ref()))
+/// The hash of the oracle module that the pool's scoop action lists, if any.
+/// Such a scoop carries an oracle Operate entry, the module's reference
+/// input, and a recomputed accumulator slot in the output datum.
+pub fn pool_oracle_hash(
+    exec: &ScooperExecution,
+    pool: &SundaeV4Pool,
+) -> Option<pallas_addresses::ScriptHash> {
+    exec.module_scripts.pool_modules(&pool.pool_datum).ok()?.oracle().copied()
 }
 
 fn pool_lp_asset(exec: &ScooperExecution, pool: &SundaeV4Pool) -> Result<AssetClass> {

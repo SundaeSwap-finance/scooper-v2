@@ -200,26 +200,13 @@ async fn main() -> Result<()> {
     // Captured before `protocol` moves into manager_loop.
     let mempool_spawn = protocol.v4.as_ref().and_then(|v4| {
         v4.mempool.clone().map(|cfg| {
-            let module_hash = |s: &Option<crate::sundaev4::ScriptRefInfo>| {
-                s.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default()
-            };
             let watch = mempool::ProtocolWatch {
                 pool_script_hash: v4.pool_script_hash,
                 order_script_hashes: v4.order_script_hashes.clone(),
-                swap_order_hash: v4
+                constraint_hashes: v4
                     .execution
                     .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.swap_order))
-                    .unwrap_or_default(),
-                basic_order_hash: v4
-                    .execution
-                    .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.basic_order))
-                    .unwrap_or_default(),
-                strategy_order_hash: v4
-                    .execution
-                    .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.strategy_order))
+                    .map(|e| crate::sundaev4::ConstraintHashes::from_scripts(&e.module_scripts))
                     .unwrap_or_default(),
             };
             // Chained execution needs both the execute flag and an execution

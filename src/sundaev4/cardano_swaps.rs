@@ -1092,7 +1092,7 @@ mod foreign_fill_tests {
     use crate::sundaev4::types::Rational;
     use num_traits::ToPrimitive;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = crate::sundaev4::test_harness::PREVIEW_FIXTURE;
 
     fn usdm() -> AssetClass {
         AssetClass {
@@ -1315,6 +1315,8 @@ mod foreign_fill_tests {
                     den: BigInt::from(1),
                 },
                 weight_total: BigInt::from(0),
+                ext: None,
+                rules: crate::sundaev4::types::ClRules::REVISION_1,
             },
         };
         assert!(
@@ -1544,7 +1546,7 @@ mod composition_tests {
     use crate::sundaev4::router;
     use crate::sundaev4::test_harness::{TestEnv, ada, make_basic_swap_order, make_settings};
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = crate::sundaev4::test_harness::PREVIEW_FIXTURE;
 
     fn usdm() -> AssetClass {
         AssetClass {
