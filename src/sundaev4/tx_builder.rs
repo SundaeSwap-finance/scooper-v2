@@ -1902,6 +1902,15 @@ pub fn build_multi_pool_scoop_tx(
             }
         }
 
+        // Backstop for the scooper's pre-routing filter: every config this
+        // scoop sends must hash to the pool input's slot. A guessed default
+        // for a pool whose config was not recovered fails here, not on
+        // chain. The stableswap and CL arms above run their own checks
+        // first, with their own errors.
+        if let Err(e) = crate::sundaev4::module_configs_match_datum(&batch.pool, exec) {
+            bail!("pool {}: {e}", batch.pool_ident);
+        }
+
         // Per-pool fee_split config from chain (recovered from the pool's
         // mint tx or a recent scoop). Falls back to the global protocol_share
         // from the scooper config, which only matches pools created with the

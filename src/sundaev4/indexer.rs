@@ -784,6 +784,7 @@ fn withdrawal_index_of_script(tx: &MultiEraTx, script_hash: &ScriptHash) -> Opti
 /// Free-function form: try to extract a `ConstantSumConfig` from a tx's
 /// CS module Create withdrawal redeemer. Used by both the live indexer and
 /// the bootstrap path (which fetches a historical tx via Blockfrost).
+#[cfg(test)]
 pub fn extract_cs_config_from_tx(
     tx: &MultiEraTx,
     cs_script_hash: &ScriptHash,
@@ -812,6 +813,7 @@ pub fn extract_cs_config_from_tx(
 /// one config entry per pool in a multi-pool scoop and are ambiguous without
 /// a `pool_oref`, so this function intentionally returns `None` for them.
 /// Use `extract_fee_split_config_for_pool_from_tx` when you have an oref.
+#[cfg(test)]
 pub fn extract_fee_split_config_from_tx(
     tx: &MultiEraTx,
     fs_script_hash: &ScriptHash,
@@ -830,25 +832,139 @@ pub fn extract_fee_split_config_from_tx(
     }
 }
 
-/// Same shape as `extract_fee_split_config_from_tx`: returns `Some(config)`
-/// only for `Create` redeemers (mint tx). Operate's per-pool entries are
-/// only safe when matched against a known `pool_oref`.
-pub fn extract_cp_config_from_tx(
+/// The value of `datum`'s `module_state` slot for `module_hash`.
+pub fn module_slot<'a>(datum: &'a PoolDatum, module_hash: &[u8]) -> Option<&'a [u8]> {
+    datum
+        .module_state
+        .iter()
+        .find(|(cred, _)| cred.as_slice() == module_hash)
+        .map(|(_, v)| v.as_slice())
+}
+
+/// `blake2b_256(serialise_data(config))`: the value a module keeps in the
+/// pool's `module_state` slot for its config. The same rule holds for
+/// constant_product, constant_sum, fee_split, stableswap and CL.
+pub fn module_config_hash<T: AsPlutus + Clone>(cfg: &T) -> Vec<u8> {
+    let cbor = minicbor::to_vec(cfg.clone().to_plutus()).expect("PlutusData encodes");
+    Hasher::<256>::hash(&cbor).to_vec()
+}
+
+/// True when `cfg` hashes to `datum`'s slot for `module_hash`.
+pub fn config_hashes_to_slot<T: AsPlutus + Clone>(
+    cfg: &T,
+    datum: &PoolDatum,
+    module_hash: &[u8],
+) -> bool {
+    module_slot(datum, module_hash).is_some_and(|slot| slot == module_config_hash(cfg).as_slice())
+}
+
+/// The data of the `Reward` redeemer for `script_hash`'s withdrawal.
+fn reward_redeemer_data(tx: &MultiEraTx, script_hash: &ScriptHash) -> Option<PlutusData> {
+    let wd_index = withdrawal_index_of_script(tx, script_hash)?;
+    tx.redeemers()
+        .iter()
+        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)
+        .map(|r| r.data().clone())
+}
+
+/// Every `ConstantSumConfig` the CS withdrawal redeemer of `cs_script_hash`
+/// in `tx` holds: a `Create`'s `initial_state` and each `Operate` entry's
+/// `config`. An `Operate` entry can belong to any pool of the scoop, so the
+/// caller must accept a candidate only when it hashes to the pool's slot.
+pub fn extract_cs_config_candidates(
+    tx: &MultiEraTx,
+    cs_script_hash: &ScriptHash,
+) -> Vec<crate::sundaev4::types::ConstantSumConfig> {
+    use crate::sundaev4::types::{ConstantSumConfig, ConstantSumRedeemer};
+    let Some(data) = reward_redeemer_data(tx, cs_script_hash) else {
+        return vec![];
+    };
+    match ConstantSumRedeemer::from_plutus(data) {
+        Ok(ConstantSumRedeemer::Create { initial_state, .. }) => {
+            ConstantSumConfig::from_plutus(initial_state).into_iter().collect()
+        }
+        Ok(ConstantSumRedeemer::Operate { entries }) => {
+            entries.into_iter().map(|e| e.config).collect()
+        }
+        _ => vec![],
+    }
+}
+
+/// [`extract_cs_config_candidates`] for constant_product.
+pub fn extract_cp_config_candidates(
     tx: &MultiEraTx,
     cp_script_hash: &ScriptHash,
-) -> Option<crate::sundaev4::types::ConstantProductConfig> {
+) -> Vec<crate::sundaev4::types::ConstantProductConfig> {
     use crate::sundaev4::types::ConstantProductRedeemer;
-
-    let wd_index = withdrawal_index_of_script(tx, cp_script_hash)?;
-    let redeemers = tx.redeemers();
-    let redeemer = redeemers
-        .iter()
-        .find(|r| r.tag() == RedeemerTag::Reward && r.index() == wd_index as u32)?;
-    let parsed: ConstantProductRedeemer = AsPlutus::from_plutus(redeemer.data().clone()).ok()?;
-    match parsed {
-        ConstantProductRedeemer::Create { initial_state } => Some(initial_state),
-        _ => None,
+    let Some(data) = reward_redeemer_data(tx, cp_script_hash) else {
+        return vec![];
+    };
+    match ConstantProductRedeemer::from_plutus(data) {
+        Ok(ConstantProductRedeemer::Create { initial_state }) => vec![initial_state],
+        Ok(ConstantProductRedeemer::Operate { entries }) => {
+            entries.into_iter().map(|e| e.config).collect()
+        }
+        _ => vec![],
     }
+}
+
+/// [`extract_cs_config_candidates`] for fee_split.
+pub fn extract_fee_split_config_candidates(
+    tx: &MultiEraTx,
+    fs_script_hash: &ScriptHash,
+) -> Vec<crate::sundaev4::types::FeeSplitConfig> {
+    use crate::sundaev4::types::FeeSplitRedeemer;
+    let Some(data) = reward_redeemer_data(tx, fs_script_hash) else {
+        return vec![];
+    };
+    match FeeSplitRedeemer::from_plutus(data) {
+        Ok(FeeSplitRedeemer::Create { config, .. }) => vec![config],
+        Ok(FeeSplitRedeemer::Operate { entries }) => {
+            entries.into_iter().map(|e| e.config).collect()
+        }
+        _ => vec![],
+    }
+}
+
+/// The config of module kind `kind` for `datum` that `tx` holds, from the
+/// withdrawal redeemer of ANY registered hash of that kind.
+///
+/// `current` is the hash of `kind` that the pool names now. The function
+/// reads the redeemer of `current` first, then the redeemers of the other
+/// registered hashes of `kind`. It accepts a candidate only when the
+/// candidate hashes to the datum's slot for `current`.
+///
+/// Why every hash of the kind: a governor can move a pool to a new module
+/// hash in place. The migration transaction rewrites the action map and the
+/// `module_state` keys but carries no module redeemer. If the config type
+/// did not change, the slot value did not change, and the config is only in
+/// redeemers under the old hash. The slot check makes the wider search safe.
+pub fn find_slot_config<T: AsPlutus + Clone>(
+    tx: &MultiEraTx,
+    datum: &PoolDatum,
+    scripts: &crate::sundaev4::types::ModuleScripts,
+    kind: crate::sundaev4::ModuleKind,
+    current: &ScriptHash,
+    extract: impl Fn(&MultiEraTx, &ScriptHash) -> Vec<T>,
+) -> Option<T> {
+    let expected = module_slot(datum, current.as_ref())?;
+    scripts.hashes_of_kind_first(kind, current).iter().find_map(|h| {
+        extract(tx, h).into_iter().find(|c| module_config_hash(c).as_slice() == expected)
+    })
+}
+
+/// Every stableswap candidate `tx` holds under any registered stableswap
+/// hash, `current` first. The caller selects by the slot hash.
+pub fn extract_ss_config_candidates_any(
+    tx: &MultiEraTx,
+    scripts: &crate::sundaev4::types::ModuleScripts,
+    current: &ScriptHash,
+) -> Vec<crate::sundaev4::types::StableSwapConfig> {
+    scripts
+        .hashes_of_kind_first(crate::sundaev4::ModuleKind::Stableswap, current)
+        .iter()
+        .flat_map(|h| extract_ss_config_candidates(tx, h))
+        .collect()
 }
 
 /// Every `StableSwapConfig` a tx vouches for, from its stableswap module
@@ -1234,19 +1350,43 @@ impl ChainIndex for SundaeV4Indexer {
                     let bcl_module_hash = invariant_hash(ModuleKind::ConcentratedLiquidity);
                     let fs_module_hash =
                         scripts.and_then(|m| m.pool_module_of_kind(&pd, ModuleKind::FeeSplit));
-                    let cs_config_from_tx =
-                        cs_module_hash.and_then(|h| extract_cs_config_from_tx(&tx, &h));
+                    // CS, CP and fee_split: a Create or Operate config
+                    // under any registered hash of the kind, accepted only
+                    // when it hashes to this output's slot
+                    // (`find_slot_config`).
+                    let slot_config = |kind: ModuleKind, h: Option<ScriptHash>| {
+                        scripts.zip(h).map(|(m, h)| (m, h, kind))
+                    };
+                    let cs_config_from_tx = slot_config(ModuleKind::ConstantSum, cs_module_hash)
+                        .and_then(|(m, h, k)| {
+                            find_slot_config(&tx, &pd, m, k, &h, extract_cs_config_candidates)
+                        });
                     let cp_config_from_tx =
-                        cp_module_hash.and_then(|h| extract_cp_config_from_tx(&tx, &h));
-                    let fs_config_from_tx =
-                        fs_module_hash.and_then(|h| extract_fee_split_config_from_tx(&tx, &h));
+                        slot_config(ModuleKind::ConstantProduct, cp_module_hash).and_then(
+                            |(m, h, k)| {
+                                find_slot_config(&tx, &pd, m, k, &h, extract_cp_config_candidates)
+                            },
+                        );
+                    let fs_config_from_tx = slot_config(ModuleKind::FeeSplit, fs_module_hash)
+                        .and_then(|(m, h, k)| {
+                            find_slot_config(
+                                &tx,
+                                &pd,
+                                m,
+                                k,
+                                &h,
+                                extract_fee_split_config_candidates,
+                            )
+                        });
                     // Stableswap: every config this tx vouches for (Create
                     // initial_state, Operate entry configs, and the
-                    // post-rate-update form of each). The datum's
-                    // module_state hash selects one below.
+                    // post-rate-update form of each), under any registered
+                    // stableswap hash. The datum's module_state hash
+                    // selects one below.
                     let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> =
-                        ss_module_hash
-                            .map(|h| extract_ss_config_candidates(&tx, &h))
+                        scripts
+                            .zip(ss_module_hash)
+                            .map(|(m, h)| extract_ss_config_candidates_any(&tx, m, &h))
                             .unwrap_or_default();
                     // Banded: the ladder a Create pins or an Operate entry re-sends.
                     let bcl_candidates_from_tx: Vec<crate::sundaev4::types::BandedCLConfig> =
@@ -1260,7 +1400,7 @@ impl ChainIndex for SundaeV4Indexer {
                     let fs_module_hash_bytes = fs_module_hash.map(|h| h.as_ref().to_vec());
                     // Resolution priority for the CS/CP branch inside detect_pool_type:
                     //   1. config-file override (consulted internally)
-                    //   2. this tx's Create redeemer
+                    //   2. this tx's Create or Operate redeemer (slot-checked)
                     //   3. previously-resolved persisted config (cache)
                     //   4. defaults
                     let resolved_cs =
@@ -2039,6 +2179,72 @@ fn payment_hash_equals(addr: &Address, hash: &ScriptHash) -> bool {
     } else {
         false
     }
+}
+
+/// `Ok` when every module config a scoop of `pool` sends hashes to the
+/// pool datum's `module_state` slot for that module: the invariant config
+/// from `pool_type`, and the fee_split config (the per-pool config, else the
+/// scooper default that the tx builder falls back to).
+///
+/// A pool whose config bootstrap could not recover carries a guessed
+/// default (`detect_pool_type`) or a placeholder. The module rejects a
+/// config that does not hash to the slot, so the scooper must not scoop
+/// such a pool. A guessed default passes only when it is the pool's real
+/// config. The scooper drops a pool that fails this check before routing,
+/// and the tx builder checks again before it builds.
+pub fn module_configs_match_datum(
+    pool: &SundaeV4Pool,
+    exec: &crate::sundaev4::types::ScooperExecution,
+) -> Result<(), String> {
+    use crate::sundaev4::types::{
+        ConstantProductConfig, ConstantSumConfig, FeeSplitConfig, PoolType, Rational,
+    };
+    let datum = &pool.pool_datum;
+    let modules = exec.module_scripts.pool_modules(datum)?;
+    let (kind, hash) = modules.invariant();
+    let invariant_hash = match &pool.pool_type {
+        PoolType::ConstantProduct { fee } => {
+            module_config_hash(&ConstantProductConfig { fee: fee.clone() })
+        }
+        PoolType::ConstantSum {
+            prices,
+            fee,
+            bounty_k,
+            balance_fee,
+        } => module_config_hash(&ConstantSumConfig {
+            prices: prices.clone(),
+            fee: fee.clone(),
+            bounty_k: bounty_k.clone(),
+            balance_fee: balance_fee.clone(),
+        }),
+        PoolType::StableSwap { config } => crate::sundaev4::ss_math::config_hash(config),
+        PoolType::BandedConcentratedLiquidity { config } => {
+            crate::sundaev4::banded_math::config_hash(config)
+        }
+    };
+    let check = |module: &str, h: &ScriptHash, expected: &[u8]| -> Result<(), String> {
+        match module_slot(datum, h.as_ref()) {
+            Some(slot) if slot == expected => Ok(()),
+            slot => Err(format!(
+                "{module} config hash {} does not match the pool's module_state slot for {} \
+                 ({}); the config is unknown or stale",
+                hex::encode(expected),
+                hex::encode(h),
+                slot.map(hex::encode).unwrap_or_else(|| "absent".into()),
+            )),
+        }
+    };
+    check(&kind.to_string(), hash, &invariant_hash)?;
+    if let Some(fs_hash) = modules.fee_split() {
+        let cfg = pool.fee_split_config.clone().unwrap_or_else(|| FeeSplitConfig {
+            protocol_share: Rational {
+                num: crate::bigint::BigInt::from(exec.protocol_share.0),
+                den: crate::bigint::BigInt::from(exec.protocol_share.1),
+            },
+        });
+        check("fee_split", fs_hash, &module_config_hash(&cfg))?;
+    }
+    Ok(())
 }
 
 /// Detect the pool type from a pool datum's action modules.
