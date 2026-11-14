@@ -1638,8 +1638,10 @@ fn needs_bcl_lookup(
     let Some(h) = pool_config_hashes(pool_datum, execution).bcl else {
         return false;
     };
+    // A form of the held config counts: a four-field config also covers a
+    // pool a governor migrated to the five-field form (`config_forms`).
     !bcl_configs.get(&pool_datum.identifier).is_some_and(|cfg| {
-        crate::sundaev4::banded_math::config_matches_datum(cfg, pool_datum, h.as_ref())
+        crate::sundaev4::banded_math::matching_form(cfg, pool_datum, h.as_ref()).is_some()
     })
 }
 
@@ -2116,10 +2118,10 @@ async fn bootstrap_v4(
                 crate::sundaev4::ss_math::config_matches_datum(cfg, &pool_datum, h)
             })
         });
-        let resolved_bcl = bcl_configs.get(&pool_datum.identifier).filter(|cfg| {
-            bcl_module_hash.as_ref().is_some_and(|h| {
-                crate::sundaev4::banded_math::config_matches_datum(cfg, &pool_datum, h)
-            })
+        let resolved_bcl = bcl_configs.get(&pool_datum.identifier).and_then(|cfg| {
+            bcl_module_hash
+                .as_ref()
+                .and_then(|h| crate::sundaev4::banded_math::matching_form(cfg, &pool_datum, h))
         });
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
@@ -2127,7 +2129,7 @@ async fn bootstrap_v4(
             resolved_cs,
             resolved_cp,
             resolved_ss,
-            resolved_bcl,
+            resolved_bcl.as_ref(),
         );
         let fs_cfg = fs_configs.get(&pool_datum.identifier).cloned();
         pools.insert(
@@ -2990,7 +2992,7 @@ mod recover_missing_configs_tests {
     use crate::sundaev4::{ConstantSumConfig, PoolConfig, PoolType, Rational, SundaeV4Pool};
     use std::collections::BTreeMap;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
 
     fn cs_pool(env: &TestEnv) -> std::sync::Arc<SundaeV4Pool> {
         make_cs_pool(

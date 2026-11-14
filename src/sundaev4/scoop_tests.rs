@@ -16,7 +16,7 @@ mod tests {
     use num_traits::Signed;
     use plutus_parser::AsPlutus;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
 
     #[test]
     fn test_fixture_loads() {
@@ -1709,13 +1709,7 @@ mod tests {
             cfg,
             true,
         );
-        let oracle_hash = env
-            .exec
-            .module_scripts
-            .first_of(crate::sundaev4::ModuleKind::Oracle)
-            .unwrap()
-            .hash
-            .to_vec();
+        let oracle_hash = env.oracle_script(cl_test_revision()).hash.to_vec();
         let slot_of = |p: &crate::sundaev4::SundaeV4Pool| -> Vec<u8> {
             p.pool_datum.module_state.iter().find(|(h, _)| *h == oracle_hash).unwrap().1.clone()
         };
@@ -1748,13 +1742,15 @@ mod tests {
         let after1 = result.predicted_pools[0].2.clone();
         let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
         assert_eq!(s1.volume_b, BigInt::from(624));
-        // The band fee rounds up to 2 (sundae-v4 SV4-006), so 624 B pays 615 A.
-        assert_eq!(s1.volume_a, BigInt::from(615));
+        // From CL revision 2 the band fee rounds up to 2 (sundae-v4
+        // SV4-006), so 624 B pays 615 A. Revision 1 floors it to 1: 616 A.
+        let out = by_cl_revision(616, 615);
+        assert_eq!(s1.volume_a, BigInt::from(out));
         assert_eq!(s1.creation_time, s1.last_time);
         assert_eq!(s1.twap_num, BigInt::from(0));
         assert_eq!(
             s1.last_price,
-            &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(615)
+            &(&BigInt::from(624) * &OracleSlot::price_scale()) / &BigInt::from(out)
         );
 
         // Second scoop, later: advance.
@@ -1919,7 +1915,9 @@ mod tests {
         )
         .expect("banded batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 1);
-        assert_eq!(batch.swaps[0].dy, BigInt::from(615));
+        // Revision 1 (branch banded-cl): the fee floors to 1, 616 out, the
+        // counter moves to 999_999_938 and the budget is 125.
+        assert_eq!(batch.swaps[0].dy, BigInt::from(by_cl_revision(616, 615)));
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -1953,7 +1951,7 @@ mod tests {
             .expect("banded entry carries a list");
         assert_eq!(
             BigInt::from_plutus(pair[0].clone()).unwrap(),
-            BigInt::from(1_000_000_062i64)
+            BigInt::from(by_cl_revision(999_999_938i64, 1_000_000_062i64))
         );
         assert_eq!(
             BigInt::from_plutus(pair[1].clone()).unwrap(),
@@ -1978,9 +1976,12 @@ mod tests {
         assert_eq!(entry.active_band, BigInt::from(0));
         assert_eq!(entry.config, cfg);
         let after = &result.predicted_pools[0].2;
-        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_753i64));
+        assert_eq!(
+            after.pool_datum.assets[0].1,
+            BigInt::from(by_cl_revision(8_636_752i64, 8_636_753i64))
+        );
         assert_eq!(after.pool_datum.assets[1].1, BigInt::from(625_623i64));
-        // fee_budget 213 at the default protocol share grows total_lp, not
+        // fee_budget 213 (125 in revision 1) at the default protocol share grows total_lp, not
         // circulating_lp.
         assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
         assert_eq!(
@@ -4296,7 +4297,7 @@ mod prop_tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
 
     /// Generate random orders for a token-to-token pool.
     ///
@@ -4704,7 +4705,7 @@ mod blend_cost {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
     const TOKENS: usize = 13;
 
     fn tok(i: usize) -> crate::cardano_types::AssetClass {
@@ -4837,7 +4838,7 @@ mod module_hash_tests {
     use plutus_parser::AsPlutus;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
 
     /// Register a second script of `kind` at `alias`, served by the same
     /// compiled code as the first script of that kind. Returns the alias's

@@ -945,8 +945,12 @@ pub fn extract_ss_config_candidates(
 ///     adds the index in place without writing the new config to any
 ///     redeemer, so the derived form is the only way to recover the config
 ///     of a migrated pool from chain history.
+///  3. After each four-field candidate it adds the same ladder with
+///     `ext = Void` (`banded_math::config_forms`). A governor migration
+///     from CL revision 1 to revision 2 writes that five-field config's
+///     hash to the pool's slot and the config itself to no redeemer.
 ///
-/// Both rules only ADD candidates. The hash pin rejects anything wrong.
+/// All three rules only ADD candidates. The hash pin rejects anything wrong.
 pub fn extract_bcl_config_candidates(
     tx: &MultiEraTx,
     bcl_script_hash: &ScriptHash,
@@ -960,9 +964,10 @@ pub fn extract_bcl_config_candidates(
         tx.redeemers().into_iter().filter(|r| r.tag() == RedeemerTag::Reward).collect();
     redeemers.sort_by_key(|r| (Some(r.index()) != preferred, r.index()));
 
-    let mut out = vec![];
+    let mut found = vec![];
     for redeemer in redeemers {
         let data = redeemer.data().clone();
+        let out = &mut found;
         if let Ok(parsed) = BandedCLRedeemer::from_plutus(data.clone()) {
             match parsed {
                 BandedCLRedeemer::Create { initial_state, .. } => out.push(initial_state),
@@ -989,13 +994,18 @@ pub fn extract_bcl_config_candidates(
             LegacyBandedCLRedeemer::Destroy { .. } => {}
         }
     }
-    out
+    found.iter().flat_map(crate::sundaev4::banded_math::config_forms).collect()
 }
 
 /// The banded ladder for `pool_datum`: the first of `candidates`, else
-/// `cached`, whose hash the datum's banded `module_state` slot names, and
-/// which passes the module's Create-time shape checks. `None` when nothing
-/// matches; the tx builder then refuses the pool.
+/// a form of `cached` (`banded_math::config_forms`), whose hash the datum's
+/// banded `module_state` slot names, and which passes the module's
+/// Create-time shape checks. `None` when nothing matches; the tx builder
+/// then refuses the pool.
+///
+/// The cached config's `ext = Void` form is how a pool that a governor has
+/// just migrated to CL revision 2 is recovered while indexing: the
+/// migration transaction holds no CL redeemer.
 pub fn resolve_bcl_config(
     pool_datum: &PoolDatum,
     bcl_module_hash: &[u8],
@@ -1019,7 +1029,7 @@ pub fn resolve_bcl_config(
     if let Some(c) = candidates.iter().find(|c| accepted(c)) {
         return Some(c.clone());
     }
-    cached.filter(|c| accepted(c)).cloned()
+    cached.and_then(|c| crate::sundaev4::banded_math::config_forms(c).find(|c| accepted(c)))
 }
 
 /// The stableswap config for `pool_datum`: the first of `candidates`, else
@@ -2065,7 +2075,8 @@ pub fn detect_pool_type(
     // of one kind (two versions of a module) classify the same way.
     use crate::sundaev4::ModuleKind;
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-    let matched_kind = exec.module_scripts.pool_invariant(pool_datum).map(|(k, _)| k);
+    let invariant = exec.module_scripts.pool_invariant(pool_datum);
+    let matched_kind = invariant.map(|(k, _)| k);
     if matched_kind.is_none() {
         // Log the unknown first-module hashes so the operator can see why
         // detect_pool_type couldn't classify this pool. The scooper does not
@@ -2186,10 +2197,15 @@ pub fn detect_pool_type(
     }
 
     if matched_kind == Some(ModuleKind::ConcentratedLiquidity) {
-        if let Some(cfg) = bcl_config {
-            return PoolType::BandedConcentratedLiquidity {
-                config: cfg.clone(),
-            };
+        // The config takes the rules of the CL hash the pool names. A config
+        // whose shape that revision does not read cannot be the pool's.
+        let revision = invariant.and_then(|(_, h)| exec.module_scripts.revision_of(h.as_ref()));
+        let rules = revision.and_then(crate::sundaev4::types::ClRules::of);
+        if let (Some(cfg), Some(rules)) = (bcl_config, rules) {
+            match cfg.clone().with_rules(rules) {
+                Ok(config) => return PoolType::BandedConcentratedLiquidity { config },
+                Err(e) => warn!(pool = %ident_hex, "banded pool's config is refused: {e}"),
+            }
         }
         // No preimage that hashes to the datum's module_state slot, and no
         // operator override: the ladder is hash-pinned and the module reads
@@ -2210,6 +2226,8 @@ pub fn detect_pool_type(
                     den: BigInt::from(1),
                 },
                 weight_total: BigInt::from(0),
+                ext: None,
+                rules: rules.unwrap_or(crate::sundaev4::types::ClRules::REVISION_1),
             },
         };
     }

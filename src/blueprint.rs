@@ -30,6 +30,10 @@ pub struct Validator {
     pub hash: String,
     #[serde(default)]
     pub compiled_code: Option<String>,
+    /// The module's behaviour revision within its kind
+    /// (`module_scripts::Revision`). Absent means revision 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::sundaev4::module_scripts::Revision>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -315,7 +319,13 @@ impl Blueprint {
         let mut modules = crate::sundaev4::ModuleRegistry::default();
         let mut add = |kind: ModuleKind, info: Option<ScriptRefInfo>| -> Result<()> {
             if let Some(info) = info {
-                modules.insert(kind, info).map_err(|e| anyhow::anyhow!(e))?;
+                let revision = self
+                    .validators
+                    .iter()
+                    .find(|v| v.hash.eq_ignore_ascii_case(&hex::encode(info.hash)))
+                    .and_then(|v| v.revision)
+                    .unwrap_or(crate::sundaev4::module_scripts::Revision::DEFAULT);
+                modules.insert_revision(kind, revision, info).map_err(|e| anyhow::anyhow!(e))?;
             }
             Ok(())
         };

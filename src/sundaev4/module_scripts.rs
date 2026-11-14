@@ -9,10 +9,16 @@
 //! the hash that the pool or order names, and chooses behaviour from the
 //! [`ModuleKind`] of that hash.
 //!
+//! A kind says what a module is (its config type and its place in a
+//! transaction). It does not say which rules the module applies: two hashes
+//! of one kind can check different arithmetic. Each registered hash
+//! therefore also carries a [`Revision`] of its kind, and the scooper
+//! chooses rules from `(kind, revision)`. See [`Revision`] for the table.
+//!
 //! Config form, under `protocol.v4.execution.module-scripts`: each key is a
-//! role. A role key maps to one `{hash, ref-utxo}` object, or to a JSON array
-//! of them. The four boot-fixed roles (`pool`, `order`, `pool-mint`,
-//! `settings`) take one object only.
+//! role. A role key maps to one `{hash, ref-utxo, revision?}` object, or to
+//! a JSON array of them. The four boot-fixed roles (`pool`, `order`,
+//! `pool-mint`, `settings`) take one object only, and no `revision`.
 
 use std::collections::BTreeMap;
 
@@ -113,6 +119,66 @@ impl ModuleKind {
     }
 }
 
+impl ModuleKind {
+    /// The newest revision of this kind that the scooper implements. Every
+    /// revision from [`Revision::DEFAULT`] to this one is implemented.
+    pub fn latest_revision(self) -> Revision {
+        match self {
+            ModuleKind::ConcentratedLiquidity | ModuleKind::Oracle => Revision(2),
+            _ => Revision::DEFAULT,
+        }
+    }
+
+    /// True when the scooper implements `revision` of this kind.
+    pub fn implements(self, revision: Revision) -> bool {
+        revision >= Revision::DEFAULT && revision <= self.latest_revision()
+    }
+}
+
+/// The behaviour revision of one module hash, within its [`ModuleKind`].
+///
+/// A revision names a set of on-chain rules that the scooper must mirror.
+/// Two hashes of one kind with the same rules (for example two builds of
+/// `fee_split` with different parameters) have the same revision. A hash
+/// whose module checks different arithmetic, a different redeemer shape or
+/// a different config shape needs a new revision.
+///
+/// The implemented revisions, by kind:
+///
+/// | kind | revision | sundae-v4 source | rules |
+/// | --- | --- | --- | --- |
+/// | every kind | 1 | the first module of the kind | the rules the scooper had before revisions existed |
+/// | `banded-concentrated-liquidity` | 1 | `e7d9c14`, preview `33485bba…` | `ClRules::REVISION_1` |
+/// | `banded-concentrated-liquidity` | 2 | `25d60ae`, the launch candidate | `ClRules::REVISION_2` |
+/// | `oracle` | 1 | `e7d9c14`, preview `31e23dfd…` and `144f4c99…` | `OracleRules::REVISION_1` |
+/// | `oracle` | 2 | `25d60ae`, the launch candidate | `OracleRules::REVISION_2` |
+///
+/// To add a revision: add a rules constant for it next to the existing
+/// ones, return it from that rules type's `of`, raise
+/// [`ModuleKind::latest_revision`] for the kind, and branch on the rule
+/// field (not on the revision number) where the behaviour differs.
+///
+/// A config entry with no `revision` is revision 1. Revision 1 is the
+/// behaviour every scooper release before revisions applied to the CL and
+/// oracle hashes that the files in `config/` name, so an existing config
+/// keeps its meaning.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct Revision(pub u16);
+
+impl Revision {
+    /// The revision of an entry that names none.
+    pub const DEFAULT: Revision = Revision(1);
+}
+
+impl std::fmt::Display for Revision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl std::fmt::Display for ModuleKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.config_key())
@@ -137,6 +203,8 @@ pub struct ScriptRefInfo {
 #[derive(Clone, Debug)]
 pub struct ModuleEntry {
     pub kind: ModuleKind,
+    /// The rules this hash applies, within its kind.
+    pub revision: Revision,
     pub script: ScriptRefInfo,
 }
 
@@ -145,6 +213,9 @@ pub struct ModuleEntry {
 #[derive(Clone, Debug, Default)]
 pub struct ModuleRegistry {
     entries: BTreeMap<ScriptHash, ModuleEntry>,
+    /// Insertion order, for `ModuleScripts::first_of`.
+    #[cfg(test)]
+    order: Vec<ScriptHash>,
 }
 
 fn hash_of_slice(hash: &[u8]) -> Option<ScriptHash> {
@@ -153,9 +224,29 @@ fn hash_of_slice(hash: &[u8]) -> Option<ScriptHash> {
 }
 
 impl ModuleRegistry {
-    /// Add a script. Fails when the hash is already registered, under the
-    /// same kind or a different kind.
+    /// Add a script at revision 1. See [`ModuleRegistry::insert_revision`].
+    #[cfg(test)]
     pub fn insert(&mut self, kind: ModuleKind, script: ScriptRefInfo) -> Result<(), String> {
+        self.insert_revision(kind, Revision::DEFAULT, script)
+    }
+
+    /// Add a script with its revision. Fails when the hash is already
+    /// registered, under the same kind or a different kind, and when the
+    /// scooper does not implement that revision of the kind.
+    pub fn insert_revision(
+        &mut self,
+        kind: ModuleKind,
+        revision: Revision,
+        script: ScriptRefInfo,
+    ) -> Result<(), String> {
+        if !kind.implements(revision) {
+            return Err(format!(
+                "module script {}: '{kind}' revision {revision} is not implemented \
+                 (this scooper implements 1 to {})",
+                script.hash,
+                kind.latest_revision()
+            ));
+        }
         if let Some(prev) = self.entries.get(&script.hash) {
             return Err(if prev.kind == kind {
                 format!(
@@ -169,7 +260,16 @@ impl ModuleRegistry {
                 )
             });
         }
-        self.entries.insert(script.hash, ModuleEntry { kind, script });
+        #[cfg(test)]
+        self.order.push(script.hash);
+        self.entries.insert(
+            script.hash,
+            ModuleEntry {
+                kind,
+                revision,
+                script,
+            },
+        );
         Ok(())
     }
 
@@ -181,6 +281,11 @@ impl ModuleRegistry {
     /// The kind of a registered hash.
     pub fn kind_of(&self, hash: &[u8]) -> Option<ModuleKind> {
         self.get(hash).map(|e| e.kind)
+    }
+
+    /// The revision of a registered hash.
+    pub fn revision_of(&self, hash: &[u8]) -> Option<Revision> {
+        self.get(hash).map(|e| e.revision)
     }
 
     /// Every script of one kind, in hash order.
@@ -220,35 +325,60 @@ pub struct ModuleScripts {
     pub modules: ModuleRegistry,
 }
 
+/// One config entry: a script and, for a module, its optional revision.
+#[derive(serde::Deserialize)]
+struct ConfiguredScript {
+    #[serde(flatten)]
+    script: ScriptRefInfo,
+    #[serde(default)]
+    revision: Option<Revision>,
+}
+
 /// The config value of one role key: one script, or a list of them.
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum OneOrMany {
-    One(ScriptRefInfo),
-    Many(Vec<ScriptRefInfo>),
+    One(ConfiguredScript),
+    Many(Vec<ConfiguredScript>),
 }
 
 impl<'de> serde::Deserialize<'de> for ModuleScripts {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let raw: BTreeMap<String, OneOrMany> = BTreeMap::deserialize(d)?;
-        ModuleScripts::from_role_map(raw.into_iter().map(|(k, v)| {
+        ModuleScripts::from_role_map_with_revisions(raw.into_iter().map(|(k, v)| {
             let scripts = match v {
                 OneOrMany::One(s) => vec![s],
                 OneOrMany::Many(v) => v,
             };
-            (k, scripts)
+            (
+                k,
+                scripts.into_iter().map(|c| (c.script, c.revision)).collect(),
+            )
         }))
         .map_err(D::Error::custom)
     }
 }
 
 impl ModuleScripts {
-    /// Build from `(role key, scripts)` pairs. The four boot-fixed roles
-    /// take exactly one script. Every other key must name a [`ModuleKind`].
-    /// `fee-split` and `fairness` must have at least one script.
+    /// [`ModuleScripts::from_role_map_with_revisions`] with no revision on
+    /// any script, so every module is revision 1.
+    #[cfg(test)]
     pub fn from_role_map(
         roles: impl IntoIterator<Item = (String, Vec<ScriptRefInfo>)>,
+    ) -> Result<Self, String> {
+        Self::from_role_map_with_revisions(
+            roles.into_iter().map(|(k, v)| (k, v.into_iter().map(|s| (s, None)).collect())),
+        )
+    }
+
+    /// Build from `(role key, [(script, revision)])` pairs. The four
+    /// boot-fixed roles take exactly one script and no revision. Every other
+    /// key must name a [`ModuleKind`], and a script with no revision is
+    /// [`Revision::DEFAULT`]. `fee-split` and `fairness` must have at least
+    /// one script.
+    pub fn from_role_map_with_revisions(
+        roles: impl IntoIterator<Item = (String, Vec<(ScriptRefInfo, Option<Revision>)>)>,
     ) -> Result<Self, String> {
         let mut pool = None;
         let mut order = None;
@@ -266,9 +396,14 @@ impl ModuleScripts {
             };
             if let Some((name, slot)) = fixed {
                 let mut scripts = scripts.into_iter();
-                let (Some(s), None) = (scripts.next(), scripts.next()) else {
+                let (Some((s, revision)), None) = (scripts.next(), scripts.next()) else {
                     return Err(format!("module-scripts.{name} must be exactly one script"));
                 };
+                if revision.is_some() {
+                    return Err(format!(
+                        "module-scripts.{name} is boot-fixed and takes no revision"
+                    ));
+                }
                 if let Some(prev) = fixed_hashes.insert(s.hash, name) {
                     return Err(format!(
                         "script {} is listed under both '{prev}' and '{name}'",
@@ -280,8 +415,8 @@ impl ModuleScripts {
             }
             let kind = ModuleKind::from_config_key(&key)
                 .ok_or_else(|| format!("module-scripts: unknown role '{key}'"))?;
-            for s in scripts {
-                modules.insert(kind, s)?;
+            for (s, revision) in scripts {
+                modules.insert_revision(kind, revision.unwrap_or(Revision::DEFAULT), s)?;
             }
         }
         for e in modules.iter() {
@@ -314,6 +449,11 @@ impl ModuleScripts {
         self.modules.kind_of(hash)
     }
 
+    /// The revision of a registered module hash.
+    pub fn revision_of(&self, hash: &[u8]) -> Option<Revision> {
+        self.modules.revision_of(hash)
+    }
+
     /// The registered module script for a hash.
     pub fn get(&self, hash: &[u8]) -> Option<&ScriptRefInfo> {
         self.modules.get(hash).map(|e| &e.script)
@@ -325,12 +465,32 @@ impl ModuleScripts {
         self.modules.of_kind(kind)
     }
 
-    /// The first script of `kind` in hash order. Test fixtures configure one
-    /// script per kind; production code must look up by the hash a pool or
-    /// order names instead.
+    /// The first script of `kind` in insertion order: the main fixture's
+    /// script, before any that a test adds. Production code must look up by
+    /// the hash a pool or order names instead.
     #[cfg(test)]
     pub fn first_of(&self, kind: ModuleKind) -> Option<&ScriptRefInfo> {
-        self.of_kind(kind).next()
+        self.modules
+            .order
+            .iter()
+            .filter_map(|h| self.modules.entries.get(h))
+            .find(|e| e.kind == kind)
+            .map(|e| &e.script)
+    }
+
+    /// The first script (insertion order) of `kind` at `revision`.
+    #[cfg(test)]
+    pub fn first_of_revision(
+        &self,
+        kind: ModuleKind,
+        revision: Revision,
+    ) -> Option<&ScriptRefInfo> {
+        self.modules
+            .order
+            .iter()
+            .filter_map(|h| self.modules.entries.get(h))
+            .find(|e| e.kind == kind && e.revision == revision)
+            .map(|e| &e.script)
     }
 
     /// Every script: the four boot-fixed ones, then the registry.

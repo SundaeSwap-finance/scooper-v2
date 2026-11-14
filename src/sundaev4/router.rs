@@ -330,7 +330,8 @@ fn banded_marginal(
     }
     let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
     let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
-    let dx_eff = raw_allocated - &crate::sundaev4::banded_math::band_fee(raw_allocated, fee);
+    let dx_eff = raw_allocated
+        - &crate::sundaev4::banded_math::band_fee_rounded(raw_allocated, fee, band.fee_rounds_up);
     if is_a_input {
         let va = &va0 + &(&dx_eff * spb_num);
         let denom = &fee_den * spa_den * &va * &va;

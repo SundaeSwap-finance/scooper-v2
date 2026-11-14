@@ -253,11 +253,13 @@ pub fn compute_fee_budget(
             }
         }
         super::types::PoolType::BandedConcentratedLiquidity { config } => {
-            // cl_check.fee_value_pair: `bp - lp_before = floor(lp_before *
-            // fee_value / pool_value)` with `bp = lp_after + fee_budget`, at
-            // the before witness's band price (sundae-v4 SV4-001b). This
-            // prices the change as ONE transcript step. A non-swap step must
-            // declare 0.
+            // From revision 2, cl_check.fee_value_pair: `bp - lp_before =
+            // floor(lp_before * fee_value / pool_value)` with `bp = lp_after
+            // + fee_budget`, at the before witness's band price (sundae-v4
+            // SV4-001b). In revision 1, banded_cl_check.banded_swap step 9:
+            // `bp * X0 <= lp_before * X1 < (bp + 1) * X0` on the two ladder
+            // counters. This prices the change as ONE transcript step. A
+            // non-swap step must declare 0.
             if assets_before.len() != 2 || assets_after.len() != 2 {
                 warn!("banded fee_budget: pool does not hold two assets");
                 return BigInt::from(0);
@@ -267,6 +269,18 @@ pub fn compute_fee_budget(
             let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
             if !is_swap {
                 return BigInt::from(0);
+            }
+            if !config.rules.fee_budget_is_fee_value {
+                let (Some(before), Some(after)) = (
+                    super::banded_math::find_witness(config, a0, b0),
+                    super::banded_math::find_witness(config, a1, b1),
+                ) else {
+                    warn!("banded fee_budget: no ladder witness for the step's reserves");
+                    return BigInt::from(0);
+                };
+                return super::banded_math::counter_fee_budget(
+                    lp_before, &before.x, &after.x, lp_before,
+                );
             }
             let Some(before) = super::banded_math::find_witness(config, a0, b0) else {
                 warn!("banded fee_budget: no ladder witness for the step's before reserves");
