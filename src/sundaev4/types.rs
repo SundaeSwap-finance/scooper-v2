@@ -1153,11 +1153,56 @@ impl OracleSlot {
         })
     }
 
+    /// `acc_modulus` in the module: the accumulators count modulo 2^256.
+    pub fn acc_modulus() -> BigInt {
+        let mut m = BigInt::from(1);
+        for _ in 0..256 {
+            m = &m * &BigInt::from(2);
+        }
+        m
+    }
+
+    /// `price_max` in the module: the largest value of the 16-byte price.
+    pub fn price_max() -> BigInt {
+        let mut m = BigInt::from(1);
+        for _ in 0..128 {
+            m = &m * &BigInt::from(2);
+        }
+        &m - &BigInt::from(1)
+    }
+
+    /// `oracle_check.spend_price`: a spend's volume-weighted price, scaled.
+    pub fn spend_price(volume_a: &BigInt, volume_b: &BigInt) -> BigInt {
+        &(volume_b * &Self::price_scale()) / volume_a
+    }
+
+    /// `oracle_check.unstarted`: every field zero.
+    pub fn unstarted() -> Self {
+        Self {
+            creation_time: BigInt::from(0),
+            last_time: BigInt::from(0),
+            last_price: BigInt::from(0),
+            volume_a: BigInt::from(0),
+            volume_b: BigInt::from(0),
+            twap_num: BigInt::from(0),
+        }
+    }
+
+    /// `oracle_check.is_unstarted`: no price has existed yet.
+    pub fn is_unstarted(&self) -> bool {
+        self.creation_time == BigInt::from(0)
+    }
+
+    /// The bytes a spend writes to the slot (`oracle_check.encode_slot`).
+    pub fn encode_slot(&self) -> Result<Vec<u8>, String> {
+        self.encode()
+    }
+
     /// `oracle_check.initialise`.
     pub fn initialise(now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Self {
         use num_traits::Signed;
         let last_price = if volume_a.is_positive() {
-            &(volume_b * &Self::price_scale()) / volume_a
+            Self::spend_price(volume_a, volume_b)
         } else {
             BigInt::from(0)
         };
@@ -1182,7 +1227,7 @@ impl OracleSlot {
             ));
         }
         let last_price = if volume_a.is_positive() {
-            &(volume_b * &Self::price_scale()) / volume_a
+            Self::spend_price(volume_a, volume_b)
         } else {
             self.last_price.clone()
         };
@@ -1196,19 +1241,21 @@ impl OracleSlot {
         })
     }
 
-    /// The slot after a scoop: `oracle_check.walk_deltas` over the transcript
-    /// (swap steps add |Δa| and |Δb|; non-swap steps add nothing), then
-    /// initialise or advance.
-    pub fn after_scoop(
-        in_slot: &[u8],
-        now: &BigInt,
+    /// A spend's two volumes (`oracle_check.spend_volumes`): the walk over
+    /// the transcript from the input reserves. A swap step adds |da| and
+    /// |db|; a non-swap step adds nothing. `lp_in` and `lp_out` are the
+    /// total_lp of the pool input and output datums. Each transcript state
+    /// is `(a, b, total_lp)`.
+    pub fn spend_volumes(
         reserves_before: (&BigInt, &BigInt),
-        transcript_states: impl Iterator<Item = (BigInt, BigInt)>,
-    ) -> Result<Self, String> {
+        _lp_in: &BigInt,
+        _lp_out: &BigInt,
+        transcript_states: impl Iterator<Item = (BigInt, BigInt, BigInt)>,
+    ) -> Result<(BigInt, BigInt), String> {
         let (mut a0, mut b0) = (reserves_before.0.clone(), reserves_before.1.clone());
         let mut va = BigInt::from(0);
         let mut vb = BigInt::from(0);
-        for (a1, b1) in transcript_states {
+        for (a1, b1, _lp1) in transcript_states {
             let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
             if is_swap {
                 va = &va + &(if a1 > a0 { &a1 - &a0 } else { &a0 - &a1 });
@@ -1217,6 +1264,20 @@ impl OracleSlot {
             a0 = a1;
             b0 = b1;
         }
+        Ok((va, vb))
+    }
+
+    /// The slot after a scoop: `spend_volumes` over the transcript, then
+    /// initialise or advance.
+    pub fn after_scoop(
+        in_slot: &[u8],
+        now: &BigInt,
+        reserves_before: (&BigInt, &BigInt),
+        lp_in: &BigInt,
+        lp_out: &BigInt,
+        transcript_states: impl Iterator<Item = (BigInt, BigInt, BigInt)>,
+    ) -> Result<Self, String> {
+        let (va, vb) = Self::spend_volumes(reserves_before, lp_in, lp_out, transcript_states)?;
         if in_slot == Self::FRESH {
             Ok(Self::initialise(now, &va, &vb))
         } else {
@@ -2452,5 +2513,232 @@ mod datum_round_trip {
         trip::<PoolDatum>("pool", &format!("{dir}/datum-pool.hex"));
         trip::<OrderDatum>("order", &format!("{dir}/datum-order.hex"));
         trip::<OrderConfig>("orderconfig", &format!("{dir}/datum-orderconfig.hex"));
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    //! The oracle slot the scooper writes must equal the slot the module
+    //! computes (sundae-v4 PR #230, `lib/modules/oracle_check.ak`). The
+    //! vectors are from `lib/tests/unit/oracle_scale.ak` and
+    //! `lib/tests/unit/oracle_total.ak` on branch pi/sv4-008-oracle-total.
+    use super::OracleSlot;
+    use crate::bigint::BigInt;
+
+    fn b(v: i64) -> BigInt {
+        BigInt::from(v)
+    }
+
+    fn pow2(n: u32) -> BigInt {
+        let mut m = b(1);
+        for _ in 0..n {
+            m = &m * &b(2);
+        }
+        m
+    }
+
+    /// `spend_volumes` on transcript states `(a, b, total_lp)`.
+    fn vols(a0: &BigInt, b0: &BigInt, lp_in: &BigInt, lp_out: &BigInt, states: &[(BigInt, BigInt, BigInt)]) -> (BigInt, BigInt) {
+        OracleSlot::spend_volumes((a0, b0), lp_in, lp_out, states.iter().cloned()).unwrap()
+    }
+
+    /// The SV4-002 runbook pool of `oracle_scale.ak`: 800,000 A, 1,200,000
+    /// B, total_lp 2,000,000.
+    fn runbook(states: &[(i64, i64, i64)], lp_out: i64) -> (BigInt, BigInt) {
+        let st: Vec<_> = states.iter().map(|&(a, bb, l)| (b(a), b(bb), b(l))).collect();
+        vols(&b(800_000), &b(1_200_000), &b(2_000_000), &b(lp_out), &st)
+    }
+
+    // ── Honest transcripts: counted unchanged ──────────────────────────
+
+    #[test]
+    fn counts_an_honest_swap() {
+        assert_eq!(runbook(&[(880_000, 1_120_200, 2_000_040)], 2_000_040), (b(80_000), b(79_800)));
+    }
+
+    #[test]
+    fn counts_a_swap_before_a_deposit() {
+        let t = [(880_000, 1_120_200, 2_000_040), (968_000, 1_232_220, 2_200_044)];
+        assert_eq!(runbook(&t, 2_200_044), (b(80_000), b(79_800)));
+    }
+
+    #[test]
+    fn counts_a_swap_after_a_deposit() {
+        let t = [(880_000, 1_320_000, 2_200_000), (968_000, 1_232_220, 2_200_044)];
+        assert_eq!(runbook(&t, 2_200_044), (b(88_000), b(87_780)));
+    }
+
+    #[test]
+    fn counts_a_swap_after_a_withdrawal() {
+        let t = [(720_000, 1_080_000, 1_800_000), (792_000, 1_008_180, 1_800_036)];
+        assert_eq!(runbook(&t, 1_800_036), (b(72_000), b(71_820)));
+    }
+
+    // ── Unbacked liquidity steps: counted at the real size (SV4-008/009) ─
+
+    /// Withdraw to 1/40, swap 2,000 A at that scale, deposit back. The step
+    /// at total_lp 50,001 is below lo = 2,000,000, so it scales by
+    /// 2,000,000 / 50,001 (floored per volume).
+    #[test]
+    fn counts_a_shrunk_swap_at_the_real_size() {
+        let t = [(20_000, 30_000, 50_000), (22_000, 28_005, 50_001), (880_000, 1_120_200, 2_000_040)];
+        assert_eq!(runbook(&t, 2_000_040), (b(79_998), b(79_798)));
+    }
+
+    /// An unbacked x1000 deposit, a round trip of 500,000,000 A, and the
+    /// withdrawal back. Unscaled it counted 998,750,000 A.
+    #[test]
+    fn counts_an_inflated_round_trip_at_the_real_size() {
+        let t = [
+            (800_000_000, 1_200_000_000, 2_000_000_000),
+            (1_300_000_000, 701_250_000, 2_000_250_000),
+            (801_250_000, 1_200_000_000, 2_000_250_000),
+            (801_250, 1_200_000, 2_000_250),
+        ];
+        assert_eq!(runbook(&t, 2_000_250), (b(998_750), b(997_500)));
+    }
+
+    /// The inflation at any factor `k`: a zero-fee round trip of 100,000 A
+    /// at x`k` counts as the same round trip at x1.
+    #[test]
+    fn inflation_at_any_factor_counts_at_the_real_size() {
+        for k in [b(2), b(1000), pow2(200)] {
+            let st = vec![
+                (&b(800_000) * &k, &b(1_200_000) * &k, &b(2_000_000) * &k),
+                (&b(900_000) * &k, &b(1_100_000) * &k, &b(2_000_000) * &k),
+                (&b(800_000) * &k, &b(1_200_000) * &k, &b(2_000_000) * &k),
+                (b(800_000), b(1_200_000), b(2_000_000)),
+            ];
+            let got = vols(&b(800_000), &b(1_200_000), &b(2_000_000), &b(2_000_000), &st);
+            assert_eq!(got, (b(200_000), b(200_000)), "k={k}");
+        }
+    }
+
+    /// The shrink at any factor `k`: a pool `k` times the base pool shrinks
+    /// to the base pool, swaps 1,000 A, and grows back. The swap counts as
+    /// 1,000 * `k`.
+    #[test]
+    fn shrink_at_any_factor_counts_at_the_real_size() {
+        for k in [b(2), b(7), b(1_000_000)] {
+            let st = vec![
+                (b(800_000), b(1_200_000), b(2_000_000)),
+                (b(801_000), b(1_199_000), b(2_000_000)),
+                (&b(801_000) * &k, &b(1_199_000) * &k, &b(2_000_000) * &k),
+            ];
+            let lp = &b(2_000_000) * &k;
+            let got = vols(&(&b(800_000) * &k), &(&b(1_200_000) * &k), &lp, &lp, &st);
+            assert_eq!(got, (&b(1000) * &k, &b(1000) * &k), "k={k}");
+        }
+    }
+
+    /// The known undercount: a deposit, the swap, a withdrawal. The swap ran
+    /// above both ends and counts at the end size.
+    #[test]
+    fn undercounts_a_swap_between_a_deposit_and_a_withdrawal() {
+        let t = [(880_000, 1_320_000, 2_200_000), (968_000, 1_232_220, 2_200_044), (880_000, 1_120_200, 2_000_040)];
+        assert_eq!(runbook(&t, 2_000_040), (b(80_000), b(79_800)));
+    }
+
+    /// `lp_lo` and `lp_hi` are the min and max of the two ends, whichever
+    /// end is larger.
+    #[test]
+    fn the_bounds_do_not_depend_on_which_end_is_larger() {
+        // lp_in 4,000,000 > lp_out 2,000,000; the swap at 8,000,000 scales
+        // down to hi = 4,000,000.
+        let st = vec![(b(1_000_100), b(999_900), b(8_000_000))];
+        assert_eq!(vols(&b(1_000_000), &b(1_000_000), &b(4_000_000), &b(2_000_000), &st), (b(50), b(50)));
+        assert_eq!(vols(&b(1_000_000), &b(1_000_000), &b(2_000_000), &b(4_000_000), &st), (b(50), b(50)));
+    }
+
+    /// A swap step below `lp_lo` with total_lp 0 makes the module fail
+    /// (`expect lp1 > 0`). The scooper refuses it instead of dividing.
+    #[test]
+    fn a_swap_step_at_zero_total_lp_is_refused() {
+        let st = vec![(b(1_000_100), b(999_900), b(0))];
+        assert!(OracleSlot::spend_volumes((&b(1_000_000), &b(1_000_000)), &b(10), &b(10), st.into_iter()).is_err());
+    }
+
+    // ── Wrap and saturate ──────────────────────────────────────────────
+
+    fn state(volume_a: BigInt, volume_b: BigInt, twap_num: BigInt, last_price: BigInt) -> OracleSlot {
+        OracleSlot { creation_time: b(1_000), last_time: b(2_000), last_price, volume_a, volume_b, twap_num }
+    }
+
+    /// `oracle_volume_wraps_past_two_to_the_256`.
+    #[test]
+    fn volume_wraps_past_two_to_the_256() {
+        let prev = state(&pow2(256) - &b(1), b(10), b(0), b(450_000_000_000_000_000));
+        let next = prev.advance(&b(3_000), &b(300), &b(135)).unwrap();
+        assert_eq!(next.volume_a, b(299));
+        assert_eq!(next.volume_b, b(145));
+        assert_eq!(OracleSlot::decode(&next.encode().unwrap()).unwrap(), next);
+    }
+
+    /// `twap_num` counts modulo 2^256 too.
+    #[test]
+    fn twap_num_wraps_past_two_to_the_256() {
+        let prev = state(b(1), b(1), &pow2(256) - &b(1), b(2));
+        let next = prev.advance(&b(2_001), &b(0), &b(0)).unwrap();
+        assert_eq!(next.twap_num, b(1));
+        assert!(next.encode().is_ok());
+    }
+
+    /// `oracle_price_saturates`: one A for 10^21 B is 10^39 scaled.
+    #[test]
+    fn price_saturates() {
+        let first = OracleSlot::initialise(&b(5_000), &b(1), &(&b(1_000_000_000) * &b(1_000_000_000_000)));
+        assert_eq!(first.last_price, &pow2(128) - &b(1));
+        assert_eq!(OracleSlot::decode(&first.encode().unwrap()).unwrap(), first);
+        let prev = state(b(1), b(1), b(0), b(1));
+        let next = prev.advance(&b(3_000), &b(1), &(&b(1_000_000_000) * &b(1_000_000_000_000))).unwrap();
+        assert_eq!(next.last_price, &pow2(128) - &b(1));
+    }
+
+    /// The first priced spend stores its volumes modulo 2^256. The price
+    /// uses the unreduced volumes.
+    #[test]
+    fn initialise_reduces_its_volumes() {
+        let va = &pow2(256) + &b(5);
+        let vb = &pow2(256) + &b(7);
+        let first = OracleSlot::initialise(&b(5_000), &va, &vb);
+        assert_eq!(first.volume_a, b(5));
+        assert_eq!(first.volume_b, b(7));
+        assert_eq!(first.last_price, OracleSlot::spend_price(&va, &vb));
+        assert!(first.encode().is_ok());
+    }
+
+    // ── The sentinel (oracle_check.encode_slot) ────────────────────────
+
+    /// A spend with no swap on a fresh slot has no price. The module writes
+    /// the `0x80` sentinel back, so the clock starts with the first swap.
+    #[test]
+    fn a_swapless_first_spend_writes_the_sentinel() {
+        let deposit = vec![(b(2_000), b(2_000), b(2_000_000))];
+        let next =
+            OracleSlot::after_scoop(OracleSlot::FRESH, &b(5_000), (&b(1_000), &b(1_000)), &b(1_000_000), &b(2_000_000), deposit.into_iter())
+                .unwrap();
+        assert!(next.is_unstarted());
+        assert_eq!(next.encode_slot().unwrap(), OracleSlot::FRESH.to_vec());
+    }
+
+    /// `advance` on an unstarted state is `initialise`: no interval is owed
+    /// to a price that did not exist.
+    #[test]
+    fn advance_from_unstarted_is_initialise() {
+        let next = OracleSlot::unstarted().advance(&b(5_000), &b(100), &b(120)).unwrap();
+        assert_eq!(next, OracleSlot::initialise(&b(5_000), &b(100), &b(120)));
+        assert_eq!(next.creation_time, b(5_000));
+        assert_eq!(next.twap_num, b(0));
+    }
+
+    /// A priced first spend writes the 128-byte state.
+    #[test]
+    fn a_priced_first_spend_writes_the_state() {
+        let swap = vec![(b(1_100), b(880), b(1_000_000))];
+        let next =
+            OracleSlot::after_scoop(OracleSlot::FRESH, &b(5_000), (&b(1_000), &b(1_000)), &b(1_000_000), &b(1_000_000), swap.into_iter())
+                .unwrap();
+        assert_eq!((next.volume_a.clone(), next.volume_b.clone()), (b(100), b(120)));
+        assert_eq!(next.encode_slot().unwrap().len(), OracleSlot::BYTES);
     }
 }

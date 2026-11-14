@@ -1361,13 +1361,21 @@ pub fn build_multi_pool_scoop_tx(
                 bail!("pool {}: the oracle needs a two-asset pool", pool.pool_datum.identifier);
             }
             let now_ms = BigInt::from(exec.slot_config.slot_to_posix_ms(validity.start));
-            let states = per_pool_transcripts[i]
-                .iter()
-                .map(|e| (e.state_after.assets[0].1.clone(), e.state_after.assets[1].1.clone()));
+            let states = per_pool_transcripts[i].iter().map(|e| {
+                (
+                    e.state_after.assets[0].1.clone(),
+                    e.state_after.assets[1].1.clone(),
+                    e.state_after.total_lp.clone(),
+                )
+            });
+            // The module reads total_lp from the pool input datum and from
+            // the pool output datum, which carries `final_total_lp`.
             let next = crate::sundaev4::types::OracleSlot::after_scoop(
                 &slot.1,
                 &now_ms,
                 (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1),
+                &pool.pool_datum.total_lp,
+                &final_total_lp,
                 states,
             )
             .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
@@ -1379,7 +1387,7 @@ pub fn build_multi_pool_scoop_tx(
                 last_price = %next.last_price,
                 "oracle slot after scoop",
             );
-            slot.1 = next.encode().map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
+            slot.1 = next.encode_slot().map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
         }
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
