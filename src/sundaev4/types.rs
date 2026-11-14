@@ -440,6 +440,7 @@ impl Constraint {
     /// `basic_order_hash`, then decoding that inner Data with the matching
     /// class's field shapes (the two modules encode different layouts for
     /// tag 2).
+    #[cfg(test)]
     pub fn from_order_datum(
         datum: &OrderDatum,
         swap_order_hash: &[u8],
@@ -460,18 +461,20 @@ impl Constraint {
     /// so it must be selected by hash, never by ctor tag.
     pub fn from_order_datum_with_strategy(
         datum: &OrderDatum,
-        swap_order_hash: &[u8],
-        basic_order_hash: &[u8],
-        strategy_order_hash: &[u8],
+        hashes: &ConstraintHashes,
     ) -> anyhow::Result<Self> {
-        if !strategy_order_hash.is_empty()
-            && let Some(data) = datum.find_constraint_by_hash(strategy_order_hash)
-        {
+        if let Some(data) = hashes.find(datum, &hashes.strategy) {
             let constraints = StrategyConstraints::from_plutus(data.clone())
                 .map_err(|e| anyhow::anyhow!("decode StrategyConstraints: {e}"))?;
             return Ok(Constraint::Strategy { constraints });
         }
-        Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
+        if let Some(data) = hashes.find(datum, &hashes.swap) {
+            return Self::from_plutus_constraint(data);
+        }
+        if let Some(data) = hashes.find(datum, &hashes.basic) {
+            return Self::from_basic_plutus_constraint(data);
+        }
+        anyhow::bail!("order has neither swap_order nor basic_order constraint")
     }
 
     /// The strategy constraints, for a strategy order.
@@ -521,22 +524,13 @@ impl Constraint {
 /// reason rather than dropping it silently.
 pub fn decode_order_constraint(
     datum: &OrderDatum,
-    swap_order_hash: &[u8],
-    basic_order_hash: &[u8],
-    strategy_order_hash: &[u8],
+    hashes: &ConstraintHashes,
 ) -> Result<Constraint, String> {
-    Constraint::from_order_datum_with_strategy(
-        datum,
-        swap_order_hash,
-        basic_order_hash,
-        strategy_order_hash,
-    )
-    .map_err(|e| {
-        let supported: [&[u8]; 3] = [swap_order_hash, basic_order_hash, strategy_order_hash];
+    Constraint::from_order_datum_with_strategy(datum, hashes).map_err(|e| {
         let unsupported: Vec<String> = datum
             .constraints
             .iter()
-            .filter(|(h, _)| !supported.contains(&h.as_slice()))
+            .filter(|(h, _)| !hashes.is_executable(h))
             .map(|(h, _)| hex::encode(h))
             .collect();
         if unsupported.is_empty() {
@@ -548,6 +542,36 @@ pub fn decode_order_constraint(
             )
         }
     })
+}
+
+/// The constraint-module hashes whose order data the scooper can decode:
+/// every configured `swap_order`, `basic_order` and `strategy_order` hash.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConstraintHashes {
+    pub swap: Vec<Vec<u8>>,
+    pub basic: Vec<Vec<u8>>,
+    pub strategy: Vec<Vec<u8>>,
+}
+
+impl ConstraintHashes {
+    pub fn from_scripts(scripts: &ModuleScripts) -> Self {
+        ConstraintHashes {
+            swap: scripts.modules.hashes_of_kind(ModuleKind::SwapOrder),
+            basic: scripts.modules.hashes_of_kind(ModuleKind::BasicOrder),
+            strategy: scripts.modules.hashes_of_kind(ModuleKind::StrategyOrder),
+        }
+    }
+
+    /// The data of the first datum constraint whose hash is in `set`.
+    fn find<'a>(&self, datum: &'a OrderDatum, set: &[Vec<u8>]) -> Option<&'a PlutusData> {
+        datum.constraints.iter().find(|(h, _)| set.contains(h)).map(|(_, d)| d)
+    }
+
+    fn is_executable(&self, hash: &[u8]) -> bool {
+        [&self.swap, &self.basic, &self.strategy]
+            .iter()
+            .any(|set| set.iter().any(|h| h.as_slice() == hash))
+    }
 }
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
@@ -1680,80 +1704,7 @@ pub fn normalize_secret_key_hex(input: &str) -> anyhow::Result<String> {
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ModuleScripts {
-    /// Optional: only required when scooping constant-product pools (the
-    /// audit-final cs-launch deployment does not publish CP).
-    #[serde(default)]
-    pub constant_product: Option<ScriptRefInfo>,
-    pub fee_split: ScriptRefInfo,
-    pub fairness: ScriptRefInfo,
-    pub pool: ScriptRefInfo,
-    pub order: ScriptRefInfo,
-    pub pool_mint: ScriptRefInfo,
-    pub settings: ScriptRefInfo,
-    /// Optional: only required when scooping constant-sum pools.
-    #[serde(default)]
-    pub constant_sum: Option<ScriptRefInfo>,
-    /// Optional: only required when scooping stableswap pools. Without it
-    /// the scooper cannot classify a stableswap pool and skips it (see
-    /// `detect_pool_type`).
-    #[serde(default)]
-    pub stableswap: Option<ScriptRefInfo>,
-    /// Optional: only required when scooping banded concentrated-liquidity
-    /// pools (`banded_concentrated_liquidity.withdraw`).
-    #[serde(default)]
-    pub banded_concentrated_liquidity: Option<ScriptRefInfo>,
-    /// Optional: the general price oracle module (`oracle.withdraw`). A pool
-    /// that lists it as a fourth trade-action module needs it to run on every
-    /// scoop. Parsed so the config can name it; the scooper does not build
-    /// its entries yet, and refuses pools that require it.
-    #[serde(default)]
-    pub oracle: Option<ScriptRefInfo>,
-    /// Per-class constraint validators (modular order constraints, PR #11).
-    /// Every order's OrderConfig lists which constraint hashes it requires;
-    /// the order_validator's withdraw handler requires each listed constraint
-    /// to also withdraw. Slots are `Option` so a deployment that doesn't use
-    /// e.g. strategy orders can omit that module.
-    #[serde(default)]
-    pub swap_order: Option<ScriptRefInfo>,
-    /// `basic_order_constraint` covers Deposit/Withdraw/Claim shapes.
-    #[serde(default)]
-    pub basic_order: Option<ScriptRefInfo>,
-    /// `route_order_constraint` carries the per-order route table (pool
-    /// whitelist + per-step pool_input / transcript_step indices).
-    #[serde(default)]
-    pub route_order: Option<ScriptRefInfo>,
-    /// `fairness_order_constraint` pins the authorized scooper for the tx
-    /// via the global settings entry's authorized_scoopers list.
-    #[serde(default)]
-    pub fairness_order: Option<ScriptRefInfo>,
-    /// `strategy_order_constraint` accepts a `List<SignedStrategyExecution>`
-    /// redeemer signed off-chain. The scooper doesn't yet construct these —
-    /// optional until strategy execution ingestion is designed.
-    #[serde(default)]
-    pub strategy_order: Option<ScriptRefInfo>,
-    /// `fee_constraint` — the once-per-scoop service-fee aggregator
-    /// (docs/fee-system.md). Optional: absent = fee-bearing OrderConfigs
-    /// can't be scooped.
-    #[serde(default)]
-    pub fee_constraint: Option<ScriptRefInfo>,
-}
-
-#[serde_with::serde_as]
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ScriptRefInfo {
-    pub hash: ScriptHash,
-    #[serde_as(as = "serde_with::DisplayFromStr")]
-    pub ref_utxo: crate::cardano_types::TransactionInput,
-    /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
-    /// Hex-encoded script CBOR, populated from blueprint. Retained for serde round-trip.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub script_cbor: Option<String>,
-}
+pub use super::module_scripts::{ModuleKind, ModuleRegistry, ModuleScripts, ScriptRefInfo};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Indexed state wrapper types

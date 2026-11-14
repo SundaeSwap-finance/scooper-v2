@@ -651,9 +651,18 @@ mod tests {
         let executed = [
             ("pool", &ms.pool),
             ("order", &ms.order),
-            ("fee_split", &ms.fee_split),
-            ("fairness", &ms.fairness),
-            ("constant_sum", ms.constant_sum.as_ref().unwrap()),
+            (
+                "fee_split",
+                ms.first_of(crate::sundaev4::ModuleKind::FeeSplit).unwrap(),
+            ),
+            (
+                "fairness",
+                ms.first_of(crate::sundaev4::ModuleKind::Fairness).unwrap(),
+            ),
+            (
+                "constant_sum",
+                ms.first_of(crate::sundaev4::ModuleKind::ConstantSum).unwrap(),
+            ),
         ];
         for (name, info) in executed {
             assert!(
@@ -1700,7 +1709,13 @@ mod tests {
             cfg,
             true,
         );
-        let oracle_hash = env.exec.module_scripts.oracle.as_ref().unwrap().hash.to_vec();
+        let oracle_hash = env
+            .exec
+            .module_scripts
+            .first_of(crate::sundaev4::ModuleKind::Oracle)
+            .unwrap()
+            .hash
+            .to_vec();
         let slot_of = |p: &crate::sundaev4::SundaeV4Pool| -> Vec<u8> {
             p.pool_datum.module_state.iter().find(|(h, _)| *h == oracle_hash).unwrap().1.clone()
         };
@@ -3353,8 +3368,14 @@ mod tests {
 
         // Dispatch-equivalent: parse the whitelist off the order and filter
         // the pool view before routing.
-        let route_hash =
-            env.exec.module_scripts.route_order.as_ref().unwrap().hash.as_ref().to_vec();
+        let route_hash = env
+            .exec
+            .module_scripts
+            .first_of(crate::sundaev4::ModuleKind::RouteOrder)
+            .unwrap()
+            .hash
+            .as_ref()
+            .to_vec();
         let wl = parse_route_whitelist(
             order.datum.find_constraint_by_hash(&route_hash).expect("order carries route module"),
         )
@@ -3758,8 +3779,18 @@ mod tests {
         let parsed = <crate::sundaev4::OrderDatum as AsPlutus>::from_plutus(datum).unwrap();
         let c = crate::sundaev4::Constraint::from_order_datum(
             &parsed,
-            env.exec.module_scripts.swap_order.as_ref().unwrap().hash.as_ref(),
-            env.exec.module_scripts.basic_order.as_ref().unwrap().hash.as_ref(),
+            env.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::SwapOrder)
+                .unwrap()
+                .hash
+                .as_ref(),
+            env.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::BasicOrder)
+                .unwrap()
+                .hash
+                .as_ref(),
         )
         .unwrap();
         match c {

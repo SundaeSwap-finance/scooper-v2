@@ -61,9 +61,7 @@ pub struct ProtocolWatch {
     /// Constraint-module hashes for decoding order datums into dispatchable
     /// constraints (empty when execution isn't configured — parsing then
     /// classifies orders but can't produce candidates).
-    pub swap_order_hash: Vec<u8>,
-    pub basic_order_hash: Vec<u8>,
-    pub strategy_order_hash: Vec<u8>,
+    pub constraint_hashes: crate::sundaev4::ConstraintHashes,
 }
 
 /// What a mempool tx does to the protocol, as far as we can tell without
@@ -404,9 +402,7 @@ pub fn provisional_orders_from_tx(
         };
         let constraint = match crate::sundaev4::Constraint::from_order_datum_with_strategy(
             &datum,
-            &watch.swap_order_hash,
-            &watch.basic_order_hash,
-            &watch.strategy_order_hash,
+            &watch.constraint_hashes,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -1211,31 +1207,9 @@ mod tests {
         let watch = ProtocolWatch {
             pool_script_hash: env.exec.module_scripts.pool.hash,
             order_script_hashes: vec![env.exec.module_scripts.order.hash],
-            swap_order_hash: env
-                .exec
-                .module_scripts
-                .swap_order
-                .as_ref()
-                .unwrap()
-                .hash
-                .as_ref()
-                .to_vec(),
-            basic_order_hash: env
-                .exec
-                .module_scripts
-                .basic_order
-                .as_ref()
-                .unwrap()
-                .hash
-                .as_ref()
-                .to_vec(),
-            strategy_order_hash: env
-                .exec
-                .module_scripts
-                .strategy_order
-                .as_ref()
-                .map(|m| m.hash.as_ref().to_vec())
-                .unwrap_or_default(),
+            constraint_hashes: crate::sundaev4::ConstraintHashes::from_scripts(
+                &env.exec.module_scripts,
+            ),
         };
         let parsed = provisional_orders_from_tx(&tx, &watch, 42);
         assert_eq!(
@@ -1293,9 +1267,7 @@ mod tests {
         let watch = ProtocolWatch {
             pool_script_hash: env.exec.module_scripts.pool.hash,
             order_script_hashes: vec![env.exec.module_scripts.order.hash],
-            swap_order_hash: Vec::new(),
-            basic_order_hash: Vec::new(),
-            strategy_order_hash: Vec::new(),
+            constraint_hashes: Default::default(),
         };
         let order_inputs: BTreeSet<(Vec<u8>, u64)> = orders
             .iter()
@@ -1317,9 +1289,7 @@ mod tests {
         let other_watch = ProtocolWatch {
             pool_script_hash: pallas_primitives::Hash::new([0xEE; 28]),
             order_script_hashes: vec![pallas_primitives::Hash::new([0xDD; 28])],
-            swap_order_hash: Vec::new(),
-            basic_order_hash: Vec::new(),
-            strategy_order_hash: Vec::new(),
+            constraint_hashes: Default::default(),
         };
         let class = classify_tx(&tx, &other_watch, &BTreeSet::new(), &BTreeSet::new());
         assert!(!class.relevant());

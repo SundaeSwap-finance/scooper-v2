@@ -164,11 +164,11 @@ impl TestEnv {
             .find(|v| v.title == "settingsMint" || v.title.contains("settings_mint"))
             .map(|v| hex::decode(&v.hash).expect("settingsMint hash hex"));
         let ctx = match (
-            &module_scripts.swap_order,
-            &module_scripts.basic_order,
-            &module_scripts.route_order,
-            &module_scripts.fairness_order,
-            &module_scripts.strategy_order,
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::SwapOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::BasicOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::RouteOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::FairnessOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::StrategyOrder),
             settings_mint,
         ) {
             (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
@@ -506,16 +506,28 @@ impl TestEnv {
             (
                 self.exec
                     .module_scripts
-                    .constant_product
-                    .as_ref()
+                    .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                     .expect("harness blueprint includes constantProduct")
                     .hash
                     .to_vec(),
                 cp_hash,
             ),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -526,13 +538,22 @@ impl TestEnv {
         vec![
             self.exec
                 .module_scripts
-                .constant_product
-                .as_ref()
+                .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                 .expect("harness blueprint includes constantProduct")
                 .hash
                 .to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -543,8 +564,7 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
 
         let cs_config = ConstantSumConfig {
@@ -575,9 +595,22 @@ impl TestEnv {
 
         vec![
             (cs_script.hash.to_vec(), cs_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -588,13 +621,22 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
         vec![
             cs_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -605,8 +647,7 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         let ss_hash = crate::sundaev4::ss_math::config_hash(config);
 
@@ -622,9 +663,22 @@ impl TestEnv {
 
         vec![
             (ss_script.hash.to_vec(), ss_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -637,8 +691,7 @@ impl TestEnv {
         let script = self
             .exec
             .module_scripts
-            .banded_concentrated_liquidity
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConcentratedLiquidity)
             .expect("blueprint must include the banded validator for banded tests");
         let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
         let fs_config = FeeSplitConfig {
@@ -651,8 +704,24 @@ impl TestEnv {
         let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
         vec![
             (script.hash.to_vec(), bcl_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
-            (self.exec.module_scripts.fairness.hash.to_vec(), vec![0x80]),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                vec![0x80],
+            ),
         ]
     }
 
@@ -665,8 +734,7 @@ impl TestEnv {
         let oracle = self
             .exec
             .module_scripts
-            .oracle
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Oracle)
             .expect("blueprint must include the oracle validator for oracle tests");
         let mut ms = self.bcl_module_state(config);
         ms.push((oracle.hash.to_vec(), vec![0x80]));
@@ -677,8 +745,7 @@ impl TestEnv {
         let oracle = self
             .exec
             .module_scripts
-            .oracle
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Oracle)
             .expect("blueprint must include the oracle validator for oracle tests");
         let mut m = self.bcl_action_modules();
         m.push(oracle.hash.to_vec());
@@ -689,13 +756,22 @@ impl TestEnv {
         let script = self
             .exec
             .module_scripts
-            .banded_concentrated_liquidity
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConcentratedLiquidity)
             .expect("blueprint must include the banded validator for banded tests");
         vec![
             script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -705,13 +781,22 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         vec![
             ss_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 }

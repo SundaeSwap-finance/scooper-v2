@@ -1318,6 +1318,19 @@ impl Scooper {
             .pools
             .iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
+            // A pool whose scoop action names a module hash the config does
+            // not know (or an action shape the tx builder cannot build) is
+            // not scooped. The indexer logs the reason at classification;
+            // see `detect_pool_type`.
+            .filter(
+                |(ident, pool)| match exec.module_scripts.pool_modules(&pool.pool_datum) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        trace!(pool = %ident, "skipping pool with unsupported modules: {e}");
+                        false
+                    }
+                },
+            )
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);
@@ -1643,12 +1656,10 @@ impl Scooper {
                     // blend across parallel paths (min_received is their
                     // only on-chain output check).
                     let route_constraint_data =
-                        exec.module_scripts.route_order.as_ref().and_then(|m| {
-                            order
-                                .datum
-                                .constraints
-                                .iter()
-                                .find_map(|(h, d)| (h.as_slice() == m.hash.as_ref()).then_some(d))
+                        order.datum.constraints.iter().find_map(|(h, d)| {
+                            (exec.module_scripts.kind_of(h)
+                                == Some(crate::sundaev4::ModuleKind::RouteOrder))
+                            .then_some(d)
                         });
                     let has_route_module = route_constraint_data.is_some();
                     // The route constraint's payload is a pool whitelist;
@@ -1812,18 +1823,10 @@ impl Scooper {
                     // swap.ak pays fees pro-rata, so smaller fills don't
                     // cover the scoop cost.
                     if let Err(e) = &add_result {
-                        let is_swap_module = exec
-                            .module_scripts
-                            .swap_order
-                            .as_ref()
-                            .map(|m| {
-                                order
-                                    .datum
-                                    .constraints
-                                    .iter()
-                                    .any(|(h, _)| h.as_slice() == m.hash.as_ref())
-                            })
-                            .unwrap_or(false);
+                        let is_swap_module = order.datum.constraints.iter().any(|(h, _)| {
+                            exec.module_scripts.kind_of(h)
+                                == Some(crate::sundaev4::ModuleKind::SwapOrder)
+                        });
                         // SUNDAE-2613: min_received is measured gross of
                         // the fee on ADA legs, so ADA-receiving orders can
                         // partial-fill like any other now.
@@ -3523,10 +3526,9 @@ fn carries_route_constraint(
     exec: &ScooperExecution,
     order: &crate::sundaev4::SundaeV4Order,
 ) -> bool {
-    let Some(route) = exec.module_scripts.route_order.as_ref() else {
-        return false;
-    };
-    order.datum.constraints.iter().any(|(h, _)| h.as_slice() == route.hash.as_ref())
+    order.datum.constraints.iter().any(|(h, _)| {
+        exec.module_scripts.kind_of(h) == Some(crate::sundaev4::ModuleKind::RouteOrder)
+    })
 }
 
 /// Resolve the effective pool snapshot to scoop against — preferring an

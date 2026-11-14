@@ -195,63 +195,50 @@ impl SundaeV4Indexer {
     /// pool re-classifies it with an empty cache and silently falls back
     /// to default configs (wrong module_state hash → on-chain eval fails).
     pub async fn rehydrate_module_configs(&self) -> Result<()> {
+        use crate::sundaev4::ModuleKind;
         use crate::sundaev4::types::{
             ConstantProductConfig, ConstantSumConfig, FeeSplitConfig, StableSwapConfig,
         };
         let persisted_configs = self.dao.load_module_configs().await?;
-        let ss_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.stableswap.as_ref())
-            .map(|ss| ss.hash.as_ref().to_vec());
-        let bcl_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
-            .map(|m| m.hash.as_ref().to_vec());
-        let cs_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_sum.as_ref())
-            .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
-        let fs_module_hash: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
         let mut cache = self.module_configs.lock().await;
         for cfg in persisted_configs {
+            let Some(kind) = self
+                .protocol
+                .execution
+                .as_ref()
+                .and_then(|e| e.module_scripts.kind_of(&cfg.module_hash))
+            else {
+                continue;
+            };
             let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
                 .context("could not parse persisted module config CBOR")?;
-            if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
-                let parsed = ConstantSumConfig::from_plutus(pd)
-                    .context("could not parse persisted ConstantSumConfig")?;
-                cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
-                let parsed = ConstantProductConfig::from_plutus(pd)
-                    .context("could not parse persisted ConstantProductConfig")?;
-                cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == fs_module_hash.as_ref() {
-                let parsed = FeeSplitConfig::from_plutus(pd)
-                    .context("could not parse persisted FeeSplitConfig")?;
-                cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
-                let parsed = StableSwapConfig::from_plutus(pd)
-                    .context("could not parse persisted StableSwapConfig")?;
-                cache.ss.insert(Ident::new(&cfg.pool_id), parsed);
-            } else if Some(&cfg.module_hash) == bcl_module_hash.as_ref() {
-                let parsed = crate::sundaev4::types::BandedCLConfig::from_plutus(pd)
-                    .context("could not parse persisted BandedCLConfig")?;
-                cache.bcl.insert(Ident::new(&cfg.pool_id), parsed);
+            match kind {
+                ModuleKind::ConstantSum => {
+                    let parsed = ConstantSumConfig::from_plutus(pd)
+                        .context("could not parse persisted ConstantSumConfig")?;
+                    cache.cs.insert(Ident::new(&cfg.pool_id), parsed);
+                }
+                ModuleKind::ConstantProduct => {
+                    let parsed = ConstantProductConfig::from_plutus(pd)
+                        .context("could not parse persisted ConstantProductConfig")?;
+                    cache.cp.insert(Ident::new(&cfg.pool_id), parsed);
+                }
+                ModuleKind::FeeSplit => {
+                    let parsed = FeeSplitConfig::from_plutus(pd)
+                        .context("could not parse persisted FeeSplitConfig")?;
+                    cache.fee_split.insert(Ident::new(&cfg.pool_id), parsed);
+                }
+                ModuleKind::Stableswap => {
+                    let parsed = StableSwapConfig::from_plutus(pd)
+                        .context("could not parse persisted StableSwapConfig")?;
+                    cache.ss.insert(Ident::new(&cfg.pool_id), parsed);
+                }
+                ModuleKind::ConcentratedLiquidity => {
+                    let parsed = crate::sundaev4::types::BandedCLConfig::from_plutus(pd)
+                        .context("could not parse persisted BandedCLConfig")?;
+                    cache.bcl.insert(Ident::new(&cfg.pool_id), parsed);
+                }
+                _ => {}
             }
         }
         info!(
@@ -327,26 +314,11 @@ impl SundaeV4Indexer {
 
         // Constraint script hashes — used to find the right entry in the
         // order datum's `constraints: List<(hash, Data)>` list (PR #11).
-        let swap_order_hash: Vec<u8> = self
+        let constraint_hashes: crate::sundaev4::ConstraintHashes = self
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| e.module_scripts.swap_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.basic_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.strategy_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
+            .map(|e| crate::sundaev4::ConstraintHashes::from_scripts(&e.module_scripts))
             .unwrap_or_default();
 
         let cache = self.module_configs.lock().await;
@@ -386,13 +358,8 @@ impl SundaeV4Indexer {
                 "order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
                         |datum| {
-                            crate::sundaev4::decode_order_constraint(
-                                &datum,
-                                &swap_order_hash,
-                                &basic_order_hash,
-                                &strategy_order_hash,
-                            )
-                            .map(|c| (datum, c))
+                            crate::sundaev4::decode_order_constraint(&datum, &constraint_hashes)
+                                .map(|c| (datum, c))
                         },
                     ) {
                         Ok((datum, constraint)) => {
@@ -418,13 +385,8 @@ impl SundaeV4Indexer {
                 "invalid_order" => {
                     match output.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
                         |datum| {
-                            crate::sundaev4::decode_order_constraint(
-                                &datum,
-                                &swap_order_hash,
-                                &basic_order_hash,
-                                &strategy_order_hash,
-                            )
-                            .map(|c| (datum, c))
+                            crate::sundaev4::decode_order_constraint(&datum, &constraint_hashes)
+                                .map(|c| (datum, c))
                         },
                     ) {
                         Ok((datum, constraint)) => {
@@ -545,9 +507,7 @@ impl SundaeV4Indexer {
                         && let Ok(constraint) =
                             crate::sundaev4::Constraint::from_order_datum_with_strategy(
                                 &od,
-                                &swap_order_hash,
-                                &basic_order_hash,
-                                &strategy_order_hash,
+                                &constraint_hashes,
                             )
                     {
                         state.spent_orders.push(SpentOrder {
@@ -654,14 +614,10 @@ impl SundaeV4Indexer {
         pool_datum: &PoolDatum,
         cache: &PoolModuleConfigCache,
     ) -> Option<crate::sundaev4::types::BandedCLConfig> {
-        let h = self
-            .protocol
-            .execution
-            .as_ref()?
-            .module_scripts
-            .banded_concentrated_liquidity
-            .as_ref()?
-            .hash;
+        let h = self.pool_invariant_hash(
+            pool_datum,
+            crate::sundaev4::ModuleKind::ConcentratedLiquidity,
+        )?;
         resolve_bcl_config(
             pool_datum,
             h.as_ref(),
@@ -679,13 +635,24 @@ impl SundaeV4Indexer {
         pool_datum: &PoolDatum,
         cache: &PoolModuleConfigCache,
     ) -> Option<crate::sundaev4::types::StableSwapConfig> {
-        let ss_hash = self.protocol.execution.as_ref()?.module_scripts.stableswap.as_ref()?.hash;
+        let ss_hash =
+            self.pool_invariant_hash(pool_datum, crate::sundaev4::ModuleKind::Stableswap)?;
         resolve_ss_config(
             pool_datum,
             ss_hash.as_ref(),
             &[],
             cache.ss.get(&pool_datum.identifier),
         )
+    }
+
+    /// The hash of the pool's invariant module, when it has kind `kind`.
+    fn pool_invariant_hash(
+        &self,
+        pool_datum: &PoolDatum,
+        kind: crate::sundaev4::ModuleKind,
+    ) -> Option<ScriptHash> {
+        let (k, h) = self.protocol.execution.as_ref()?.module_scripts.pool_invariant(pool_datum)?;
+        (k == kind).then_some(h)
     }
 
     fn parse_pool(
@@ -780,18 +747,6 @@ impl SundaeV4Indexer {
             .find(|r| r.tag() == RedeemerTag::Spend && r.index() == spend_index as u32)?;
         T::from_plutus(redeemer.data().clone()).ok()
     }
-
-    /// Try to extract a `ConstantSumConfig` from this tx's CS module Create redeemer.
-    ///
-    /// Returns `None` if: no CS module configured, no matching withdrawal in the tx,
-    /// the redeemer isn't `Create`, or the initial_state can't be parsed.
-    fn extract_cs_config_from_tx(
-        &self,
-        tx: &MultiEraTx,
-    ) -> Option<crate::sundaev4::types::ConstantSumConfig> {
-        let cs_hash = &self.protocol.execution.as_ref()?.module_scripts.constant_sum.as_ref()?.hash;
-        extract_cs_config_from_tx(tx, cs_hash)
-    }
 }
 
 /// The reference-script UTxOs the indexer must keep so the evaluator's
@@ -802,32 +757,7 @@ impl SundaeV4Indexer {
 pub fn module_ref_utxos(
     scripts: &crate::sundaev4::types::ModuleScripts,
 ) -> BTreeSet<crate::cardano_types::TransactionInput> {
-    let required = [
-        &scripts.pool,
-        &scripts.order,
-        &scripts.fee_split,
-        &scripts.fairness,
-        &scripts.pool_mint,
-        &scripts.settings,
-    ];
-    let optional = [
-        &scripts.constant_product,
-        &scripts.constant_sum,
-        &scripts.stableswap,
-        &scripts.swap_order,
-        &scripts.basic_order,
-        &scripts.route_order,
-        &scripts.fairness_order,
-        &scripts.strategy_order,
-        &scripts.fee_constraint,
-        &scripts.banded_concentrated_liquidity,
-        &scripts.oracle,
-    ];
-    required
-        .into_iter()
-        .chain(optional.into_iter().filter_map(|o| o.as_ref()))
-        .map(|s| s.ref_utxo.clone())
-        .collect()
+    scripts.all_scripts().map(|s| s.ref_utxo.clone()).collect()
 }
 
 /// True when `reward_account` is the script reward account for `script_hash`
@@ -1249,90 +1179,12 @@ impl ChainIndex for SundaeV4Indexer {
 
         let datums = state.datums.for_tx(&tx);
 
-        // Try to extract per-module configs from this tx's Create/Operate
-        // redeemers (if any). For scoop txs without a Create redeemer for a
-        // given module, these return None — harmless. We use the result to
-        // populate per-pool config caches.
-        let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
-        let cp_config_from_tx = self
+        let constraint_hashes: crate::sundaev4::ConstraintHashes = self
             .protocol
             .execution
             .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
-            .and_then(|h| extract_cp_config_from_tx(&tx, &h));
-        let fs_config_from_tx =
-            self.protocol.execution.as_ref().and_then(|e| {
-                extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
-            });
-        // Stableswap: every config this tx vouches for (Create initial_state,
-        // Operate entry configs, and the post-rate-update form of each).
-        // Which one applies to a given pool output is decided by its datum's
-        // module_state hash below.
-        let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.stableswap.as_ref())
-            .map(|ss| extract_ss_config_candidates(&tx, &ss.hash))
+            .map(|e| crate::sundaev4::ConstraintHashes::from_scripts(&e.module_scripts))
             .unwrap_or_default();
-        // Banded: the ladder a Create pins or an Operate entry re-sends.
-        let bcl_candidates_from_tx: Vec<crate::sundaev4::types::BandedCLConfig> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
-            .map(|m| extract_bcl_config_candidates(&tx, &m.hash))
-            .unwrap_or_default();
-        let swap_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.swap_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.basic_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.strategy_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let cs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_sum.as_ref())
-            .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
-        let ss_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.stableswap.as_ref())
-            .map(|ss| ss.hash.as_ref().to_vec());
-        let bcl_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.banded_concentrated_liquidity.as_ref())
-            .map(|m| m.hash.as_ref().to_vec());
-        let fs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
 
         // Lock the persisted-config cache for the duration of output scanning:
         // pool outputs read from it, and Create writes a new entry.
@@ -1356,6 +1208,46 @@ impl ChainIndex for SundaeV4Indexer {
                     });
 
                     let pool_id = pd.identifier.clone();
+                    // Extract per-module configs from this tx's Create/Operate
+                    // redeemers, for the module hashes THIS pool names. Two
+                    // pools can name different hashes of one kind (for
+                    // example two fee_split versions). For a scoop tx without
+                    // a Create redeemer for a module, these return None.
+                    use crate::sundaev4::ModuleKind;
+                    let scripts = self.protocol.execution.as_ref().map(|e| &e.module_scripts);
+                    let invariant = scripts.and_then(|m| m.pool_invariant(&pd));
+                    let invariant_hash =
+                        |kind: ModuleKind| invariant.filter(|(k, _)| *k == kind).map(|(_, h)| h);
+                    let cs_module_hash = invariant_hash(ModuleKind::ConstantSum);
+                    let cp_module_hash = invariant_hash(ModuleKind::ConstantProduct);
+                    let ss_module_hash = invariant_hash(ModuleKind::Stableswap);
+                    let bcl_module_hash = invariant_hash(ModuleKind::ConcentratedLiquidity);
+                    let fs_module_hash =
+                        scripts.and_then(|m| m.pool_module_of_kind(&pd, ModuleKind::FeeSplit));
+                    let cs_config_from_tx =
+                        cs_module_hash.and_then(|h| extract_cs_config_from_tx(&tx, &h));
+                    let cp_config_from_tx =
+                        cp_module_hash.and_then(|h| extract_cp_config_from_tx(&tx, &h));
+                    let fs_config_from_tx =
+                        fs_module_hash.and_then(|h| extract_fee_split_config_from_tx(&tx, &h));
+                    // Stableswap: every config this tx vouches for (Create
+                    // initial_state, Operate entry configs, and the
+                    // post-rate-update form of each). The datum's
+                    // module_state hash selects one below.
+                    let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> =
+                        ss_module_hash
+                            .map(|h| extract_ss_config_candidates(&tx, &h))
+                            .unwrap_or_default();
+                    // Banded: the ladder a Create pins or an Operate entry re-sends.
+                    let bcl_candidates_from_tx: Vec<crate::sundaev4::types::BandedCLConfig> =
+                        bcl_module_hash
+                            .map(|h| extract_bcl_config_candidates(&tx, &h))
+                            .unwrap_or_default();
+                    let cs_module_hash_bytes = cs_module_hash.map(|h| h.as_ref().to_vec());
+                    let cp_module_hash_bytes = cp_module_hash.map(|h| h.as_ref().to_vec());
+                    let ss_module_hash_bytes = ss_module_hash.map(|h| h.as_ref().to_vec());
+                    let bcl_module_hash_bytes = bcl_module_hash.map(|h| h.as_ref().to_vec());
+                    let fs_module_hash_bytes = fs_module_hash.map(|h| h.as_ref().to_vec());
                     // Resolution priority for the CS/CP branch inside detect_pool_type:
                     //   1. config-file override (consulted internally)
                     //   2. this tx's Create redeemer
@@ -1526,13 +1418,8 @@ impl ChainIndex for SundaeV4Indexer {
                 let tx_out = cardano_types::convert_txo(output);
                 match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
                     |datum| {
-                        crate::sundaev4::decode_order_constraint(
-                            &datum,
-                            &swap_order_hash,
-                            &basic_order_hash,
-                            &strategy_order_hash,
-                        )
-                        .map(|c| (datum, c))
+                        crate::sundaev4::decode_order_constraint(&datum, &constraint_hashes)
+                            .map(|c| (datum, c))
                     },
                 ) {
                     Ok((od, constraint)) => {
@@ -2171,61 +2058,19 @@ pub fn detect_pool_type(
         };
     };
 
-    // Look at every enabled action's first module and classify by which known
-    // module hash it matches. CS and CP swap actions use different tags
-    // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by tag.
+    // The scoop action is the first enabled action whose first module is a
+    // configured invariant module. CS and CP swap actions use different tags
+    // (cs_check.ak's tag_swap=3 vs CP's tag=100), so we can't pre-pick by
+    // tag. The kind of that module's hash selects the pool type. Two hashes
+    // of one kind (two versions of a module) classify the same way.
+    use crate::sundaev4::ModuleKind;
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
-    let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash.as_ref().to_vec());
-    let bcl_hash = exec
-        .module_scripts
-        .banded_concentrated_liquidity
-        .as_ref()
-        .map(|s| s.hash.as_ref().to_vec());
-    let mut matched_action: Option<&crate::sundaev4::types::ActionEntry> = None;
-    let mut matched_kind: Option<&'static str> = None;
-    for action in &pool_datum.actions {
-        if !action.enabled {
-            continue;
-        }
-        let Some(first) = action.modules.first() else {
-            continue;
-        };
-        if let Some(h) = &cp_hash
-            && first.as_slice() == h.as_slice()
-        {
-            matched_action = Some(action);
-            matched_kind = Some("cp");
-            break;
-        }
-        if let Some(h) = &cs_hash
-            && first.as_slice() == h.as_slice()
-        {
-            matched_action = Some(action);
-            matched_kind = Some("cs");
-            break;
-        }
-        if let Some(h) = &ss_hash
-            && first.as_slice() == h.as_slice()
-        {
-            matched_action = Some(action);
-            matched_kind = Some("ss");
-            break;
-        }
-        if let Some(h) = &bcl_hash
-            && first.as_slice() == h.as_slice()
-        {
-            matched_action = Some(action);
-            matched_kind = Some("bcl");
-            break;
-        }
-    }
-    if matched_action.is_none() {
+    let matched_kind = exec.module_scripts.pool_invariant(pool_datum).map(|(k, _)| k);
+    if matched_kind.is_none() {
         // Log the unknown first-module hashes so the operator can see why
-        // detect_pool_type couldn't classify this pool. Until detect_pool_type
-        // learns the corresponding module, scoops referencing this pool will
-        // fail with `module: not found in module_state` on the wrong module.
+        // detect_pool_type couldn't classify this pool. The scooper does not
+        // scoop a pool whose modules it cannot resolve (see
+        // `ModuleScripts::pool_modules`).
         let unknowns: Vec<String> = pool_datum
             .actions
             .iter()
@@ -2236,23 +2081,22 @@ pub fn detect_pool_type(
             pool = %ident_hex,
             modules = ?unknowns,
             "pool's enabled actions reference unknown module hash(es); \
-             falling back to ConstantProduct (likely wrong)",
+             the pool is not scooped (classified as ConstantProduct for display only)",
         );
+    } else if let Err(e) = exec.module_scripts.pool_modules(pool_datum) {
+        warn!(pool = %ident_hex, "pool's scoop action is not supported, the pool is not scooped: {e}");
     }
 
-    let _action = match matched_action {
-        Some(a) => a,
-        None => {
-            return PoolType::ConstantProduct {
-                fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
-                    num: BigInt::from(exec.fee.0),
-                    den: BigInt::from(exec.fee.1),
-                }),
-            };
-        }
-    };
+    if matched_kind.is_none() {
+        return PoolType::ConstantProduct {
+            fee: cp_config_from_tx.map(|c| c.fee.clone()).unwrap_or_else(|| Rational {
+                num: BigInt::from(exec.fee.0),
+                den: BigInt::from(exec.fee.1),
+            }),
+        };
+    }
 
-    if matched_kind == Some("cs") {
+    if matched_kind == Some(ModuleKind::ConstantSum) {
         // Priority: config file override > on-chain Create redeemer > defaults
         if let Some(crate::sundaev4::types::PoolConfig::ConstantSum { prices, fee }) =
             exec.pool_configs.get(&ident_hex)
@@ -2309,7 +2153,7 @@ pub fn detect_pool_type(
         };
     }
 
-    if matched_kind == Some("ss") {
+    if matched_kind == Some(ModuleKind::Stableswap) {
         if let Some(cfg) = ss_config {
             return PoolType::StableSwap {
                 config: cfg.clone(),
@@ -2341,7 +2185,7 @@ pub fn detect_pool_type(
         };
     }
 
-    if matched_kind == Some("bcl") {
+    if matched_kind == Some(ModuleKind::ConcentratedLiquidity) {
         if let Some(cfg) = bcl_config {
             return PoolType::BandedConcentratedLiquidity {
                 config: cfg.clone(),
@@ -2462,51 +2306,49 @@ mod mainnet_create_tx_tests {
     #[test]
     fn every_configured_module_ref_utxo_is_tracked() {
         use crate::cardano_types::TransactionInput;
-        use crate::sundaev4::types::{ModuleScripts, ScriptRefInfo};
-        let mut n = 0u64;
-        let mut next = |hash_hex: &str| {
+        use crate::sundaev4::types::{ModuleKind, ModuleScripts, ScriptRefInfo};
+        let mut n = 0u8;
+        let mut next = || {
             n += 1;
             ScriptRefInfo {
-                hash: hash_hex.parse().unwrap(),
-                ref_utxo: TransactionInput::new([n as u8; 32].into(), 0),
+                hash: ScriptHash::new([n; 28]),
+                ref_utxo: TransactionInput::new([n; 32].into(), 0),
                 script_cbor: None,
             }
         };
-        let scripts = ModuleScripts {
-            constant_product: Some(next(CS_HASH)),
-            fee_split: next(FEE_SPLIT_HASH),
-            fairness: next(CS_HASH),
-            pool: next(CS_HASH),
-            order: next(CS_HASH),
-            pool_mint: next(CS_HASH),
-            settings: next(CS_HASH),
-            constant_sum: Some(next(CS_HASH)),
-            stableswap: None,
-            banded_concentrated_liquidity: Some(next(CS_HASH)),
-            oracle: Some(next(CS_HASH)),
-            swap_order: Some(next(CS_HASH)),
-            basic_order: Some(next(CS_HASH)),
-            route_order: Some(next(CS_HASH)),
-            fairness_order: Some(next(CS_HASH)),
-            strategy_order: Some(next(CS_HASH)),
-            fee_constraint: Some(next(CS_HASH)),
-        };
+        let mut roles: Vec<(String, Vec<ScriptRefInfo>)> =
+            ["pool", "order", "pool-mint", "settings"]
+                .into_iter()
+                .map(|k| (k.to_string(), vec![next()]))
+                .collect();
+        for kind in ModuleKind::ALL {
+            if kind == ModuleKind::Stableswap {
+                continue;
+            }
+            roles.push((kind.config_key().to_string(), vec![next()]));
+        }
+        // A second fee_split version, as a CL deployment adds next to the
+        // constant-sum one.
+        roles.push(("fee-split".to_string(), vec![next()]));
+        let scripts = ModuleScripts::from_role_map(roles).unwrap();
         let tracked = module_ref_utxos(&scripts);
         assert_eq!(
             tracked.len(),
-            16,
-            "six required modules and ten optional ones"
+            4 + 12 + 1,
+            "four boot-fixed scripts, twelve module kinds, and a second fee_split"
         );
-        let bcl_ref = scripts.banded_concentrated_liquidity.as_ref().unwrap().ref_utxo.clone();
-        assert!(
-            tracked.contains(&bcl_ref),
-            "the banded module is invoked by every banded scoop and must be in the store"
-        );
-        let fee_constraint_ref = scripts.fee_constraint.as_ref().unwrap().ref_utxo.clone();
-        assert!(
-            tracked.contains(&fee_constraint_ref),
-            "fee_constraint is invoked by every scoop and must be in the store"
-        );
+        for kind in [
+            ModuleKind::ConcentratedLiquidity,
+            ModuleKind::FeeConstraint,
+            ModuleKind::FeeSplit,
+        ] {
+            for s in scripts.of_kind(kind) {
+                assert!(
+                    tracked.contains(&s.ref_utxo),
+                    "{kind} is invoked by scoops and must be in the store"
+                );
+            }
+        }
     }
 }
 
