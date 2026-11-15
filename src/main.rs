@@ -643,11 +643,16 @@ mod decode_stack_tests {
         assert!(decodes_on_stack(WORKER_STACK_SIZE));
     }
 
+    // Release builds only. An unoptimized build uses larger frames: it
+    // overflows at 32 MiB on this block and decodes at the 64 MiB worker
+    // stack, which the test above checks in every build. The 4x headroom
+    // claim is about the binary operators run.
+    #[cfg(not(debug_assertions))]
     #[test]
     fn worker_stack_is_well_above_what_the_block_needs() {
         // 8 MiB is enough; the worker gets 64. If pallas ever needs more per
         // level, this is the test that says so before an operator does.
         assert!(decodes_on_stack(8 * 1024 * 1024));
-        assert!(WORKER_STACK_SIZE >= 4 * 8 * 1024 * 1024);
+        const { assert!(WORKER_STACK_SIZE >= 4 * 8 * 1024 * 1024) };
     }
 }
