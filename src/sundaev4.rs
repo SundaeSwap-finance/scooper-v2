@@ -9,6 +9,7 @@ pub mod conversions;
 pub mod evaluator;
 mod indexer;
 pub mod intents;
+pub mod module_scripts;
 pub mod router;
 pub mod script_context;
 pub mod ss_math;

@@ -28,28 +28,27 @@ use crate::sundaev4::types::*;
 /// it cannot find at 30,000,000,000, so a shorter PV10 list makes every
 /// Value builtin overspend any budget.
 pub const PLUTUS_V3_COST_MODEL: &[i64] = &[
-    100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
-    100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100,
-    94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848,
-    123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 30623, 28755, 75, 1,
-    898148, 27279, 1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
-    76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1,
-    33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900,
-    1716, 960, 57, 85848, 0, 1, 90434, 519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716,
-    960, 57, 85848, 0, 1, 1, 85848, 123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 955506,
-    213312, 0, 2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788, 420,
-    1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933, 32, 24623, 32, 43053543,
-    10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000, 100, 962335, 18, 2780678,
-    6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18, 1995836, 36,
-    3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36, 74698472, 36,
-    333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4, 1293828,
-    28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1,
-    100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1,
-    158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1, 1964219, 24520, 3,
-    607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7, 1, 232010, 32,
-    321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951, 9444, 1,
-    1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22, 1000,
-    95933, 1, 1, 11, 1000, 277577, 12, 21,
+    100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000, 100,
+    16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100, 94375, 32,
+    132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900,
+    1716, 960, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 30623, 28755, 75, 1, 898148, 27279, 1, 51775,
+    558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32, 76049, 1, 13169, 4, 22100, 10,
+    28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32,
+    7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 90434,
+    519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 1, 85848, 123203,
+    7305, -900, 1716, 960, 57, 85848, 0, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325, 64566,
+    4, 20467, 1, 4, 0, 141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32,
+    20744, 32, 25933, 32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000,
+    100, 16000, 100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006,
+    8868, 18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
+    158221314, 26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571,
+    4, 207616, 8310, 4, 1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0,
+    1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848,
+    0, 1, 180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655,
+    1, 1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7,
+    1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951,
+    9444, 1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
+    1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
 ];
 
 /// Deterministic test secret key (same as devnet config).
@@ -92,9 +91,127 @@ pub struct TestEnv {
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
 }
 
+/// The launch-candidate deployment on preview parameters (sundae-v4
+/// 25d60ae). Built by `test/fixtures/preview-fixtures.py`.
+pub const PREVIEW_FIXTURE: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+/// The revision-1 CL and oracle, and the e7d9c14 constant_sum, on the same
+/// parameters. Add with `TestEnv::with_modules_file`.
+pub const REVISION_1_MODULES: &str = "test/fixtures/preview-revision-1-modules.json";
+
+pub use crate::sundaev4::module_scripts::Revision;
+
+thread_local! {
+    static CL_TEST_REVISION: std::cell::Cell<Revision> = const { std::cell::Cell::new(Revision(2)) };
+}
+
+/// The CL revision the current test runs on: 2 unless the test runs inside
+/// `with_cl_revision`. `bcl_eq8_config` builds its config in this
+/// revision's form, and `TestEnv::from_blueprint_file(PREVIEW_FIXTURE)`
+/// adds the revision-1 modules when it is 1. Each test runs on its own
+/// thread, so the setting does not leak between tests.
+pub fn cl_test_revision() -> Revision {
+    CL_TEST_REVISION.with(|c| c.get())
+}
+
+/// Run `f` with the CL test revision set to `revision`. This runs an
+/// existing CL test, unchanged, against another revision's script.
+pub fn with_cl_revision(revision: Revision, f: impl FnOnce()) {
+    let prev = CL_TEST_REVISION.with(|c| c.replace(revision));
+    struct Restore(Revision);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CL_TEST_REVISION.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// `r1` under CL revision 1, `r2` under revision 2 (`cl_test_revision`).
+pub fn by_cl_revision<T>(r1: T, r2: T) -> T {
+    if cl_test_revision() == Revision(1) {
+        r1
+    } else {
+        r2
+    }
+}
+
 impl TestEnv {
-    /// Load from a blueprint fixture file.
+    /// Register more module scripts: each validator's title is a config role
+    /// key (`banded-concentrated-liquidity`, `oracle`, ...) and its
+    /// `revision` the module revision. The scripts join the evaluator's
+    /// store and the reference UTxOs. `first_of` still returns the main
+    /// fixture's script of each kind.
+    pub fn with_modules_file(mut self, path: &str) -> Self {
+        let data = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read module fixture {path}: {e}"));
+        let bp: Blueprint = serde_json::from_str(&data)
+            .unwrap_or_else(|e| panic!("failed to parse module fixture {path}: {e}"));
+        for v in &bp.validators {
+            let kind = crate::sundaev4::ModuleKind::from_config_key(&v.title)
+                .unwrap_or_else(|| panic!("{path}: '{}' is not a role key", v.title));
+            let code = hex::decode(v.compiled_code.as_ref().expect("module fixture has code"))
+                .expect("compiled code hex");
+            let hash = self.scripts.insert_with_version(&code, 3).expect("script decodes");
+            assert_eq!(hex::encode(hash), v.hash, "{path}: {} hash", v.title);
+            let r = bp
+                .references
+                .iter()
+                .find(|r| r.key == v.title)
+                .unwrap_or_else(|| panic!("{path}: no reference for {}", v.title));
+            let tx_hash: Hash<32> = hex::decode(&r.tx_in.hash).unwrap().as_slice().into();
+            let input = crate::cardano_types::TransactionInput::new(tx_hash, r.tx_in.index);
+            self.ref_utxo_outputs.insert(
+                input.clone(),
+                crate::cardano_types::TransactionOutput {
+                    address: pallas_addresses::Address::Shelley(
+                        pallas_addresses::ShelleyAddress::new(
+                            pallas_addresses::Network::Testnet,
+                            pallas_addresses::ShelleyPaymentPart::Key([0u8; 28].into()),
+                            pallas_addresses::ShelleyDelegationPart::Null,
+                        ),
+                    ),
+                    value: Value::default(),
+                    datum: crate::cardano_types::RawDatum::None,
+                    script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(
+                        pallas_primitives::PlutusScript::<3>(pallas_primitives::Bytes::from(code)),
+                    )),
+                },
+            );
+            self.exec
+                .module_scripts
+                .modules
+                .insert_revision(
+                    kind,
+                    v.revision.unwrap_or(Revision::DEFAULT),
+                    ScriptRefInfo {
+                        hash,
+                        ref_utxo: input,
+                        script_cbor: v.compiled_code.clone(),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+        }
+        self
+    }
+
+    /// The preview launch-candidate fixture with the revision-1 modules.
+    pub fn preview_both_revisions() -> Self {
+        Self::from_blueprint_file_only(PREVIEW_FIXTURE).with_modules_file(REVISION_1_MODULES)
+    }
+
+    /// Load from a blueprint fixture file. Under `with_cl_revision(1)` the
+    /// preview fixture also gets the revision-1 modules.
     pub fn from_blueprint_file(path: &str) -> Self {
+        let env = Self::from_blueprint_file_only(path);
+        if path == PREVIEW_FIXTURE && cl_test_revision() == Revision(1) {
+            env.with_modules_file(REVISION_1_MODULES)
+        } else {
+            env
+        }
+    }
+
+    fn from_blueprint_file_only(path: &str) -> Self {
         // Surface evaluator traces in test output (RUST_LOG to widen).
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -122,11 +239,14 @@ impl TestEnv {
         for validator in &blueprint.validators {
             if let Some(code_hex) = &validator.compiled_code {
                 // Find the reference for this validator
-                if let Some(reference) = blueprint.references.iter().find(|r| {
-                    r.key == validator.title
-                        || validator.title.contains(&r.key)
-                        || r.key.contains(&validator.title)
-                }) {
+                // An exact key first: "pool" is a substring of "poolMint".
+                if let Some(reference) =
+                    blueprint.references.iter().find(|r| r.key == validator.title).or_else(|| {
+                        blueprint.references.iter().find(|r| {
+                            validator.title.contains(&r.key) || r.key.contains(&validator.title)
+                        })
+                    })
+                {
                     let tx_hash_bytes = hex::decode(&reference.tx_in.hash).unwrap();
                     let tx_hash: Hash<32> = tx_hash_bytes.as_slice().into();
                     let input =
@@ -165,11 +285,11 @@ impl TestEnv {
             .find(|v| v.title == "settingsMint" || v.title.contains("settings_mint"))
             .map(|v| hex::decode(&v.hash).expect("settingsMint hash hex"));
         let ctx = match (
-            &module_scripts.swap_order,
-            &module_scripts.basic_order,
-            &module_scripts.route_order,
-            &module_scripts.fairness_order,
-            &module_scripts.strategy_order,
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::SwapOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::BasicOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::RouteOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::FairnessOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::StrategyOrder),
             settings_mint,
         ) {
             (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
@@ -507,16 +627,28 @@ impl TestEnv {
             (
                 self.exec
                     .module_scripts
-                    .constant_product
-                    .as_ref()
+                    .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                     .expect("harness blueprint includes constantProduct")
                     .hash
                     .to_vec(),
                 cp_hash,
             ),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -527,13 +659,22 @@ impl TestEnv {
         vec![
             self.exec
                 .module_scripts
-                .constant_product
-                .as_ref()
+                .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                 .expect("harness blueprint includes constantProduct")
                 .hash
                 .to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -544,8 +685,7 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
 
         let cs_config = ConstantSumConfig {
@@ -576,9 +716,22 @@ impl TestEnv {
 
         vec![
             (cs_script.hash.to_vec(), cs_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -589,13 +742,22 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
         vec![
             cs_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -606,8 +768,7 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         let ss_hash = crate::sundaev4::ss_math::config_hash(config);
 
@@ -623,9 +784,22 @@ impl TestEnv {
 
         vec![
             (ss_script.hash.to_vec(), ss_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -635,12 +809,7 @@ impl TestEnv {
     /// ladder's hash under the banded module credential, plus fee_split and
     /// fairness as for every pool.
     pub fn bcl_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let script = self
-            .exec
-            .module_scripts
-            .banded_concentrated_liquidity
-            .as_ref()
-            .expect("blueprint must include the banded validator for banded tests");
+        let script = self.cl_script(config.rules.revision);
         let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
         let fs_config = FeeSplitConfig {
             protocol_share: Rational {
@@ -652,8 +821,24 @@ impl TestEnv {
         let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
         vec![
             (script.hash.to_vec(), bcl_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
-            (self.exec.module_scripts.fairness.hash.to_vec(), vec![0x80]),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                vec![0x80],
+            ),
         ]
     }
 
@@ -663,40 +848,54 @@ impl TestEnv {
     /// oracle module: the ladder hash, fee_split, fairness, and the oracle's
     /// fresh slot `0x80`.
     pub fn bcl_oracle_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let oracle = self
-            .exec
-            .module_scripts
-            .oracle
-            .as_ref()
-            .expect("blueprint must include the oracle validator for oracle tests");
+        let oracle = self.oracle_script(config.rules.revision);
         let mut ms = self.bcl_module_state(config);
         ms.push((oracle.hash.to_vec(), vec![0x80]));
         ms
     }
 
-    pub fn bcl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
-        let oracle = self
-            .exec
-            .module_scripts
-            .oracle
-            .as_ref()
-            .expect("blueprint must include the oracle validator for oracle tests");
-        let mut m = self.bcl_action_modules();
+    /// The CL pool's action modules plus the oracle at the same revision:
+    /// a revision-1 CL pool lists the revision-1 oracle.
+    pub fn bcl_oracle_action_modules(&self, revision: Revision) -> Vec<Vec<u8>> {
+        let oracle = self.oracle_script(revision);
+        let mut m = self.bcl_action_modules(revision);
         m.push(oracle.hash.to_vec());
         m
     }
 
-    pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
-        let script = self
-            .exec
+    /// The CL script at `revision`. Revision 1 needs
+    /// `with_modules_file(REVISION_1_MODULES)`.
+    pub fn cl_script(&self, revision: Revision) -> &ScriptRefInfo {
+        self.exec
             .module_scripts
-            .banded_concentrated_liquidity
-            .as_ref()
-            .expect("blueprint must include the banded validator for banded tests");
+            .first_of_revision(crate::sundaev4::ModuleKind::ConcentratedLiquidity, revision)
+            .unwrap_or_else(|| panic!("the test env has no CL script at revision {revision}"))
+    }
+
+    /// The oracle script at `revision`.
+    pub fn oracle_script(&self, revision: Revision) -> &ScriptRefInfo {
+        self.exec
+            .module_scripts
+            .first_of_revision(crate::sundaev4::ModuleKind::Oracle, revision)
+            .unwrap_or_else(|| panic!("the test env has no oracle script at revision {revision}"))
+    }
+
+    pub fn bcl_action_modules(&self, revision: Revision) -> Vec<Vec<u8>> {
+        let script = self.cl_script(revision);
         vec![
             script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -706,13 +905,22 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         vec![
             ss_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 }
@@ -1022,9 +1230,28 @@ pub fn make_ss_pool(
     })
 }
 
-/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/banded_cl_check.ak`:
-/// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee.
+/// `bcl_eq8_config_at` the current test's CL revision
+/// (`cl_test_revision`, 2 by default).
 pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
+    bcl_eq8_config_at(fee, cl_test_revision())
+}
+
+/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/banded_cl_check.ak`:
+/// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee,
+/// in the config form CL `revision` reads.
+pub fn bcl_eq8_config_at(fee: Rational, revision: Revision) -> BandedCLConfig {
+    let cfg = bcl_eq8_config_r1(fee);
+    if revision == Revision(1) {
+        cfg
+    } else {
+        cfg.with_void_ext()
+            .expect("four fields")
+            .with_rules(ClRules::of(revision).expect("implemented revision"))
+            .expect("five-field form")
+    }
+}
+
+fn bcl_eq8_config_r1(fee: Rational) -> BandedCLConfig {
     let r = |n: i64, d: i64| Rational {
         num: BigInt::from(n),
         den: BigInt::from(d),
@@ -1121,9 +1348,17 @@ pub fn make_bcl_pool_with_oracle(
             actions: vec![ActionEntry {
                 tag: BigInt::from(100),
                 enabled: true,
-                modules: if with_oracle { env.bcl_oracle_action_modules() } else { env.bcl_action_modules() },
+                modules: if with_oracle {
+                    env.bcl_oracle_action_modules(config.rules.revision)
+                } else {
+                    env.bcl_action_modules(config.rules.revision)
+                },
             }],
-            module_state: if with_oracle { env.bcl_oracle_module_state(&config) } else { env.bcl_module_state(&config) },
+            module_state: if with_oracle {
+                env.bcl_oracle_module_state(&config)
+            } else {
+                env.bcl_module_state(&config)
+            },
             min_surplus: BigInt::from(0),
             extension: crate::sundaev4::types::plutus_void(),
         },
