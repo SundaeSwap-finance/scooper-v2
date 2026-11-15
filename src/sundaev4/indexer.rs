@@ -2047,6 +2047,22 @@ impl ChainIndex for SundaeV4Indexer {
         }
         state.pools.append(&mut updated_pools);
 
+        // The block at `loaded_slot` is re-processed on restart (a block
+        // that was only partly applied must get the rest of its
+        // transactions), so a transaction that was already applied finds
+        // its orders already loaded. An output is created once on chain;
+        // drop the ones the state already holds.
+        if !new_orders.is_empty() || !new_invalid_orders.is_empty() {
+            let held: std::collections::BTreeSet<&TransactionInput> = state
+                .orders
+                .iter()
+                .map(|o| &o.input)
+                .chain(state.invalid_orders.iter().map(|o| &o.input))
+                .collect();
+            new_orders.retain(|o| !held.contains(&o.input));
+            new_invalid_orders.retain(|o| !held.contains(&o.input));
+        }
+
         // Emit events for new orders
         for order in &new_orders {
             events.push(IndexEvent::V4OrderCreated {
@@ -2746,5 +2762,131 @@ mod steelswap_quote_dump {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_block_replay_tests {
+    //! On restart, `load()` restores the state up to `loaded_slot`, and the
+    //! driver re-delivers the block AT `loaded_slot` (70a2456: a block that
+    //! was only partly applied must get the rest of its transactions). The
+    //! transactions of that block that were already applied must not add
+    //! their orders a second time.
+    use super::*;
+    use crate::bigint::BigInt;
+    use crate::persistence::{PersistenceConfig, connect};
+    use crate::sundaev4::accumulator::Accumulator;
+    use crate::sundaev4::router;
+    use crate::sundaev4::test_harness::*;
+
+    const SLOT: u64 = 1_000;
+
+    fn protocol(env: &TestEnv) -> SundaeV4Protocol {
+        SundaeV4Protocol {
+            pool_script_hash: env.exec.module_scripts.pool.hash,
+            order_script_hashes: vec![env.exec.module_scripts.order.hash],
+            settings_script_hash: env.exec.module_scripts.settings.hash,
+            settings_nft: AssetClass::from_pair((vec![], vec![])),
+            pool_nft_policy: env.exec.module_scripts.pool_mint.hash,
+            fee_settings_token: None,
+            starting_point: Point::Origin,
+            execution: Some(env.exec.clone()),
+            mempool: None,
+            blueprint: None,
+            network: Default::default(),
+        }
+    }
+
+    fn block(slot: u64) -> BlockInfo {
+        BlockInfo {
+            status: acropolis_common::BlockStatus::Volatile,
+            intent: acropolis_common::BlockIntent::none(),
+            slot,
+            number: slot,
+            hash: acropolis_common::BlockHash::new([0; 32]),
+            epoch: 0,
+            epoch_slot: 0,
+            new_epoch: false,
+            tip_slot: None,
+            timestamp: 0,
+            era: acropolis_common::Era::Conway,
+            is_new_era: false,
+        }
+    }
+
+    /// A partial-fill scoop: its continuation output is a real order at the
+    /// order address.
+    fn tx_creating_an_order(env: &TestEnv) -> Vec<u8> {
+        let pool = make_pool(env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
+        let order =
+            make_order_with_budget(token_a(), 400_000_000, token_b(), 240_000_000, 1, 8_000_000);
+        let route = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            &BigInt::from(100_000_000u64),
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("partial route exists");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("partial fill adds");
+        let plan = accum.into_plan();
+        let settings = make_settings(env, &env.scooper_keyhash());
+        let (build, _) = env.build_and_eval_plan(&plan, &settings, 1000).expect("builds");
+        build.cbor
+    }
+
+    async fn start(
+        env: &TestEnv,
+        state: &Arc<Mutex<SundaeV4HistoricalState>>,
+        persistence: &dyn crate::persistence::Persistence,
+    ) -> SundaeV4Indexer {
+        let (event_tx, _) = broadcast::channel(16);
+        let mut indexer = SundaeV4Indexer::new(
+            state.clone(),
+            event_tx,
+            protocol(env),
+            2160,
+            persistence.indexer_dao("sundae_v4"),
+        );
+        indexer.load().await.expect("load");
+        indexer
+    }
+
+    #[tokio::test]
+    async fn replaying_the_loaded_block_does_not_add_its_orders_twice() {
+        let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
+        let tx = tx_creating_an_order(&env);
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+
+        // First run: the block at SLOT is applied, then the service stops.
+        let state = Arc::new(Mutex::new(SundaeV4HistoricalState::new()));
+        let mut node = start(&env, &state, &*persistence).await;
+        node.handle_block(&block(SLOT)).await.unwrap();
+        node.handle_onchain_tx_bytes(&block(SLOT), &tx).await.unwrap();
+        assert_eq!(state.lock().await.latest().orders.len(), 1, "the tx creates one order");
+
+        // Restart: load() restores SLOT, and the driver re-delivers SLOT.
+        let state = Arc::new(Mutex::new(SundaeV4HistoricalState::new()));
+        let mut node = start(&env, &state, &*persistence).await;
+        assert_eq!(state.lock().await.latest().orders.len(), 1, "load restores the order");
+        node.handle_block(&block(SLOT)).await.unwrap();
+        node.handle_onchain_tx_bytes(&block(SLOT), &tx).await.unwrap();
+
+        let history = state.lock().await;
+        let orders = &history.latest().orders;
+        let mut inputs: Vec<_> = orders.iter().map(|o| o.input.clone()).collect();
+        inputs.sort();
+        inputs.dedup();
+        assert_eq!(
+            orders.len(),
+            inputs.len(),
+            "an order appears {} times after the replay",
+            orders.len()
+        );
+        assert_eq!(orders.len(), 1);
     }
 }
