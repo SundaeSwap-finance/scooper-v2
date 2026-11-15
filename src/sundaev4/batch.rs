@@ -1292,14 +1292,14 @@ pub fn resolve_proportional_withdraw(
     // by name, instead of building a scoop that fails evaluation and gets
     // quarantined as a suspected scooper bug: that is what a 3-asset
     // withdraw with three zero minimums looked like on preview, 2026-11-07.
-    if let Constraint::Withdraw { min_received, .. } = &order.constraint {
-        if let Some((asset, amount)) = min_received.iter().find(|(_, amount)| !amount.is_positive()) {
-            return Err(format!(
-                "withdraw min_received for {} is {}; the basic-order constraint requires every minimum to be positive, so this order cannot be scooped (the order was built wrong; its owner must cancel it)",
-                hex::encode(&asset.token),
-                amount
-            ));
-        }
+    if let Constraint::Withdraw { min_received, .. } = &order.constraint
+        && let Some((asset, amount)) = min_received.iter().find(|(_, amount)| !amount.is_positive())
+    {
+        return Err(format!(
+            "withdraw min_received for {} is {}; the basic-order constraint requires every minimum to be positive, so this order cannot be scooped (the order was built wrong; its owner must cancel it)",
+            hex::encode(&asset.token),
+            amount
+        ));
     }
     let lp_burned = offered
         .iter()
@@ -1964,7 +1964,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("a zero minimum must be refused"),
         };
-        assert!(err.contains("requires every minimum to be positive"), "{err}");
+        assert!(
+            err.contains("requires every minimum to be positive"),
+            "{err}"
+        );
         assert!(err.contains("cancel"), "{err}");
     }
 }
