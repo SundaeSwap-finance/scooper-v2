@@ -8,6 +8,11 @@ use crate::sundaev4::{SundaeV4Order, SundaeV4Pool, SundaeV4Settings};
 
 #[derive(Debug, Clone)]
 pub enum IndexEvent {
+    /// A Cardano-Swaps order was created or spent (any owner, any filler):
+    /// the router's external edges changed.
+    CardanoSwapsOrderbookChanged {
+        tx_id: String,
+    },
     V3PoolCreated {
         id: Ident,
         pool: Arc<SundaeV3Pool>,

@@ -1,13 +1,16 @@
 pub mod access;
 pub mod accumulator;
+pub mod banded_math;
 pub mod batch;
 pub mod butane;
+pub mod cardano_swaps;
 pub mod chain_tracker;
 pub mod claims;
 pub mod conversions;
 pub mod evaluator;
 mod indexer;
 pub mod intents;
+pub mod module_scripts;
 pub mod rate_guard;
 pub mod router;
 pub mod script_context;

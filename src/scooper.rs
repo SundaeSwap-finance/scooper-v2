@@ -78,6 +78,16 @@ pub struct Scooper {
     quarantine: BTreeMap<TransactionInput, Quarantine>,
     /// Loaded + verified Butane runtime (None = integration disabled).
     v4_butane: Option<crate::sundaev4::butane::ButaneRuntime>,
+    /// Loaded Cardano-Swaps runtime (None = integration disabled).
+    v4_cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsRuntime>,
+    /// Cardano-Swaps orders our in-flight scoops already fill, with the
+    /// time we submitted; withheld from routing until the chain shows them
+    /// spent or the entry ages out.
+    cswaps_inflight: BTreeMap<TransactionInput, std::time::Instant>,
+    /// Foreign fills that failed to build, evaluate, or clear the floor,
+    /// keyed by (order, pool) and holding the pool UTxO they were planned
+    /// against. The pair is skipped until that pool UTxO changes.
+    cswaps_failed: BTreeMap<(TransactionInput, crate::sundaev3::Ident), TransactionInput>,
     /// Posted strategy intents (shared with the admin server's ingest).
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
@@ -101,7 +111,45 @@ pub struct Scooper {
     rate_guard_blocked: BTreeSet<crate::sundaev3::Ident>,
     /// Last time each blocked pool was reported, for a periodic reminder.
     rate_guard_last_warn: BTreeMap<crate::sundaev3::Ident, std::time::Instant>,
+    /// How many times in a row the node has called a given pool UTxO a bad
+    /// input. Keyed on the UTxO, NOT the tx hash: every rebuild produces a
+    /// new hash, so the tx-keyed `last_node_reject` counter resets each
+    /// cycle and its three-strike guard can never fire.
+    pool_reject_streak: BTreeMap<(Ident, TransactionInput), u32>,
+    /// Pool UTxOs already reported as stale, so the report is made once and
+    /// not every cycle.
+    reported_stale_pools: BTreeSet<(Ident, TransactionInput)>,
 }
+
+/// Consecutive node rejections of the SAME pool UTxO before the scooper
+/// reports that its own index, not the chain, is what is wrong.
+///
+/// This REPORTS; it does not recover. Recovery is a resync. The point is
+/// that the condition is loud instead of silent: the scooper will go on
+/// rebuilding against the dead UTxO, but an operator can see why.
+///
+/// A lost race also produces `BadInputsUTxO` on a pool input, so a couple of
+/// rejections prove nothing. But a race is resolved by the next block: the
+/// winner's tx arrives, the indexer advances the pool, and the next build
+/// uses a different UTxO. A pool input that is STILL rejected after three
+/// rebuilds across separate cycles is one the chain has moved past and the
+/// indexer has not.
+///
+/// Why that happens: the indexer commits its per-transaction writes
+/// immediately but advances its cursor per block, so stopping the service
+/// partway through a block durably applies the transactions already
+/// processed and records the block as complete. Transactions after the stop
+/// point are never processed and their pool spends are lost. Nothing
+/// reconciles the index against the chain afterwards, so the pool keeps its
+/// dead UTxO for the life of the database.
+///
+/// Observed on preview 2026-10-07: block 4733493 held three transactions,
+/// the service stopped after the first, and transaction [2] — which spent
+/// two pool UTxOs — was never seen. The scooper then rebuilt against one of
+/// those dead UTxOs 125 times over four hours, scooping nothing, while 119
+/// orders queued behind it. Every one of those rejections was counted as a
+/// lost race.
+const STALE_POOL_REJECTS: u32 = 3;
 
 /// Where a node-rejected tx is kept for offline re-evaluation, and how many
 /// to keep.
@@ -184,6 +232,12 @@ impl Scooper {
                 v4_rate_guards.push(guard);
             }
         }
+        let v4_cardano_swaps = v4_execution
+            .as_ref()
+            .and_then(|e| crate::sundaev4::cardano_swaps::load_runtime(&e.cardano_swaps));
+        if v4_cardano_swaps.is_some() {
+            info!("cardano-swaps: order-book edges enabled");
+        }
         Ok(Self {
             event_rx,
             v3_state,
@@ -202,7 +256,12 @@ impl Scooper {
             v4_provisional,
             v4_node_submit,
             last_node_reject: None,
+            pool_reject_streak: BTreeMap::new(),
+            reported_stale_pools: BTreeSet::new(),
             v4_butane,
+            v4_cardano_swaps,
+            cswaps_inflight: BTreeMap::new(),
+            cswaps_failed: BTreeMap::new(),
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
             access_config_logged: false,
@@ -625,6 +684,13 @@ impl Scooper {
                 }
                 IndexEvent::V4PoolUpdated { id, pool, .. } => {
                     trace!(slot, pool = %id, "v4 pool updated");
+                    // The index has moved the pool on, so whatever UTxO we
+                    // were stuck on is behind us.
+                    if self.reported_stale_pools.iter().any(|(i, u)| i == &id && *u != pool.input) {
+                        info!(pool = %id, now = %pool.input, "stale pool recovered");
+                    }
+                    self.pool_reject_streak.retain(|(i, _), _| i != &id);
+                    self.reported_stale_pools.retain(|(i, _)| i != &id);
                     // Check if this update settles one of our in-flight txs
                     if let Some(tx_hash) = self.v4_chain_tracker.find_settled_tx(&id, &pool.input) {
                         self.v4_chain_tracker.confirm_settlement(&id, &tx_hash);
@@ -638,6 +704,8 @@ impl Scooper {
                 }
                 IndexEvent::V4PoolRemoved { id, .. } => {
                     trace!(slot, pool = %id, "v4 pool removed");
+                    self.pool_reject_streak.retain(|(i, _), _| i != &id);
+                    self.reported_stale_pools.retain(|(i, _)| i != &id);
                     self.v4_chain_tracker.discard_chain_and_related(&id);
                 }
                 IndexEvent::V4OrderCreated { order } => {
@@ -661,6 +729,9 @@ impl Scooper {
                     // The provisional store already holds it — receipt of
                     // this event is what wakes the dispatch loop.
                     trace!(slot, order = %order.input, "provisional order seen in mempool");
+                }
+                IndexEvent::CardanoSwapsOrderbookChanged { tx_id } => {
+                    trace!(slot, tx = %tx_id, "cardano-swaps order book changed");
                 }
                 IndexEvent::V4MempoolTxDropped { tx_hash } => {
                     let n = self.v4_chain_tracker.discard_by_provisional_parent(&tx_hash);
@@ -1239,6 +1310,23 @@ impl Scooper {
                     "\u{23f3} all orders in-flight or quarantined, waiting"
                 );
             }
+            // Nothing of ours to scoop: see whether a resting foreign order
+            // is worth filling against one of our pools for the protocol.
+            if self
+                .try_foreign_fill(
+                    &v4_state,
+                    &exec,
+                    &settings,
+                    &language_views,
+                    &collateral_input,
+                    &collateral_value,
+                    &funding_owned,
+                    &in_flight_pools,
+                )
+                .await
+            {
+                return true;
+            }
             return false;
         }
 
@@ -1288,6 +1376,7 @@ impl Scooper {
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     funding_is_predicted,
+                    None,
                 )
                 .await;
         }
@@ -1361,6 +1450,32 @@ impl Scooper {
             .iter()
             .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
             .filter(|(ident, _)| !rate_guarded.contains(ident))
+            // A pool whose scoop action names a module hash the config does
+            // not know (or an action shape the tx builder cannot build) is
+            // not scooped. The indexer logs the reason at classification;
+            // see `detect_pool_type`.
+            .filter(
+                |(ident, pool)| match exec.module_scripts.pool_modules(&pool.pool_datum) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        trace!(pool = %ident, "skipping pool with unsupported modules: {e}");
+                        false
+                    }
+                },
+            )
+            // A pool whose module config the scooper does not hold (bootstrap
+            // could not recover it, so `detect_pool_type` guessed) is not
+            // scooped: the module rejects a config that does not hash to the
+            // pool's slot. Bootstrap logs the WARN that names the pool.
+            .filter(|(ident, pool)| {
+                match crate::sundaev4::module_configs_match_datum(pool, &exec) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        debug!(pool = %ident, "skipping pool without a matching module config: {e}");
+                        false
+                    }
+                }
+            })
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);
@@ -1394,7 +1509,23 @@ impl Scooper {
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
 
+        // In-flight exclusions age out well after any validity window, or
+        // as soon as the chain shows the order spent.
+        {
+            let ttl = std::time::Duration::from_secs(600);
+            self.cswaps_inflight.retain(|oref, t| {
+                t.elapsed() < ttl && v4_state.cardano_swaps.orders.contains_key(oref)
+            });
+        }
+        let cswaps_snapshot = self.cardano_swaps_snapshot(&v4_state, &exec);
         let mut conversion_edges = crate::sundaev4::conversions::routable_edges(&exec.conversions);
+        if let Some(snap) = &cswaps_snapshot {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            conversion_edges.extend(snap.edges(now_ms));
+        }
         if let Some(rt) = &self.v4_butane {
             if exec.plutus_v2_cost_model.is_some() {
                 conversion_edges.extend(rt.edges());
@@ -1431,6 +1562,96 @@ impl Scooper {
             }
             let mut candidate = accum.clone();
             let added = match &order.constraint {
+                crate::sundaev4::Constraint::Deposit { .. }
+                | crate::sundaev4::Constraint::Withdraw { .. }
+                | crate::sundaev4::Constraint::Swap { .. }
+                    if batch::is_liquidity_op(order, &pools_filtered) =>
+                {
+                    // Multi-leg liquidity op: LP burned in some pools, LP
+                    // minted in others (movement, multi-withdrawal,
+                    // multi-deposit or a mix). Each leg is a proportional
+                    // pool op; the order is fulfilled once.
+                    let (burn_specs, mint_specs) = batch::lp_legs(order, &pools_filtered);
+                    let idents: Vec<_> = burn_specs
+                        .iter()
+                        .chain(mint_specs.iter())
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    if !idents
+                        .iter()
+                        .all(|p| exec.pool_allowlists.permits(p, order, order_strategy))
+                    {
+                        trace!(order = %order.input, "order dispatch: liquidity op, not on a pool's allowlist");
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
+                    tracing::info!(
+                        order = %order.input,
+                        kind = "liquidity-op",
+                        burns = ?burn_specs.iter().map(|(p, q)| format!("{p}:{q}")).collect::<Vec<_>>(),
+                        mints = ?mint_specs.iter().map(|(p, q)| format!("{p}:{q}")).collect::<Vec<_>>(),
+                        "order dispatch",
+                    );
+                    let resolve = |specs: &[(crate::sundaev3::Ident, crate::bigint::BigInt)]| {
+                        specs
+                            .iter()
+                            .map(|(p, q)| {
+                                pick_effective_pool(
+                                    &candidate,
+                                    &self.v4_chain_tracker,
+                                    &v4_state,
+                                    p,
+                                )
+                                .map(|pool| (p.clone(), q.clone(), pool))
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    };
+                    let (Some(burns), Some(mints)) = (resolve(&burn_specs), resolve(&mint_specs))
+                    else {
+                        skip_no_pool += 1;
+                        continue;
+                    };
+                    let plain_offered = batch::plain_offered(order, &pools_filtered);
+                    let plain_floors = batch::plain_floors(order, &pools_filtered);
+                    let limits = {
+                        use num_traits::ToPrimitive;
+                        let budget =
+                            order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
+                        let base_fee_lov =
+                            v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
+                        // Every burn and mint leg is a pool touch and a
+                        // transcript step the order's budget has to buy,
+                        // priced like a routed hop. What is left buys the
+                        // swap stage between the legs.
+                        let legs = burn_specs.len() + mint_specs.len();
+                        let all = router::RoutingLimits::from_budget(
+                            budget,
+                            base_fee_lov,
+                            exec.cost_per_pool_lovelace,
+                            exec.cost_per_step_lovelace,
+                        );
+                        router::RoutingLimits {
+                            max_pools: all.max_pools.saturating_sub(legs),
+                            max_steps: all.max_steps.saturating_sub(legs),
+                        }
+                    };
+                    match candidate.try_add_liquidity_op(
+                        order,
+                        &burns,
+                        &mints,
+                        &plain_offered,
+                        &plain_floors,
+                        &pools_filtered,
+                        limits,
+                    ) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            skip_add_failed += 1;
+                            tracing::info!(error = %e, order = %order.input, "try_add failed");
+                            false
+                        }
+                    }
+                }
                 crate::sundaev4::Constraint::Deposit { .. } => {
                     let Some(pool_ident) =
                         batch::find_pool_for_deposit_order(order, &pools_filtered)
@@ -1473,6 +1694,7 @@ impl Scooper {
                                 effective_pool.pool_type,
                                 crate::sundaev4::PoolType::ConstantSum { .. }
                                     | crate::sundaev4::PoolType::StableSwap { .. }
+                                    | crate::sundaev4::PoolType::BandedConcentratedLiquidity { .. }
                             ) {
                                 // A two-asset deposit is rejected on chain by
                                 // cp_check, which reads both reserves rising as
@@ -1482,8 +1704,8 @@ impl Scooper {
                                 // turn a cheap skip into a build failure, and a
                                 // lone order failing to build is quarantined
                                 // for good.
-                                Err("only constant-sum and stableswap pools zap: \
-                                     the other curves reject a two-asset deposit \
+                                Err("only constant-sum, stableswap and banded pools zap: \
+                                     constant product rejects the deposit step \
                                      on chain"
                                     .to_string())
                             } else if carries_route_constraint(&exec, order) {
@@ -1555,8 +1777,8 @@ impl Scooper {
                     // Swap: route through the optimizer against the
                     // accumulator's *current* pool state, so prior orders'
                     // depletion is visible. The router then naturally splits
-                    // across CL+non-CL pools when an earlier order has
-                    // drained the optimal CL pool.
+                    // across pools when an earlier order has
+                    // drained the optimal one.
                     let (offer_asset, _) = order.swap_offered();
                     let offer_amount = &order.swap_executable();
                     let (ask_asset, _) = order.swap_min_received();
@@ -1596,12 +1818,10 @@ impl Scooper {
                     // blend across parallel paths (min_received is their
                     // only on-chain output check).
                     let route_constraint_data =
-                        exec.module_scripts.route_order.as_ref().and_then(|m| {
-                            order
-                                .datum
-                                .constraints
-                                .iter()
-                                .find_map(|(h, d)| (h.as_slice() == m.hash.as_ref()).then_some(d))
+                        order.datum.constraints.iter().find_map(|(h, d)| {
+                            (exec.module_scripts.kind_of(h)
+                                == Some(crate::sundaev4::ModuleKind::RouteOrder))
+                            .then_some(d)
                         });
                     let has_route_module = route_constraint_data.is_some();
                     // The route constraint's payload is a pool whitelist;
@@ -1765,18 +1985,10 @@ impl Scooper {
                     // swap.ak pays fees pro-rata, so smaller fills don't
                     // cover the scoop cost.
                     if let Err(e) = &add_result {
-                        let is_swap_module = exec
-                            .module_scripts
-                            .swap_order
-                            .as_ref()
-                            .map(|m| {
-                                order
-                                    .datum
-                                    .constraints
-                                    .iter()
-                                    .any(|(h, _)| h.as_slice() == m.hash.as_ref())
-                            })
-                            .unwrap_or(false);
+                        let is_swap_module = order.datum.constraints.iter().any(|(h, _)| {
+                            exec.module_scripts.kind_of(h)
+                                == Some(crate::sundaev4::ModuleKind::SwapOrder)
+                        });
                         // SUNDAE-2613: min_received is measured gross of
                         // the fee on ADA legs, so ADA-receiving orders can
                         // partial-fill like any other now.
@@ -1858,21 +2070,25 @@ impl Scooper {
                 skip_route_failed,
                 "no orders could be added to batch"
             );
-            return false;
+            // Candidates that cannot be batched must not starve foreign fills:
+            // with nothing of ours going out this cycle, try one of those.
+            return self
+                .try_foreign_fill(
+                    &v4_state,
+                    &exec,
+                    &settings,
+                    &language_views,
+                    &collateral_input,
+                    &collateral_value,
+                    &funding_owned,
+                    &in_flight_pools,
+                )
+                .await;
         }
 
         // ── Phase 2: Binary search for largest batch within limits ────────
 
-        /// Three-state result of testing whether a candidate accumulator
-        /// produces a viable tx. We never submit txs we can't evaluate, so
-        /// eval failure is treated as a hard bail — not a "fall back to
-        /// worst-case budget" hint. See the failure taxonomy in scoop().
-        #[derive(Debug)]
-        enum Fitness {
-            Fits,
-            Overbudget,
-            Bail(String),
-        }
+        use crate::sundaev4::batch::{Fitness, ScoopTxCost};
 
         let within_limits = |accum: &Accumulator| -> Fitness {
             let plan = accum.clone().into_plan();
@@ -1892,6 +2108,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                cswaps_snapshot.as_ref().map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1946,79 +2163,14 @@ impl Scooper {
                 }
             };
 
-            let total_mem: u64 = r.budgets.iter().map(|(_, eu)| eu.mem).sum();
-            let total_steps: u64 = r.budgets.iter().map(|(_, eu)| eu.steps).sum();
-            let tx_size = build.cbor.len();
-
-            let (pad_num, pad_den) = exec.budget_padding;
-            let padded_mem = total_mem * pad_num / pad_den;
-            let padded_steps = total_steps * pad_num / pad_den;
-
-            let fits = padded_mem <= exec.max_tx_ex_mem
-                && padded_steps <= exec.max_tx_ex_steps
-                && tx_size <= exec.max_tx_size;
-            if fits {
-                Fitness::Fits
-            } else {
-                Fitness::Overbudget
-            }
+            ScoopTxCost::new(build.cbor.len(), &r, &exec).fitness(&exec)
         };
 
-        // Find the largest checkpoint (prefix of accumulated orders) that builds
-        // and evaluates within limits. checkpoints[i] has (i+1) orders.
-        //
-        // Outcome handling per probe:
-        // - Fits        → best = this index; try larger
-        // - Overbudget  → too many ex-units / too big; try smaller
-        // - Bail        → a build/eval failure was introduced by some order.
-        //                 Rather than abort the whole cycle (which lets one bad
-        //                 order wedge the queue for everyone), treat it like
-        //                 Overbudget and search downward: this still scoops the
-        //                 valid prefix and isolates the failing suffix. If even
-        //                 the smallest (1-order) batch bails, that order is
-        //                 quarantined below so it stops blocking the queue.
-        let mut best: Option<usize> = None;
-        let mut last_bail: Option<String> = None;
-
-        let probe = |idx: usize| -> Fitness { within_limits(&checkpoints[idx]) };
-
-        let top = checkpoints.len() - 1;
-        // Quick check: try the full batch first (common case).
-        match probe(top) {
-            Fitness::Fits => best = Some(top),
-            outcome => {
-                if let Fitness::Bail(reason) = outcome {
-                    last_bail = Some(reason);
-                }
-                // Full batch failed — binary search the smaller prefixes,
-                // treating Overbudget and Bail alike as "go smaller".
-                if top > 0 {
-                    let (mut lo, mut hi) = (0usize, top - 1);
-                    while lo <= hi {
-                        let mid = lo + (hi - lo) / 2;
-                        match probe(mid) {
-                            Fitness::Fits => {
-                                best = Some(mid);
-                                lo = mid + 1;
-                            }
-                            Fitness::Overbudget => {
-                                if mid == 0 {
-                                    break;
-                                }
-                                hi = mid - 1;
-                            }
-                            Fitness::Bail(reason) => {
-                                last_bail = Some(reason);
-                                if mid == 0 {
-                                    break;
-                                }
-                                hi = mid - 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // checkpoints[i] has (i+1) orders.
+        let (best, last_bail) =
+            crate::sundaev4::batch::largest_fitting_checkpoint(checkpoints.len(), |idx| {
+                within_limits(&checkpoints[idx])
+            });
 
         // If we found a valid prefix but had to drop a failing suffix, note it.
         if let (Some(idx), Some(reason)) = (best, &last_bail)
@@ -2070,6 +2222,7 @@ impl Scooper {
                         v4_state.fee_settings.as_deref(),
                         funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                         self.v4_butane.as_ref(),
+                        cswaps_snapshot.as_ref().map(|s| s.context()).as_ref(),
                     ) {
                         // A missing funding input is a wallet condition, not
                         // a defect of the order: take the temporary-quarantine
@@ -2236,8 +2389,264 @@ impl Scooper {
             &provisional_parent,
             &foreign_pool_parent,
             funding_is_predicted,
+            cswaps_snapshot.as_ref(),
         )
         .await
+    }
+
+    /// After a rejection: per redeemer, what the tx declared, what our
+    /// evaluator measured on the final tx, and what the node measures
+    /// (ogmios `evaluateTransaction`), with a flag on any redeemer whose
+    /// declared budget is below the node's number. Also writes the
+    /// ScriptContext our evaluator built for every redeemer to
+    /// /tmp/ctx-<tx>-<purpose><index>.cbor, to diff against the node's.
+    async fn diagnose_rejected_scoop(
+        evaluate_url: &str,
+        final_tx: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
+        padded_budgets: &[(
+            pallas_primitives::conway::RedeemersKey,
+            pallas_primitives::ExUnits,
+        )],
+        final_raw: &[(
+            pallas_primitives::conway::RedeemersKey,
+            pallas_primitives::ExUnits,
+        )],
+        slot_config: &crate::sundaev4::SlotConfig,
+    ) {
+        // Per redeemer: what we declared, what our evaluator
+        // measured on the final tx, and what the node measures
+        // (ogmios evaluateTransaction, when the submit endpoint
+        // is ogmios). A declared budget below the node's number
+        // is a phase-2 rejection the local check cannot see.
+        let node = crate::sundaev4::submit::evaluate_ogmios(evaluate_url, &final_tx.cbor)
+            .await
+            .unwrap_or_default();
+        // The tx itself, for the node-side context tool, then the
+        // contexts our evaluator built for it, one file per redeemer.
+        let tx_dump = format!("/tmp/submit-fail-{}.cbor", final_tx.tx_hash_hex);
+        if let Err(e) = std::fs::write(&tx_dump, &final_tx.cbor) {
+            warn!(error = %e, path = %tx_dump, "failed to write rejected tx dump");
+        }
+        let ctx_paths = crate::sundaev4::evaluator::dump_script_contexts(
+            &final_tx.tx_body,
+            &final_tx.redeemers,
+            &final_tx.resolved_inputs,
+            &final_tx.resolved_ref_inputs,
+            final_tx.tx_hash,
+            slot_config,
+        );
+        warn!(tx_hash = %final_tx.tx_hash_hex, contexts = ?ctx_paths, "submit-fail local script contexts dumped");
+        for (k, declared) in padded_budgets {
+            let local = final_raw.iter().find(|(fk, _)| fk == k).map(|(_, eu)| *eu);
+            let purpose = match k.tag {
+                pallas_primitives::conway::RedeemerTag::Spend => "spend",
+                pallas_primitives::conway::RedeemerTag::Mint => "mint",
+                pallas_primitives::conway::RedeemerTag::Cert => "publish",
+                pallas_primitives::conway::RedeemerTag::Reward => "withdraw",
+                _ => "other",
+            };
+            let measured = node
+                .iter()
+                .find(|(p, i, _, _)| p == purpose && *i == u64::from(k.index))
+                .map(|(_, _, m, c)| (*m, *c));
+            let short = measured.is_some_and(|(m, c)| m > declared.mem || c > declared.steps);
+            warn!(
+                tx_hash = %final_tx.tx_hash_hex,
+                redeemer = format!("{purpose}#{}", k.index),
+                declared_mem = declared.mem,
+                declared_steps = declared.steps,
+                local_mem = local.map(|e| e.mem),
+                local_steps = local.map(|e| e.steps),
+                node_mem = measured.map(|m| m.0),
+                node_steps = measured.map(|m| m.1),
+                short,
+                "submit-fail budget",
+            );
+        }
+    }
+
+    /// Price every fillable Cardano-Swaps order into the snapshot the
+    /// router's edges and the builder's fill context both come from. None
+    /// when the integration is off or the swap script's reference UTxO has
+    /// not been indexed (without it the transaction cannot be witnessed).
+    fn cardano_swaps_snapshot(
+        &self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+    ) -> Option<crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot> {
+        let rt = self.v4_cardano_swaps.as_ref()?;
+        for r in rt.static_ref_utxos() {
+            if !v4_state.ref_utxo_outputs.contains_key(&r) {
+                tracing::debug!(
+                    utxo = %r,
+                    "cardano-swaps: swap script ref UTxO not indexed — edges closed",
+                );
+                return None;
+            }
+        }
+        let mut state = v4_state.cardano_swaps.clone();
+        for oref in self.cswaps_inflight.keys() {
+            state.orders.remove(oref);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let (edges, legs) = rt.edges(&state, now_ms);
+        if !edges.is_empty() {
+            tracing::debug!(
+                edges = edges.len(),
+                orders = state.orders.len(),
+                "cardano-swaps: order-book edges priced",
+            );
+        }
+        Some(crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
+            runtime: rt.clone(),
+            state,
+            legs,
+            slot_config: exec.slot_config.clone(),
+        })
+    }
+
+    /// The most valuable fill of a resting Cardano-Swaps order against one
+    /// of our pools, as a plan with no Sundae order in it. None when the
+    /// integration or its foreign-fill mode is off, or nothing clears the
+    /// projected floor. Pools already in flight are skipped: the fill would
+    /// contend with our own chain for the UTxO.
+    /// Plan, build and submit the best foreign fill, if one clears the
+    /// screens. Called wherever a cycle ends with no Sundae order going out.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_foreign_fill(
+        &mut self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+        settings: &std::sync::Arc<crate::sundaev4::SundaeV4Settings>,
+        language_views: &[u8],
+        collateral_input: &TransactionInput,
+        collateral_value: &crate::cardano_types::Value,
+        funding_owned: &Option<(TransactionInput, crate::cardano_types::Value)>,
+        in_flight_pools: &[crate::sundaev3::Ident],
+    ) -> bool {
+        let Some(plan) = self.plan_foreign_fill(v4_state, exec, in_flight_pools) else {
+            return false;
+        };
+        let batch = &plan.batches[0];
+        let key = (
+            batch.foreign[0].attribution.clone(),
+            batch.pool_ident.clone(),
+        );
+        let pool_input = batch.pool.input.clone();
+        let submitted = self
+            .build_and_submit_plan(
+                plan,
+                settings,
+                exec,
+                v4_state,
+                language_views,
+                collateral_input,
+                collateral_value,
+                funding_owned,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                false,
+                self.cardano_swaps_snapshot(v4_state, exec).as_ref(),
+            )
+            .await;
+        if !submitted {
+            // Same order against the same pool UTxO would fail the same way;
+            // retrying every cycle only spams the log and the context dumps.
+            self.cswaps_failed.insert(key, pool_input);
+        }
+        submitted
+    }
+
+    fn plan_foreign_fill(
+        &mut self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+        exec: &ScooperExecution,
+        in_flight_pools: &[crate::sundaev3::Ident],
+    ) -> Option<crate::sundaev4::batch::ScoopPlan> {
+        let snap = self.cardano_swaps_snapshot(v4_state, exec)?;
+        snap.runtime.foreign_fills.as_ref()?;
+        self.cswaps_failed
+            .retain(|(order, _), _| v4_state.cardano_swaps.orders.contains_key(order));
+        let mut best: Option<(
+            u64,
+            std::sync::Arc<crate::sundaev4::SundaeV4Pool>,
+            crate::sundaev4::batch::ResolvedForeign,
+        )> = None;
+        // Why each pool holding the order's pair was not a candidate, for
+        // the one-line report when nothing is planned.
+        let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+        for leg in snap.legs.values() {
+            for (ident, pool) in &v4_state.pools {
+                if in_flight_pools.contains(ident) || exec.pool_allowlists.is_restricted(ident) {
+                    continue;
+                }
+                if self
+                    .cswaps_failed
+                    .get(&(leg.order.input.clone(), ident.clone()))
+                    .is_some_and(|failed_against| *failed_against == pool.input)
+                {
+                    continue;
+                }
+                match snap.runtime.plan_foreign_fill_explained(pool, leg) {
+                    Ok(plan) => {
+                        if best.as_ref().is_none_or(|(g, _, _)| plan.gross_surplus > *g) {
+                            best = Some((plan.gross_surplus, pool.clone(), plan.resolved));
+                        }
+                    }
+                    Err(why) => {
+                        let holds_pair =
+                            pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.offer)
+                                && pool
+                                    .pool_datum
+                                    .assets
+                                    .iter()
+                                    .any(|(a, _)| *a == leg.order.datum.ask);
+                        if holds_pair {
+                            *reasons.entry(why).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if best.is_none() && !snap.legs.is_empty() {
+            info!(
+                orders = snap.legs.len(),
+                reasons = ?reasons,
+                "no foreign fill this cycle",
+            );
+        }
+        let (gross, pool, resolved) = best?;
+        info!(
+            order = %resolved.attribution,
+            pool = %pool.pool_datum.identifier,
+            dx = %resolved.dx,
+            projected_gross_surplus = gross,
+            "foreign fill planned",
+        );
+        Some(crate::sundaev4::batch::ScoopPlan {
+            batches: vec![crate::sundaev4::batch::Batch {
+                pool: pool.clone(),
+                pool_ident: pool.pool_datum.identifier.clone(),
+                swaps: Vec::new(),
+                continuations: Vec::new(),
+                deposits: Vec::new(),
+                withdraws: Vec::new(),
+                zaps: Vec::new(),
+                claims: Vec::new(),
+                foreign: vec![resolved],
+                ops_order: vec![crate::sundaev4::batch::BatchOp::Foreign(0)],
+                final_assets: pool.pool_datum.assets.clone(),
+                final_total_lp: pool.pool_datum.total_lp.clone(),
+            }],
+            routes: Vec::new(),
+            global_seq: Vec::new(),
+            conversions: Vec::new(),
+            moves: Vec::new(),
+        })
     }
 
     /// Build the tx for `final_plan`, evaluate, compute the exact fee,
@@ -2258,14 +2667,17 @@ impl Scooper {
         provisional_parent: &BTreeMap<TransactionInput, Vec<u8>>,
         foreign_pool_parent: &BTreeMap<crate::sundaev3::Ident, Vec<u8>>,
         funding_is_predicted: bool,
+        cardano_swaps: Option<&crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot>,
     ) -> bool {
+        // A movement's two legs serve one order; count distinct orders.
         let n_orders: usize = final_plan
             .batches
             .iter()
             .map(|b| {
                 b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len()
             })
-            .sum();
+            .sum::<usize>()
+            - final_plan.moves.iter().map(|m| m.legs() - 1).sum::<usize>();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
             final_plan.batches.iter().map(|b| b.pool_ident.clone()).collect();
@@ -2281,6 +2693,8 @@ impl Scooper {
                     .chain(b.zaps.iter().map(|o| o.order.input.clone()))
                     .chain(b.claims.iter().map(|o| o.order.input.clone()))
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         // Refresh the validity window — the binary search phase may have taken
         // many seconds, so the window captured at the start of the cycle could
@@ -2311,7 +2725,7 @@ impl Scooper {
             )>,
         > = None;
         let mut redeclare_rounds = 0u32;
-        let (padded_budgets, final_tx) = loop {
+        let (padded_budgets, final_tx, final_raw) = loop {
             let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
                 settings,
@@ -2328,6 +2742,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                cardano_swaps.map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e)
@@ -2458,6 +2873,52 @@ impl Scooper {
                 first_pass.total_ref_script_bytes,
             ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
 
+            // Drain the witness-search timings this cycle accumulated. The
+            // router calls find_witness once per banded pool per graph build
+            // and twice per step evaluation, so a cycle produces many
+            // observations; this is where they become a histogram.
+            for secs in crate::sundaev4::banded_math::drain_witness_times() {
+                self.metrics.witness_latency.observe(secs);
+            }
+            // Calls the memo answered. The histogram above only sees the
+            // searches that ran, so without this the per-call cost reads
+            // far higher than it is.
+            let memo_hits = crate::sundaev4::banded_math::drain_witness_memo_hits();
+            if memo_hits > 0 {
+                self.metrics
+                    .witness_memo_hits
+                    .fetch_add(memo_hits, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Route cost per call, and the evaluate_path multiplier.
+            for st in crate::sundaev4::router::drain_route_stats() {
+                self.metrics.route_latency.observe(st.secs);
+                self.metrics.route_evals.observe(st.evals as f64);
+                self.metrics.route_paths.observe(st.paths as f64);
+                self.metrics.route_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Record the budget against the Conway per-tx limits. This is
+            // the only continuous measurement of how close a scoop runs to
+            // the ceiling; without it, "four banded pools is the practical
+            // limit" is an inference from a stale manual measurement.
+            {
+                let transcript_steps: u64 = final_plan
+                    .batches
+                    .iter()
+                    // ops_order is exactly what the builder turns into
+                    // transcript entries, and it includes continuations —
+                    // the band crossings — so this counts bands traversed.
+                    .map(|b| b.ops_order.len() as u64)
+                    .sum();
+                self.metrics.note_scoop_budget(
+                    total_eval_mem,
+                    total_eval_steps,
+                    first_pass.cbor.len() as u64,
+                    final_plan.batches.len() as u64,
+                    transcript_steps,
+                );
+            }
+
             let final_tx = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
                 settings,
@@ -2474,6 +2935,7 @@ impl Scooper {
                 v4_state.fee_settings.as_deref(),
                 funding_owned.as_ref().map(|(i, v)| (i.0.clone(), v)),
                 self.v4_butane.as_ref(),
+                cardano_swaps.map(|s| s.context()).as_ref(),
             ) {
                 Ok(r) => r,
                 Err(e)
@@ -2534,6 +2996,36 @@ impl Scooper {
                     return false;
                 }
             };
+            // Budget drift: the declared budget is the FIRST pass's
+            // measurement plus the pad, and the check above only sees the
+            // final tx against that. A script that costs more in the final
+            // tx than in the first pass eats into the pad silently; past
+            // the pad the node rejects the tx at submit with no local
+            // warning. Log every redeemer whose final cost moved by more
+            // than 0.5% either way, so the margin can be sized from data.
+            {
+                let (pad_num, pad_den) = exec.budget_padding;
+                for (k, declared) in &padded_budgets {
+                    let Some((_, raw_final)) = final_raw.iter().find(|(fk, _)| fk == k) else {
+                        continue;
+                    };
+                    let first_mem = declared.mem * pad_den / pad_num;
+                    let first_steps = declared.steps * pad_den / pad_num;
+                    let drift_mem = raw_final.mem as f64 / first_mem.max(1) as f64 - 1.0;
+                    let drift_steps = raw_final.steps as f64 / first_steps.max(1) as f64 - 1.0;
+                    if drift_mem.abs() > 0.005 || drift_steps.abs() > 0.005 {
+                        info!(
+                            tx_hash = %final_tx.tx_hash_hex,
+                            redeemer = format!("{:?}#{}", k.tag, k.index),
+                            first_pass_mem = first_mem,
+                            final_mem = raw_final.mem,
+                            drift_mem_pct = format!("{:+.2}", drift_mem * 100.0),
+                            drift_steps_pct = format!("{:+.2}", drift_steps * 100.0),
+                            "budget drift between first pass and final tx",
+                        );
+                    }
+                }
+            }
             if !over_budget.is_empty() {
                 if redeclare_rounds < 2 {
                     redeclare_rounds += 1;
@@ -2570,9 +3062,45 @@ impl Scooper {
             // tx fee. Logging which way this went is what tells an operator
             // whether the wallet UTxO a scoop consumed was actually needed.
             info!(funding_input = funding_owned.is_some(), "scoop built");
-            break (padded_budgets, final_tx);
+            break (padded_budgets, final_tx, final_raw);
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
+
+        // A foreign-order fill is made for the protocol's revenue and nothing
+        // else: the exact residual the rebuilt transaction lands, net of its
+        // real fee, must clear the configured floor.
+        let has_foreign = final_plan.batches.iter().any(|b| !b.foreign.is_empty());
+        if has_foreign {
+            let floor = cardano_swaps
+                .and_then(|s| s.runtime.foreign_fills.as_ref())
+                .map(|f| f.min_revenue_lovelace)
+                .unwrap_or(u64::MAX);
+            match final_tx.foreign_surplus {
+                Some(landed) if landed >= floor => {
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        landed_surplus = landed,
+                        fee = final_tx.tx_body.fee,
+                        floor,
+                        "foreign fill clears the revenue floor",
+                    );
+                }
+                Some(landed) => {
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        landed_surplus = landed,
+                        fee = final_tx.tx_body.fee,
+                        floor,
+                        "foreign fill under the revenue floor after the real fee — not submitting",
+                    );
+                    return false;
+                }
+                None => {
+                    warn!(tx_hash = %final_tx.tx_hash_hex, "foreign fill built without a landed surplus — not submitting");
+                    return false;
+                }
+            }
+        }
 
         let submitted_mem: u64 = padded_budgets.iter().map(|(_, eu)| eu.mem).sum();
         let submitted_steps: u64 = padded_budgets.iter().map(|(_, eu)| eu.steps).sum();
@@ -2668,6 +3196,15 @@ impl Scooper {
         match submit_result {
             Ok(submitted_hash) => {
                 info!(tx_hash = %submitted_hash, n_orders, n_pools, "multi-pool scoop tx submitted");
+                for key in
+                    final_plan.conversions.iter().map(|c| &c.key).chain(
+                        final_plan.batches.iter().flat_map(|b| b.foreign.iter().map(|f| &f.key)),
+                    )
+                {
+                    if let Some(oref) = crate::sundaev4::cardano_swaps::order_from_key(key) {
+                        self.cswaps_inflight.insert(oref, std::time::Instant::now());
+                    }
+                }
                 self.metrics.batches_submitted.fetch_add(1, Ordering::Relaxed);
                 self.metrics.orders_scooped.fetch_add(n_orders as u64, Ordering::Relaxed);
 
@@ -2688,10 +3225,10 @@ impl Scooper {
                             crate::metrics::PoolFamily::ConstantProduct
                         }
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
-                        PoolType::ConcentratedLiquidity { .. } => {
-                            crate::metrics::PoolFamily::ConcentratedLiquidity
-                        }
                         PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
+                        PoolType::BandedConcentratedLiquidity { .. } => {
+                            crate::metrics::PoolFamily::BandedConcentratedLiquidity
+                        }
                     };
                     let n = (batch.swaps.len()
                         + batch.deposits.len()
@@ -2720,7 +3257,16 @@ impl Scooper {
                     // appears ONLY here, and missing it would let the next
                     // cycle re-dispatch a spent order.
                     .chain(final_plan.conversions.iter().map(|c| c.order.clone()))
-                    .collect();
+                    // A movement's two legs name the same order once each.
+                    .fold(
+                        Vec::new(),
+                        |mut acc: Vec<Arc<crate::sundaev4::SundaeV4Order>>, o| {
+                            if !acc.iter().any(|a| a.input == o.input) {
+                                acc.push(o);
+                            }
+                            acc
+                        },
+                    );
 
                 // Build predicted pools for chain tracker
                 let predicted_pools: Vec<_> = final_tx
@@ -2812,6 +3358,11 @@ impl Scooper {
                     // inputs; for node rejects, scan the reason hex for each
                     // plan input's tx hash.
                     let mut bad_refs = parse_bad_inputs(&msg);
+                    // Pool UTxOs the node called bad. A pool is not an order:
+                    // it never enters `bad_refs`, so without this a rejection
+                    // that implicated only pools looks like it implicated
+                    // nothing at all, and falls through to a blind retry.
+                    let mut rejected_pools: Vec<(Ident, TransactionInput)> = vec![];
                     if let Some(hex_reason) = node_reject_hex {
                         let mut implicated_kinds: Vec<String> = Vec::new();
                         for input in plan_order_inputs.iter() {
@@ -2825,6 +3376,7 @@ impl Scooper {
                             if hex_reason.contains(&hex::encode(pin.0.transaction_id.as_ref())) {
                                 implicated_kinds
                                     .push(format!("pool {} ({})", batch.pool_ident, pin));
+                                rejected_pools.push((batch.pool_ident.clone(), pin.clone()));
                             }
                         }
                         if let Some((fi, _)) = &funding_owned
@@ -2843,6 +3395,14 @@ impl Scooper {
                             reason_hex = %hex_reason,
                             "node rejected scoop tx",
                         );
+                        Self::diagnose_rejected_scoop(
+                            &exec.evaluate_url,
+                            &final_tx,
+                            &padded_budgets,
+                            &final_raw,
+                            &exec.slot_config,
+                        )
+                        .await;
                     } else {
                         info!(
                             tx_hash = %final_tx.tx_hash_hex,
@@ -2858,6 +3418,36 @@ impl Scooper {
                     };
                     if node_reject_hex.is_some() {
                         self.last_node_reject = Some((final_tx.tx_hash_hex.clone(), repeat_count));
+                    }
+                    // A pool UTxO the node keeps calling bad is evidence
+                    // about OUR INDEX, not about contention. Count the streak
+                    // against the UTxO so rebuilds accumulate.
+                    for (ident, input) in &rejected_pools {
+                        let key = (ident.clone(), input.clone());
+                        let n = *self
+                            .pool_reject_streak
+                            .entry(key.clone())
+                            .and_modify(|n| *n += 1)
+                            .or_insert(1);
+                        if n >= STALE_POOL_REJECTS && self.reported_stale_pools.insert(key) {
+                            error!(
+                                pool = %ident,
+                                dead_utxo = %input,
+                                rejects = n,
+                                "pool UTxO rejected repeatedly: the INDEX is stale, not the \
+                                 chain. The chain has spent this UTxO and the indexer did not \
+                                 record it, so every scoop built on this pool will be rejected \
+                                 and its orders cannot be served. Recover with a resync.",
+                            );
+                        }
+                    }
+                    // Pools that were NOT implicated this time are healthy
+                    // again: drop any streak so a later genuine race starts
+                    // from zero.
+                    if node_reject_hex.is_some() {
+                        let implicated: std::collections::BTreeSet<&Ident> =
+                            rejected_pools.iter().map(|(i, _)| i).collect();
+                        self.pool_reject_streak.retain(|(ident, _), _| implicated.contains(ident));
                     }
                     let until_slot = self.now_slot(tip_slot) + TEMP_QUARANTINE_SLOTS;
                     let order_inputs: Vec<&TransactionInput> = plan_order_inputs.iter().collect();
@@ -2924,11 +3514,69 @@ impl Scooper {
                         dump = %dump_path,
                         "multi-pool scoop tx submit failed — tx CBOR dumped for uplc-turbo diagnosis"
                     );
+                    Self::diagnose_rejected_scoop(
+                        &exec.evaluate_url,
+                        &final_tx,
+                        &padded_budgets,
+                        &final_raw,
+                        &exec.slot_config,
+                    )
+                    .await;
                 }
                 for ident in &pool_idents {
                     self.v4_chain_tracker.discard_chain_and_related(ident);
                 }
                 self.sync_in_flight_metrics();
+
+                // Losing a race to another scooper does NOT need a block.
+                //
+                // The default response to a submit failure is to wait for
+                // the tip to advance, which on preview costs 20-70s. That is
+                // right for an unexplained failure: retrying the same thing
+                // against the same state would just fail again.
+                //
+                // It is wrong when we lost to a competitor, because their
+                // transaction is already in OUR mempool. The provisional
+                // store has it, Phase 1 overlays foreign pool predictions on
+                // top of the confirmed state, and the next cycle will chain
+                // onto their output instead of the UTxO they just spent. So
+                // there is nothing to wait for — waiting only hands them the
+                // orders we were both bidding for.
+                //
+                // Third-party scoopers on preview took 7 of the last 12
+                // spends of one pool, and each lost race cost us ~70s of
+                // idleness on top of the loss. Measured: reject at 06:11:21,
+                // next build 06:12:31.
+                //
+                // Bounded by the existing repeat guard: a tx that bounces
+                // three times is structurally stuck, not contested, and
+                // falls through to the block backoff.
+                let contested: Vec<&Ident> = match &self.v4_provisional {
+                    Some(prov) => {
+                        let live = prov.lock().unwrap().foreign_pools();
+                        pool_idents
+                            .iter()
+                            .filter(|ident| live.iter().any(|(i, fp)| i == *ident && !fp.gone))
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                // `last_node_reject` was just updated for this tx, so it
+                // carries the same count the branches above used.
+                let repeats = self.last_node_reject.as_ref().map(|(_, n)| *n).unwrap_or(1);
+                if !contested.is_empty() && repeats < 3 {
+                    info!(
+                        pools = ?contested.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                        repeats,
+                        "lost the race but the winner is in our mempool — rebuilding on it now \
+                         instead of waiting for a block",
+                    );
+                    self.metrics.note_race_rebuild();
+                    // `true` keeps the main loop from blocking on the next
+                    // event, so Phase 1 re-runs immediately with the foreign
+                    // prediction in place.
+                    return true;
+                }
                 if let Some(tip) = self.current_tip_slot().await {
                     self.backoff_until_after_slot = Some(tip);
                 }
@@ -3101,6 +3749,7 @@ impl Scooper {
                 op_idx: 0,
             }],
             conversions: Vec::new(),
+            moves: Vec::new(),
         };
         Some((scoop_plan, sse_pd))
     }
@@ -3213,15 +3862,15 @@ fn carries_route_constraint(
     exec: &ScooperExecution,
     order: &crate::sundaev4::SundaeV4Order,
 ) -> bool {
-    let Some(route) = exec.module_scripts.route_order.as_ref() else {
-        return false;
-    };
-    order.datum.constraints.iter().any(|(h, _)| h.as_slice() == route.hash.as_ref())
+    order.datum.constraints.iter().any(|(h, _)| {
+        exec.module_scripts.kind_of(h) == Some(crate::sundaev4::ModuleKind::RouteOrder)
+    })
 }
 
 /// Resolve the effective pool snapshot to scoop against — preferring an
 /// already-accumulated state, then the chain tracker's in-flight prediction
 /// (so we chain off our own pending tx), then the on-chain state.
+///
 fn pick_effective_pool(
     accum: &Accumulator,
     chain_tracker: &crate::sundaev4::chain_tracker::ChainTracker,

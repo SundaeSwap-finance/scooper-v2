@@ -12,6 +12,7 @@ use crate::bigint::BigInt;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::Ident;
 use crate::sundaev4::swap_math;
+use crate::sundaev4::types::ScooperExecution;
 use crate::sundaev4::types::*;
 
 /// A resolved swap with precomputed math.
@@ -57,7 +58,7 @@ pub struct ContinuationSwap {
     /// verbatim at tx-time (the router's allocation across split pools is the
     /// authoritative split of the user's offer). For *later-hop* continuations
     /// this acts as the numerator of a proportional split — tx_builder rescales
-    /// against the actual previous-hop output to handle dy drift from CL
+    /// against the actual previous-hop output to handle dy drift from curved pools
     /// recompute and similar.
     pub dx: BigInt,
     pub route: RouteRef,
@@ -166,6 +167,13 @@ pub enum BatchOp {
     /// Index into `batch.claims`. Phase 1: a claim is always the only op in
     /// its batch (dedicated single-order batches, no transcript mixing).
     Claim(usize),
+    /// Index into `batch.foreign`: a pool swap that serves an order held at
+    /// a foreign order contract (a Cardano-Swaps limit order), not a Sundae
+    /// order. The pool step is an ordinary swap; what differs is that its
+    /// emission goes into the foreign order's continuing output and the
+    /// lovelace the foreign order releases beyond the pool's price lands on
+    /// the pool as protocol surplus.
+    Foreign(usize),
 }
 
 /// Cross-batch pointer to an op for the global topological walk. `op_idx`
@@ -189,6 +197,172 @@ pub struct ScoopPlan {
     /// Off-protocol conversion legs (Butane mints, …) the tx must compose
     /// alongside the pool ops. Empty for pool-only plans.
     pub conversions: Vec<PlannedConversion>,
+    /// Liquidity movements: one order that burns pool X's LP and mints pool
+    /// Y's. Each move also appears as a withdraw leg in X's batch and a
+    /// deposit leg in Y's batch, so the pool walks need no new op kind; the
+    /// order itself is fulfilled once, from this record.
+    pub moves: Vec<ResolvedMove>,
+}
+
+/// One order that burns LP in any number of pools and mints LP in any
+/// number of pools, in one transaction: a movement (one of each), a
+/// multi-withdrawal (burns only, several pools), a multi-deposit (mints
+/// only, several pools) or any mix. The order's plain offered assets join
+/// the withdraw payouts as the deposit basket; whatever the ceil-pinned
+/// deposits do not use returns to the user. Every leg is an ordinary
+/// withdraw or deposit op in its pool's batch; the order is fulfilled once
+/// from this record.
+#[derive(Clone, Debug)]
+pub struct ResolvedMove {
+    pub order: Arc<SundaeV4Order>,
+    pub burns: Vec<BurnLeg>,
+    /// Swaps between the burns and the mints: basket assets no target
+    /// needs, routed into assets the targets lack. Their pool ops are
+    /// continuation swaps on routes owned by this order.
+    pub swaps: Vec<SwapLeg>,
+    pub mints: Vec<MintLeg>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SwapLeg {
+    pub from: AssetClass,
+    pub dx: BigInt,
+    pub to: AssetClass,
+    /// Output predicted at accumulate time; the walk's route state is the
+    /// authority for the fulfillment, so nothing reads this (kept for
+    /// `Debug`).
+    #[allow(dead_code)]
+    pub dy: BigInt,
+    /// Indices into `ScoopPlan.routes` of the branches that carry it.
+    pub route_idxs: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BurnLeg {
+    pub pool: Ident,
+    /// Batch index, filled in by `into_plan`.
+    pub batch: usize,
+    pub lp_burned: BigInt,
+    /// Withdraw payout, in the pool's asset order.
+    pub withdrawn: Vec<(AssetClass, BigInt)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MintLeg {
+    pub pool: Ident,
+    /// Batch index, filled in by `into_plan`.
+    pub batch: usize,
+    /// Deposit contribution, in the pool's asset order.
+    pub deposited: Vec<(AssetClass, BigInt)>,
+    pub lp_minted: BigInt,
+}
+
+impl ResolvedMove {
+    /// Pool ops this order occupies across all batches.
+    pub fn legs(&self) -> usize {
+        self.burns.len() + self.mints.len()
+    }
+}
+
+/// An order's LP-token legs: `(burns, mints)` as `(pool, amount)`.
+pub type LpLegs = (Vec<(Ident, BigInt)>, Vec<(Ident, BigInt)>);
+
+/// The LP legs an order asks for: `(burns, mints)` as `(pool, amount)`
+/// pairs read from the LP tokens in its offered and min_received lists.
+/// Plain assets are left to the caller. Works on any constraint tag: the
+/// tag is a dispatch hint, the chain only checks consumption and floors.
+pub fn lp_legs(order: &SundaeV4Order, pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>) -> LpLegs {
+    type Amounts = [(AssetClass, BigInt)];
+    let (offered, min_received): (Vec<(AssetClass, BigInt)>, &Amounts) = match &order.constraint {
+        Constraint::Deposit {
+            offered,
+            min_received,
+        }
+        | Constraint::Withdraw {
+            offered,
+            min_received,
+        }
+        | Constraint::Claim {
+            offered,
+            min_received,
+        } => (offered.clone(), min_received),
+        Constraint::Swap {
+            offered,
+            remaining_offered,
+            min_received,
+            ..
+        } => (
+            vec![(offered.clone(), remaining_offered.clone())],
+            min_received,
+        ),
+        _ => return (Vec::new(), Vec::new()),
+    };
+    let classify = |list: &[(AssetClass, BigInt)]| -> Vec<(Ident, BigInt)> {
+        list.iter()
+            .filter_map(|(a, q)| {
+                let one = [(a.clone(), q.clone())];
+                find_pool_by_lp_asset(&one, pools).map(|p| (p, q.clone()))
+            })
+            .collect()
+    };
+    (classify(&offered), classify(min_received))
+}
+
+/// Whether an order needs the multi-leg liquidity path: more than one LP
+/// leg in total, or a burn and a mint together. A plain deposit (one mint),
+/// a plain withdraw (one burn) and a plain swap (no LP legs) keep their
+/// own paths.
+pub fn is_liquidity_op(order: &SundaeV4Order, pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>) -> bool {
+    let (burns, mints) = lp_legs(order, pools);
+    burns.len() + mints.len() >= 2
+}
+
+/// The order's offered assets that are not LP tokens of indexed pools, in
+/// the form the deposit basket uses.
+pub fn plain_offered(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Vec<(AssetClass, BigInt)> {
+    let offered: Vec<(AssetClass, BigInt)> = match &order.constraint {
+        Constraint::Deposit { offered, .. }
+        | Constraint::Withdraw { offered, .. }
+        | Constraint::Claim { offered, .. } => offered.clone(),
+        Constraint::Swap {
+            offered,
+            remaining_offered,
+            ..
+        } => vec![(offered.clone(), remaining_offered.clone())],
+        _ => Vec::new(),
+    };
+    offered
+        .into_iter()
+        .filter(|(a, q)| {
+            let one = [(a.clone(), q.clone())];
+            find_pool_by_lp_asset(&one, pools).is_none()
+        })
+        .collect()
+}
+
+/// The order's min_received floors on plain assets (not LP tokens of
+/// indexed pools).
+pub fn plain_floors(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Vec<(AssetClass, BigInt)> {
+    let mins: &[(AssetClass, BigInt)] = match &order.constraint {
+        Constraint::Deposit { min_received, .. }
+        | Constraint::Withdraw { min_received, .. }
+        | Constraint::Claim { min_received, .. }
+        | Constraint::Swap { min_received, .. } => min_received,
+        _ => &[],
+    };
+    mins.iter()
+        .filter(|(a, q)| {
+            let one = [(a.clone(), q.clone())];
+            find_pool_by_lp_asset(&one, pools).is_none()
+        })
+        .cloned()
+        .collect()
 }
 
 /// One planned off-protocol conversion leg: `dx` of `from` becomes `out` of
@@ -219,6 +393,24 @@ pub struct PlannedConversion {
     pub hop_idx: usize,
 }
 
+/// A pool swap serving a foreign order: `dx` of the pool asset at
+/// `input_idx` goes into the pool (it is what the foreign order offers and
+/// we take), and the pool's emission of the asset at `output_idx` is what
+/// the foreign order asks and we deposit. The tx builder recomputes the
+/// emission against the live pool state, derives the foreign order's exact
+/// amounts from it, and lands the lovelace left over as pool surplus.
+#[derive(Clone, Debug)]
+pub struct ResolvedForeign {
+    /// Conversion-edge key naming the foreign order ("cswaps:<outref>").
+    pub key: String,
+    /// The foreign order's output reference — stamped into the transcript
+    /// entry's operation_data so the indexer can attribute the step.
+    pub attribution: crate::cardano_types::TransactionInput,
+    pub input_idx: usize,
+    pub output_idx: usize,
+    pub dx: BigInt,
+}
+
 /// A complete batch for one pool, ready for the tx builder.
 #[derive(Clone)]
 pub struct Batch {
@@ -232,6 +424,8 @@ pub struct Batch {
     /// CS rebalance-bounty claims (tag 5, waived mode). Phase 1: at most one,
     /// and never mixed with other ops in the same batch.
     pub claims: Vec<ResolvedClaim>,
+    /// Pool swaps serving foreign orders (see `ResolvedForeign`).
+    pub foreign: Vec<ResolvedForeign>,
     /// The interleaved order of swaps, continuations, and deposits as they
     /// were accumulated. Used by the tx_builder to build transcript entries
     /// with correct intermediate reserve states.
@@ -279,6 +473,7 @@ pub fn build_claim_batch(
         withdraws: Vec::new(),
         zaps: Vec::new(),
         claims: vec![resolved],
+        foreign: Vec::new(),
         ops_order: vec![BatchOp::Claim(0)],
         final_assets,
         final_total_lp: pool.pool_datum.total_lp.clone(),
@@ -377,9 +572,22 @@ pub fn find_pool_for_withdraw_order(
     find_pool_by_lp_asset(offered, pools)
 }
 
+#[cfg(test)]
+/// A movement: exactly one burn leg and one mint leg in different pools.
+pub fn movement_pools(
+    order: &SundaeV4Order,
+    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+) -> Option<(Ident, Ident)> {
+    let (burns, mints) = lp_legs(order, pools);
+    match (burns.as_slice(), mints.as_slice()) {
+        ([(from, _)], [(to, _)]) if from != to => Some((from.clone(), to.clone())),
+        _ => None,
+    }
+}
+
 /// Search a `(asset, qty)` list for a CIP-67 LP token (label `0014df10`) and
 /// return the pool whose identifier matches the token's suffix.
-fn find_pool_by_lp_asset(
+pub fn find_pool_by_lp_asset(
     assets: &[(AssetClass, BigInt)],
     pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
 ) -> Option<Ident> {
@@ -501,6 +709,7 @@ pub fn assemble_batch(
         withdraws: Vec::new(),
         zaps: Vec::new(),
         claims: Vec::new(),
+        foreign: Vec::new(),
         ops_order,
         final_assets: running_assets,
         final_total_lp,
@@ -562,9 +771,9 @@ pub fn try_execute_order(
 }
 
 /// Dispatch swap result computation based on pool type. `total_lp` is only
-/// used by `ConcentratedLiquidity` (CP/CS swap math doesn't depend on LP);
-/// callers should pass the pool's current `total_lp` so CL math can derive
-/// virtual reserves.
+/// used by the banded ladder (CP/CS swap math doesn't depend on LP);
+/// callers should pass the pool's current `total_lp` so the ladder math can
+/// derive its counter.
 ///
 /// A swap that cannot fill folds to `0` here. Callers that only price a
 /// step want that; `check_order_executability` wants the reason, and takes
@@ -657,34 +866,29 @@ pub fn explain_swap_result(
                 Err(e) => Err(format!("stableswap: {e}")),
             }
         }
-        PoolType::ConcentratedLiquidity {
-            sqrt_price_a,
-            sqrt_price_b,
-            fee,
-        } => {
-            // CL pools have exactly 2 assets in positional order [A, B].
-            // The validator's virtual-reserve formulas always use the same
-            // (a, b, spa, spb) layout regardless of swap direction; only the
-            // dx_eff multiplier and the denominator's sqrt-price differ.
-            let (a, b) = (&assets[0].1, &assets[1].1);
-            let is_a_input = input_idx == 0;
-            let dy = swap_math::cl_swap_result(
-                a,
-                b,
-                total_lp,
-                dx,
-                is_a_input,
-                &sqrt_price_a.num,
-                &sqrt_price_a.den,
-                &sqrt_price_b.num,
-                &sqrt_price_b.den,
-                &fee.num,
-                &fee.den,
-            );
-            if !dy.is_positive() {
-                return Err(no_output(&dy));
+        PoolType::BandedConcentratedLiquidity { config } => {
+            // One ladder step inside the active band. A step the band cannot
+            // hold (the output would exceed the band's residual) is
+            // unfillable here: crossing into the next band is a second
+            // transcript step, which this scooper does not build yet. The
+            // message names the largest input the band does fill.
+            if assets.len() != 2 || input_idx > 1 || output_idx > 1 || input_idx == output_idx {
+                return Err(format!(
+                    "banded pool has {} assets; swap {input_idx} -> {output_idx} is not a pair",
+                    assets.len()
+                ));
             }
-            Ok(dy)
+            let _ = total_lp;
+            match super::banded_math::swap_steps(
+                config,
+                &assets[0].1,
+                &assets[1].1,
+                input_idx == 0,
+                dx,
+            ) {
+                Ok(steps) => Ok(steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy)),
+                Err(e) => Err(format!("banded: {e}")),
+            }
         }
     }
 }
@@ -949,7 +1153,7 @@ pub fn plan_zap_swap(
             Ok((0..n).map(|i| &give[i] - &pay[i]).collect())
         }
         PoolType::ConstantProduct { .. }
-        | PoolType::ConcentratedLiquidity { .. }
+        | PoolType::BandedConcentratedLiquidity { .. }
         | PoolType::StableSwap { .. } => {
             // Stableswap's deposit pin mints floor(lp · t / D) with
             // t = min_i floor(have_i · D / r_i), so the LP minted after a
@@ -1149,20 +1353,17 @@ pub fn resolve_deposit_basket(
             let step = super::ss_math::liquidity_step(&p, &reserves_owned, total_lp, &t, None)?;
             (step.deltas, step.lp_delta, Some(t))
         }
-        // Constant product AND concentrated liquidity share the same
-        // proportional pinning. CP's validator bounds LP by per-asset
-        // proportionality (`after_i·lp_b >= before_i·lp_a`); CL's non-swap
-        // check is the virtual-reserve product `va1·vb1·L0² >= va0·vb0·L1²`
-        // (cl_check.ak). Ceil-pinning each reserve delta to the worst
-        // offered ratio makes `a1·L0 >= a0·L1` hold PER ASSET — and those
-        // per-asset bounds multiply to exactly CL's product invariant. So
-        // the identical fill is chain-valid for both curves:
+        // Constant product pins LP by per-asset proportionality
+        // (`after_i·lp_b >= before_i·lp_a`). Ceil-pinning each reserve delta
+        // to the worst offered ratio makes `a1·L0 >= a0·L1` hold PER ASSET:
         //   minted  = min_i floor(offered_i·L0/r_i)
         //   delta_i = ceil(r_i·minted/L0)
-        // (L0 = total_lp = the CL virtual liquidity). A CL-specific
-        // property test asserts the product invariant on the generated fill.
+        // A banded ladder's non-swap step is `check_proportional` too
+        // (banded_cl_check.banded_step_raw): every reserve must move at
+        // least in proportion to total_lp, and `X` follows because the
+        // prefix sums and `L_i` are degree-1 homogeneous in it.
         crate::sundaev4::types::PoolType::ConstantProduct { .. }
-        | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
+        | crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { .. } => {
             let mut minted: Option<BigInt> = None;
             for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
                 if r.is_zero() {
@@ -1183,7 +1384,7 @@ pub fn resolve_deposit_basket(
             let minted = minted.unwrap_or_else(|| BigInt::from(0));
             if !minted.is_positive() {
                 return Err("deposit can't be filled — a constant-product or \
-                     concentrated-liquidity deposit must offer every pool \
+                     banded deposit must offer every pool \
                      asset in proportion"
                     .into());
             }
@@ -1269,7 +1470,7 @@ pub fn resolve_proportional_deposit(
 ///
 /// Works for any pool type that admits proportional reserve/LP changes:
 /// CP's non-swap check, CS's `check_withdraw` (post-SUN-202 `tag_withdraw=4`)
-/// constraint, and CL's `va1·vb1·lp²` invariant all hold for proportional
+/// constraint all hold for proportional
 /// shrinkage by the same scale factor.
 pub fn resolve_proportional_withdraw(
     pool: &SundaeV4Pool,
@@ -1281,11 +1482,6 @@ pub fn resolve_proportional_withdraw(
         Constraint::Withdraw { offered, .. } => offered,
         _ => return Err("order is not a Withdraw".into()),
     };
-
-    // Withdrawals offer exactly one LP token; locate it via the CIP-67 label
-    // and confirm it belongs to this pool.
-    const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
-    let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
     // The basic-order constraint refuses any min_received entry that is not
     // positive (basic.ak: `expect list.all(min_received, fn((_, amount)) {
     // amount > 0 })`), so such an order can never be scooped. Say so here,
@@ -1301,6 +1497,29 @@ pub fn resolve_proportional_withdraw(
             amount
         ));
     }
+    let (lp_burned, dy, target_delta_v) = resolve_withdraw_of_offered(pool, offered)?;
+    Ok(ResolvedWithdraw {
+        order: order.clone(),
+        lp_burned,
+        dy,
+        target_delta_v,
+    })
+}
+
+/// Resolve a proportional withdraw from an offered list that must name this
+/// pool's LP token. Returns `(lp_burned, dy, target_delta_v)`; `lp_burned`
+/// can fall short of the offered LP when the curve's pin leaves a remainder,
+/// which the fulfillment returns to the user.
+pub fn resolve_withdraw_of_offered(
+    pool: &SundaeV4Pool,
+    offered: &[(AssetClass, BigInt)],
+) -> Result<(BigInt, Vec<BigInt>, Option<BigInt>), String> {
+    use num_traits::Signed;
+
+    // Withdrawals offer exactly one LP token; locate it via the CIP-67 label
+    // and confirm it belongs to this pool.
+    const LP_LABEL: &[u8] = &[0x00, 0x14, 0xdf, 0x10];
+    let pool_ident_bytes: &[u8] = pool.pool_datum.identifier.to_bytes();
     let lp_burned = offered
         .iter()
         .find_map(|(a, q)| {
@@ -1372,12 +1591,7 @@ pub fn resolve_proportional_withdraw(
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned: actual_burn,
-                dy,
-                target_delta_v: Some(t),
-            })
+            Ok((actual_burn, dy, Some(t)))
         }
         // Target-pinned withdraw (ss_check tag 4): the entry declares a
         // negative D delta t; each reserve moves by ceil(r_i · t / D) (so
@@ -1399,7 +1613,6 @@ pub fn resolve_proportional_withdraw(
             let step =
                 super::ss_math::liquidity_step(&p, &reserves, total_lp, &t, Some(&d_before))?;
             tracing::debug!(
-                order = %order.input,
                 reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                 total_lp = %total_lp,
                 lp_burned = %lp_burned,
@@ -1418,12 +1631,7 @@ pub fn resolve_proportional_withdraw(
             if dy.iter().all(|q| !q.is_positive()) {
                 return Err("withdraw pays out zero of every reserve".into());
             }
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned: actual_burn,
-                dy,
-                target_delta_v: Some(t),
-            })
+            Ok((actual_burn, dy, Some(t)))
         }
         _ => {
             let dy: Vec<BigInt> =
@@ -1433,14 +1641,123 @@ pub fn resolve_proportional_withdraw(
                 return Err("withdraw pays out zero of every reserve".into());
             }
 
-            Ok(ResolvedWithdraw {
-                order: order.clone(),
-                lp_burned,
-                dy,
-                target_delta_v: None,
-            })
+            Ok((lp_burned, dy, None))
         }
     }
+}
+
+/// Size and ExUnits of a built and evaluated scoop tx, the ExUnits summed over
+/// its scripts and padded with `budget_padding`. (Ported from scooper-v2
+/// PR #108, where the block-capacity bench shares it with the scooper.)
+#[derive(Clone, Copy, Debug)]
+pub struct ScoopTxCost {
+    pub bytes: usize,
+    pub mem: u64,
+    pub steps: u64,
+}
+
+impl ScoopTxCost {
+    pub fn new(
+        tx_size: usize,
+        eval: &crate::sundaev4::evaluator::EvalResult,
+        exec: &ScooperExecution,
+    ) -> Self {
+        let total_mem: u64 = eval.budgets.iter().map(|(_, eu)| eu.mem).sum();
+        let total_steps: u64 = eval.budgets.iter().map(|(_, eu)| eu.steps).sum();
+        let (pad_num, pad_den) = exec.budget_padding;
+        Self {
+            bytes: tx_size,
+            mem: total_mem * pad_num / pad_den,
+            steps: total_steps * pad_num / pad_den,
+        }
+    }
+
+    /// `Fits` within the per-tx limits of `exec`, `Overbudget` otherwise.
+    pub fn fitness(&self, exec: &ScooperExecution) -> Fitness {
+        let fits = self.mem <= exec.max_tx_ex_mem
+            && self.steps <= exec.max_tx_ex_steps
+            && self.bytes <= exec.max_tx_size;
+        if fits {
+            Fitness::Fits
+        } else {
+            Fitness::Overbudget
+        }
+    }
+}
+
+/// Three-state result of testing whether a candidate accumulator produces a
+/// viable tx. We never submit txs we can't evaluate, so eval failure is
+/// treated as a hard bail — not a "fall back to worst-case budget" hint. See
+/// the failure taxonomy in `Scooper::scoop`.
+#[derive(Debug)]
+pub enum Fitness {
+    Fits,
+    Overbudget,
+    Bail(String),
+}
+
+/// Find the largest checkpoint (prefix of accumulated orders) that builds
+/// and evaluates within limits, among `checkpoint_count` checkpoints:
+/// checkpoint `i` has `i + 1` orders, `probe(i)` tests it.
+///
+/// The full batch is probed first (common case), then the smaller prefixes
+/// by binary search. Outcome handling per probe:
+/// - Fits        → best = this index; try larger
+/// - Overbudget  → too many ex-units / too big; try smaller
+/// - Bail        → a build/eval failure was introduced by some order. Rather
+///   than abort the whole cycle (which lets one bad order wedge the queue for
+///   everyone), treat it like Overbudget and search downward: this still
+///   scoops the valid prefix and isolates the failing suffix. If even the
+///   smallest (1-order) batch bails, the caller quarantines that order so it
+///   stops blocking the queue.
+///
+/// Returns the largest fitting checkpoint, if any, and the reason of the
+/// last `Bail` seen, if any.
+pub fn largest_fitting_checkpoint(
+    checkpoint_count: usize,
+    mut probe: impl FnMut(usize) -> Fitness,
+) -> (Option<usize>, Option<String>) {
+    let mut best: Option<usize> = None;
+    let mut last_bail: Option<String> = None;
+    let Some(top) = checkpoint_count.checked_sub(1) else {
+        return (best, last_bail);
+    };
+    match probe(top) {
+        Fitness::Fits => best = Some(top),
+        outcome => {
+            if let Fitness::Bail(reason) = outcome {
+                last_bail = Some(reason);
+            }
+            // Full batch failed — binary search the smaller prefixes,
+            // treating Overbudget and Bail alike as "go smaller".
+            if top > 0 {
+                let (mut lo, mut hi) = (0usize, top - 1);
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    match probe(mid) {
+                        Fitness::Fits => {
+                            best = Some(mid);
+                            lo = mid + 1;
+                        }
+                        Fitness::Overbudget => {
+                            if mid == 0 {
+                                break;
+                            }
+                            hi = mid - 1;
+                        }
+                        Fitness::Bail(reason) => {
+                            last_bail = Some(reason);
+                            if mid == 0 {
+                                break;
+                            }
+                            hi = mid - 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (best, last_bail)
 }
 
 #[cfg(test)]
@@ -1530,150 +1847,6 @@ mod tests {
             BigInt::from(1_500_000i64),
             slot,
         ))
-    }
-
-    // A concentrated-liquidity pool over (ada, token_a) with the given reserves,
-    // total LP (the virtual liquidity L), and sqrt-price bounds as (num, den).
-    fn make_cl_pool(
-        a_reserve: i64,
-        b_reserve: i64,
-        total_lp: i64,
-        spa: (i64, i64),
-        spb: (i64, i64),
-    ) -> Arc<SundaeV4Pool> {
-        let mut value = Value::default();
-        value.insert(&ada(), BigInt::from(a_reserve));
-        value.insert(&token_a(), BigInt::from(b_reserve));
-        Arc::new(SundaeV4Pool {
-            input: TransactionInput::new([0xcc; 32].into(), 0),
-            address: Vec::new(),
-            value,
-            pool_datum: PoolDatum {
-                assets: vec![
-                    (ada(), BigInt::from(a_reserve)),
-                    (token_a(), BigInt::from(b_reserve)),
-                ],
-                total_lp: BigInt::from(total_lp),
-                circulating_lp: BigInt::from(total_lp / 2),
-                preminted_lp: BigInt::from(total_lp / 2),
-                identifier: Ident::new(&[0xde, 0xad]),
-                actions: vec![],
-                module_state: vec![],
-                min_surplus: BigInt::from(0),
-                extension: crate::sundaev4::types::plutus_void(),
-            },
-            pool_type: PoolType::ConcentratedLiquidity {
-                sqrt_price_a: Rational {
-                    num: BigInt::from(spa.0),
-                    den: BigInt::from(spa.1),
-                },
-                sqrt_price_b: Rational {
-                    num: BigInt::from(spb.0),
-                    den: BigInt::from(spb.1),
-                },
-                fee: Rational {
-                    num: BigInt::from(3),
-                    den: BigInt::from(1000),
-                },
-            },
-            slot: 100,
-            fee_split_config: None,
-        })
-    }
-
-    // A deposit order offering (ada, token_a) amounts. min_received names the
-    // pool's LP token (label 0014df10 || ident[0xde,0xad]) so the resolver's LP
-    // floor check matches.
-    fn make_deposit_order(offer_a: i64, offer_b: i64, min_lp: i64) -> Arc<SundaeV4Order> {
-        let lp_asset = AssetClass {
-            policy: vec![],
-            token: vec![0x00, 0x14, 0xdf, 0x10, 0xde, 0xad],
-        };
-        let mut value = Value::default();
-        value.insert(&ada(), BigInt::from(offer_a));
-        value.insert(&token_a(), BigInt::from(offer_b));
-        let offered_bi = vec![
-            (ada(), BigInt::from(offer_a)),
-            (token_a(), BigInt::from(offer_b)),
-        ];
-        let min_received = vec![(lp_asset.clone(), BigInt::from(min_lp))];
-        let mut order = SundaeV4Order::test_swap_order(
-            TransactionInput::new([0x7d; 32].into(), 0),
-            value,
-            Multisig::Signature(vec![0xaa; 28]),
-            Destination::SelfDestination,
-            (ada(), BigInt::from(offer_a)),
-            (lp_asset, BigInt::from(min_lp)),
-            BigInt::from(1_500_000i64),
-            1,
-        );
-        order.constraint = Constraint::Deposit {
-            offered: offered_bi,
-            min_received,
-        };
-        Arc::new(order)
-    }
-
-    // The on-chain CL non-swap invariant (cl_check.ak): the resolved deposit
-    // fill must satisfy va1·vb1·L0² >= va0·vb0·L1².
-    #[allow(clippy::too_many_arguments)]
-    fn cl_invariant_holds(
-        a0: &BigInt,
-        b0: &BigInt,
-        l0: &BigInt,
-        da: &BigInt,
-        db: &BigInt,
-        dl: &BigInt,
-        spa: (i64, i64),
-        spb: (i64, i64),
-    ) -> bool {
-        let (span, spad) = (BigInt::from(spa.0), BigInt::from(spa.1));
-        let (spbn, spbd) = (BigInt::from(spb.0), BigInt::from(spb.1));
-        let l1 = l0 + dl;
-        let a1 = a0 + da;
-        let b1 = b0 + db;
-        let va0 = a0 * &spbn + l0 * &spbd;
-        let vb0 = b0 * &spad + l0 * &span;
-        let va1 = &a1 * &spbn + &l1 * &spbd;
-        let vb1 = &b1 * &spad + &l1 * &span;
-        &va1 * &vb1 * l0 * l0 >= &va0 * &vb0 * &l1 * &l1
-    }
-
-    #[test]
-    fn test_cl_deposit_satisfies_invariant() {
-        let spa = (1, 2);
-        let spb = (2, 1);
-        // Non-proportional offer (token_a surplus) into an imbalanced CL pool.
-        let cases: [(i64, i64, i64, i64, i64); 3] = [
-            // (aReserve, bReserve, totalLp, offerA, offerB)
-            (1_000_000, 2_000_000, 1_000_000, 100_000, 500_000),
-            (3_333_331, 991_237, 1_777_777, 250_000, 90_000),
-            (10_000_000, 10_000_000, 5_000_000, 12_345, 67_890),
-        ];
-        for (ar, br, lp, oa, ob) in cases {
-            let pool = make_cl_pool(ar, br, lp, spa, spb);
-            let order = make_deposit_order(oa, ob, 1);
-            let resolved =
-                resolve_proportional_deposit(&pool, &order).expect("CL deposit should resolve");
-            assert!(resolved.lp_minted.is_positive(), "mints LP");
-            // Never consumes more than offered.
-            assert!(resolved.dx[0] <= BigInt::from(oa));
-            assert!(resolved.dx[1] <= BigInt::from(ob));
-            // The generated fill is chain-valid under the CL invariant.
-            assert!(
-                cl_invariant_holds(
-                    &BigInt::from(ar),
-                    &BigInt::from(br),
-                    &BigInt::from(lp),
-                    &resolved.dx[0],
-                    &resolved.dx[1],
-                    &resolved.lp_minted,
-                    spa,
-                    spb,
-                ),
-                "CL non-swap invariant must hold for the resolved deposit",
-            );
-        }
     }
 
     #[test]

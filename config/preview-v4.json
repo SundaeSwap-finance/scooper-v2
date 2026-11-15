@@ -439,6 +439,14 @@
      "stableswap": {
       "hash": "9db7ce54fb25f4390a89bb715a022fe79a86b9a043aa22c31c27380a",
       "ref-utxo": "849ff000d1b17e974f8024bf962e82d9317cbc28fc8be7010e52462f28ada689#0"
+     },
+     "banded-concentrated-liquidity": {
+      "hash": "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18",
+      "ref-utxo": "797d5fe621ad87df854a29c21a4d0cf039872cdbd5025efc16ec6cadfdd1e983#0"
+     },
+     "oracle": {
+      "hash": "144f4c996e3e85a10f2c3bd3d01b32fc4bdee1d237167fc7dd678d59",
+      "ref-utxo": "ea332c77bf7ec5bdf6cb328c78cc4c6000c31ac367e9ca7f5631ca2e57fd7312#0"
      }
     },
     "plutus-v2-cost-model": [
@@ -803,7 +811,20 @@
     "partial-fill-margin": [
      3,
      2
-    ]
+    ],
+    "evaluate-url": "http://localhost:1337",
+    "cardano-swaps": {
+     "enabled": true,
+     "swap-script-hash": "e5a22e4c31db20bce1c8b081f8e4009683990a33157947d75030deb8",
+     "swap-ref-utxo": "e0e3ac1c179e24411758966e4d1dacf902e41fd173e5e94eb89c0fa8ca5e4b7e#0",
+     "beacon-policy": "274765b4c626c28d18752176b59c0ff63db56b8305c1daa49c9879fe",
+     "min-keep-lovelace": 3000000,
+     "foreign-fills": {
+      "enabled": true,
+      "min-revenue-lovelace": 1000000,
+      "fee-estimate-lovelace": 1000000
+     }
+    }
    },
    "fee-settings-token": "007e873372b3f5f3f8c6c70866acdf2644e7c9af64fa6aa4cff3ff094b417264"
   }
