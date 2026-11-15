@@ -1,7 +1,7 @@
 [package]
 name = "scooper-v2"
 description = "Server for Sundae Scooper"
-version = "0.7.2"
+version = "0.7.16"
 edition = "2024"
 repository = "https://github.com/SundaeSwap-finance/scooper-v2"
 license-file = "LICENSE"
@@ -15,6 +15,7 @@ acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://gith
 acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
 acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
 anyhow = "1"
+bech32 = "0.11"
 async-trait = "0.1"
 caryatid_sdk = { version = "0.14.1", git = "https://github.com/input-output-hk/caryatid.git", rev = "538c3f8" }
 caryatid_process = { version = "0.14.3", git = "https://github.com/input-output-hk/caryatid.git", rev = "538c3f8" }
@@ -46,7 +47,8 @@ thiserror = "2"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-util = "0.7"
-uplc-turbo = { version = "0.1.0", git = "https://github.com/pragma-org/uplc.git", rev = "6152616" }
+uplc-turbo = { package = "amaru-uplc", version = "0.4", git = "https://github.com/pragma-org/amaru.git", rev = "34a453005bcaaf837ee73bd996b99eab8ef92961" }
+amaru-kernel = { git = "https://github.com/pragma-org/amaru.git", rev = "34a453005bcaaf837ee73bd996b99eab8ef92961" }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = [
   "env-filter",
@@ -56,6 +58,7 @@ tracing-subscriber = { version = "0.3", features = [
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1.46.1", features = ["full", "test-util"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

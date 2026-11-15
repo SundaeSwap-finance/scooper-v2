@@ -474,6 +474,14 @@ impl Constraint {
         Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
     }
 
+    /// The strategy constraints, for a strategy order.
+    pub fn strategy(&self) -> Option<&StrategyConstraints> {
+        match self {
+            Constraint::Strategy { constraints } => Some(constraints),
+            _ => None,
+        }
+    }
+
     /// For Swap orders: `(offered_asset, remaining_offered_qty)` borrowed from
     /// the constraint. Returns `None` for non-Swap orders — the scooper's
     /// batching path only handles swaps.
@@ -631,11 +639,37 @@ pub enum PoolType {
         sqrt_price_b: Rational,
         fee: Rational,
     },
+    /// Curve-style stableswap (`validators/modules/stableswap.ak`). The whole
+    /// config preimage rides along: the Operate redeemer re-sends it, the
+    /// output datum's `module_state` slot is its hash, and `rates` may change
+    /// on chain through a manager-signed tag-7 step, so the scooper must
+    /// always price against the config it holds for the pool's current UTxO.
+    StableSwap {
+        config: StableSwapConfig,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Module config types
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// `StableSwapConfig` (`validators/modules/stableswap.ak`). Stored in the
+/// pool datum's `module_state` as `blake2b_256(serialise_data(config))`; the
+/// preimage travels in every `StableSwapRedeemer::Operate` entry.
+///
+/// `rates` is one positive multiplier per pool asset, positionally aligned
+/// with the pool's `assets`. A tag-7 transcript step (rate update, signed by
+/// `rate_manager`) replaces it and the module rewrites the hash; the other
+/// fields change only through an Upgrade ceremony.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StableSwapConfig {
+    pub linear_amplification: BigInt,
+    pub fee: Rational,
+    pub rates: Vec<BigInt>,
+    pub rate_manager: Option<Multisig>,
+    pub monotone_rates: bool,
+    pub max_rate_step: Option<Rational>,
+}
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantProductConfig {
@@ -794,6 +828,15 @@ pub struct BountyClaim {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Constant-sum swap step.
+/// The largest quantity a Cardano `Value` entry can carry. Token amounts and
+/// the mint field are both signed 64-bit on the ledger, so anything above
+/// this cannot be put on chain no matter what the datum says.
+///
+/// `total_lp` in the datum is a Plutus integer and may exceed it — a pool's
+/// TVL is not capped. What is capped is any single LP holding, a deposit's
+/// minted output, and one transaction's total mint.
+pub const MAX_VALUE_QUANTITY: i64 = i64::MAX;
+
 pub const TAG_SWAP: u64 = 3;
 /// Constant-sum LP-redemption step (SUN-202).
 pub const TAG_WITHDRAW: u64 = 4;
@@ -801,6 +844,47 @@ pub const TAG_WITHDRAW: u64 = 4;
 pub const TAG_CLAIM: u64 = 5;
 /// Constant-sum proportional-deposit step.
 pub const TAG_DEPOSIT: u64 = 6;
+/// Stableswap rate-update step (`ss_check.tag_update_rates`). Admitted only
+/// as the first transcript entry, manager-signed; the scooper never builds
+/// one but must recognise it when it indexes a scoop.
+pub const TAG_UPDATE_RATES: u64 = 7;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stableswap transcript operation_data (lib/modules/ss_check.ak)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `operation_data` of a stableswap tag-3 swap step. The first two values
+/// are computed off-chain (`ss_math`) and pinned on chain: `raw_swap_result`
+/// is the gross output in numeraire units at `calc_precision` scale, before
+/// the fee; `next_sum_invariant` is `D` for the post-step reserves.
+/// `attribution` is not read by the module: the scooper stamps the serving
+/// order's output reference there (the encoding it writes into
+/// `operation_data` for the other curves), or Void when no order is served.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SwapStep {
+    pub raw_swap_result: BigInt,
+    pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
+}
+
+/// `operation_data` of a stableswap tag-6 deposit or tag-4 withdraw step.
+/// `target_delta_d` is the declared change in `D` (scaled), positive for a
+/// deposit and negative for a withdrawal. `attribution` as on `SwapStep`.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LiquidityStep {
+    pub target_delta_d: BigInt,
+    pub next_sum_invariant: BigInt,
+    pub attribution: PlutusData,
+}
+
+/// `operation_data` of a stableswap tag-7 rate update. `rates` replaces the
+/// config's rate vector for every later step and for the output datum's
+/// config hash.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RateUpdate {
+    pub rates: Vec<BigInt>,
+    pub next_sum_invariant: BigInt,
+}
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub enum ConstantProductRedeemer {
@@ -881,6 +965,38 @@ pub struct CLOperateEntry {
 pub struct CSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: ConstantSumConfig,
+}
+
+// `Create` carries the whole config; `AsPlutus` has no `Box` support and the
+// enum is parsed, not stored, so the size gap is harmless.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum StableSwapRedeemer {
+    /// `initial_state` stays field 0 (pool_mint hashes it for module_state).
+    /// `sum_invariant` is `D` for the pool's initial reserves.
+    Create {
+        initial_state: StableSwapConfig,
+        pool_output_index: u64,
+        sum_invariant: BigInt,
+    },
+    Operate {
+        entries: Vec<SSOperateEntry>,
+    },
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `StableSwapRedeemer::Operate`. `config` is the config
+/// as stored in the pool INPUT's `module_state`; `sum_invariant` is `D` for
+/// the pool input's reserves at `config.rates`, which the module checks
+/// before it walks the transcript.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct SSOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: StableSwapConfig,
+    pub sum_invariant: BigInt,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1083,17 +1199,27 @@ pub struct ScooperExecution {
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
-    /// Budgets are evaluated on the first-pass tx; the final rebuild shifts
-    /// output values (~0.2% on a redeemer) and uplc-turbo's step accounting
-    /// differs from cardano-node's (~0.04%). Default: (21, 20), 5%.
+    /// Default: (1, 1), no padding. The declared budget is what our
+    /// evaluator measures, and the evaluator matches the node to the unit
+    /// (amaru-uplc main; the previous revision priced divideInteger short).
+    /// Every padded unit is fee the protocol pays for nothing.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
-    /// Pool idents (hex) to exclude from scooping. Useful as an operator
-    /// escape hatch for pools the scooper can't currently fulfill (e.g. a
-    /// pool whose on-chain config the scooper hasn't been able to recover,
-    /// or any pool the operator wants to skip).
+    /// Pool idents (hex) to exclude from scooping; see
+    /// [`crate::sundaev4::access::PoolBlacklist`].
     #[serde(default)]
-    pub blacklisted_pools: std::collections::BTreeSet<String>,
+    pub blacklisted_pools: crate::sundaev4::access::PoolBlacklist,
+    /// Stableswap pools whose `rates` a keeper maintains from a backing
+    /// vault. Each is withheld from scooping while its on-chain rate has
+    /// drifted from the vault's past the configured share of the fee, or
+    /// while the vault cannot be read; see [`crate::sundaev4::rate_guard`].
+    #[serde(default)]
+    pub rate_guards: Vec<crate::sundaev4::rate_guard::RateGuardConfig>,
+    /// Per-pool trading allowlists, keyed by pool ident (hex). A pool named
+    /// here is closed: only the listed credentials may trade on it. Absent =
+    /// unrestricted.
+    #[serde(default)]
+    pub pool_allowlists: crate::sundaev4::access::PoolAllowlists,
     /// Lovelace charged against an order's budget for each pool its route
     /// touches. 0 = no limit. Together with `cost_per_step_lovelace` this
     /// gates router fan-out by what the order paid for: a 1-ADA order gets a
@@ -1146,7 +1272,7 @@ fn default_max_tx_size() -> usize {
     16_384
 }
 pub(crate) fn default_budget_padding() -> (u64, u64) {
-    (21, 20)
+    (1, 1)
 }
 
 impl ScooperExecution {
@@ -1237,6 +1363,11 @@ pub struct ModuleScripts {
     /// Optional: only required when scooping concentrated-liquidity pools.
     #[serde(default)]
     pub concentrated_liquidity: Option<ScriptRefInfo>,
+    /// Optional: only required when scooping stableswap pools. Without it
+    /// the scooper cannot classify a stableswap pool and skips it (see
+    /// `detect_pool_type`).
+    #[serde(default)]
+    pub stableswap: Option<ScriptRefInfo>,
     /// Per-class constraint validators (modular order constraints, PR #11).
     /// Every order's OrderConfig lists which constraint hashes it requires;
     /// the order_validator's withdraw handler requires each listed constraint
@@ -1314,6 +1445,15 @@ impl PartialOrd for SundaeV4Pool {
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SundaeV4Order {
     pub input: TransactionInput,
+    /// The order UTxO's address as the chain holds it, stake part included.
+    /// The ScriptContext we evaluate against carries this for the order
+    /// input, and scripts compare it with `equalsData` (fee_lib: the
+    /// fulfilment output's address against the order's). A rebuilt
+    /// script-only address lost the stake part — 16 memory units of Data
+    /// per comparison, 436,464 steps of cpu the node charged and we did
+    /// not (preview, 2026-10-08). Empty only for test and provisional
+    /// orders, where the resolver falls back to the script address.
+    pub address: Vec<u8>,
     pub value: Value,
     pub datum: OrderDatum,
     /// Decoded constraint, computed once at index time so consumers don't re-parse.
@@ -1394,11 +1534,26 @@ impl SundaeV4Order {
             .expect("test_swap_order: constraint should decode");
         SundaeV4Order {
             input,
+            address: Vec::new(),
             value,
             datum,
             constraint,
             slot,
         }
+    }
+
+    /// How much of the offered asset a fill can spend: `remaining_offered`
+    /// capped by what the order UTxO holds. The swap constraint bounds
+    /// consumption only from above, so an order holding less still fills;
+    /// a fill spending all of this is terminal and owes the full
+    /// `min_received`. Lovelace is not capped: an ADA order's lovelace also
+    /// pays its fee and the fulfilment output's min-UTxO.
+    pub fn swap_executable(&self) -> BigInt {
+        let (offered, remaining) = self.swap_offered();
+        if offered.policy.is_empty() {
+            return remaining.clone();
+        }
+        self.value.get(offered).min(remaining.clone())
     }
 }
 

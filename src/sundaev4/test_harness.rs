@@ -23,26 +23,32 @@ use crate::sundaev4::submit::encode_language_views;
 use crate::sundaev4::tx_builder::{MultiPoolBuildResult, build_multi_pool_scoop_tx};
 use crate::sundaev4::types::*;
 
-/// The cost model from our devnet config.
+/// The PlutusV3 cost model of the chain we build for: the 350 PV11
+/// parameters (config/mainnet-v4.json). The evaluator charges a parameter
+/// it cannot find at 30,000,000,000, so a shorter PV10 list makes every
+/// Value builtin overspend any budget.
 pub const PLUTUS_V3_COST_MODEL: &[i64] = &[
     100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000, 100,
     16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100, 94375, 32,
     132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900,
-    1716, 549, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1, 898148, 27279, 1, 51775,
+    1716, 960, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 30623, 28755, 75, 1, 898148, 27279, 1, 51775,
     558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32, 76049, 1, 13169, 4, 22100, 10,
     28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32,
-    7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 90434,
-    519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 1, 85848, 123203,
-    7305, -900, 1716, 549, 57, 85848, 0, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325, 64566,
+    7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 90434,
+    519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716, 960, 57, 85848, 0, 1, 1, 85848, 123203,
+    7305, -900, 1716, 960, 57, 85848, 0, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325, 64566,
     4, 20467, 1, 4, 0, 141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32,
-    20744, 32, 25933, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100,
-    16000, 100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868,
-    18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
+    20744, 32, 25933, 32, 24623, 32, 43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000,
+    100, 16000, 100, 962335, 18, 2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006,
+    8868, 18, 52948122, 18, 1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36,
     158221314, 26549, 36, 74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571,
     4, 207616, 8310, 4, 1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0,
     1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848,
     0, 1, 180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655,
-    1, 1964219, 24520, 3,
+    1, 1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7,
+    1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951,
+    9444, 1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
+    1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
 ];
 
 /// Deterministic test secret key (same as devnet config).
@@ -60,6 +66,7 @@ pub struct TestConstraintCtx {
     pub fairness_order: Vec<u8>,
     pub strategy_order: Vec<u8>,
     pub settings_mint: Vec<u8>,
+    pub fee_constraint: Vec<u8>,
 }
 pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync::OnceLock::new();
 
@@ -67,6 +74,16 @@ pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync:
 pub const CFG_SWAP: &[u8] = b"cfg-swap";
 pub const CFG_BASIC: &[u8] = b"cfg-basic";
 pub const CFG_STRATEGY: &[u8] = b"cfg-strategy";
+/// CFG_SWAP plus the fee constraint (docs/fee-system.md).
+pub const CFG_SWAP_FEE: &[u8] = b"cfg-swap-fee";
+
+/// The `fee_token_name` the fixture's fee constraint was applied with.
+pub const FEE_SETTINGS_TOKEN: &[u8] = b"fee0";
+/// `base_fee` of the FeeSettings node passed to every build. The first-pass
+/// tx fee is `min(base_fee, TX_FEE)`, so `base_fee >= TX_FEE` leaves fee-less
+/// tests unchanged.
+pub const FEE_SETTINGS_BASE_FEE: u64 = 2_000_000;
+const _: () = assert!(FEE_SETTINGS_BASE_FEE >= crate::sundaev4::tx_builder::TX_FEE);
 
 /// Complete test environment for building and evaluating scoop transactions.
 pub struct TestEnv {
@@ -164,8 +181,9 @@ impl TestEnv {
             &module_scripts.fairness_order,
             &module_scripts.strategy_order,
             settings_mint,
+            &module_scripts.fee_constraint,
         ) {
-            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
+            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm), Some(fc)) => {
                 Some(TestConstraintCtx {
                     swap_order: sw.hash.as_ref().to_vec(),
                     basic_order: ba.hash.as_ref().to_vec(),
@@ -173,6 +191,7 @@ impl TestEnv {
                     fairness_order: fo.hash.as_ref().to_vec(),
                     strategy_order: st.hash.as_ref().to_vec(),
                     settings_mint: sm,
+                    fee_constraint: fc.hash.as_ref().to_vec(),
                 })
             }
             _ => None,
@@ -181,7 +200,7 @@ impl TestEnv {
             BTreeMap::new();
         if let Some(ctx) = &ctx {
             // Mirrors the CLI's mint-order-config presets.
-            let entries: [(&[u8], Vec<Vec<u8>>); 3] = [
+            let entries: [(&[u8], Vec<Vec<u8>>); 4] = [
                 (
                     CFG_SWAP,
                     vec![
@@ -200,6 +219,15 @@ impl TestEnv {
                         ctx.strategy_order.clone(),
                         ctx.route_order.clone(),
                         ctx.fairness_order.clone(),
+                    ],
+                ),
+                (
+                    CFG_SWAP_FEE,
+                    vec![
+                        ctx.swap_order.clone(),
+                        ctx.route_order.clone(),
+                        ctx.fairness_order.clone(),
+                        ctx.fee_constraint.clone(),
                     ],
                 ),
             ];
@@ -254,7 +282,9 @@ impl TestEnv {
             max_tx_ex_steps: 10_000_000_000,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
-            blacklisted_pools: std::collections::BTreeSet::new(),
+            blacklisted_pools: Default::default(),
+            rate_guards: Vec::new(),
+            pool_allowlists: Default::default(),
             cost_per_pool_lovelace: 0,
             cost_per_step_lovelace: 0,
             strategy_peers: Vec::new(),
@@ -388,7 +418,7 @@ impl TestEnv {
             None, // fee_override
             &self.order_configs,
             &std::collections::BTreeMap::new(), // strategy_executions
-            None,                               // fee_settings (harness configs are fee-less)
+            Some(&fee_settings_node()),
             self.funding.as_ref().map(|(i, v)| (i.clone(), v)),
             self.butane.as_ref(),
         )?;
@@ -448,6 +478,59 @@ impl TestEnv {
                 out_ada,
                 build.tx_body.fee,
                 in_ada as i128 - out_ada as i128 - build.tx_body.fee as i128,
+            );
+        }
+
+        // Native assets likewise: inputs + mint == outputs, per asset.
+        {
+            use num_traits::ToPrimitive;
+            use pallas_primitives::conway::{PseudoTransactionOutput, Value as TxValue};
+            let mut net: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), i128> =
+                std::collections::BTreeMap::new();
+            for i in &build.tx_body.inputs {
+                let key = crate::cardano_types::TransactionInput::new(i.transaction_id, i.index);
+                let Some(r) = build.resolved_inputs.get(&key) else {
+                    continue;
+                };
+                for (policy, assets) in &r.value.0 {
+                    if policy.is_empty() {
+                        continue;
+                    }
+                    for (name, qty) in assets {
+                        *net.entry((policy.to_vec(), name.to_vec())).or_default() +=
+                            qty.clone().unwrap().to_i128().unwrap();
+                    }
+                }
+            }
+            if let Some(mint) = &build.tx_body.mint {
+                for (policy, assets) in mint.iter() {
+                    for (name, qty) in assets.iter() {
+                        *net.entry((policy.to_vec(), name.to_vec())).or_default() +=
+                            i64::from(qty) as i128;
+                    }
+                }
+            }
+            for o in &build.tx_body.outputs {
+                if let PseudoTransactionOutput::PostAlonzo(b) = o
+                    && let TxValue::Multiasset(_, ma) = &b.value
+                {
+                    for (policy, assets) in ma.iter() {
+                        for (name, qty) in assets.iter() {
+                            *net.entry((policy.to_vec(), name.to_vec())).or_default() -=
+                                u64::from(qty) as i128;
+                        }
+                    }
+                }
+            }
+            let unbalanced: Vec<String> = net
+                .iter()
+                .filter(|(_, d)| **d != 0)
+                .map(|((p, n), d)| format!("{}.{}: {d}", hex::encode(p), hex::encode(n)))
+                .collect();
+            anyhow::ensure!(
+                unbalanced.is_empty(),
+                "native assets not conserved (inputs + mint - outputs): {}",
+                unbalanced.join(", "),
             );
         }
 
@@ -584,6 +667,54 @@ impl TestEnv {
             .expect("blueprint must include constantSum validator for CS tests");
         vec![
             cs_script.hash.to_vec(),
+            self.exec.module_scripts.fee_split.hash.to_vec(),
+            self.exec.module_scripts.fairness.hash.to_vec(),
+        ]
+    }
+
+    /// `module_state` entries for a stableswap pool: the config hash under
+    /// the stableswap module credential, plus fee_split and fairness as for
+    /// every pool.
+    pub fn ss_module_state(&self, config: &StableSwapConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let ss_script = self
+            .exec
+            .module_scripts
+            .stableswap
+            .as_ref()
+            .expect("blueprint must include the stableswap validator for SS tests");
+        let ss_hash = crate::sundaev4::ss_math::config_hash(config);
+
+        let fs_config = FeeSplitConfig {
+            protocol_share: Rational {
+                num: BigInt::from(self.exec.protocol_share.0),
+                den: BigInt::from(self.exec.protocol_share.1),
+            },
+        };
+        let fs_cbor = minicbor::to_vec(fs_config.to_plutus()).unwrap();
+        let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
+        let fairness_hash = vec![0x80];
+
+        vec![
+            (ss_script.hash.to_vec(), ss_hash),
+            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
+            (
+                self.exec.module_scripts.fairness.hash.to_vec(),
+                fairness_hash,
+            ),
+        ]
+    }
+
+    /// The action entry modules list for stableswap pools:
+    /// `[ss_hash, fs_hash, fairness_hash]`.
+    pub fn ss_action_modules(&self) -> Vec<Vec<u8>> {
+        let ss_script = self
+            .exec
+            .module_scripts
+            .stableswap
+            .as_ref()
+            .expect("blueprint must include the stableswap validator for SS tests");
+        vec![
+            ss_script.hash.to_vec(),
             self.exec.module_scripts.fee_split.hash.to_vec(),
             self.exec.module_scripts.fairness.hash.to_vec(),
         ]
@@ -895,6 +1026,95 @@ pub fn make_cs_pool(
     })
 }
 
+/// A stableswap config at unit-scale rates and no rate manager (the
+/// shape a pool with two same-decimal assets and a fixed 1:1 peg uses).
+pub fn ss_config(amp: i64, fee: Rational, rates: [i64; 2]) -> StableSwapConfig {
+    StableSwapConfig {
+        linear_amplification: BigInt::from(amp),
+        fee,
+        rates: vec![BigInt::from(rates[0]), BigInt::from(rates[1])],
+        rate_manager: None,
+        monotone_rates: false,
+        max_rate_step: None,
+    }
+}
+
+/// Create a stableswap pool with the proper module pipeline (SS + FS +
+/// fairness). Like `make_cs_pool`, with `PoolType::StableSwap` and the
+/// config hash in `module_state`. `total_lp` follows the module's Create
+/// rule `D / calc_precision` so LP-denominated budgets have the on-chain
+/// scale.
+pub fn make_ss_pool(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: StableSwapConfig,
+) -> Arc<SundaeV4Pool> {
+    assert_eq!(assets.len(), 2, "stableswap pools hold exactly two assets");
+    let ident_bytes = vec![ident_byte; 28];
+
+    let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+    nft_name.extend_from_slice(&ident_bytes);
+    let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+    lp_name.extend_from_slice(&ident_bytes);
+
+    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let nft_asset = AssetClass {
+        policy: pool_mint_policy.clone(),
+        token: nft_name,
+    };
+    let lp_asset = AssetClass {
+        policy: pool_mint_policy,
+        token: lp_name,
+    };
+
+    let reserves: Vec<BigInt> = assets.iter().map(|(_, r)| BigInt::from(*r)).collect();
+    let d = crate::sundaev4::ss_math::SsParams::from_config(&config)
+        .d_of(&reserves)
+        .expect("D for the initial reserves");
+    let total_lp = &d / &BigInt::from(crate::sundaev4::ss_math::CALC_PRECISION);
+    let circulating_lp = BigInt::from(0);
+    let preminted_lp = total_lp.clone();
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(50_000_000i64));
+    for (asset, reserve) in &assets {
+        value.insert(asset, BigInt::from(*reserve));
+    }
+    value.insert(&nft_asset, BigInt::from(1i64));
+    value.insert(&lp_asset, preminted_lp.clone());
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = ident_byte;
+
+    let datum_assets: Vec<(AssetClass, BigInt)> =
+        assets.iter().map(|(a, r)| (a.clone(), BigInt::from(*r))).collect();
+
+    Arc::new(SundaeV4Pool {
+        input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
+        value,
+        pool_datum: PoolDatum {
+            assets: datum_assets,
+            total_lp,
+            circulating_lp,
+            preminted_lp,
+            identifier: Ident::new(&ident_bytes),
+            actions: vec![ActionEntry {
+                tag: BigInt::from(100),
+                enabled: true,
+                modules: env.ss_action_modules(),
+            }],
+            module_state: env.ss_module_state(&config),
+            min_surplus: BigInt::from(0),
+            extension: crate::sundaev4::types::plutus_void(),
+        },
+        pool_type: PoolType::StableSwap { config },
+        slot: 100,
+        fee_split_config: None,
+    })
+}
+
 /// Create an order that offers `offer_tok` and wants `want_tok` in return.
 ///
 /// For a token-to-token pool with assets (A, B):
@@ -1017,7 +1237,7 @@ pub fn make_basic_swap_order(
 /// Rewrite a test order's datum to the PR#11 modular shape using the
 /// real constraint hashes from the loaded blueprint (when available):
 /// the module-specific payload keeps its slot, route gets an empty pool
-/// whitelist, fairness gets void — mirroring the CLI's constraint list
+/// whitelist, fairness and fee get void — mirroring the CLI's constraint list
 /// builders. No-op on pre-PR#11 fixtures.
 pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> SundaeV4Order {
     let Some(Some(ctx)) = TEST_CTX.get() else {
@@ -1047,6 +1267,12 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
             ctx.route_order.clone(),
             ctx.fairness_order.clone(),
         ],
+        t if t == CFG_SWAP_FEE => &[
+            ctx.swap_order.clone(),
+            ctx.route_order.clone(),
+            ctx.fairness_order.clone(),
+            ctx.fee_constraint.clone(),
+        ],
         _ => panic!("unknown cfg token"),
     };
     order.datum.config_token = cfg_token.to_vec();
@@ -1055,7 +1281,7 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
         .map(|h| {
             let data = if *h == ctx.route_order {
                 empty_list.clone()
-            } else if *h == ctx.fairness_order {
+            } else if *h == ctx.fairness_order || *h == ctx.fee_constraint {
                 void.clone()
             } else {
                 payload.clone()
@@ -1235,6 +1461,16 @@ pub fn with_real_constraints_payload(
         }
     }
     order
+}
+
+/// The fixture deployment's FeeSettings node, needed by `CFG_SWAP_FEE` orders.
+pub fn fee_settings_node() -> SundaeV4FeeSettings {
+    SundaeV4FeeSettings {
+        input: crate::cardano_types::TransactionInput::new([0xF5; 32].into(), 0),
+        token: FEE_SETTINGS_TOKEN.to_vec(),
+        base_fee: FEE_SETTINGS_BASE_FEE,
+        slot: 1,
+    }
 }
 
 pub fn make_settings(_env: &TestEnv, scooper_keyhash: &[u8]) -> SundaeV4Settings {

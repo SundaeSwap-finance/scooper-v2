@@ -21,8 +21,35 @@ pub const ROLLBACK_LIMIT: u64 = 2160;
 /// malformed?" for anything recent.
 pub const INVALID_ORDER_CAP: usize = 10_000;
 
+/// What an instance is for.
+///
+/// The public-facing box must not be able to sign. Making that a role the
+/// binary enforces, rather than only the absence of a key file, means a key
+/// that arrives on that box by accident stops it starting instead of
+/// quietly arming it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeRole {
+    /// Indexes, executes orders and signs transactions. The default, so an
+    /// existing config keeps the behaviour it had.
+    #[default]
+    Scooper,
+    /// Indexes, accepts strategy intents, gossips them to peers, and does
+    /// nothing else. Holds no key, builds no transaction, and does not serve
+    /// the controls that stop or restart the indexer.
+    Observer,
+}
+
+impl NodeRole {
+    pub fn is_observer(self) -> bool {
+        matches!(self, Self::Observer)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub role: NodeRole,
     pub log: LogConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
@@ -95,11 +122,33 @@ mod tests {
     /// on a host that also runs a node for another network, a peer that refuses
     /// the handshake on a network-magic mismatch. `config/default.json` turns it
     /// off; this test keeps it off for every environment config.
+    /// The mainnet config guards the USDr/sUSDr stableswap pool against a
+    /// stale keeper-maintained rate. The guard must resolve, or the scooper
+    /// refuses to start, so a typo here is caught by the suite rather than
+    /// by a deploy.
+    #[test]
+    fn mainnet_rate_guard_resolves() {
+        let config = load_config(["config/mainnet-v4.json"]).expect("config loads");
+        let exec = config.protocol.v4.expect("v4").execution.expect("execution");
+        assert_eq!(exec.rate_guards.len(), 1);
+        let guard = crate::sundaev4::rate_guard::RateGuard::resolve(&exec.rate_guards[0])
+            .expect("the mainnet guard resolves");
+        assert_eq!(
+            guard.pool.to_string(),
+            "10aceb43bb0127e40b4696bb0e06174c830bec3f7ee6063b1d104546"
+        );
+        assert_eq!(guard.share_asset_index, 1);
+        assert_eq!(guard.base_asset_index, 0);
+        assert_eq!(guard.refuse_at, 1.0);
+        assert_eq!(hex::encode(&guard.backing.token), "55534472");
+    }
+
     #[test]
     fn peer_sharing_is_disabled_for_every_environment() {
         for file in [
             "config/preview-v4.json",
             "config/preprod-v4.json",
+            "config/mainnet-v4.json",
             "config/mainnet.json",
         ] {
             let config = load_config([file]).expect("config loads");
@@ -108,6 +157,86 @@ mod tests {
                 .get_bool("module.peer-network-interface.peer-sharing-enabled")
                 .unwrap_or(true);
             assert!(!enabled, "{file}: peer sharing must be disabled");
+        }
+    }
+
+    /// The preview allowlist overlay loads through config-rs and restricts the
+    /// pool it names.
+    #[test]
+    fn preview_allowlist_overlay_restricts_its_pool() {
+        let config = load_config([
+            "config/preview-v4.json",
+            "config/preview-allowlist-test.json",
+        ])
+        .expect("config loads");
+        let exec = config.protocol.v4.and_then(|v4| v4.execution).expect("v4 execution config");
+        let pool = crate::sundaev3::Ident::new(
+            &hex::decode("3b809fd966274082c16ea6e670dd7c5d384a44a8989a70fd9fe4cc45").unwrap(),
+        );
+        assert!(exec.pool_allowlists.is_restricted(&pool));
+        assert_eq!(exec.pool_allowlists.0.len(), 1);
+    }
+
+    /// An uppercase blacklist entry loads through config-rs and still
+    /// blacklists the pool.
+    #[test]
+    fn uppercase_blacklist_entry_still_blacklists_the_pool() {
+        let pool = crate::sundaev3::Ident::new(&[0xab; 28]);
+        let overlay = serde_json::json!({
+            "protocol": { "v4": { "execution": { "blacklisted-pools": ["AB".repeat(28)] } } }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "scooper-blacklist-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, overlay.to_string()).unwrap();
+        let config = load_config(["config/preview-v4.json", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        let exec = config.expect("config loads").protocol.v4.and_then(|v4| v4.execution);
+        assert!(exec.expect("v4 execution config").blacklisted_pools.contains(&pool));
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::NodeRole;
+
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        #[serde(default)]
+        role: NodeRole,
+    }
+
+    fn role_of(json: &str) -> NodeRole {
+        serde_json::from_str::<Holder>(json).unwrap().role
+    }
+
+    #[test]
+    fn the_default_is_the_scooper_it_has_always_been() {
+        assert_eq!(role_of("{}"), NodeRole::Scooper);
+        assert!(!role_of("{}").is_observer());
+    }
+
+    #[test]
+    fn observer_is_spelled_in_kebab_case() {
+        assert_eq!(role_of(r#"{"role":"observer"}"#), NodeRole::Observer);
+        assert!(role_of(r#"{"role":"observer"}"#).is_observer());
+    }
+
+    #[test]
+    fn an_unrecognised_role_is_refused_rather_than_defaulted() {
+        // A typo must not quietly produce a scooper. It would then demand a
+        // signing key and fail to start, which is the safe direction, but
+        // the error should name the role rather than the missing key.
+        for bad in [
+            r#"{"role":"Observer"}"#,
+            r#"{"role":"observe"}"#,
+            r#"{"role":""}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Holder>(bad).is_err(),
+                "{bad} must not parse"
+            );
         }
     }
 }

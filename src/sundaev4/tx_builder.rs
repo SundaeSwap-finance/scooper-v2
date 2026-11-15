@@ -37,13 +37,40 @@ use std::collections::BTreeMap;
 // bound. The order validator's contract check is `each order's budget * n
 // >= fee`, evaluated against THIS placeholder during first-pass eval. If
 // the placeholder is too pessimistic, orders whose `budget * n` could
-// satisfy the real fee fail the eval and abort the cycle. The minimum
-// realistic scoop fee is ~1.5 ADA (1 pool, 1 order, current tracing-on
-// contracts). Setting placeholder = 1.5 ADA means every order with budget
-// >= 1.5 ADA passes any first-pass eval; the rebuild's higher fee_override
-// is still checked against `budget * n` in the on-chain re-eval, which
-// scales with n so it stays satisfied.
+// satisfy the real fee fail the eval and abort the cycle.
+//
+// This is a CEILING now, not the value used: `first_pass_fee` prefers the
+// settings node's base_fee, which is what the orders actually pay. Two
+// reasons the constant alone was wrong:
+//
+//   1. It is stale. The comment used to claim ~1.5 ADA was the minimum
+//      realistic scoop fee for 1 pool / 1 order. Mainnet tx
+//      cd7e06cc832f522dcf4ab063dcb3f9e40f531b8555440a6dd4215288adce6624
+//      is exactly that shape and paid 1.007553 ADA. The contracts got
+//      cheaper; the constant did not move.
+//
+//   2. A placeholder ABOVE what the orders pay forces a funding input on
+//      every scoop that cannot cover it. `designated_required` is
+//      `total_fee_deducted.saturating_sub(tx_fee)`, so a placeholder of
+//      1.5 against a 1.28 pot saturates to 0, the identity
+//      `total_fee_deducted == tx_fee + designated_required` fails, and the
+//      build reports FundingRequired. The retry adds a wallet UTxO that
+//      the rebuild then returns untouched, because the real fee lands
+//      below the pot. Only n=1 tripped it: at n=2 the pot is 2.56 and
+//      clears 1.5 on its own.
 pub const TX_FEE: u64 = 1_500_000;
+
+/// The fee to stamp into a first-pass build.
+///
+/// The settings node's `base_fee` is what every order deducts, so using it
+/// makes the first pass balance by construction: `designated_required`
+/// becomes the real surplus rather than saturating to zero. Clamped to
+/// [`TX_FEE`] so this can only ever be LESS pessimistic than before — a
+/// base_fee above the ceiling would re-create the eval risk the note above
+/// warns about.
+pub fn first_pass_fee(fee_settings: Option<&crate::sundaev4::types::SundaeV4FeeSettings>) -> u64 {
+    fee_settings.map(|fs| fs.base_fee).unwrap_or(TX_FEE).min(TX_FEE)
+}
 
 /// Encode an order's input UTxO ref as `OutputReference { transaction_id,
 /// output_index }` = `Constr 0 [Bytes, Int]` — the Aiken `OutputReference`
@@ -66,6 +93,74 @@ fn order_ref_to_plutus(
             )),
         ]),
     })
+}
+
+/// `SwapStep { raw_swap_result, next_sum_invariant, attribution }` for a
+/// stableswap swap entry, derived from the reserves the walk moved: the
+/// module pins the first two values with `exchange_invariant` /
+/// `liquidity_invariant`, and the step builder runs those same checks
+/// before it returns. The trader's `dy` (`before_out − after_out`) must
+/// equal what the curve pays after the fee; a mismatch means the walk and
+/// the pricing disagree, so the tx is refused. `attribution` is the serving
+/// order's reference (unread by the module).
+fn ss_swap_op_data(
+    config: &crate::sundaev4::types::StableSwapConfig,
+    before: &[(AssetClass, BigInt)],
+    after: &[(AssetClass, BigInt)],
+    lp_before: &BigInt,
+    attribution: pallas_primitives::PlutusData,
+) -> Result<pallas_primitives::PlutusData> {
+    use num_traits::Signed;
+    if before.len() != 2 || after.len() != 2 {
+        bail!("stableswap pool must hold exactly two assets");
+    }
+    let (in_idx, out_idx) = if after[0].1 > before[0].1 {
+        (0usize, 1usize)
+    } else {
+        (1usize, 0usize)
+    };
+    let dx = &after[in_idx].1 - &before[in_idx].1;
+    let takes = &before[out_idx].1 - &after[out_idx].1;
+    if !dx.is_positive() || !takes.is_positive() {
+        bail!("stableswap swap entry must raise one reserve and lower the other");
+    }
+    let p = swap_math::ss_params(config);
+    let reserves: Vec<BigInt> = before.iter().map(|(_, q)| q.clone()).collect();
+    let step = crate::sundaev4::ss_math::swap_step(&p, &reserves, lp_before, in_idx, &dx, None)
+        .map_err(|e| anyhow::anyhow!("stableswap swap step: {e}"))?;
+    if step.dy != takes {
+        bail!(
+            "stableswap swap entry pays {takes} but the curve pays {} for {dx}",
+            step.dy
+        );
+    }
+    Ok(crate::sundaev4::types::SwapStep {
+        raw_swap_result: step.raw,
+        next_sum_invariant: step.next_d,
+        attribution,
+    }
+    .to_plutus())
+}
+
+/// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
+/// a stableswap deposit or withdraw entry: the declared delta plus `D` for
+/// the reserves the entry leaves, and the serving order's reference.
+fn ss_liquidity_op_data(
+    config: &crate::sundaev4::types::StableSwapConfig,
+    target_delta_d: &BigInt,
+    after: &[(AssetClass, BigInt)],
+    attribution: pallas_primitives::PlutusData,
+) -> Result<pallas_primitives::PlutusData> {
+    let p = swap_math::ss_params(config);
+    let reserves: Vec<BigInt> = after.iter().map(|(_, q)| q.clone()).collect();
+    let next_d =
+        p.d_of(&reserves).map_err(|e| anyhow::anyhow!("stableswap liquidity step: {e}"))?;
+    Ok(crate::sundaev4::types::LiquidityStep {
+        target_delta_d: target_delta_d.clone(),
+        next_sum_invariant: next_d,
+        attribution,
+    }
+    .to_plutus())
 }
 
 // Upper bound on the *real* fee any single scoop tx can have under our
@@ -300,19 +395,24 @@ pub fn build_multi_pool_scoop_tx(
     // offer edges the builder can't compose; this is the backstop).
     butane: Option<&crate::sundaev4::butane::ButaneRuntime>,
 ) -> Result<MultiPoolBuildResult> {
-    // First-pass builds use the TX_FEE upper bound; the rebuild passes the
-    // exact fee computed from `compute_tx_fee(size, mem, cpu)`.
-    let tx_fee = fee_override.unwrap_or(TX_FEE);
+    // First-pass builds use the settings base_fee (see `first_pass_fee`);
+    // the rebuild passes the exact fee from `compute_tx_fee(size, mem, cpu)`.
+    let tx_fee = fee_override.unwrap_or_else(|| first_pass_fee(fee_settings));
     let batches: &[Batch] = &plan.batches;
     let routes = &plan.routes;
     let m_pools = batches.len();
     let n_swap_orders: usize = batches.iter().map(|b| b.swaps.len()).sum();
     let n_deposit_orders: usize = batches.iter().map(|b| b.deposits.len()).sum();
     let n_withdraw_orders: usize = batches.iter().map(|b| b.withdraws.len()).sum();
+    let n_zap_orders: usize = batches.iter().map(|b| b.zaps.len()).sum();
     let n_claim_orders: usize = batches.iter().map(|b| b.claims.len()).sum();
     let n_conversion_orders: usize = plan.conversions.iter().filter(|c| c.primary).count();
-    let n_orders: usize =
-        n_swap_orders + n_deposit_orders + n_withdraw_orders + n_claim_orders + n_conversion_orders;
+    let n_orders: usize = n_swap_orders
+        + n_deposit_orders
+        + n_withdraw_orders
+        + n_zap_orders
+        + n_claim_orders
+        + n_conversion_orders;
     // Pure-conversion scoops (ADA→ADAb mint orders) have zero pool batches:
     // the tx is order spend + mechanism pieces + fulfillment, no transcripts.
     if n_orders == 0 || (m_pools == 0 && plan.conversions.is_empty()) {
@@ -395,12 +495,14 @@ pub fn build_multi_pool_scoop_tx(
     struct PerPoolData {
         transcript: Vec<TranscriptEntry>,
         updated_datum: PoolDatum,
-        /// Sum of LP minted by all deposits in this batch. Zero for swap-only
-        /// batches. Used to drive the pool_mint policy's LP mint entry below.
+        /// LP the preminted reserve could not cover, minted under pool_mint.
+        /// Zero whenever the reserve served every deposit — the usual case —
+        /// and for swap-only batches.
         lp_minted: BigInt,
-        /// Sum of LP burned by all withdraws in this batch. Zero unless there
-        /// are withdraws. The pool_mint entry uses `lp_minted - lp_burned`.
-        lp_burned: BigInt,
+        /// Net change of the preminted reserve: withdrawn LP returned minus
+        /// deposit LP drawn. The pool output's LP balance moves by exactly
+        /// this much.
+        lp_reserve_delta: BigInt,
         /// Effective dy for each swap in this batch (used for direct, non-
         /// routed fulfillment). Routed-order fulfillment reads from
         /// `route_states[route_idx].final_output` instead.
@@ -431,7 +533,10 @@ pub fn build_multi_pool_scoop_tx(
     let mut per_pool_running_circ_lp: Vec<BigInt> =
         batches.iter().map(|b| b.pool.pool_datum.circulating_lp.clone()).collect();
     let mut per_pool_lp_minted: Vec<BigInt> = vec![BigInt::from(0); m_pools];
-    let mut per_pool_lp_burned: Vec<BigInt> = vec![BigInt::from(0); m_pools];
+    // Deposits draw their LP from the preminted reserve and withdraws return
+    // theirs to it; only a deposit the reserve can't cover is minted.
+    let mut per_pool_running_preminted: Vec<BigInt> =
+        batches.iter().map(|b| b.pool.pool_datum.preminted_lp.clone()).collect();
     let mut per_pool_cum_gross_fb: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_cum_protocol_lp: Vec<BigInt> = vec![BigInt::from(0); m_pools];
     let mut per_pool_transcripts: Vec<Vec<TranscriptEntry>> = vec![Vec::new(); m_pools];
@@ -469,20 +574,35 @@ pub fn build_multi_pool_scoop_tx(
     let per_pool_swap_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
-            PoolType::ConstantSum { .. } => BigInt::from(crate::sundaev4::types::TAG_SWAP),
+            PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
+                BigInt::from(crate::sundaev4::types::TAG_SWAP)
+            }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
             PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
         })
         .collect();
 
-    // Initialize per-route state. hop_input[0] = order's offered amount
+    // Per-pool operation_tag for deposit entries. CS dispatches on tag==6
+    // (`tag_deposit` in cs_check.ak); CP/CL infer from asset deltas.
+    let per_pool_deposit_tag: Vec<BigInt> = batches
+        .iter()
+        .map(|b| match &b.pool.pool_type {
+            PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
+                BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
+            }
+            PoolType::ConstantProduct { .. } => BigInt::from(100),
+            PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
+        })
+        .collect();
+
+    // Initialize per-route state. hop_input[0] = order's executable amount
     // (entry-hop incoming). Subsequent hops start at 0 and accumulate dys.
     let mut route_states: Vec<RouteState> = routes
         .iter()
         .map(|r| {
             let n_hops = r.hops.len();
             let mut hop_input = vec![BigInt::from(0); n_hops];
-            hop_input[0] = r.order.swap_offered().1.clone();
+            hop_input[0] = r.order.swap_executable();
             RouteState {
                 hop_input,
                 hop_allocated: vec![BigInt::from(0); n_hops],
@@ -524,7 +644,7 @@ pub fn build_multi_pool_scoop_tx(
             route_idx = r_idx,
             order = %r.order.input,
             n_hops = r.hops.len(),
-            offered = %r.order.swap_offered().1,
+            executable = %r.order.swap_executable(),
             final_output_asset = %short_asset(&r.final_output_asset),
             "streaming walk: route init",
         );
@@ -540,6 +660,7 @@ pub fn build_multi_pool_scoop_tx(
         let running_assets = &mut per_pool_running_assets[batch_idx];
         let running_total_lp = &mut per_pool_running_total_lp[batch_idx];
         let running_circ_lp = &mut per_pool_running_circ_lp[batch_idx];
+        let running_preminted = &mut per_pool_running_preminted[batch_idx];
 
         let prev_assets = running_assets.clone();
 
@@ -721,6 +842,46 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 (per_pool_swap_tag[batch_idx].clone(), fb)
             }
+            crate::sundaev4::batch::BatchOp::ZapSwap(i) => {
+                let z = &batch.zaps[*i];
+                op_data_override = Some(order_ref_to_plutus(&z.order.input));
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 + &z.swap_deltas[idx];
+                }
+                let fb = swap_math::compute_fee_budget(
+                    &pool_type,
+                    &prev_assets,
+                    running_assets,
+                    running_total_lp,
+                );
+                tracing::debug!(
+                    walk = "op-zap-swap",
+                    batch_idx,
+                    pool = %batch.pool_ident,
+                    zap_idx = *i,
+                    deltas = ?z.swap_deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    fee_budget = %fb,
+                    "streaming walk: zap swap op",
+                );
+                (per_pool_swap_tag[batch_idx].clone(), fb)
+            }
+            crate::sundaev4::batch::BatchOp::ZapDeposit(i) => {
+                let z = &batch.zaps[*i];
+                for (idx, amt) in running_assets.iter_mut().enumerate() {
+                    amt.1 = &amt.1 + &z.deposit_dx[idx];
+                }
+                *running_total_lp = &*running_total_lp + &z.lp_minted;
+                *running_circ_lp = &*running_circ_lp + &z.lp_minted;
+                if *running_preminted >= z.lp_minted {
+                    *running_preminted = &*running_preminted - &z.lp_minted;
+                } else {
+                    per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &z.lp_minted;
+                }
+                if let Some(t) = &z.target_delta_v {
+                    op_data_override = Some(t.clone().to_plutus());
+                }
+                (per_pool_deposit_tag[batch_idx].clone(), BigInt::from(0))
+            }
             crate::sundaev4::batch::BatchOp::Deposit(i) => {
                 let d = &batch.deposits[*i];
                 for (idx, amt) in running_assets.iter_mut().enumerate() {
@@ -728,20 +889,17 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 *running_total_lp = &*running_total_lp + &d.lp_minted;
                 *running_circ_lp = &*running_circ_lp + &d.lp_minted;
-                per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &d.lp_minted;
-                let dep_tag = match &pool_type {
-                    PoolType::ConstantSum { .. } => {
-                        BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
-                    }
-                    PoolType::ConstantProduct { .. } => BigInt::from(100),
-                    PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                };
+                if *running_preminted >= d.lp_minted {
+                    *running_preminted = &*running_preminted - &d.lp_minted;
+                } else {
+                    per_pool_lp_minted[batch_idx] = &per_pool_lp_minted[batch_idx] + &d.lp_minted;
+                }
                 // cs_check's target-pinned deposit reads the declared value
                 // delta t from operation_data.
                 if let Some(t) = &d.target_delta_v {
                     op_data_override = Some(t.clone().to_plutus());
                 }
-                (dep_tag, BigInt::from(0))
+                (per_pool_deposit_tag[batch_idx].clone(), BigInt::from(0))
             }
             crate::sundaev4::batch::BatchOp::Withdraw(i) => {
                 let w = &batch.withdraws[*i];
@@ -750,14 +908,21 @@ pub fn build_multi_pool_scoop_tx(
                 }
                 *running_total_lp = &*running_total_lp - &w.lp_burned;
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
-                per_pool_lp_burned[batch_idx] = &per_pool_lp_burned[batch_idx] + &w.lp_burned;
+                *running_preminted = &*running_preminted + &w.lp_burned;
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
                 // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP/CL infer
                 // from asset deltas, so any sentinel tag works.
+                tracing::debug!(
+                    order = %w.order.input,
+                    lp_burned = %w.lp_burned,
+                    target_delta_v = ?w.target_delta_v.as_ref().map(|t| t.to_string()),
+                    total_lp_before = %running_total_lp,
+                    "stableswap withdraw entry",
+                );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
                     PoolType::ConcentratedLiquidity { .. } => BigInt::from(100),
-                    PoolType::ConstantSum { .. } => {
+                    PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                 };
@@ -769,6 +934,67 @@ pub fn build_multi_pool_scoop_tx(
                 (wd_tag, BigInt::from(0))
             }
         };
+
+        // Stableswap entries carry typed operation_data the module reads
+        // (ss_check.ak): SwapStep for swaps, LiquidityStep for deposits and
+        // withdrawals. Both replace the order-ref stamp / CS delta above;
+        // the serving order's reference moves into their `attribution`
+        // slot (Void when a step serves no order). The budget above was
+        // computed from the same before/after reserves, so the D values
+        // here agree with it.
+        if let PoolType::StableSwap { config } = &pool_type {
+            use crate::sundaev4::batch::BatchOp;
+            // fee_budget is pinned on lp_before: the running LP before this
+            // entry's protocol share lands.
+            let lp_before = running_total_lp.clone();
+            let served_order = match op {
+                BatchOp::Swap(i) => Some(&batch.swaps[*i].order.input),
+                BatchOp::Continuation(i) => {
+                    Some(&routes[batch.continuations[*i].route.route_idx].order.input)
+                }
+                BatchOp::ZapSwap(i) | BatchOp::ZapDeposit(i) => Some(&batch.zaps[*i].order.input),
+                BatchOp::Deposit(i) => Some(&batch.deposits[*i].order.input),
+                BatchOp::Withdraw(i) => Some(&batch.withdraws[*i].order.input),
+                BatchOp::Claim(i) => Some(&batch.claims[*i].order.input),
+            };
+            let attribution = served_order.map(order_ref_to_plutus).unwrap_or_else(|| {
+                pallas_primitives::PlutusData::Constr(pallas_primitives::Constr {
+                    tag: 121,
+                    any_constructor: None,
+                    fields: pallas_codec::utils::MaybeIndefArray::Def(vec![]),
+                })
+            });
+            op_data_override = Some(match op {
+                BatchOp::Swap(_) | BatchOp::Continuation(_) | BatchOp::ZapSwap(_) => {
+                    ss_swap_op_data(
+                        config,
+                        &prev_assets,
+                        running_assets,
+                        &lp_before,
+                        attribution,
+                    )?
+                }
+                BatchOp::Deposit(i) => {
+                    let t = batch.deposits[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap deposit without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
+                }
+                BatchOp::ZapDeposit(i) => {
+                    let t = batch.zaps[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap zap deposit without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
+                }
+                BatchOp::Withdraw(i) => {
+                    let t = batch.withdraws[*i].target_delta_v.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("stableswap withdraw without a declared target delta")
+                    })?;
+                    ss_liquidity_op_data(config, t, running_assets, attribution)?
+                }
+                BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
+            });
+        }
 
         // Per-entry protocol_lp share. fee_split.Operate's check is
         // *cumulative* per pool: protocol_lp = floor(total_gross * ps_num /
@@ -794,7 +1020,7 @@ pub fn build_multi_pool_scoop_tx(
                 assets: running_assets.clone(),
                 total_lp: running_total_lp.clone(),
                 circulating_lp: running_circ_lp.clone(),
-                preminted_lp: batch.pool.pool_datum.preminted_lp.clone(),
+                preminted_lp: running_preminted.clone(),
             },
             fee_budget: submitted_fee_budget,
             operation_tag,
@@ -836,16 +1062,35 @@ pub fn build_multi_pool_scoop_tx(
     let mut per_pool: Vec<PerPoolData> = Vec::with_capacity(m_pools);
     for (i, batch) in batches.iter().enumerate() {
         let pool = &batch.pool;
+        // Backstop. Admission already refuses an order that would take a
+        // Value entry past what the ledger carries (signed 64-bit), so
+        // reaching this means the two have drifted apart. Fail the build
+        // rather than hand the node a transaction it cannot accept.
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        if per_pool_lp_minted[i] > cap {
+            bail!(
+                "pool {}: batch mints {} LP, over the {cap} a transaction's mint field holds",
+                pool.pool_datum.identifier,
+                per_pool_lp_minted[i],
+            );
+        }
+        if per_pool_running_preminted[i] > cap {
+            bail!(
+                "pool {}: batch leaves {} LP in the pool's escrow, over the {cap} a Value \
+                 entry holds",
+                pool.pool_datum.identifier,
+                per_pool_running_preminted[i],
+            );
+        }
         let final_total_lp = per_pool_running_total_lp[i].clone();
-        let final_circ_lp =
-            &pool.pool_datum.circulating_lp + &per_pool_lp_minted[i] - &per_pool_lp_burned[i];
+        let final_circ_lp = per_pool_running_circ_lp[i].clone();
         let final_assets_actual = per_pool_running_assets[i].clone();
 
         let updated_datum = PoolDatum {
             assets: final_assets_actual.clone(),
             total_lp: final_total_lp,
             circulating_lp: final_circ_lp,
-            preminted_lp: pool.pool_datum.preminted_lp.clone(),
+            preminted_lp: per_pool_running_preminted[i].clone(),
             identifier: pool.pool_datum.identifier.clone(),
             actions: pool.pool_datum.actions.clone(),
             module_state: pool.pool_datum.module_state.clone(),
@@ -857,7 +1102,7 @@ pub fn build_multi_pool_scoop_tx(
             transcript: std::mem::take(&mut per_pool_transcripts[i]),
             updated_datum,
             lp_minted: per_pool_lp_minted[i].clone(),
-            lp_burned: per_pool_lp_burned[i].clone(),
+            lp_reserve_delta: &per_pool_running_preminted[i] - &pool.pool_datum.preminted_lp,
             effective_swap_dys: std::mem::take(&mut per_pool_effective_swap_dys[i]),
             final_assets_actual,
         });
@@ -877,6 +1122,7 @@ pub fn build_multi_pool_scoop_tx(
         Swap(usize),     // index into batch.swaps
         Deposit(usize),  // index into batch.deposits
         Withdraw(usize), // index into batch.withdraws
+        Zap(usize),      // index into batch.zaps
         Claim(usize),    // index into batch.claims
         /// Index into plan.conversions — a conversion leg that IS the
         /// order's primary op (pure-conversion orders; batch_idx unused).
@@ -907,12 +1153,17 @@ pub fn build_multi_pool_scoop_tx(
                 kind: FlatOrderKind::Withdraw(wi),
                 order_ref: w.order.input.0.clone(),
             });
+            let zps = b.zaps.iter().enumerate().map(move |(zi, z)| FlatOrder {
+                batch_idx: bi,
+                kind: FlatOrderKind::Zap(zi),
+                order_ref: z.order.input.0.clone(),
+            });
             let cls = b.claims.iter().enumerate().map(move |(ci, c)| FlatOrder {
                 batch_idx: bi,
                 kind: FlatOrderKind::Claim(ci),
                 order_ref: c.order.input.0.clone(),
             });
-            swaps.chain(deps).chain(wds).chain(cls)
+            swaps.chain(deps).chain(wds).chain(zps).chain(cls)
         })
         .collect();
     let mut flat_orders = flat_orders;
@@ -990,6 +1241,7 @@ pub fn build_multi_pool_scoop_tx(
     let mut cp_entries: Vec<CPOperateEntry> = Vec::new();
     let mut cs_entries: Vec<CSOperateEntry> = Vec::new();
     let mut cl_entries: Vec<CLOperateEntry> = Vec::new();
+    let mut ss_entries: Vec<crate::sundaev4::types::SSOperateEntry> = Vec::new();
     let mut fs_entries: Vec<FSOperateEntry> = Vec::new();
     let mut fairness_entries: Vec<FairnessOperateEntry> = Vec::new();
 
@@ -1119,6 +1371,55 @@ pub fn build_multi_pool_scoop_tx(
                     config: cl_cfg,
                 });
             }
+            PoolType::StableSwap { config } => {
+                // The entry re-sends the config preimage and D for the pool
+                // input. The module verifies the preimage against the input
+                // datum's module_state slot, so a stale preimage (a rate
+                // update this scooper has not indexed) can only fail on chain
+                // — refuse to build instead.
+                let ss_script = exec.module_scripts.stableswap.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pool {} is stableswap but no stableswap module script is configured",
+                        batch.pool.pool_datum.identifier
+                    )
+                })?;
+                let ss_cred = ss_script.hash.as_ref();
+                let stored = batch
+                    .pool
+                    .pool_datum
+                    .module_state
+                    .iter()
+                    .find(|(cred, _)| cred.as_slice() == ss_cred)
+                    .map(|(_, h)| h.clone());
+                let expected = crate::sundaev4::ss_math::config_hash(config);
+                if stored.as_deref() != Some(expected.as_slice()) {
+                    bail!(
+                        "pool {}: stableswap config preimage hash {} does not match the pool's \
+                         module_state {:?}; the held rates are stale or the config is unknown",
+                        batch.pool.pool_datum.identifier,
+                        hex::encode(&expected),
+                        stored.map(hex::encode),
+                    );
+                }
+                let reserves: Vec<BigInt> =
+                    batch.pool.pool_datum.assets.iter().map(|(_, q)| q.clone()).collect();
+                let sum_invariant = swap_math::ss_params(config).d_of(&reserves).map_err(|e| {
+                    anyhow::anyhow!("pool {}: {e}", batch.pool.pool_datum.identifier)
+                })?;
+                tracing::debug!(
+                    pool = %batch.pool.pool_datum.identifier,
+                    reserves = ?reserves.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                    amp = %config.linear_amplification,
+                    rates = ?config.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                    sum_invariant = %sum_invariant,
+                    "stableswap redeemer sum_invariant",
+                );
+                ss_entries.push(crate::sundaev4::types::SSOperateEntry {
+                    pool_oref: pool_oref_plutus.clone(),
+                    config: config.clone(),
+                    sum_invariant,
+                });
+            }
         }
 
         // Per-pool fee_split config from chain (recovered from the pool's
@@ -1204,6 +1505,9 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Withdraw(i) => {
                 batches[flat.batch_idx].withdraws[*i].order.datum.config_token.clone()
             }
+            FlatOrderKind::Zap(i) => {
+                batches[flat.batch_idx].zaps[*i].order.datum.config_token.clone()
+            }
             FlatOrderKind::Claim(i) => {
                 batches[flat.batch_idx].claims[*i].order.datum.config_token.clone()
             }
@@ -1225,6 +1529,10 @@ pub fn build_multi_pool_scoop_tx(
                 FlatOrderKind::Withdraw(i) => (
                     &flat.order_ref,
                     &batches[flat.batch_idx].withdraws[*i].order.datum,
+                ),
+                FlatOrderKind::Zap(i) => (
+                    &flat.order_ref,
+                    &batches[flat.batch_idx].zaps[*i].order.datum,
                 ),
                 FlatOrderKind::Claim(i) => (
                     &flat.order_ref,
@@ -1269,21 +1577,18 @@ pub fn build_multi_pool_scoop_tx(
     let has_cp = !cp_entries.is_empty();
     let has_cs = !cs_entries.is_empty();
     let has_cl = !cl_entries.is_empty();
+    let has_ss = !ss_entries.is_empty();
 
-    // pool_mint is only needed when the tx actually mints or burns LP tokens
-    // (deposits/withdraws). Pure-swap batches grow the protocol_lp gap inside
-    // each pool's datum but don't mint anything on chain — pool_lib's
-    // check_lp_accounting compares `circulating + preminted` (not total_lp)
-    // against `net_lp_minted`, so it's satisfied by 0 mint when only swaps
-    // happen. The gap can be minted later by a separate "claim" tx. Skipping
-    // pool_mint's ref script here drops ~5KB of ref_script_bytes per
-    // pure-swap scoop, which on the tiered Conway fee saves real lovelace.
-    let has_lp_mint_or_burn = {
+    // pool_mint is only needed when the preminted reserve couldn't cover a
+    // deposit. Deposits draw LP from `preminted_lp`, withdraws return it, and
+    // pure-swap batches grow the protocol_lp gap inside the datum — pool_lib's
+    // check_lp_accounting compares `circulating + preminted` against
+    // `net_lp_minted`, which all of those leave at zero. Skipping pool_mint's
+    // ref script drops ~5KB of ref_script_bytes, which on the tiered Conway
+    // fee saves real lovelace.
+    let has_lp_mint = {
         use num_traits::Zero;
-        per_pool_lp_minted
-            .iter()
-            .zip(per_pool_lp_burned.iter())
-            .any(|(m, b)| !(m - b).clone().unwrap().is_zero())
+        per_pool_lp_minted.iter().any(|m| !m.clone().unwrap().is_zero())
     };
 
     let fs_redeemer = FeeSplitRedeemer::Operate {
@@ -1301,7 +1606,7 @@ pub fn build_multi_pool_scoop_tx(
         exec.module_scripts.fee_split.ref_utxo.0.clone(),
         exec.module_scripts.fairness.ref_utxo.0.clone(),
     ];
-    if has_lp_mint_or_burn {
+    if has_lp_mint {
         all_ref_inputs.push(exec.module_scripts.pool_mint.ref_utxo.0.clone());
     }
     if has_cp && let Some(cp) = &exec.module_scripts.constant_product {
@@ -1312,6 +1617,9 @@ pub fn build_multi_pool_scoop_tx(
     }
     if has_cl && let Some(cl) = &exec.module_scripts.concentrated_liquidity {
         all_ref_inputs.push(cl.ref_utxo.0.clone());
+    }
+    if has_ss && let Some(ss) = &exec.module_scripts.stableswap {
+        all_ref_inputs.push(ss.ref_utxo.0.clone());
     }
     // PR #11 modular order constraints. For each unique OrderConfig token
     // referenced by orders in this batch:
@@ -1474,11 +1782,7 @@ pub fn build_multi_pool_scoop_tx(
 
     // ── Step 7: Build withdrawal map ───────────────────────────────────────
 
-    fn reward_account(script_hash: &Hash<28>) -> PallasBytes {
-        let mut account = vec![0xf0u8];
-        account.extend_from_slice(script_hash.as_ref());
-        PallasBytes::from(account)
-    }
+    let reward_account = |script_hash: &Hash<28>| script_reward_account(exec.network, script_hash);
 
     // Always present: order, fee_split, fairness
     let mut withdrawals: Vec<(PallasBytes, pallas_primitives::PlutusData)> = vec![(
@@ -1522,6 +1826,14 @@ pub fn build_multi_pool_scoop_tx(
             entries: cl_entries,
         };
         withdrawals.push((reward_account(&cl_script.hash), cl_redeemer.to_plutus()));
+    }
+
+    // Conditionally add stableswap withdrawal
+    if has_ss && let Some(ss_script) = &exec.module_scripts.stableswap {
+        let ss_redeemer = crate::sundaev4::types::StableSwapRedeemer::Operate {
+            entries: ss_entries,
+        };
+        withdrawals.push((reward_account(&ss_script.hash), ss_redeemer.to_plutus()));
     }
 
     // Modular order constraints (PR #11). For each constraint hash listed in
@@ -1857,10 +2169,12 @@ pub fn build_multi_pool_scoop_tx(
     for (pos, &batch_idx) in pool_output_order.iter().enumerate() {
         let batch = &batches[batch_idx];
         let pool_datum_pd = per_pool[batch_idx].updated_datum.clone().to_plutus();
+        let lp_asset = pool_lp_asset(exec, &batch.pool)?;
         let pool_output_value = build_pool_output_value(
             &batch.pool,
             &per_pool[batch_idx].final_assets_actual,
             pool_ada_deltas[batch_idx],
+            Some((&lp_asset, &per_pool[batch_idx].lp_reserve_delta)),
         )?;
         let mut out = TransactionOutput::PostAlonzo(
             pallas_primitives::babbage::PseudoPostAlonzoTransactionOutput {
@@ -1927,12 +2241,13 @@ pub fn build_multi_pool_scoop_tx(
             FlatOrderKind::Swap(i) => &batches[fo_meta.batch_idx].swaps[*i].order,
             FlatOrderKind::Deposit(i) => &batches[fo_meta.batch_idx].deposits[*i].order,
             FlatOrderKind::Withdraw(i) => &batches[fo_meta.batch_idx].withdraws[*i].order,
+            FlatOrderKind::Zap(i) => &batches[fo_meta.batch_idx].zaps[*i].order,
             FlatOrderKind::Claim(i) => &batches[fo_meta.batch_idx].claims[*i].order,
             FlatOrderKind::Conversion(i) => &plan.conversions[*i].order,
         };
         // Partial fill detection (swap-module orders only): the fill size
         // is the route's hop-0 input (routed) or the resolved swap's dx
-        // (direct). Below remaining_offered → continuation at the order
+        // (direct). Below what the order can spend → continuation at the order
         // address with remaining decremented (swap.ak's continuation arm);
         // the received tokens accumulate ON the continuation.
         let swap_fill: Option<crate::bigint::BigInt> = match &fo_meta.kind {
@@ -1977,7 +2292,7 @@ pub fn build_multi_pool_scoop_tx(
         // terminal fills settle terminal_settlement as before. The inclusion
         // gate (base_fee <= max_per_execution) is enforced on-chain; bail
         // here so the plan fails with a diagnosable error instead.
-        let is_partial = matches!(&swap_fill, Some(fill) if fill < order.swap_offered().1);
+        let is_partial = matches!(&swap_fill, Some(fill) if *fill < order.swap_executable());
         let is_continuation = is_partial
             || matches!(
                 &order.datum.destination,
@@ -2002,7 +2317,7 @@ pub fn build_multi_pool_scoop_tx(
                 bf_big
             } else {
                 match &swap_fill {
-                    Some(fill) if fill < order.swap_offered().1 => {
+                    Some(fill) if *fill < order.swap_executable() => {
                         let (_, remaining) = order.swap_offered();
                         let prorata = &(fill * &order.datum.service_budget) / remaining;
                         prorata.min(order.datum.max_per_execution.clone())
@@ -2025,7 +2340,7 @@ pub fn build_multi_pool_scoop_tx(
         total_fee_deducted += actual_fee;
 
         let partial_continuation: Option<pallas_primitives::PlutusData> = match &swap_fill {
-            Some(fill) if fill < order.swap_offered().1 => {
+            Some(fill) if *fill < order.swap_executable() => {
                 let (_, remaining) = order.swap_offered();
                 let new_remaining = remaining - fill;
                 let swap_hash = exec
@@ -2115,8 +2430,9 @@ pub fn build_multi_pool_scoop_tx(
                         (&output_asset, &dy_owned)
                     }
                 };
-                let (offer_asset, offer_amount) = swap.order.swap_offered();
-                let spend_amount = swap_fill.as_ref().unwrap_or(offer_amount);
+                let (offer_asset, _) = swap.order.swap_offered();
+                let executable = swap.order.swap_executable();
+                let spend_amount = swap_fill.as_ref().unwrap_or(&executable);
                 // (The pro-rata anti-micro-fill cap is applied when
                 // actual_fee is computed above — vs REMAINING offered,
                 // per the redesigned swap constraint.)
@@ -2138,6 +2454,21 @@ pub fn build_multi_pool_scoop_tx(
                     &dep.dx,
                     &lp_asset,
                     &dep.lp_minted,
+                    actual_fee,
+                )?
+            }
+            FlatOrderKind::Zap(i) => {
+                let z = &batches[fo_meta.batch_idx].zaps[*i];
+                let lp_asset = pool_lp_asset(exec, &batches[fo_meta.batch_idx].pool)?;
+                let net_in: Vec<BigInt> = (0..z.swap_deltas.len())
+                    .map(|k| &z.swap_deltas[k] + &z.deposit_dx[k])
+                    .collect();
+                build_deposit_fulfillment_value(
+                    &z.order.value,
+                    &batches[fo_meta.batch_idx].pool.pool_datum.assets,
+                    &net_in,
+                    &lp_asset,
+                    &z.lp_minted,
                     actual_fee,
                 )?
             }
@@ -2385,22 +2716,19 @@ pub fn build_multi_pool_scoop_tx(
         wallet_change = Some(((outputs.len() - 1) as u64, change_val));
     }
 
-    // ── Step 8.5: LP mint/burn for deposits and withdraws ──────────────────
+    // ── Step 8.5: LP mint for deposits the reserve couldn't cover ─────────
     //
-    // Each pool with a non-zero net LP delta (`lp_minted - lp_burned`) emits
-    // one entry under the pool_mint policy with asset name
-    // `0014df10 ++ pool_ident`. Quantity is positive for net mint (deposit-
-    // heavy) and negative for net burn (withdraw-heavy). The minting redeemer
-    // is `PoolMintRedeemer::MintLP { pool_ident }` — the policy's `only_own_lp`
-    // check doesn't constrain sign, so the same redeemer covers both.
-    // The mint redeemer's index matches the policy's position in the sorted
-    // mint map (always 0 since we only use pool_mint).
+    // Each pool with LP left to mint emits one entry under the pool_mint
+    // policy with asset name `0014df10 ++ pool_ident`; the redeemer is
+    // `PoolMintRedeemer::MintLP { pool_idents }`. Withdraws never burn — the
+    // LP returns to the pool's preminted reserve. The mint redeemer's index
+    // matches the policy's position in the sorted mint map.
     let mint = {
         use num_traits::{ToPrimitive, Zero};
         use pallas_primitives::{NonEmptyKeyValuePairs, NonZeroInt};
         let mut asset_pairs: Vec<(PallasBytes, NonZeroInt)> = Vec::new();
         for (i, batch) in batches.iter().enumerate() {
-            let net = &per_pool[i].lp_minted - &per_pool[i].lp_burned;
+            let net = per_pool[i].lp_minted.clone();
             if net.is_zero() {
                 continue;
             }
@@ -2454,7 +2782,7 @@ pub fn build_multi_pool_scoop_tx(
                 let pool_idents: Vec<_> = batches
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| !(&per_pool[*i].lp_minted - &per_pool[*i].lp_burned).is_zero())
+                    .filter(|(i, _)| !per_pool[*i].lp_minted.is_zero())
                     .map(|(_, b)| b.pool.pool_datum.identifier.clone())
                     .collect();
                 let r = PoolMintRedeemer::MintLP { pool_idents };
@@ -2649,7 +2977,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -2679,7 +3011,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 swap.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if swap.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        swap.order.address.clone()
+                    },
                     value: swap.order.value.clone(),
                     datum: DatumOption::InlineDatum(swap.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -2690,7 +3026,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 dep.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if dep.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        dep.order.address.clone()
+                    },
                     value: dep.order.value.clone(),
                     datum: DatumOption::InlineDatum(dep.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -2701,9 +3041,28 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 wd.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if wd.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        wd.order.address.clone()
+                    },
                     value: wd.order.value.clone(),
                     datum: DatumOption::InlineDatum(wd.order.datum.clone().to_plutus()),
+                    script_ref: None,
+                },
+            );
+        }
+        for z in &batch.zaps {
+            resolved_inputs.insert(
+                z.order.input.clone(),
+                ResolvedTxOut {
+                    address: if z.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        z.order.address.clone()
+                    },
+                    value: z.order.value.clone(),
+                    datum: DatumOption::InlineDatum(z.order.datum.clone().to_plutus()),
                     script_ref: None,
                 },
             );
@@ -2712,7 +3071,11 @@ pub fn build_multi_pool_scoop_tx(
             resolved_inputs.insert(
                 c.order.input.clone(),
                 ResolvedTxOut {
-                    address: order_addr_bytes.clone(),
+                    address: if c.order.address.is_empty() {
+                        order_addr_bytes.clone()
+                    } else {
+                        c.order.address.clone()
+                    },
                     value: c.order.value.clone(),
                     datum: DatumOption::InlineDatum(c.order.datum.clone().to_plutus()),
                     script_ref: None,
@@ -2919,11 +3282,24 @@ pub fn build_multi_pool_scoop_tx(
             }
             predicted_value.insert(asset, new_amount.clone());
         }
-        // Set predicted ADA to match the actual pool output (input ADA + delta)
+        {
+            let lp_asset = pool_lp_asset(exec, &batch.pool)?;
+            let cur = predicted_value.get(&lp_asset);
+            predicted_value.insert(&lp_asset, &cur + &per_pool[out_idx].lp_reserve_delta);
+        }
+        // Set predicted ADA to match the actual pool output: input ADA + delta,
+        // plus the fee surplus (`designated_required`, step 8.4) that lands on
+        // the designated pool, outputs[0]. Without it the next chained scoop
+        // fails with ValueNotConservedUTxO.
         {
             use num_traits::ToPrimitive;
             let pool_ada = batch.pool.value.get(&ada_asset).clone().unwrap().to_u64().unwrap_or(0);
-            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128)
+            let surplus = if batch_idx == 0 {
+                designated_required as i128
+            } else {
+                0
+            };
+            let predicted_ada = (pool_ada as i128 + pool_ada_deltas[out_idx] as i128 + surplus)
                 .max(POOL_MIN_ADA as i128) as u64;
             predicted_value.insert(&ada_asset, BigInt::from(predicted_ada as i64));
         }
@@ -2936,6 +3312,27 @@ pub fn build_multi_pool_scoop_tx(
             slot: validity.start,
             fee_split_config: batch.pool.fee_split_config.clone(),
         };
+        // A wrong prediction only surfaces as ValueNotConservedUTxO on the
+        // next chained scoop; fail here, where we can name the pool.
+        {
+            let actual_ada = match body.outputs.get(batch_idx) {
+                Some(TransactionOutput::PostAlonzo(b)) => match &b.value {
+                    ConwayValue::Coin(c) => *c,
+                    ConwayValue::Multiasset(c, _) => *c,
+                },
+                _ => bail!("pool output {batch_idx} missing while predicting pool state"),
+            };
+            let pred_ada: u64 =
+                predicted_pool.value.get(&ada_asset).to_string().parse().unwrap_or(0);
+            if pred_ada != actual_ada {
+                bail!(
+                    "predicted pool {} lovelace disagrees with output {batch_idx}: \
+                     output holds {actual_ada}, prediction says {pred_ada} (difference {})",
+                    hex::encode(batch.pool_ident.to_bytes()),
+                    actual_ada as i128 - pred_ada as i128,
+                );
+            }
+        }
         predicted_pools.push((batch.pool_ident.clone(), predicted_input, predicted_pool));
     }
 
@@ -3031,6 +3428,15 @@ fn compute_script_ref_hash(script_ref: &crate::cardano_types::ScriptRef) -> Hash
     }
 }
 
+/// Script reward account for a withdrawal: header 0xf0 | network id, then
+/// the 28-byte script hash. Mainnet is 0xf1; every testnet is 0xf0. A
+/// hardcoded 0xf0 built testnet withdrawals into mainnet scoops.
+pub fn script_reward_account(network: AddressNetwork, script_hash: &Hash<28>) -> PallasBytes {
+    let mut account = vec![0xf0u8 | network.id()];
+    account.extend_from_slice(script_hash.as_ref());
+    PallasBytes::from(account)
+}
+
 /// Either a 32-byte standard ed25519 key or a 64-byte Cardano-extended key.
 /// Cardano HD-derived keys (BIP32 / CIP-1852) are always extended; the
 /// standard form is only useful for one-off keys provided as a raw seed.
@@ -3086,6 +3492,7 @@ fn build_pool_output_value(
     pool: &SundaeV4Pool,
     new_assets: &[(AssetClass, BigInt)],
     ada_delta: i64,
+    lp_reserve: Option<(&AssetClass, &BigInt)>,
 ) -> Result<ConwayValue> {
     use num_traits::ToPrimitive;
     use pallas_primitives::NonEmptyKeyValuePairs;
@@ -3138,6 +3545,24 @@ fn build_pool_output_value(
         }
     }
 
+    // LP moved between the preminted reserve and this scoop's orders.
+    if let Some((lp_asset, delta)) = lp_reserve {
+        let delta: i128 =
+            delta.clone().unwrap().to_i128().context("LP reserve delta doesn't fit in i128")?;
+        if delta != 0 {
+            let tokens = policy_map.entry(lp_asset.policy.clone()).or_default();
+            let next = tokens.get(&lp_asset.token).copied().unwrap_or(0) as i128 + delta;
+            anyhow::ensure!(
+                next >= 0,
+                "pool output LP balance would go negative ({next})"
+            );
+            if next == 0 {
+                tokens.remove(&lp_asset.token);
+            } else {
+                tokens.insert(lp_asset.token.clone(), next as u64);
+            }
+        }
+    }
     if policy_map.is_empty() {
         return Ok(ConwayValue::Coin(lovelace));
     }
@@ -3717,5 +4142,85 @@ mod validity_tests {
         };
         let w = ValidityWindow::new(500, 500);
         assert_eq!(w.ttl - w.start, VALIDITY_RANGE);
+    }
+}
+
+#[cfg(test)]
+mod reward_account_tests {
+    use super::*;
+
+    #[test]
+    fn reward_account_header_follows_the_network() {
+        let hash: Hash<28> =
+            "4e1a435f8d55f26068150579c18964e58078082b899e6bb560be7cd5".parse().unwrap();
+        let mainnet: Vec<u8> = script_reward_account(AddressNetwork::Mainnet, &hash).to_vec();
+        let testnet: Vec<u8> = script_reward_account(AddressNetwork::Testnet, &hash).to_vec();
+        assert_eq!(mainnet[0], 0xf1, "mainnet script reward account");
+        assert_eq!(testnet[0], 0xf0, "testnet script reward account");
+        assert_eq!(&mainnet[1..], hash.as_ref());
+        assert_eq!(mainnet.len(), 29);
+    }
+}
+
+#[cfg(test)]
+mod first_pass_fee_tests {
+    use super::*;
+    use crate::sundaev4::types::SundaeV4FeeSettings;
+
+    fn settings(base_fee: u64) -> SundaeV4FeeSettings {
+        SundaeV4FeeSettings {
+            input: crate::cardano_types::TransactionInput::new([0u8; 32].into(), 0),
+            token: vec![],
+            base_fee,
+            slot: 0,
+        }
+    }
+
+    /// The invariant the funding input depended on.
+    ///
+    /// `designated_required` is `total_fee_deducted.saturating_sub(tx_fee)`,
+    /// and the build demands a funding UTxO unless
+    /// `total_fee_deducted == tx_fee + designated_required`. That identity
+    /// holds for every `tx_fee <= total_fee_deducted` and fails for every
+    /// `tx_fee > total_fee_deducted`, because the subtraction saturates.
+    fn identity_holds(total_fee_deducted: u64, tx_fee: u64) -> bool {
+        let designated_required = total_fee_deducted.saturating_sub(tx_fee);
+        total_fee_deducted == tx_fee + designated_required
+    }
+
+    #[test]
+    fn a_single_order_at_the_base_fee_needs_no_funding_input() {
+        // The case that forced a funding input on every 1-order scoop: the
+        // 1.5 ADA constant against a 1.28 ADA pot.
+        assert!(!identity_holds(1_280_000, TX_FEE), "1.5 > 1.28 saturates");
+        // Derived from settings, the first pass balances.
+        let fee = first_pass_fee(Some(&settings(1_280_000)));
+        assert_eq!(fee, 1_280_000);
+        assert!(identity_holds(1_280_000, fee));
+    }
+
+    #[test]
+    fn holds_for_any_order_count() {
+        let base = 1_280_000;
+        let fee = first_pass_fee(Some(&settings(base)));
+        for n in 1..=10u64 {
+            assert!(
+                identity_holds(base * n, fee),
+                "n={n} orders should not need a funding input"
+            );
+        }
+    }
+
+    #[test]
+    fn never_more_pessimistic_than_the_ceiling() {
+        // A base_fee above the ceiling would re-create the eval risk the
+        // note on TX_FEE warns about, so it is clamped.
+        assert_eq!(first_pass_fee(Some(&settings(9_000_000))), TX_FEE);
+        assert_eq!(first_pass_fee(Some(&settings(1_280_000))), 1_280_000);
+    }
+
+    #[test]
+    fn falls_back_to_the_constant_without_settings() {
+        assert_eq!(first_pass_fee(None), TX_FEE);
     }
 }

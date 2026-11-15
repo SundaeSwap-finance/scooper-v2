@@ -82,6 +82,8 @@ pub struct Scooper {
     v4_intents: Option<crate::sundaev4::intents::IntentServiceHandle>,
     /// Intent ids we've already logged a match for (log once, not per cycle).
     logged_intent_matches: std::collections::BTreeSet<Vec<u8>>,
+    /// Whether the pool access config has been reported against chain state.
+    access_config_logged: bool,
     /// Unconfirmed orders observed in the local node's mempool, shared with
     /// the mempool monitor. None = chained execution disabled.
     v4_provisional: Option<crate::mempool::SharedProvisional>,
@@ -91,6 +93,60 @@ pub struct Scooper {
     /// (tx hash, consecutive node-reject count) — a tx rejected repeatedly
     /// is structurally stuck, not transiently contested.
     last_node_reject: Option<(String, u32)>,
+    /// Stableswap pools guarded against a stale keeper-maintained rate;
+    /// see [`crate::sundaev4::rate_guard`]. Resolved once from config.
+    v4_rate_guards: Vec<crate::sundaev4::rate_guard::RateGuard>,
+    /// Pools the guards withheld in the previous cycle, so a block is
+    /// logged when it starts and when it clears rather than every cycle.
+    rate_guard_blocked: BTreeSet<crate::sundaev3::Ident>,
+    /// Last time each blocked pool was reported, for a periodic reminder.
+    rate_guard_last_warn: BTreeMap<crate::sundaev3::Ident, std::time::Instant>,
+}
+
+/// Where a node-rejected tx is kept for offline re-evaluation, and how many
+/// to keep.
+///
+/// A rejected scoop is retried, so one stuck order writes a dump per attempt
+/// — a mainnet stableswap withdrawal produced 77 in under an hour. Only the
+/// newest few are ever wanted (they differ by collateral and fee, not by the
+/// defect), so cap the set rather than filling /tmp.
+const REJECT_DUMP_PREFIX: &str = "/tmp/scoop-reject-";
+const REJECT_DUMP_KEEP: usize = 20;
+
+/// Delete all but the newest `REJECT_DUMP_KEEP` rejected-tx dumps. Best
+/// effort: losing a dump must never fail a scoop, so every error is ignored.
+fn prune_reject_dumps() {
+    prune_dumps(REJECT_DUMP_PREFIX, REJECT_DUMP_KEEP);
+}
+
+fn prune_dumps(dump_prefix: &str, keep: usize) {
+    let Some((dir, prefix)) = dump_prefix.rsplit_once('/') else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dumps: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?;
+            // Match the .cbor of each pair; its .reason.hex goes with it.
+            if !name.starts_with(prefix) || !name.ends_with(".cbor") {
+                return None;
+            }
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if dumps.len() <= keep {
+        return;
+    }
+    dumps.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
+    for (_, path) in dumps.drain(keep..) {
+        let _ = std::fs::remove_file(path.with_extension("reason.hex"));
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 impl Scooper {
@@ -112,6 +168,22 @@ impl Scooper {
         }
         let v4_butane =
             v4_execution.as_ref().and_then(|e| crate::sundaev4::butane::load_runtime(&e.butane));
+        // A guard that does not resolve is a config error, and the pool it
+        // meant to protect would run unguarded: refuse to start instead.
+        let mut v4_rate_guards = Vec::new();
+        if let Some(exec) = &v4_execution {
+            for cfg in &exec.rate_guards {
+                let guard = crate::sundaev4::rate_guard::RateGuard::resolve(cfg)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                info!(
+                    pool = %guard.pool,
+                    vault = %guard.vault_address_bech32,
+                    refuse_at = guard.refuse_at,
+                    "v4: rate guard armed"
+                );
+                v4_rate_guards.push(guard);
+            }
+        }
         Ok(Self {
             event_rx,
             v3_state,
@@ -133,7 +205,69 @@ impl Scooper {
             v4_butane,
             v4_intents,
             logged_intent_matches: std::collections::BTreeSet::new(),
+            access_config_logged: false,
+            v4_rate_guards,
+            rate_guard_blocked: BTreeSet::new(),
+            rate_guard_last_warn: BTreeMap::new(),
         })
+    }
+
+    /// Judge every rate guard against the current state and return the
+    /// pools to withhold this cycle. Exports the verdicts and logs a block
+    /// when it starts, every five minutes while it lasts, and when it
+    /// clears.
+    fn apply_rate_guards(
+        &mut self,
+        v4_state: &crate::sundaev4::SundaeV4State,
+    ) -> BTreeSet<crate::sundaev3::Ident> {
+        if self.v4_rate_guards.is_empty() {
+            return BTreeSet::new();
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut blocked = BTreeSet::new();
+        let mut samples = Vec::with_capacity(self.v4_rate_guards.len());
+        const REMIND_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+        // Cloned so the loop can write the reminder map; a handful of guards.
+        let guards = self.v4_rate_guards.clone();
+        for guard in &guards {
+            let verdict = crate::sundaev4::rate_guard::evaluate(
+                guard,
+                v4_state.pools.get(&guard.pool).map(|p| p.as_ref()),
+                &v4_state.vault_utxos,
+                now_ms,
+            );
+            samples.push(crate::metrics::RateGuardSample {
+                pool: verdict.pool.to_string(),
+                drift_bp: verdict.drift_bp,
+                refuse_bp: verdict.refuse_bp,
+                blocked: verdict.blocked,
+            });
+            let was_blocked = self.rate_guard_blocked.contains(&verdict.pool);
+            if verdict.blocked {
+                blocked.insert(verdict.pool.clone());
+                let remind = self
+                    .rate_guard_last_warn
+                    .get(&verdict.pool)
+                    .map(|t| t.elapsed() >= REMIND_EVERY)
+                    .unwrap_or(true);
+                if !was_blocked || remind {
+                    warn!("v4: rate guard withholds {verdict}; orders on this pool wait");
+                    self.rate_guard_last_warn
+                        .insert(verdict.pool.clone(), std::time::Instant::now());
+                }
+            } else if was_blocked {
+                info!("v4: rate guard clears {verdict}");
+                self.rate_guard_last_warn.remove(&verdict.pool);
+            } else {
+                trace!("v4: rate guard holds {verdict}");
+            }
+        }
+        self.rate_guard_blocked = blocked.clone();
+        self.metrics.update_rate_guards(samples);
+        blocked
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) {
@@ -636,6 +770,20 @@ impl Scooper {
             }
         };
 
+        if !self.access_config_logged {
+            crate::sundaev4::access::log_config(
+                &exec.pool_allowlists,
+                settings.datum.authorized_scoopers.as_ref(),
+                &v4_state.pools,
+            );
+            crate::sundaev4::access::log_blacklist(&exec.blacklisted_pools, &v4_state.pools);
+            self.access_config_logged = true;
+        }
+
+        // Judged up front, before anything below borrows the scooper: the
+        // verdicts only need the state snapshot.
+        let rate_guarded = self.apply_rate_guards(&v4_state);
+
         // The network tip (actual chain tip, falling back to the last block we
         // processed) anchors the validity interval's *start*; wall clock
         // anchors everything that means "now", including the TTL.
@@ -812,6 +960,11 @@ impl Scooper {
         // redeemer (in canonical input order).
         let mut strategy_executions: BTreeMap<TransactionInput, pallas_primitives::PlutusData> =
             BTreeMap::new();
+        // For the allowlist gate (`PoolAllowlists::permits`).
+        let mut strategy_constraints: BTreeMap<
+            TransactionInput,
+            crate::sundaev4::StrategyConstraints,
+        > = BTreeMap::new();
         // A claim-hinted intent that matched: executes as a dedicated
         // single-order plan, short-circuiting the normal accumulation cycle.
         let mut pending_claim_plan: Option<crate::sundaev4::batch::ScoopPlan> = None;
@@ -921,8 +1074,12 @@ impl Scooper {
                         );
                     }
                     strategy_executions.insert(order.input.clone(), sse_pd);
+                    if let Some(constraints) = order.constraint.strategy() {
+                        strategy_constraints.insert(order.input.clone(), constraints.clone());
+                    }
                     candidates.push(Arc::new(crate::sundaev4::SundaeV4Order {
                         input: order.input.clone(),
+                        address: order.address.clone(),
                         value: order.value.clone(),
                         datum: order.datum.clone(),
                         constraint,
@@ -1044,6 +1201,7 @@ impl Scooper {
                 provisional_spent: prov_spent,
                 foreign_pools: foreign_count,
                 config_missing_orders: n_config_missing as usize,
+                restricted_pools: exec.pool_allowlists.0.len(),
                 backoff_active: self.backoff_until_after_slot.is_some(),
             });
         }
@@ -1196,10 +1354,13 @@ impl Scooper {
         // prediction when it IS the tip (it spends our latest predicted
         // output — someone chained on us) or when we have no chain.
         let mut foreign_pool_parent: BTreeMap<crate::sundaev3::Ident, Vec<u8>> = BTreeMap::new();
+        // Pools whose keeper-maintained rate is stale, or whose vault cannot
+        // be read, are withheld like a blacklisted pool: their orders wait.
         let pools_filtered: std::collections::BTreeMap<_, _> = v4_state
             .pools
             .iter()
-            .filter(|(ident, _)| !exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes())))
+            .filter(|(ident, _)| !exec.blacklisted_pools.contains(ident))
+            .filter(|(ident, _)| !rate_guarded.contains(ident))
             .map(|(ident, pool)| {
                 let own = self.v4_chain_tracker.latest_predicted_pool(ident);
                 let foreign = foreign_pools.get(ident);
@@ -1222,6 +1383,13 @@ impl Scooper {
         let mut skip_no_pool = 0u32;
         let mut skip_add_failed = 0u32;
         let mut skip_no_route = 0u32;
+        let mut skip_not_allowlisted = 0u32;
+        // A pool the allowlist withheld leaves the router with nothing to
+        // route through, which counts as skip_no_route and reads in the
+        // summary as though no pool existed. Counted apart so the summary
+        // distinguishes "nobody made this pool" from "this owner may not use
+        // it", which are the operator's problem and the user's respectively.
+        let mut skip_no_route_allowlisted = 0u32;
         let mut skip_route_failed = 0u32;
         let mut n_confirmed_added = 0u32;
         let mut n_provisional_added = 0u32;
@@ -1254,6 +1422,7 @@ impl Scooper {
             // with both assets" picked a suboptimal pool and rejected the
             // order when a better pool existed.
             let is_provisional = provisional_inputs.contains(&order.input);
+            let order_strategy = strategy_constraints.get(&order.input);
             if is_provisional && n_confirmed_added > 0 {
                 // Provisional orders ride their own tx; the loop re-runs
                 // immediately after this one submits, so they only wait one
@@ -1270,6 +1439,15 @@ impl Scooper {
                         skip_no_pool += 1;
                         continue;
                     };
+                    if !exec.pool_allowlists.permits(&pool_ident, order, order_strategy) {
+                        trace!(
+                            order = %order.input,
+                            pool = %pool_ident,
+                            "order dispatch: not on the pool's allowlist",
+                        );
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
                     tracing::info!(order = %order.input, kind = "deposit", matched_pool = %pool_ident, "order dispatch");
                     let effective_pool = pick_effective_pool(
                         &candidate,
@@ -1283,10 +1461,56 @@ impl Scooper {
                     };
                     match candidate.try_add_deposit(order, &pool_ident, &effective_pool) {
                         Ok(_) => true,
-                        Err(e) => {
-                            skip_add_failed += 1;
-                            tracing::info!(error = %e, order = %order.input, "try_add failed");
-                            false
+                        Err(deposit_err) => {
+                            // A basket out of proportion with the pool still
+                            // fills as a zap: a rebalancing swap, then the
+                            // deposit that swap makes possible.
+                            let mut zap_candidate = accum.clone();
+                            // Constant-sum and stableswap admit a swap
+                            // followed by a proportional deposit in one
+                            // transcript; the other curves do not.
+                            let zap = if !matches!(
+                                effective_pool.pool_type,
+                                crate::sundaev4::PoolType::ConstantSum { .. }
+                                    | crate::sundaev4::PoolType::StableSwap { .. }
+                            ) {
+                                // A two-asset deposit is rejected on chain by
+                                // cp_check, which reads both reserves rising as
+                                // a zero-sized swap and fails its tightness
+                                // test (sundae-v4's own cp_deposit.ak pins that
+                                // as a `fail` test). Zapping there would only
+                                // turn a cheap skip into a build failure, and a
+                                // lone order failing to build is quarantined
+                                // for good.
+                                Err("only constant-sum and stableswap pools zap: \
+                                     the other curves reject a two-asset deposit \
+                                     on chain"
+                                    .to_string())
+                            } else if carries_route_constraint(&exec, order) {
+                                Err("route-constrained orders can't zap: \
+                                     check_intermediate_flow demands the deposit \
+                                     consume the swap's payout exactly, which the \
+                                     deposit's ceil-pin doesn't hit"
+                                    .to_string())
+                            } else {
+                                zap_candidate.try_add_zap(order, &pool_ident, &effective_pool)
+                            };
+                            match zap {
+                                Ok(()) => {
+                                    candidate = zap_candidate;
+                                    true
+                                }
+                                Err(zap_err) => {
+                                    skip_add_failed += 1;
+                                    tracing::info!(
+                                        error = %deposit_err,
+                                        zap_error = %zap_err,
+                                        order = %order.input,
+                                        "try_add failed",
+                                    );
+                                    false
+                                }
+                            }
                         }
                     }
                 }
@@ -1298,6 +1522,15 @@ impl Scooper {
                         skip_no_pool += 1;
                         continue;
                     };
+                    if !exec.pool_allowlists.permits(&pool_ident, order, order_strategy) {
+                        trace!(
+                            order = %order.input,
+                            pool = %pool_ident,
+                            "order dispatch: not on the pool's allowlist",
+                        );
+                        skip_not_allowlisted += 1;
+                        continue;
+                    }
                     tracing::info!(order = %order.input, kind = "withdraw", matched_pool = %pool_ident, "order dispatch");
                     let effective_pool = pick_effective_pool(
                         &candidate,
@@ -1324,12 +1557,20 @@ impl Scooper {
                     // depletion is visible. The router then naturally splits
                     // across CL+non-CL pools when an earlier order has
                     // drained the optimal CL pool.
-                    let (offer_asset, offer_amount) = order.swap_offered();
+                    let (offer_asset, _) = order.swap_offered();
+                    let offer_amount = &order.swap_executable();
                     let (ask_asset, _) = order.swap_min_received();
                     if offer_asset == ask_asset {
                         continue;
                     }
-                    let pool_view = candidate.current_pool_view(&pools_filtered);
+                    // Filtered after the overlay, never before — see
+                    // `PoolAllowlists::retain_visible`.
+                    let (pool_view, withheld_by_allowlist) =
+                        exec.pool_allowlists.retain_visible_reporting(
+                            candidate.current_pool_view(&pools_filtered),
+                            order,
+                            order_strategy,
+                        );
                     // Per-order fan-out limits: the order's tx-fee budget
                     // buys it a number of pools and routing steps. Orders
                     // paying more get more elaborate routes.
@@ -1339,8 +1580,13 @@ impl Scooper {
                         // execution can spend, so it buys the route fan-out.
                         order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0)
                     };
+                    // base_fee already bought one pool and one step; the rest
+                    // of the budget buys the extras (RoutingLimits::from_budget).
+                    let base_fee_lov =
+                        v4_state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
                     let limits = router::RoutingLimits::from_budget(
                         order_budget_lov,
+                        base_fee_lov,
                         exec.cost_per_pool_lovelace,
                         exec.cost_per_step_lovelace,
                     );
@@ -1405,7 +1651,44 @@ impl Scooper {
                         offer_amount,
                         limits,
                     ) else {
-                        tracing::info!(order = %order.input, "order dispatch: swap, no route");
+                        // "No route" covers three situations that need three
+                        // different answers, and the operator cannot tell
+                        // them apart from the words alone:
+                        //
+                        //   the allowlist withheld every pool for the pair
+                        //     -> add the owner's credential, or drop the list
+                        //   the fee budget bought too few pools or steps
+                        //     -> the client under-budgeted the order
+                        //   neither
+                        //     -> no pool for the pair, or not enough depth
+                        //
+                        // Only the first is something an operator fixes, and
+                        // an allowlist makes it routine, so name the pools
+                        // that were withheld.
+                        if withheld_by_allowlist.is_empty() {
+                            tracing::info!(
+                                order = %order.input,
+                                pools_considered = pool_view.len(),
+                                max_pools = limits.max_pools,
+                                max_steps = limits.max_steps,
+                                budget_lovelace = order_budget_lov,
+                                "order dispatch: swap, no route",
+                            );
+                        } else {
+                            let withheld = withheld_by_allowlist
+                                .iter()
+                                .map(|i| i.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            tracing::info!(
+                                order = %order.input,
+                                pools_considered = pool_view.len(),
+                                withheld_pools = %withheld,
+                                withheld_count = withheld_by_allowlist.len(),
+                                "order dispatch: swap, no route; the allowlist withheld pools this order could otherwise have used",
+                            );
+                            skip_no_route_allowlisted += 1;
+                        }
                         skip_no_route += 1;
                         continue;
                     };
@@ -1570,6 +1853,8 @@ impl Scooper {
                 skip_no_pool,
                 skip_add_failed,
                 skip_no_route,
+                skip_no_route_allowlisted,
+                skip_not_allowlisted,
                 skip_route_failed,
                 "no orders could be added to batch"
             );
@@ -1977,7 +2262,9 @@ impl Scooper {
         let n_orders: usize = final_plan
             .batches
             .iter()
-            .map(|b| b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.claims.len())
+            .map(|b| {
+                b.swaps.len() + b.deposits.len() + b.withdraws.len() + b.zaps.len() + b.claims.len()
+            })
             .sum();
         let n_pools = final_plan.batches.len();
         let pool_idents: Vec<crate::sundaev3::Ident> =
@@ -1991,6 +2278,7 @@ impl Scooper {
                     .map(|o| o.order.input.clone())
                     .chain(b.deposits.iter().map(|o| o.order.input.clone()))
                     .chain(b.withdraws.iter().map(|o| o.order.input.clone()))
+                    .chain(b.zaps.iter().map(|o| o.order.input.clone()))
                     .chain(b.claims.iter().map(|o| o.order.input.clone()))
             })
             .collect();
@@ -2009,6 +2297,20 @@ impl Scooper {
         // adding an input shifts the spend redeemer indices, so budgets from a
         // funding-less first pass do not carry over.
         let mut funding_owned: Option<(TransactionInput, crate::cardano_types::Value)> = None;
+        // Budgets the FINAL tx measured above the first pass's declaration.
+        // The first pass is built without budgets or fee, and a script's
+        // cost can move with the values the final build writes (mainnet
+        // 2026-10-08: a deposit's module withdraw +402 mem / +165,208 steps,
+        // 0.05%). With no pad that was an abort. Instead the loop runs once
+        // more declaring the final measurement, which is what the node
+        // charges.
+        let mut redeclared: Option<
+            Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )>,
+        > = None;
+        let mut redeclare_rounds = 0u32;
         let (padded_budgets, final_tx) = loop {
             let first_pass = match crate::sundaev4::tx_builder::build_multi_pool_scoop_tx(
                 &final_plan,
@@ -2033,7 +2335,7 @@ impl Scooper {
                         && funding_owned.is_none()
                         && funding_available.is_some() =>
                 {
-                    debug!(reason = %e, "scoop needs a funding input; rebuilding with one");
+                    info!(reason = %e, "scoop needs a funding input; rebuilding with one");
                     funding_owned = funding_available.clone();
                     continue;
                 }
@@ -2119,6 +2421,26 @@ impl Scooper {
                 }
             };
 
+            // A previous round measured the final tx above these: declare at
+            // least that.
+            let padded_budgets: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = match &redeclared {
+                None => padded_budgets,
+                Some(prev) => padded_budgets
+                    .into_iter()
+                    .map(|(k, eu)| {
+                        let floor = prev.iter().find(|(pk, _)| *pk == k).map(|(_, p)| *p);
+                        let mut eu = eu;
+                        if let Some(f) = floor {
+                            eu.mem = eu.mem.max(f.mem);
+                            eu.steps = eu.steps.max(f.steps);
+                        }
+                        (k, eu)
+                    })
+                    .collect(),
+            };
             // Compute the exact protocol fee from the first-pass size and the
             // evaluated ex_units. The final rebuild changes per-order fee share
             // (and therefore output ADA values), but those values stay in the
@@ -2175,6 +2497,10 @@ impl Scooper {
             // can shift a script's cost. The node rejects any script that runs
             // past its declared budget, and that rejection is indistinguishable
             // from a lost race at submit time.
+            let mut final_raw: Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::ExUnits,
+            )> = Vec::new();
             let over_budget: Vec<String> = match crate::sundaev4::evaluator::evaluate_scoop_tx(
                 &final_tx.tx_body,
                 &final_tx.redeemers,
@@ -2190,6 +2516,7 @@ impl Scooper {
                 Ok(r) => r
                     .budgets
                     .iter()
+                    .inspect(|(k, raw)| final_raw.push((k.clone(), *raw)))
                     .filter_map(|(k, raw)| {
                         let (_, declared) = padded_budgets.iter().find(|(pk, _)| pk == k)?;
                         (raw.mem > declared.mem || raw.steps > declared.steps).then(|| {
@@ -2208,14 +2535,41 @@ impl Scooper {
                 }
             };
             if !over_budget.is_empty() {
+                if redeclare_rounds < 2 {
+                    redeclare_rounds += 1;
+                    info!(
+                        tx_hash = %final_tx.tx_hash_hex,
+                        over_budget = ?over_budget,
+                        round = redeclare_rounds,
+                        "final tx measured above the declared budgets; rebuilding with the final measurement declared",
+                    );
+                    let (pad_num, pad_den) = exec.budget_padding;
+                    redeclared = Some(
+                        final_raw
+                            .iter()
+                            .map(|(k, eu)| {
+                                let mut p = *eu;
+                                p.mem = eu.mem * pad_num / pad_den;
+                                p.steps = eu.steps * pad_num / pad_den;
+                                (k.clone(), p)
+                            })
+                            .collect(),
+                    );
+                    continue;
+                }
                 warn!(
                     tx_hash = %final_tx.tx_hash_hex,
                     over_budget = ?over_budget,
-                    "final tx exceeds declared budgets — aborting scoop cycle",
+                    "final tx exceeds declared budgets after re-declaring — aborting scoop cycle",
                 );
                 self.metrics.record_batch_failure(crate::metrics::BatchFailureReason::EvalError);
                 return false;
             }
+            // Funding is an input the scoop returns untouched: it exists only
+            // to absorb min-ada support and any gap between the fee pot and the
+            // tx fee. Logging which way this went is what tells an operator
+            // whether the wallet UTxO a scoop consumed was actually needed.
+            info!(funding_input = funding_owned.is_some(), "scoop built");
             break (padded_budgets, final_tx);
         };
         let funding_is_predicted = funding_is_predicted && funding_owned.is_some();
@@ -2259,6 +2613,7 @@ impl Scooper {
                     .map(|s| &s.order)
                     .chain(b.deposits.iter().map(|d| &d.order))
                     .chain(b.withdraws.iter().map(|w| &w.order))
+                    .chain(b.zaps.iter().map(|z| &z.order))
             })
             .chain(final_plan.conversions.iter().map(|c| &c.order))
             .filter_map(|o| provisional_parent.get(&o.input).cloned())
@@ -2336,9 +2691,12 @@ impl Scooper {
                         PoolType::ConcentratedLiquidity { .. } => {
                             crate::metrics::PoolFamily::ConcentratedLiquidity
                         }
+                        PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
                     };
-                    let n =
-                        (batch.swaps.len() + batch.deposits.len() + batch.withdraws.len()) as u64;
+                    let n = (batch.swaps.len()
+                        + batch.deposits.len()
+                        + batch.withdraws.len()
+                        + batch.zaps.len()) as u64;
                     self.metrics.record_pool_family_orders(family, n);
                 }
 
@@ -2355,6 +2713,7 @@ impl Scooper {
                             .map(|s| s.order.clone())
                             .chain(b.deposits.iter().map(|d| d.order.clone()))
                             .chain(b.withdraws.iter().map(|w| w.order.clone()))
+                            .chain(b.zaps.iter().map(|z| z.order.clone()))
                     })
                     // Conversion legs consume their order too — a pure-
                     // conversion order (e.g. ADAb mint with no pool split)
@@ -2412,8 +2771,22 @@ impl Scooper {
                 // quarantined — an order whose input is fine must not sit
                 // out minutes for a wallet-UTxO conflict.
                 let node_reject_hex: Option<&str> = msg.strip_prefix("node rejected tx: ");
-                if node_reject_hex.is_some() {
+                if let Some(hex_reason) = node_reject_hex {
                     self.metrics.node_rejects.fetch_add(1, Ordering::Relaxed);
+                    // Keep what the node refused. A reject is not always a
+                    // race: on 2026-09-28 mainnet refused a stableswap
+                    // withdraw scoop twelve times running with a script
+                    // failure our own evaluator did not reproduce, and
+                    // nothing had the tx bytes to re-evaluate with traced
+                    // scripts. The reason from pallas is cut at one mux
+                    // segment (12288 bytes), before the node's trace, so the
+                    // bytes are the only way to get one.
+                    let base = format!("{REJECT_DUMP_PREFIX}{}", final_tx.tx_hash_hex);
+                    if let Err(e) = std::fs::write(format!("{base}.cbor"), &final_tx.cbor) {
+                        warn!(%e, "couldn't write rejected tx dump");
+                    }
+                    let _ = std::fs::write(format!("{base}.reason.hex"), hex_reason);
+                    prune_reject_dumps();
                 }
                 let is_race_lost = msg.contains("BadInputsUTxO")
                     || msg.contains("ConwayMempoolFailure")
@@ -2591,9 +2964,11 @@ impl Scooper {
 
         let (ident, pool) =
             v4_state.pools.iter().find(|(id, _)| hex::encode(id.to_bytes()) == pool_hex)?;
-        if in_flight_pools.contains(ident)
-            || exec.blacklisted_pools.contains(&hex::encode(ident.to_bytes()))
-        {
+        if in_flight_pools.contains(ident) || exec.blacklisted_pools.contains(ident) {
+            return None;
+        }
+        if !exec.pool_allowlists.permits(ident, order, order.constraint.strategy()) {
+            debug!(order = %order.input, pool = %pool_hex, "claim intent's order is not on the pool's allowlist");
             return None;
         }
         let PoolType::ConstantSum {
@@ -2757,6 +3132,7 @@ impl Scooper {
             return None;
         };
         let (offer_asset, remaining) = order.swap_offered();
+        let executable = order.swap_executable();
         let (ask_asset, min_qty) = order.swap_min_received();
 
         // Economic floor under the fee redesign (SUNDAE-2587): a partial
@@ -2772,7 +3148,7 @@ impl Scooper {
         }
         let floor_dx = &(&(remaining * &BigInt::from(margin_num)) * &fee_est)
             / &(&budget * &BigInt::from(margin_den));
-        if &floor_dx >= remaining {
+        if floor_dx >= executable {
             return None; // even the minimum viable fill exceeds what's left
         }
 
@@ -2793,7 +3169,7 @@ impl Scooper {
         if !meets(&lo) {
             return None; // pools can't clear the floor even at the minimum
         }
-        let mut hi = remaining.clone();
+        let mut hi = executable;
         // hi (full fill) is known to fail; bisect the largest passing dx.
         for _ in 0..12 {
             let mid = &(&lo + &hi) / &BigInt::from(2u64);
@@ -2832,6 +3208,17 @@ impl Scooper {
 /// The error string from submit is `"ogmios submit failed (status): {json}"`.
 /// The JSON portion is the Ogmios error object with structure:
 ///   `{"code":...,"data":{"badInputs":["txhash#idx",...]}}`
+/// Whether the order's constraint list names the route module.
+fn carries_route_constraint(
+    exec: &ScooperExecution,
+    order: &crate::sundaev4::SundaeV4Order,
+) -> bool {
+    let Some(route) = exec.module_scripts.route_order.as_ref() else {
+        return false;
+    };
+    order.datum.constraints.iter().any(|(h, _)| h.as_slice() == route.hash.as_ref())
+}
+
 /// Resolve the effective pool snapshot to scoop against — preferring an
 /// already-accumulated state, then the chain tracker's in-flight prediction
 /// (so we chain off our own pending tx), then the on-chain state.
@@ -2994,4 +3381,70 @@ enum OrderInvalidReason {
     NoPools,
     ValueError(ValueError),
     PoolErrors(BTreeMap<Ident, PoolError>),
+}
+
+#[cfg(test)]
+mod reject_dump_tests {
+    use super::prune_dumps;
+
+    /// Keeps the newest `keep` pairs, removes the rest, and leaves files that
+    /// do not belong to the dump set alone.
+    #[test]
+    fn prunes_to_the_newest_and_touches_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("scooper-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/scoop-reject-", dir.display());
+
+        for i in 0..5u32 {
+            std::fs::write(format!("{prefix}{i:02}.cbor"), [i as u8]).unwrap();
+            std::fs::write(format!("{prefix}{i:02}.reason.hex"), "ab").unwrap();
+            // Distinct mtimes, oldest first.
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000 + i as u64 * 10);
+            let f =
+                std::fs::File::options().write(true).open(format!("{prefix}{i:02}.cbor")).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        let bystander = dir.join("keep-me.cbor");
+        std::fs::write(&bystander, "x").unwrap();
+
+        prune_dumps(&prefix, 2);
+
+        for i in 0..3u32 {
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be pruned"
+            );
+            assert!(
+                !std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists(),
+                "{i}'s reason should go too"
+            );
+        }
+        for i in 3..5u32 {
+            assert!(
+                std::path::Path::new(&format!("{prefix}{i:02}.cbor")).exists(),
+                "{i} should be kept"
+            );
+            assert!(std::path::Path::new(&format!("{prefix}{i:02}.reason.hex")).exists());
+        }
+        assert!(
+            bystander.exists(),
+            "a file outside the dump set must be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under the cap nothing is removed.
+    #[test]
+    fn keeps_everything_under_the_cap() {
+        let dir = std::env::temp_dir().join(format!("scooper-prune-small-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/scoop-reject-", dir.display());
+        std::fs::write(format!("{prefix}aa.cbor"), "x").unwrap();
+        prune_dumps(&prefix, 20);
+        assert!(std::path::Path::new(&format!("{prefix}aa.cbor")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

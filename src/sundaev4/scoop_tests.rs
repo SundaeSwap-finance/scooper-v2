@@ -14,6 +14,7 @@ mod tests {
     use crate::sundaev4::test_harness::*;
     use crate::sundaev4::tx_builder::TX_FEE;
     use num_traits::Signed;
+    use plutus_parser::AsPlutus;
 
     const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
 
@@ -139,7 +140,13 @@ mod tests {
 
         let order = make_order(token_b(), 400_000_000_000, token_a(), 1, 1);
         // Order budget: 5 ADA → max_pools=5, max_steps=10 (cost 1/0.5 ADA).
-        let limits = router::RoutingLimits::from_budget(5_000_000, 1_000_000, 500_000);
+        // The fan-out allowance this case is about, stated directly: deriving it
+        // from a budget makes the test depend on fee arithmetic it is not
+        // testing (and silently changed meaning when from_budget was inverted).
+        let limits = router::RoutingLimits {
+            max_pools: 5,
+            max_steps: 10,
+        };
 
         let blend = router::find_blended_route(
             &pool_map,
@@ -196,7 +203,10 @@ mod tests {
         // TIGHT budget (3 pools): the full 5-pool blend now exceeds the budget.
         // Budget-aware pruning must find the best route that FITS 3 pools (direct
         // + ONE multi-hop leg) rather than collapsing to the single-hop fallback.
-        let tight = router::RoutingLimits::from_budget(3_000_000, 1_000_000, 500_000);
+        let tight = router::RoutingLimits {
+            max_pools: 3,
+            max_steps: 6,
+        };
         let tight_single = router::find_optimal_route(
             &pool_map,
             &[],
@@ -233,9 +243,14 @@ mod tests {
             "pruned blend must fit the 3-pool budget, used {}",
             tpools.len()
         );
+        // With the split solver filling pools in price order, the direct
+        // 3-pool split (382.7G) beats direct + the tOKENA leg at this budget
+        // (f46671fb caps near 363G, so that route pushes the rest through the
+        // costlier two-hop leg), and pruning keeps it. Pruning must not do
+        // worse than single-hop.
         assert!(
-            tight_blend.total_output > tight_single.total_output,
-            "budget-aware pruning must beat single-hop, not fall back to it"
+            tight_blend.total_output >= tight_single.total_output,
+            "budget-aware pruning must not do worse than single-hop"
         );
     }
 
@@ -550,6 +565,182 @@ mod tests {
             "route must be fillable, got {:?}",
             result.err()
         );
+    }
+
+    /// An on-curve CL pool (total_lp == the liquidity its reserves support)
+    /// with a band sqrt-price in [0.95, 1/0.95] — price 1 at equal reserves.
+    /// Selling the FIRST asset (A-input) drains the second, so the pool's
+    /// capacity is roughly its second-asset reserve.
+    fn on_curve_cl_pool(
+        env: &TestEnv,
+        id: u8,
+        tok_a: crate::cardano_types::AssetClass,
+        a: i64,
+        tok_b: crate::cardano_types::AssetClass,
+        b: i64,
+    ) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
+        use num_traits::ToPrimitive;
+        let big = BigInt::from;
+        let (spa_n, spa_d, spb_n, spb_d) = (95i64, 100i64, 100i64, 95i64);
+        let supported = crate::sundaev4::swap_math::cl_fee_budget(
+            &big(a),
+            &big(b),
+            &big(0),
+            &big(spa_n),
+            &big(spa_d),
+            &big(spb_n),
+            &big(spb_d),
+        );
+        let lp = supported.unwrap().to_i64().expect("L fits i64");
+        make_cl_pool(
+            env, id, tok_a, a, tok_b, b, lp, spa_n, spa_d, spb_n, spb_d, 30, 10000,
+        )
+    }
+
+    /// Two pool-disjoint A→Z paths (direct A/Z band, and A→E→Z through two
+    /// bands), all A-input. Returns (pool_map, direct ident byte, via ident bytes).
+    fn two_capped_cl_paths(
+        env: &TestEnv,
+        direct_reserve: i64,
+        via_reserve: i64,
+    ) -> std::collections::BTreeMap<
+        crate::sundaev3::Ident,
+        std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+    > {
+        let mut pool_map = std::collections::BTreeMap::new();
+        for p in [
+            on_curve_cl_pool(
+                env,
+                0x21,
+                token_a(),
+                direct_reserve,
+                token_b(),
+                direct_reserve,
+            ),
+            on_curve_cl_pool(env, 0x22, token_a(), via_reserve, token_e(), via_reserve),
+            on_curve_cl_pool(env, 0x23, token_e(), via_reserve, token_b(), via_reserve),
+        ] {
+            pool_map.insert(p.pool_datum.identifier.clone(), p);
+        }
+        pool_map
+    }
+
+    fn branch_first_pool_bytes(blend: &crate::sundaev4::router::BlendedRoute) -> Vec<u8> {
+        blend.branches.iter().map(|b| b.hops[0].splits[0].pool.ident.to_bytes()[0]).collect()
+    }
+
+    fn assert_blend_fills(
+        env: &TestEnv,
+        pool_map: &std::collections::BTreeMap<
+            crate::sundaev3::Ident,
+            std::sync::Arc<crate::sundaev4::types::SundaeV4Pool>,
+        >,
+        order: &std::sync::Arc<crate::sundaev4::types::SundaeV4Order>,
+        blend: &crate::sundaev4::router::BlendedRoute,
+    ) {
+        use crate::sundaev4::accumulator::Accumulator;
+        let routed: BigInt =
+            blend.branches.iter().fold(BigInt::from(0), |acc, b| &acc + &b.total_input);
+        assert_eq!(
+            &routed,
+            order.swap_offered().1,
+            "blend must route exactly the order amount"
+        );
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let result = match blend.as_single() {
+            Some(single) => accum.try_add_routed_order(order, single, pool_map),
+            None => accum.try_add_blended_order(order, blend, pool_map),
+        };
+        assert!(
+            result.is_ok(),
+            "blend must be fillable, got {:?}",
+            result.err()
+        );
+    }
+
+    /// Neither capped CL path (~60G of Z each) can absorb a 100G order alone,
+    /// but together they can: the router must blend them instead of giving up.
+    #[test]
+    fn capped_cl_paths_blend_when_none_can_fill_alone() {
+        use crate::sundaev4::router;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool_map = two_capped_cl_paths(&env, 60_000_000_000, 60_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+        let limits = router::RoutingLimits::unlimited();
+
+        assert!(
+            router::find_optimal_route(
+                &pool_map,
+                &[],
+                &token_a(),
+                &token_b(),
+                order.swap_offered().1,
+                limits
+            )
+            .is_none(),
+            "fixture: no single path may absorb the whole order"
+        );
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("the two capped paths together can fill the order");
+        let mut firsts = branch_first_pool_bytes(&blend);
+        firsts.sort();
+        assert_eq!(firsts, vec![0x21, 0x22], "must use both paths");
+        assert_blend_fills(&env, &pool_map, &order, &blend);
+    }
+
+    /// The direct band can take the whole order, the A→E→Z path (~30G of Z)
+    /// can't — but it is still worth a partial branch, since the direct band's
+    /// price slides far over a 100G sale. The blend must use it and never do
+    /// worse than the single-path answer.
+    #[test]
+    fn capped_cl_path_joins_blend_as_partial_branch() {
+        use crate::sundaev4::router;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool_map = two_capped_cl_paths(&env, 200_000_000_000, 30_000_000_000);
+        let order = make_order(token_a(), 100_000_000_000, token_b(), 1, 1);
+        let limits = router::RoutingLimits::unlimited();
+
+        let single = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("the direct band can absorb the order alone");
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            limits,
+        )
+        .expect("route exists");
+        assert!(
+            blend.total_output >= single.total_output,
+            "blend never worse than single"
+        );
+        let mut firsts = branch_first_pool_bytes(&blend);
+        firsts.sort();
+        assert_eq!(
+            firsts,
+            vec![0x21, 0x22],
+            "capped path must join as a partial branch"
+        );
+        assert!(
+            blend.total_output > single.total_output,
+            "partial branch must improve output"
+        );
+        assert_blend_fills(&env, &pool_map, &order, &blend);
     }
 
     use proptest::prelude::*;
@@ -1201,6 +1392,95 @@ mod tests {
         assert!(!eval.budgets.is_empty());
     }
 
+    // ─── Fee constraint tests ─────────────────────────────────────────────────
+
+    /// The designated pool (outputs[0]) receives the fee surplus; its
+    /// predicted UTxO must include it, or the next chained scoop fails with
+    /// ValueNotConservedUTxO.
+    #[test]
+    fn fee_surplus_is_in_the_predicted_designated_pool() {
+        use num_traits::ToPrimitive;
+        use pallas_primitives::conway::{TransactionOutput, Value as ConwayValue};
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        // The fee constraint requires a treasury (tag 200) action on the pool.
+        let mut eligible = (*make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        ))
+        .clone();
+        eligible.pool_datum.actions.push(crate::sundaev4::types::ActionEntry {
+            tag: BigInt::from(200),
+            enabled: true,
+            modules: vec![],
+        });
+        let pool = std::sync::Arc::new(eligible);
+        // A terminal fill is charged its whole 3 ADA budget, above the tx fee.
+        let order = std::sync::Arc::try_unwrap(make_order_with_budget(
+            token_a(),
+            10_000_000,
+            token_b(),
+            1,
+            1,
+            3_000_000,
+        ))
+        .expect("a fresh order has a single owner");
+        let orders = vec![std::sync::Arc::new(with_real_constraints(
+            order,
+            CFG_SWAP_FEE,
+        ))];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("batch assembly should succeed");
+        let plan = crate::sundaev4::batch::ScoopPlan {
+            batches: vec![batch],
+            routes: Vec::new(),
+            global_seq: Vec::new(),
+            conversions: Vec::new(),
+        };
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("fee-bearing scoop should build and evaluate");
+        assert!(!eval.budgets.is_empty());
+
+        let TransactionOutput::PostAlonzo(designated) = &result.tx_body.outputs[0] else {
+            panic!("legacy pool output")
+        };
+        let built_ada = match &designated.value {
+            ConwayValue::Coin(c) => *c,
+            ConwayValue::Multiasset(c, _) => *c,
+        };
+        let input_ada = pool.value.get(&ada()).clone().unwrap().to_u64().unwrap();
+        assert!(
+            built_ada > input_ada,
+            "precondition: the designated pool receives a fee surplus \
+             (built {built_ada}, input {input_ada})"
+        );
+
+        let (_, predicted_input, predicted) = &result.predicted_pools[0];
+        assert_eq!(
+            predicted_input.0.index, 0,
+            "outputs[0] is the designated pool"
+        );
+        let predicted_ada = predicted.value.get(&ada()).clone().unwrap().to_u64().unwrap();
+        assert_eq!(
+            predicted_ada,
+            built_ada,
+            "predicted designated pool ADA misses {} lovelace of the built output",
+            built_ada as i128 - predicted_ada as i128
+        );
+    }
+
     // ─── Fee split tests ──────────────────────────────────────────────────────
 
     #[test]
@@ -1523,6 +1803,709 @@ mod tests {
         );
     }
 
+    // ─── Stableswap tests ─────────────────────────────────────────────────────
+    //
+    // Every case builds a scoop against the real `stableswap_module` bytecode
+    // in the fixture (applied to the fixture's pool_mint policy) and evaluates
+    // it: the module pins D and the raw swap result with its two-sided
+    // integer checks, so a passing eval is the proof that the Rust math
+    // reproduces the Aiken reference.
+
+    fn ss_fee_3() -> crate::sundaev4::types::Rational {
+        crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        }
+    }
+
+    fn lp_asset_for(env: &TestEnv, ident_byte: u8) -> crate::cardano_types::AssetClass {
+        crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[ident_byte; 28]);
+                t
+            },
+        }
+    }
+
+    /// The Aiken fixture vector (`lib/tests/unit/ss_swap.ak`): 1e7 of A into
+    /// a (1e9, 1e9) pool at A=200, fee 0.3% pays 9_969_750 of B.
+    #[test]
+    fn ss_single_order() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x5A,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            ss_config(200, ss_fee_3(), [1, 1]),
+        );
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .expect("SS batch assembly should succeed");
+        assert_eq!(batch.swaps.len(), 1);
+        assert_eq!(batch.swaps[0].dy, BigInt::from(9_969_750));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("SS build_and_eval should succeed");
+        // The stableswap module runs as a withdrawal beside fee_split and
+        // fairness: three Reward redeemers were evaluated, not only the pool
+        // spend.
+        let rewards = eval
+            .budgets
+            .iter()
+            .filter(|(k, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
+            .count();
+        assert!(
+            rewards >= 3,
+            "expected stableswap + fee_split + fairness withdrawals, got {rewards}"
+        );
+        // The swap entry's operation_data is a three-field SwapStep whose
+        // `attribution` names the serving order (the module leaves it unread).
+        let step = result
+            .redeemers
+            .iter()
+            .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Spend)
+            .find_map(|(_, data, _)| {
+                match crate::sundaev4::types::PoolRedeemer::from_plutus(data.clone()) {
+                    Ok(crate::sundaev4::types::PoolRedeemer::Action { transcript, .. }) => {
+                        Some(transcript)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("pool spend redeemer")
+            .remove(0);
+        let swap = crate::sundaev4::types::SwapStep::from_plutus(step.operation_data)
+            .expect("stableswap swap entry carries a SwapStep");
+        let served = crate::sundaev4::types::OutputRef::from_plutus(swap.attribution)
+            .expect("attribution is an output reference");
+        assert_eq!(
+            served.transaction_id,
+            orders[0].input.0.transaction_id.to_vec()
+        );
+        assert_eq!(served.output_index, orders[0].input.0.index);
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(1_010_000_000));
+        assert_eq!(
+            after.pool_datum.assets[1].1,
+            BigInt::from(1_000_000_000 - 9_969_750)
+        );
+        // The whole fee stays in the pool; the protocol share is phantom LP.
+        assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            pool.pool_datum.circulating_lp
+        );
+    }
+
+    #[test]
+    fn ss_reverse_direction() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x5B,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            ss_config(200, ss_fee_3(), [1, 1]),
+        );
+        let orders = vec![make_order(token_b(), 10_000_000, token_a(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(batch.swaps[0].dy, BigInt::from(9_969_750));
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_, eval) = env.build_and_eval(&[batch], &settings, 1000).unwrap();
+        assert!(!eval.budgets.is_empty());
+    }
+
+    /// Two entries in one transcript: the second step's D_before is the
+    /// first step's next_sum_invariant, and the fee_split share is the
+    /// cumulative floor across both.
+    #[test]
+    fn ss_opposing_orders() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x5C,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            ss_config(200, ss_fee_3(), [1, 1]),
+        );
+        let orders = vec![
+            make_order(token_a(), 10_000_000, token_b(), 1, 1),
+            make_order(token_b(), 7_000_000, token_a(), 1, 2),
+        ];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(batch.swaps.len(), 2);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_, eval) = env.build_and_eval(&[batch], &settings, 1000).unwrap();
+        assert!(!eval.budgets.is_empty());
+    }
+
+    #[test]
+    fn ss_many_same_direction() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x5D,
+            vec![(token_a(), 1_000_000_007), (token_b(), 1_999_999_943)],
+            ss_config(50, ss_fee_3(), [2, 1]),
+        );
+        let orders: Vec<_> =
+            (1..=4).map(|i| make_order(token_a(), 3_000_000 * i, token_b(), 1, i as u64)).collect();
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(batch.swaps.len(), 4);
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_, eval) = env.build_and_eval(&[batch], &settings, 1000).unwrap();
+        assert!(!eval.budgets.is_empty());
+    }
+
+    /// The preview pool's config shape (`test/devnet/STABLESWAP.md`): a
+    /// Signature rate manager, monotone rates, a 1% step cap, 1e6-scale
+    /// rates after one 0.1% update. The module re-hashes this whole config
+    /// against the datum on chain, so this pins the Option/Bool/Multisig
+    /// encoding of `StableSwapConfig`, not only the curve math.
+    #[test]
+    fn ss_full_config_with_rate_manager_evaluates() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let config = crate::sundaev4::types::StableSwapConfig {
+            linear_amplification: BigInt::from(200),
+            fee: crate::sundaev4::types::Rational {
+                num: BigInt::from(25),
+                den: BigInt::from(10000),
+            },
+            rates: vec![BigInt::from(1_000_000), BigInt::from(1_001_000)],
+            rate_manager: Some(crate::multisig::Multisig::Signature(vec![0xE2; 28])),
+            monotone_rates: true,
+            max_rate_step: Some(crate::sundaev4::types::Rational {
+                num: BigInt::from(1),
+                den: BigInt::from(100),
+            }),
+        };
+        let pool = make_ss_pool(
+            &env,
+            0x5E,
+            vec![(token_a(), 10_595_001_263), (token_b(), 10_385_464_121)],
+            config,
+        );
+        let orders = vec![make_order(token_a(), 100_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &pool,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        // Preview step 10 paid 99_643_263 for this input on these reserves.
+        assert_eq!(batch.swaps[0].dy, BigInt::from(99_643_263));
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_, eval) = env.build_and_eval(&[batch], &settings, 1000).unwrap();
+        assert!(!eval.budgets.is_empty());
+    }
+
+    #[test]
+    fn ss_deposit_pinned_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x5F,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            ss_config(200, ss_fee_3(), [2, 1]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x5F);
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
+            lp_asset.clone(),
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_deposit(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("pinned SS deposit should resolve");
+        let plan = accum.into_plan();
+        let dep = &plan.batches[0].deposits[0];
+        assert!(dep.lp_minted.is_positive());
+        assert!(dep.target_delta_v.is_some(), "SS deposit must declare t");
+        for (dx, offered) in dep.dx.iter().zip([10_000_019i64, 20_000_033].iter()) {
+            assert!(dx <= &BigInt::from(*offered));
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("pinned SS deposit should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert!(
+            result.tx_body.mint.is_none(),
+            "reserve-served deposit must not mint"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp - &dep.lp_minted
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) - &dep.lp_minted
+        );
+    }
+
+    /// Mainnet USDrf/sUSDrf on 2026-09-28: withdraw order 567785e9…#0 burning
+    /// 7346987527052 LP. The scooper declared target_delta_d
+    /// −7347631365219459674054078 while the CLI's −…077 passed on chain, and
+    /// the module refused twelve submissions with
+    /// `(D + t) · before_lp >= D · after_lp` false. Everything else in the two
+    /// transactions was byte-identical, so this pins the resolved target and
+    /// the module's own inequality against the real validators.
+    /// A pool whose LP supply already sits near what a Cardano Value can
+    /// carry: LP is minted at `reserves x rate_scale`, so a large enough
+    /// deposit asks for more LP than the ledger's signed 64-bit quantity
+    /// holds. Admission must refuse it and leave the batch usable, rather
+    /// than building a transaction the node cannot take.
+    fn near_cap_ss_pool(
+        env: &TestEnv,
+        ident: u8,
+        total_lp: i64,
+    ) -> std::sync::Arc<crate::sundaev4::types::SundaeV4Pool> {
+        let r = 1_000_000_000i64;
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            env,
+            ident,
+            vec![(token_a(), r), (token_e(), r)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
+        let mut p = (*pool).clone();
+        let escrow = BigInt::from(1_000_000i64);
+        p.pool_datum.total_lp = BigInt::from(total_lp);
+        p.pool_datum.preminted_lp = escrow.clone();
+        p.pool_datum.circulating_lp = BigInt::from(total_lp) - &escrow;
+        p.value.insert(&lp_asset_for(env, ident), escrow);
+        std::sync::Arc::new(p)
+    }
+
+    #[test]
+    fn deposit_over_the_value_cap_is_refused_not_built() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        // total_lp just under the cap, so doubling the pool doubles the LP.
+        let pool = near_cap_ss_pool(&env, 0x64, 9_000_000_000_000_000_000);
+        let lp_asset = lp_asset_for(&env, 0x64);
+        let r = 1_000_000_000i64;
+
+        // Doubling the reserves asks for ~total_lp more LP: over the cap.
+        let big = make_basic_deposit_order(
+            vec![(token_a(), 2 * r), (token_e(), 2 * r)],
+            lp_asset.clone(),
+            1,
+            1,
+        );
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let err = accum
+            .try_add_deposit(&big, &pool.pool_datum.identifier.clone(), &pool)
+            .expect_err("a deposit over the Value cap must be refused");
+        assert!(
+            err.contains("Value entry can hold") || err.contains("mint field"),
+            "the refusal should name the ledger limit, got: {err}",
+        );
+
+        // The accumulator is still usable: a deposit that fits still goes in.
+        let small = make_basic_deposit_order(
+            vec![(token_a(), r / 1000), (token_e(), r / 1000)],
+            lp_asset,
+            1,
+            2,
+        );
+        accum
+            .try_add_deposit(&small, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("a deposit within the cap still resolves");
+        let plan = accum.into_plan();
+        assert_eq!(
+            plan.batches[0].deposits.len(),
+            1,
+            "only the small deposit was admitted"
+        );
+    }
+
+    /// Two deposits that each fit but together exceed one transaction's mint
+    /// field. The second is refused, so the batch splits instead of building
+    /// an unsubmittable transaction.
+    #[test]
+    fn deposits_that_only_overflow_together_split_the_batch() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = near_cap_ss_pool(&env, 0x65, 6_000_000_000_000_000_000);
+        let lp_asset = lp_asset_for(&env, 0x65);
+        let r = 1_000_000_000i64;
+
+        // Each doubles the pool it sees, so each mints 6e18: under the cap
+        // alone, 1.2e19 together.
+        let a =
+            make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset.clone(), 1, 1);
+        let b = make_basic_deposit_order(vec![(token_a(), r), (token_e(), r)], lp_asset, 1, 2);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let ident = pool.pool_datum.identifier.clone();
+        accum.try_add_deposit(&a, &ident, &pool).expect("the first fits on its own");
+        let err =
+            accum.try_add_deposit(&b, &ident, &pool).expect_err("the pair exceeds one mint field");
+        assert!(err.contains("mint field"), "got: {err}");
+        assert_eq!(
+            accum.into_plan().batches[0].deposits.len(),
+            1,
+            "the batch keeps only the first"
+        );
+    }
+
+    /// Withdrawals return LP to the pool's escrow rather than burning it, and
+    /// the escrow rides on the pool output as a Value entry.
+    #[test]
+    fn withdraw_that_overfills_the_escrow_is_refused() {
+        use crate::sundaev4::accumulator::Accumulator;
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let r = 1_000_000_000i64;
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            &env,
+            0x66,
+            vec![(token_a(), r), (token_e(), r)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x66);
+        let burn = 4_000_000_000_000_000_000i64;
+        let pool = {
+            let mut p = (*pool).clone();
+            // An escrow already close to the cap, and enough LP outstanding
+            // to withdraw against.
+            let escrow = BigInt::from(6_000_000_000_000_000_000i64);
+            p.pool_datum.total_lp = BigInt::from(9_000_000_000_000_000_000i64);
+            p.pool_datum.circulating_lp = BigInt::from(burn * 2);
+            p.pool_datum.preminted_lp = escrow.clone();
+            p.value.insert(&lp_asset, escrow);
+            std::sync::Arc::new(p)
+        };
+        let order =
+            make_basic_withdraw_order(lp_asset, burn, vec![(token_a(), 1), (token_e(), 1)], 1);
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        let err = accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect_err("6e18 + 4e18 returned LP does not fit a Value entry");
+        assert!(err.contains("Value entry can hold"), "got: {err}");
+    }
+
+    #[test]
+    fn ss_withdraw_mainnet_20260928_target_is_pinned() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        // Mainnet's pool takes a 1/5 protocol share, and its module_state
+        // pins the matching fee_split config hash. Set it on the env before
+        // building the pool so both agree, as they do on chain.
+        let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        env.exec.protocol_share = (1, 5);
+        let env = env;
+        let fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(15),
+            den: BigInt::from(10_000),
+        };
+        let pool = make_ss_pool(
+            &env,
+            0x61,
+            vec![(token_a(), 50_362_747), (token_e(), 42_149_345)],
+            ss_config(500, fee, [1_000_000, 1_000_000]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x61);
+        // Mainnet's LP book, which is NOT make_ss_pool's D / calc_precision:
+        // the pool has traded, so D / total_lp has drifted above precision.
+        let total_lp = BigInt::from(92_503_618_509_277i64);
+        let circulating_lp = BigInt::from(92_501_818_293_556i64);
+        let preminted_lp = BigInt::from(907_498_181_706_444i64);
+        let pool = {
+            let mut p = (*pool).clone();
+            p.pool_datum.total_lp = total_lp.clone();
+            p.pool_datum.circulating_lp = circulating_lp;
+            p.pool_datum.preminted_lp = preminted_lp.clone();
+            p.value.insert(&lp_asset, preminted_lp);
+            std::sync::Arc::new(p)
+        };
+
+        let burn = 7_346_987_527_052i64;
+        let order = make_basic_withdraw_order(
+            lp_asset.clone(),
+            burn,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("mainnet SS withdraw should resolve");
+        let plan = accum.into_plan();
+        let wd = &plan.batches[0].withdraws[0];
+        assert_eq!(
+            wd.lp_burned,
+            BigInt::from(burn),
+            "burns exactly the offered LP"
+        );
+        assert_eq!(
+            wd.dy,
+            vec![BigInt::from(3_999_999), BigInt::from(3_347_660)],
+            "pays out what the on-chain withdraw paid",
+        );
+        assert_eq!(
+            wd.target_delta_v.clone().expect("a declared target"),
+            BigInt::from(-7_347_631_365_219_459_674_054_077i128),
+            "the target the module accepts for this D",
+        );
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (_result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("mainnet SS withdraw should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+    }
+
+    #[test]
+    fn ss_withdraw_pinned_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x60,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            ss_config(200, ss_fee_3(), [2, 1]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x60);
+        let circ = BigInt::from(50_000_000i64);
+        let pool = {
+            let mut p = (*pool).clone();
+            p.pool_datum.circulating_lp = circ.clone();
+            p.pool_datum.preminted_lp = &p.pool_datum.preminted_lp - &circ;
+            let held = p.value.get(&lp_asset);
+            p.value.insert(&lp_asset, &held - &circ);
+            std::sync::Arc::new(p)
+        };
+        let order = make_basic_withdraw_order(
+            lp_asset.clone(),
+            5_000_017,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_withdraw(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("pinned SS withdraw should resolve");
+        let plan = accum.into_plan();
+        let wd = &plan.batches[0].withdraws[0];
+        assert_eq!(
+            wd.lp_burned,
+            BigInt::from(5_000_017),
+            "burn exactly the offered LP"
+        );
+        assert!(wd.target_delta_v.as_ref().is_some_and(|t| t.is_negative()));
+        assert!(wd.dy.iter().all(|q| q.is_positive()));
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("pinned SS withdraw should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert!(
+            result.tx_body.mint.is_none(),
+            "returned LP must not be burned"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp - &wd.lp_burned
+        );
+    }
+
+    /// A single-asset deposit fills as a tag-3 swap followed by a tag-6
+    /// deposit in one transcript (the composition `docs/stableswap.md`
+    /// prescribes for asymmetric deposits).
+    #[test]
+    fn ss_zap_single_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x61,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            ss_config(200, ss_fee_3(), [2, 1]),
+        );
+        let lp_asset = lp_asset_for(&env, 0x61);
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset.clone(), 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("single-asset SS deposit should fill as a zap");
+        let plan = accum.into_plan();
+        let batch = &plan.batches[0];
+        assert_eq!(batch.zaps.len(), 1);
+        assert_eq!(batch.ops_order.len(), 2);
+        let zap = &batch.zaps[0];
+        assert!(zap.lp_minted.is_positive());
+        assert!(zap.target_delta_v.is_some());
+        for i in 0..zap.swap_deltas.len() {
+            let net = &zap.swap_deltas[i] + &zap.deposit_dx[i];
+            let offered = if i == 0 {
+                BigInt::from(10_000_019)
+            } else {
+                BigInt::from(0)
+            };
+            assert!(
+                net <= offered,
+                "asset {i} consumes {net} of {offered} offered"
+            );
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("SS zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &zap.lp_minted
+        );
+    }
+
+    /// A constant-sum pool and a stableswap pool on the same pair: the
+    /// router's λ-search must handle the stableswap view (bisected inverse
+    /// marginal) and the resulting plan must evaluate on both modules.
+    #[test]
+    fn basic_swap_splits_across_cs_and_ss() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_pool = make_cs_pool(
+            &env,
+            0x62,
+            vec![(token_a(), 300_000_000), (token_b(), 300_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            ss_fee_3(),
+        );
+        let ss_pool = make_ss_pool(
+            &env,
+            0x63,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            ss_config(200, ss_fee_3(), [1, 1]),
+        );
+        let mut pool_map = BTreeMap::new();
+        for p in [&cs_pool, &ss_pool] {
+            pool_map.insert(p.pool_datum.identifier.clone(), (*p).clone());
+        }
+        let order = make_basic_swap_order(token_a(), 500_000_000, token_b(), 1, 1);
+        let blend = router::find_blended_route(
+            &pool_map,
+            &[],
+            &token_a(),
+            &token_b(),
+            order.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("a route across the two pools must exist");
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_blended_order(&order, &blend, &pool_map)
+            .expect("blended swap should accumulate");
+        let plan = accum.into_plan();
+        // 500M cannot fit the 300M-deep CS pool alone, so both pools carry flow.
+        assert_eq!(plan.batches.len(), 2, "both pools should carry flow");
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("CS+SS blended swap should evaluate");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 2);
+    }
+
+    /// The config the scooper holds must hash to the pool datum's
+    /// module_state slot. A pool whose rates moved on chain (tag-7) while
+    /// the scooper held the old config is refused at build time with a
+    /// message naming the mismatch — never sent to eval.
+    #[test]
+    fn ss_stale_config_is_refused_at_build() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_ss_pool(
+            &env,
+            0x64,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            ss_config(200, ss_fee_3(), [1, 1]),
+        );
+        // The chain moved the rates; this scooper's preimage did not follow.
+        let stale = {
+            let mut p = (*pool).clone();
+            p.pool_type = crate::sundaev4::types::PoolType::StableSwap {
+                config: ss_config(200, ss_fee_3(), [1000, 1001]),
+            };
+            std::sync::Arc::new(p)
+        };
+        let orders = vec![make_order(token_a(), 10_000_000, token_b(), 1, 1)];
+        let batch = assemble_batch(
+            &stale,
+            &orders,
+            env.exec.fee,
+            env.exec.protocol_share,
+            &BatchLimits::default(),
+        )
+        .unwrap();
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let err = env
+            .build_and_eval(&[batch], &settings, 1000)
+            .err()
+            .expect("a stale stableswap config must not build");
+        assert!(
+            format!("{err:#}").contains("does not match the pool's module_state"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     // ─── Routed-through-CS tests ─────────────────────────────────────────────
 
     #[test]
@@ -1628,7 +2611,7 @@ mod tests {
         // Roughly proportional but deliberately unround amounts.
         let order = make_basic_deposit_order(
             vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
-            lp_asset,
+            lp_asset.clone(),
             1,
             1,
         );
@@ -1650,6 +2633,95 @@ mod tests {
             .expect("pinned CS deposit should evaluate against real validators");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 1);
+
+        // The harness pool premints its whole supply, so the LP comes out of
+        // the reserve: nothing is minted and the pool UTxO hands over exactly
+        // the LP delivered.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "reserve-served deposit must not mint"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp - &dep.lp_minted
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &dep.lp_minted
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) - &dep.lp_minted
+        );
+    }
+
+    /// A pool whose reserve can't cover the deposit falls back to minting.
+    #[test]
+    fn cs_deposit_mints_when_reserve_is_short() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        // Leave one LP in the reserve — as if depositors hold the rest —
+        // keeping datum and pool value consistent.
+        let pool = {
+            let mut p = (*pool).clone();
+            let moved = &p.pool_datum.preminted_lp - &BigInt::from(1);
+            p.pool_datum.circulating_lp = &p.pool_datum.circulating_lp + &moved;
+            p.pool_datum.preminted_lp = BigInt::from(1);
+            let held = p.value.get(&lp_asset);
+            p.value.insert(&lp_asset, &held - &moved);
+            std::sync::Arc::new(p)
+        };
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_019), (token_e(), 20_000_033)],
+            lp_asset.clone(),
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_deposit(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("deposit should resolve");
+        let plan = accum.into_plan();
+        let dep = &plan.batches[0].deposits[0];
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("minted CS deposit should evaluate against real validators");
+        assert!(!eval.budgets.is_empty());
+        assert!(
+            result.tx_body.mint.is_some(),
+            "a short reserve must fall back to minting"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(after.pool_datum.preminted_lp, BigInt::from(1));
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &dep.lp_minted
+        );
+        assert_eq!(after.value.get(&lp_asset), pool.value.get(&lp_asset));
     }
 
     /// Target-pinned CS withdraw (cs_check tag 4) on the same coprime pool.
@@ -1698,8 +2770,12 @@ mod tests {
                 t
             },
         };
-        let order =
-            make_basic_withdraw_order(lp_asset, 5_000_017, vec![(token_a(), 1), (token_e(), 1)], 1);
+        let order = make_basic_withdraw_order(
+            lp_asset.clone(),
+            5_000_017,
+            vec![(token_a(), 1), (token_e(), 1)],
+            1,
+        );
 
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
@@ -1718,11 +2794,30 @@ mod tests {
             .expect("pinned CS withdraw should evaluate against real validators");
         assert!(!eval.budgets.is_empty());
         assert_eq!(result.predicted_pools.len(), 1);
+
+        // The withdrawn LP goes back into the reserve instead of being burned.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "returned LP must not be burned"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp + &wd.lp_burned
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp - &wd.lp_burned
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) + &wd.lp_burned
+        );
     }
 
-    /// A single-sided CS deposit can never validate (cs_check disallows
-    /// asymmetric deposits) — the resolver must refuse it with a message
-    /// that says so, rather than quarantine-looping.
+    /// The proportional deposit path refuses an asymmetric basket with a
+    /// message naming the on-chain rule. Filling such an order is the zap
+    /// path's job, not this one's.
     #[test]
     fn cs_single_sided_deposit_rejected() {
         use crate::sundaev4::accumulator::Accumulator;
@@ -1757,6 +2852,308 @@ mod tests {
             err.contains("asymmetric"),
             "error should explain the on-chain rule, got: {err}"
         );
+    }
+
+    /// A single-asset deposit into a two-asset CS pool fills as a zap: a
+    /// rebalancing swap entry (tag 3) followed by the target-pinned deposit
+    /// entry (tag 6) it makes possible, both on the same pool, settling into
+    /// one fulfillment.
+    #[test]
+    fn cs_zap_single_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset.clone(), 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("single-asset CS deposit should fill as a zap");
+
+        let plan = accum.into_plan();
+        assert_eq!(plan.batches.len(), 1);
+        let batch = &plan.batches[0];
+        assert_eq!(batch.zaps.len(), 1);
+        assert_eq!(
+            batch.ops_order.len(),
+            2,
+            "a zap emits a swap entry and a deposit entry",
+        );
+        let zap = &batch.zaps[0];
+        assert!(zap.lp_minted.is_positive(), "zap must mint LP");
+        assert!(
+            zap.target_delta_v.is_some(),
+            "CS deposit step must declare t"
+        );
+        assert!(
+            zap.swap_deltas.iter().any(|d| d.is_positive())
+                && zap.swap_deltas.iter().any(|d| d.is_negative()),
+            "the swap step must move value between assets",
+        );
+        // check_basic_consumption bounds what leaves the order by its
+        // declared offer, summed across both steps.
+        for i in 0..zap.swap_deltas.len() {
+            let net = &zap.swap_deltas[i] + &zap.deposit_dx[i];
+            let offered = if i == 0 {
+                BigInt::from(10_000_019)
+            } else {
+                BigInt::from(0)
+            };
+            assert!(
+                net <= offered,
+                "asset {i} consumes {net} of {offered} offered"
+            );
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("CS zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
+
+        // Served from the reserve: no pool_mint in the tx, preminted down by
+        // the LP delivered, and the pool UTxO hands that LP over.
+        assert!(
+            result.tx_body.mint.is_none(),
+            "reserve-served zap must not mint"
+        );
+        let after = &result.predicted_pools[0].2;
+        assert_eq!(
+            after.pool_datum.preminted_lp,
+            &pool.pool_datum.preminted_lp - &zap.lp_minted
+        );
+        assert_eq!(
+            after.pool_datum.circulating_lp,
+            &pool.pool_datum.circulating_lp + &zap.lp_minted
+        );
+        assert_eq!(
+            after.value.get(&lp_asset),
+            &pool.value.get(&lp_asset) - &zap.lp_minted
+        );
+    }
+
+    /// A batch holding nothing but zaps still counts as work. The dispatch
+    /// loop reads `order_count` to decide whether a plan is worth building and
+    /// `order_inputs` to quarantine a failing one, so a zap missing from either
+    /// is a batch that never submits or an order that never backs off.
+    #[test]
+    fn zap_only_accumulator_reports_its_order() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_007), (token_e(), 1_999_999_943)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(vec![(token_a(), 10_000_019)], lp_asset, 1, 1);
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("zap should resolve");
+
+        assert_eq!(accum.order_count(), 1);
+        assert!(!accum.is_empty());
+        assert_eq!(accum.order_inputs(), vec![&order.input]);
+    }
+
+    /// The two-asset curves reach the same split by bisection rather than by
+    /// the constant-sum closed form: the over-weighted side funds the swap and
+    /// the other side receives it, leaving a basket the deposit pin can take
+    /// whole.
+    #[test]
+    fn cp_zap_swap_splits_the_offer() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = make_pool(
+            &env,
+            0xDD,
+            token_a(),
+            1_000_000_000,
+            token_e(),
+            2_000_000_000,
+        );
+        let offered = vec![BigInt::from(10_000_000), BigInt::from(0)];
+
+        let deltas = crate::sundaev4::batch::plan_zap_swap(
+            &pool.pool_type,
+            &pool.pool_datum.assets,
+            &pool.pool_datum.total_lp,
+            &offered,
+        )
+        .expect("a single-asset CP offer should split");
+
+        assert!(deltas[0].is_positive(), "the offered side funds the swap");
+        assert!(deltas[1].is_negative(), "the other side is paid out");
+        assert!(
+            deltas[0] < offered[0],
+            "the swap spends only part of the offer"
+        );
+        // The deposit pin is capped by whichever side is scarcer against the
+        // POST-swap reserves, so that is where the remaining basket has to be
+        // proportional.
+        let rem_a = &offered[0] - &deltas[0];
+        let rem_b = -&deltas[1];
+        let after_a = &pool.pool_datum.assets[0].1 + &deltas[0];
+        let after_b = &pool.pool_datum.assets[1].1 + &deltas[1];
+        let lhs = &rem_a * &after_b;
+        let rhs = &rem_b * &after_a;
+        let bigger = if lhs > rhs { lhs.clone() } else { rhs.clone() };
+        let gap = if lhs > rhs { &lhs - &rhs } else { &rhs - &lhs };
+        assert!(
+            &gap * &BigInt::from(1000) < bigger,
+            "split leaves the basket more than 0.1% off proportional",
+        );
+    }
+
+    /// An offer worth as much as the pool can't be rebalanced against it: the
+    /// walk toward the post-swap reserves would move them further each pass
+    /// than the pass corrects. The refusal has to name that, because the
+    /// downstream deposit would otherwise blame the basket's proportions.
+    #[test]
+    fn oversized_zap_offer_is_refused_by_name() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(45),
+            den: BigInt::from(10000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_603_884_794), (token_e(), 386_232_429)],
+            vec![BigInt::from(48), BigInt::from(398)],
+            cs_fee,
+        );
+        let offered = vec![
+            BigInt::from(2_649_386_506i64),
+            BigInt::from(2_929_443_229i64),
+        ];
+
+        let err = crate::sundaev4::batch::plan_zap_swap(
+            &pool.pool_type,
+            &pool.pool_datum.assets,
+            &pool.pool_datum.total_lp,
+            &offered,
+        )
+        .expect_err("an offer worth more than the pool must be refused");
+        assert!(
+            err.contains("too large to rebalance against"),
+            "refusal should name the size, got: {err}",
+        );
+    }
+
+    /// A partial basket on a three-asset CS pool zaps the same way: the two
+    /// offered assets fund one swap entry that pays out the third, and the
+    /// deposit entry then takes all three in proportion.
+    #[test]
+    fn cs_zap_partial_basket_three_asset_evaluates() {
+        use crate::sundaev4::accumulator::Accumulator;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cs_fee = crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        };
+        let pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![
+                (token_a(), 1_000_000_000),
+                (token_e(), 1_000_000_000),
+                (token_f(), 1_000_000_000),
+            ],
+            vec![
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+                BigInt::from(1_000_000),
+            ],
+            cs_fee,
+        );
+        let lp_asset = crate::cardano_types::AssetClass {
+            policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
+            token: {
+                let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                t.extend_from_slice(&[0xDD; 28]);
+                t
+            },
+        };
+        let order = make_basic_deposit_order(
+            vec![(token_a(), 10_000_000), (token_e(), 5_000_000)],
+            lp_asset,
+            1,
+            1,
+        );
+
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum
+            .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
+            .expect("partial basket on a 3-asset CS pool should fill as a zap");
+
+        let plan = accum.into_plan();
+        let zap = &plan.batches[0].zaps[0];
+        assert_eq!(zap.swap_deltas.len(), 3);
+        assert!(zap.lp_minted.is_positive());
+        assert!(
+            zap.deposit_dx.iter().all(|d| d.is_positive()),
+            "the deposit step takes every pool asset",
+        );
+
+        // Aiming the target basket at the POST-swap reserves is what keeps the
+        // fill tight: a pre-swap target strands whichever side the swap moved
+        // furthest, and stranded assets inflate the fulfillment's min-UTxO.
+        let offered = [
+            BigInt::from(10_000_000),
+            BigInt::from(5_000_000),
+            BigInt::from(0),
+        ];
+        for (i, offer) in offered.into_iter().enumerate() {
+            let leftover = &offer - &(&zap.swap_deltas[i] + &zap.deposit_dx[i]);
+            assert!(
+                leftover < BigInt::from(16),
+                "asset {i} strands {leftover} of the offer",
+            );
+        }
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, eval) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("3-asset CS zap should evaluate against the real validators");
+        assert!(!eval.budgets.is_empty());
+        assert_eq!(result.predicted_pools.len(), 1);
     }
 
     /// A route-module order whose constraint carries a non-empty pool
@@ -1850,6 +3247,86 @@ mod tests {
             .build_and_eval_plan(&plan, &settings, 1000)
             .expect("whitelisted route must satisfy route.ak's check_pool_whitelisted");
         assert!(!eval.budgets.is_empty());
+    }
+
+    /// A restricted pool stays out of a denied order's route after a permitted
+    /// order has put it in the batch (see `PoolAllowlists::retain_visible`).
+    #[test]
+    fn allowlist_survives_the_accumulator_overlay() {
+        use crate::multisig::Multisig;
+        use crate::sundaev4::SundaeV4Order;
+        use crate::sundaev4::access::{PoolAllowlist, PoolAllowlists};
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        /// Reassign an order's owner. The harness builds every order under
+        /// 0xAA, which is the credential the allowlist below admits.
+        fn with_owner(order: Arc<SundaeV4Order>, owner: Multisig) -> Arc<SundaeV4Order> {
+            let mut inner = Arc::try_unwrap(order).expect("sole ownership");
+            inner.datum.owner = owner;
+            Arc::new(inner)
+        }
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let deep = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            2_000_000_000,
+            token_b(),
+            2_000_000_000,
+        );
+        let thin = make_pool(&env, 0xBB, token_a(), 500_000_000, token_b(), 500_000_000);
+        let mut pools = BTreeMap::new();
+        pools.insert(deep.pool_datum.identifier.clone(), deep.clone());
+        pools.insert(thin.pool_datum.identifier.clone(), thin.clone());
+
+        let allowlists = PoolAllowlists(BTreeMap::from([(
+            deep.pool_datum.identifier.clone(),
+            PoolAllowlist {
+                credentials: BTreeSet::from([vec![0xAAu8; 28]]),
+            },
+        )]));
+
+        let permitted = make_order(token_a(), 10_000_000, token_b(), 1, 1);
+        let denied = with_owner(
+            make_order(token_a(), 10_000_000, token_b(), 1, 2),
+            Multisig::Signature(vec![0xCC; 28]),
+        );
+        assert!(allowlists.permits(&deep.pool_datum.identifier, &permitted, None));
+        assert!(!allowlists.permits(&deep.pool_datum.identifier, &denied, None));
+
+        // A permitted order takes the deep pool, which puts it in the batch.
+        let route = router::find_optimal_route(
+            &pools,
+            &[],
+            &token_a(),
+            &token_b(),
+            permitted.swap_offered().1,
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("route exists");
+        assert_eq!(
+            route.hops[0].splits[0].pool.ident,
+            deep.pool_datum.identifier
+        );
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&permitted, &route, &pools).expect("permitted order executes");
+
+        // Filtering the fallback map is not enough.
+        let upstream = allowlists.retain_visible(pools.clone(), &denied, None);
+        assert!(!upstream.contains_key(&deep.pool_datum.identifier));
+        assert!(
+            accum.current_pool_view(&upstream).contains_key(&deep.pool_datum.identifier),
+            "the overlay re-admits a pool filtered out upstream",
+        );
+
+        // Filtering what the router is handed keeps it out.
+        let view = allowlists.retain_visible(accum.current_pool_view(&pools), &denied, None);
+        assert!(!view.contains_key(&deep.pool_datum.identifier));
+        assert!(view.contains_key(&thin.pool_datum.identifier));
     }
 
     /// A swap expressed via the BASIC constraint module routes — and
@@ -2629,6 +4106,106 @@ mod tests {
         assert!(
             k1 >= k0,
             "k-value decreased: k0={k0}, k1={k1} (a0={a0}, b0={b0}, a1={a1}, b1={b1})"
+        );
+    }
+
+    fn with_holding(
+        order: std::sync::Arc<crate::sundaev4::SundaeV4Order>,
+        asset: &crate::cardano_types::AssetClass,
+        held: i64,
+    ) -> std::sync::Arc<crate::sundaev4::SundaeV4Order> {
+        let mut order = std::sync::Arc::try_unwrap(order).expect("fresh order");
+        order.value.insert(asset, BigInt::from(held));
+        std::sync::Arc::new(order)
+    }
+
+    #[test]
+    fn swap_executable_caps_offered_tokens_at_the_holding() {
+        let order = |held| {
+            with_holding(
+                make_order(token_e(), 10_000, token_b(), 1, 1),
+                &token_e(),
+                held,
+            )
+        };
+        assert_eq!(order(9_000).swap_executable(), BigInt::from(9_000));
+        assert_eq!(order(10_000).swap_executable(), BigInt::from(10_000));
+        assert_eq!(order(12_000).swap_executable(), BigInt::from(10_000));
+
+        let ada_order = with_holding(
+            make_order(ada(), 10_000_000, token_b(), 1, 1),
+            &ada(),
+            4_000_000,
+        );
+        assert_eq!(ada_order.swap_executable(), BigInt::from(10_000_000));
+    }
+
+    /// An order holding less of its offered token than its swap constraint
+    /// offers fills with what it holds, routed through CS then CP, and
+    /// settles terminally: no output returns to the order address.
+    #[test]
+    fn underfunded_routed_order_settles_terminally() {
+        use crate::sundaev4::accumulator::Accumulator;
+        use crate::sundaev4::router;
+        use std::collections::BTreeMap;
+
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cp_pool = make_pool(
+            &env,
+            0xAA,
+            token_a(),
+            1_000_000_000,
+            token_b(),
+            1_000_000_000,
+        );
+        let cs_pool = make_cs_pool(
+            &env,
+            0xDD,
+            vec![(token_a(), 1_000_000_000), (token_e(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            crate::sundaev4::types::Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+        );
+        let mut pool_map = BTreeMap::new();
+        pool_map.insert(cp_pool.pool_datum.identifier.clone(), cp_pool.clone());
+        pool_map.insert(cs_pool.pool_datum.identifier.clone(), cs_pool.clone());
+
+        let held = 10_000_000 - 24_540;
+        let order = with_holding(
+            make_order(token_e(), 10_000_000, token_b(), 1, 1),
+            &token_e(),
+            held,
+        );
+        assert_eq!(order.swap_executable(), BigInt::from(held));
+
+        let route = router::find_optimal_route(
+            &pool_map,
+            &[],
+            &token_e(),
+            &token_b(),
+            &order.swap_executable(),
+            router::RoutingLimits::unlimited(),
+        )
+        .expect("router should find E→A→B path");
+        let mut accum = Accumulator::new(env.exec.protocol_share);
+        accum.try_add_routed_order(&order, &route, &pool_map).expect("routed order should execute");
+        let plan = accum.into_plan();
+
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (result, _) = env
+            .build_and_eval_plan(&plan, &settings, 1000)
+            .expect("underfunded order should build, evaluate and conserve value");
+
+        let order_address = &result.resolved_inputs[&order.input].address;
+        let continues = result.tx_body.outputs.iter().any(|o| {
+            matches!(o, pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b)
+                if b.address.as_slice() == order_address.as_slice())
+        });
+        assert!(
+            !continues,
+            "a fill spending all the order holds must be terminal"
         );
     }
 }

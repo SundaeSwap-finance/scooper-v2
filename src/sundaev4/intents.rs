@@ -226,6 +226,14 @@ impl IntentStore {
         describe_invalid: impl Fn(&OrderKey) -> Option<String>,
         now_ms: u64,
     ) -> Result<(SubmitOutcome, Option<StoredIntent>)> {
+        // Bound the nesting BEFORE decoding. PlutusData's decoder recurses
+        // once per level with no limit of its own, and a stack overflow in
+        // Rust aborts the process rather than failing the request, so a
+        // single unauthenticated post would take the scooper down. The guard
+        // does not recurse and stops as soon as the limit is passed.
+        crate::cbor_guard::check_depth(&sse_cbor, crate::cbor_guard::MAX_CBOR_DEPTH)
+            .map_err(|e| anyhow::anyhow!("signed_execution rejected: {e}"))?;
+
         let pd: PlutusData = minicbor::decode(&sse_cbor)
             .map_err(|e| anyhow::anyhow!("signed_execution is not valid CBOR PlutusData: {e}"))?;
 
@@ -797,10 +805,18 @@ impl IntentService {
                     .await;
                 match result {
                     Ok(resp) if resp.status().is_success() => {}
+                    // Warn, not debug. Delivery is the whole job of an
+                    // observer, and the service runs at info, so a peer that
+                    // is unreachable meant every intent was accepted and
+                    // silently dropped with nothing in the journal.
+                    //
+                    // The case that prompted this: the tailnet policy has to
+                    // grant tag:scooper-public -> tag:scooper on 9998, and
+                    // until it does the connection is refused.
                     Ok(resp) => {
-                        tracing::debug!(url, status = %resp.status(), "intent gossip rejected")
+                        tracing::warn!(url, status = %resp.status(), "intent gossip rejected")
                     }
-                    Err(e) => tracing::debug!(url, "intent gossip failed: {e}"),
+                    Err(e) => tracing::warn!(url, "intent gossip failed: {e}"),
                 }
             });
         }
@@ -950,6 +966,7 @@ mod tests {
         });
         std::sync::Arc::new(SundaeV4Order {
             input: crate::cardano_types::TransactionInput::new([0xAB; 32].into(), 1),
+            address: Vec::new(),
             value: Value::default(),
             datum: OrderDatum {
                 owner: Multisig::Signature(vec![0x11; 28]),

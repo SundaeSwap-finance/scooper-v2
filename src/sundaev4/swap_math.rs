@@ -432,6 +432,11 @@ pub fn cs_fee_budget(
     &(&(&v1 - &dock) * lp_before) / &v0 - lp_before
 }
 
+/// The stableswap step parameters for a pool's config.
+pub fn ss_params(config: &super::types::StableSwapConfig) -> super::ss_math::SsParams {
+    super::ss_math::SsParams::from_config(config)
+}
+
 /// Dispatch fee budget computation by pool type.
 pub fn compute_fee_budget(
     pool_type: &super::types::PoolType,
@@ -465,6 +470,23 @@ pub fn compute_fee_budget(
             let before: Vec<BigInt> = assets_before.iter().map(|(_, a)| a.clone()).collect();
             let after: Vec<BigInt> = assets_after.iter().map(|(_, a)| a.clone()).collect();
             cs_fee_budget(&before, &after, lp_before, prices, bounty_k)
+        }
+        super::types::PoolType::StableSwap { config } => {
+            // ss_check.check_swap bound 5: after_lp + fee_budget =
+            // floor(before_lp · D_after / D_before). D is a function of the
+            // rated reserves, so both sides derive from the asset lists.
+            let p = super::ss_math::SsParams::from_config(config);
+            let before: Vec<BigInt> = assets_before.iter().map(|(_, a)| a.clone()).collect();
+            let after: Vec<BigInt> = assets_after.iter().map(|(_, a)| a.clone()).collect();
+            match (p.d_of(&before), p.d_of(&after)) {
+                (Ok(d_b), Ok(d_a)) if d_b.is_positive() => {
+                    super::ss_math::fee_budget(&d_b, &d_a, lp_before)
+                }
+                _ => {
+                    warn!("ss fee_budget: could not derive D for the step");
+                    BigInt::from(0)
+                }
+            }
         }
         super::types::PoolType::ConcentratedLiquidity {
             sqrt_price_a,

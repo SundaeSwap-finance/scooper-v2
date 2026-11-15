@@ -385,6 +385,15 @@ impl IndexerDao for SqliteIndexerDao {
         Ok(sqlx::query_as(&query).fetch_all(&self.pool).await?)
     }
 
+    async fn load_scoop_records_since(&self, since_slot: u64) -> Result<Vec<ScoopRecord>> {
+        let scoop_records_table = self.scoop_records_table();
+        let query = format!(
+            "SELECT tx_id, slot, pool_id, n_orders, scooper FROM {scoop_records_table} \
+             WHERE slot >= ? ORDER BY slot;"
+        );
+        Ok(sqlx::query_as(&query).bind(since_slot as i64).fetch_all(&self.pool).await?)
+    }
+
     async fn load_module_configs(&self) -> Result<Vec<PersistedModuleConfig>> {
         let module_configs_table = self.module_configs_table();
         let query = format!(

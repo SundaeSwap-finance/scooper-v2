@@ -288,6 +288,20 @@ impl Blueprint {
         )
         .ok();
 
+        // Stableswap module (optional — only present once the module is deployed).
+        let stableswap = make_info(
+            self,
+            &[
+                "stableswap.withdraw",
+                "stableswap_module",
+                "stableswap",
+                "stableSwap",
+            ],
+            "stableswap.withdraw",
+            "stableswap",
+        )
+        .ok();
+
         Ok(ModuleScripts {
             constant_product: make_info(self, mappings[0].0, mappings[0].1, mappings[0].2).ok(),
             fee_split: make_info(self, mappings[1].0, mappings[1].1, mappings[1].2)?,
@@ -299,6 +313,7 @@ impl Blueprint {
             constant_sum,
             fee_constraint,
             concentrated_liquidity,
+            stableswap,
             swap_order,
             basic_order,
             route_order,

@@ -52,6 +52,42 @@ pub enum PoolViewType {
         spb_den: BigInt,
         lp: BigInt,
     },
+    /// Curve-style stableswap, direction-oriented: `rate_in` / `rate_out`
+    /// are the config rates of the view's in / out asset. `d` is the sum
+    /// invariant for the view's reserves at those rates, computed once at
+    /// graph build so the split solver's many probes skip one Newton each.
+    StableSwap {
+        amp: BigInt,
+        rate_in: BigInt,
+        rate_out: BigInt,
+        d: BigInt,
+    },
+}
+
+/// The stableswap swap for a view: `dx` of the in asset against the out
+/// asset at the view's reserves. `None` when the module would refuse the
+/// step (no output, or a self-check failure).
+fn ss_view_swap(pool: &PoolView, dx: &BigInt) -> Option<crate::sundaev4::ss_math::SsSwapResult> {
+    let PoolViewType::StableSwap {
+        amp,
+        rate_in,
+        rate_out,
+        d,
+    } = &pool.view_type
+    else {
+        return None;
+    };
+    let p = crate::sundaev4::ss_math::SsParams {
+        amp: amp.clone(),
+        fee: crate::sundaev4::types::Rational {
+            num: BigInt::from(pool.fee_num),
+            den: BigInt::from(pool.fee_den),
+        },
+        rates: vec![rate_in.clone(), rate_out.clone()],
+    };
+    let reserves = [pool.reserve_in.clone(), pool.reserve_out.clone()];
+    // total_lp only feeds the step's fee budget, which the router does not read.
+    crate::sundaev4::ss_math::swap_step(&p, &reserves, &BigInt::from(0), 0, dx, Some(d)).ok()
 }
 
 /// Lightweight pool view for the router (direction-aware).
@@ -108,14 +144,52 @@ impl RoutingLimits {
     /// Compute limits from an order's lovelace budget and per-unit costs.
     /// `cost_per_pool == 0` or `cost_per_step == 0` means that axis is
     /// unlimited.
-    pub fn from_budget(budget_lovelace: u64, cost_per_pool: u64, cost_per_step: u64) -> Self {
-        let max_pools =
-            (budget_lovelace as usize).checked_div(cost_per_pool as usize).unwrap_or(usize::MAX);
-        let max_steps =
-            (budget_lovelace as usize).checked_div(cost_per_step as usize).unwrap_or(usize::MAX);
+    ///
+    /// This is the INVERSE of how the budget was built. A client sizes an
+    /// order from the quote it was given:
+    ///
+    ///   budget = base_fee + (pools - 1)·cost_per_pool + (steps - 1)·cost_per_step
+    ///
+    /// because `base_fee` is what one pool and one step already costs, so the
+    /// marginal terms pay only for fan-out ABOVE a direct swap. Inverting it
+    /// means spending `base_fee` on that first pool and step, and letting what
+    /// remains buy the extras.
+    ///
+    /// Dividing the whole budget by `cost_per_pool` instead — as this did —
+    /// charges the first pool twice and silently caps what any order can
+    /// reach. It imposed a ceiling that was an artifact rather than a policy:
+    /// a two-pool plan was only routable while
+    /// `cost_per_pool <= base_fee + cost_per_step`, so raising the per-pool
+    /// cost past 1.78 ADA (at a 1.28 base fee) made two-pool routes
+    /// unroutable at ANY budget, including budgets sized for them. With the
+    /// inverse there is no such ceiling and the per-pool cost is free to be
+    /// whatever policy wants.
+    ///
+    /// `base_fee` unknown (the fee-settings node is not indexed yet) falls
+    /// back to 0, which is the old, conservative reading: the order is treated
+    /// as if it had paid for no minimal route, so it buys strictly fewer
+    /// pools, never more.
+    pub fn from_budget(
+        budget_lovelace: u64,
+        base_fee: u64,
+        cost_per_pool: u64,
+        cost_per_step: u64,
+    ) -> Self {
+        // What is left after the minimal one-pool, one-step route the base fee
+        // already bought. Saturating: an order budgeted below the base fee has
+        // nothing to spend on fan-out, and still gets its one pool.
+        let extra = budget_lovelace.saturating_sub(base_fee) as usize;
+        let axis = |unit: u64| -> usize {
+            match extra.checked_div(unit as usize) {
+                // The one pool and one step the base fee covers, plus what the
+                // remainder buys.
+                Some(n) => n.saturating_add(1),
+                None => usize::MAX,
+            }
+        };
         Self {
-            max_pools,
-            max_steps,
+            max_pools: axis(cost_per_pool),
+            max_steps: axis(cost_per_step),
         }
     }
 }
@@ -159,6 +233,9 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
+        // The curve is asymptotic in the out reserve: the pinned output is
+        // always below it, and a fee-bearing step never lowers D.
+        PoolViewType::StableSwap { .. } => None,
         PoolViewType::Conversion {
             rate_num, rate_den, ..
         } => {
@@ -320,6 +397,9 @@ fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
                 &fee_den,
             )
         }
+        PoolViewType::StableSwap { .. } => {
+            ss_view_swap(pool, dx).map(|s| s.dy).unwrap_or_else(|| BigInt::from(0))
+        }
     };
     // Cap at reserve_out — can't withdraw more than the pool holds.
     // (CP naturally stays below reserves; CS can exceed them.)
@@ -414,6 +494,49 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
                 }
                 &fee_mult * &va0 * &vb0 * spa_num * &scale() / &denom
             }
+        }
+        PoolViewType::StableSwap {
+            amp,
+            rate_in,
+            rate_out,
+            d,
+        } => {
+            // Implicit differentiation of 4A(x+y) + D = 4AD + D³/(4xy) on the
+            // scaled reserves gives |dy/dx| = (16A·x²y² + D³·y) / (16A·x²y² + D³·x).
+            // Evaluate at the curve point the allocation reaches (fee excluded,
+            // as the exchange invariant sees it), then convert scaled units to
+            // token units (× rate_in / rate_out) and apply the output-side fee.
+            let p = BigInt::from(crate::sundaev4::ss_math::CALC_PRECISION);
+            let x_before = &(&pool.reserve_in * rate_in) * &p;
+            let y_before = &(&pool.reserve_out * rate_out) * &p;
+            let (x, y) = if raw_allocated.is_positive() {
+                let in_after = &pool.reserve_in + raw_allocated;
+                match crate::sundaev4::ss_math::get_raw_swap_rated(
+                    amp,
+                    d,
+                    &in_after,
+                    rate_in,
+                    &pool.reserve_out,
+                    rate_out,
+                ) {
+                    Ok(raw) => (&(&in_after * rate_in) * &p, &y_before - &raw),
+                    Err(_) => return BigInt::from(0),
+                }
+            } else {
+                (x_before, y_before)
+            };
+            if !x.is_positive() || !y.is_positive() {
+                return BigInt::from(0);
+            }
+            let sixteen_a_x2y2 = &(&(&BigInt::from(16) * amp) * &(&x * &x)) * &(&y * &y);
+            let d3 = &(d * d) * d;
+            let num = &sixteen_a_x2y2 + &(&d3 * &y);
+            let den = &sixteen_a_x2y2 + &(&d3 * &x);
+            let denom = &(&fee_den * rate_out) * &den;
+            if !denom.is_positive() {
+                return BigInt::from(0);
+            }
+            &(&(&fee_mult * rate_in) * &num) * &scale() / &denom
         }
     }
 }
@@ -548,6 +671,48 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                         _ => raw,
                     }
                 }
+                PoolViewType::StableSwap {
+                    rate_in, rate_out, ..
+                } => {
+                    // No closed form: the marginal falls monotonically in dx,
+                    // so bisect for the largest dx whose marginal still meets
+                    // λ. The bracket's top is well past any allocation that
+                    // could matter (several times the pool's depth in input
+                    // units); a marginal still above λ there means the pool
+                    // takes everything the caller has.
+                    if marginal_at_allocation(pool, &BigInt::from(0)) < *lambda {
+                        return BigInt::from(0);
+                    }
+                    let depth_in_input_units = if rate_in.is_positive() {
+                        &(&pool.reserve_out * rate_out) / rate_in
+                    } else {
+                        BigInt::from(0)
+                    };
+                    let mut hi = &(&(&pool.reserve_in + &depth_in_input_units) * &BigInt::from(4))
+                        + &BigInt::from(1);
+                    if marginal_at_allocation(pool, &hi) >= *lambda {
+                        return hi;
+                    }
+                    let mut lo = BigInt::from(0);
+                    let two = BigInt::from(2);
+                    let one = BigInt::from(1);
+                    for _ in 0..64 {
+                        let width = &hi - &lo;
+                        // Stop at one part per million of the bracket; the
+                        // split solver only needs the allocation's scale.
+                        let tol = &hi / &BigInt::from(1_000_000u64);
+                        if width <= one || width <= tol {
+                            break;
+                        }
+                        let mid = &(&lo + &hi) / &two;
+                        if marginal_at_allocation(pool, &mid) >= *lambda {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                }
             }
         })
         .collect()
@@ -676,8 +841,11 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
         // Sum allocations
         let mut total_alloc: BigInt = allocs.iter().fold(BigInt::from(0), |a, b| &a + b);
 
-        // Cap proportionally if exceeds total_input
-        if &total_alloc > total_input {
+        // Cap proportionally if exceeds total_input. Remember it: the rescale
+        // brings total_alloc back under total_input, but the bisection must
+        // still raise λ.
+        let over = &total_alloc > total_input;
+        if over {
             for a in allocs.iter_mut() {
                 *a = &*a * total_input / &total_alloc;
             }
@@ -697,11 +865,11 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
             best_allocs = allocs;
         }
 
-        if &total_alloc == total_input || &lambda_hi - &lambda_lo <= BigInt::from(1) {
+        if (!over && &total_alloc == total_input) || &lambda_hi - &lambda_lo <= BigInt::from(1) {
             break;
         }
 
-        if &total_alloc > total_input {
+        if over {
             lambda_lo = lambda_mid;
         } else {
             lambda_hi = lambda_mid;
@@ -834,6 +1002,30 @@ fn build_graph(
                     Box::new(move |i, j| PoolViewType::ConstantSum {
                         price_in: prices[i].clone(),
                         price_out: prices[j].clone(),
+                    }),
+                )
+            }
+            PoolType::StableSwap { config } => {
+                let fn_num = config.fee.num.clone().unwrap().to_u64().unwrap_or(0);
+                let fn_den = config.fee.den.clone().unwrap().to_u64().unwrap_or(1);
+                let params = swap_math::ss_params(config);
+                let reserves: Vec<BigInt> = assets.iter().map(|(_, q)| q.clone()).collect();
+                // A pool whose D cannot be derived (wrong shape, or a config
+                // the module would reject) gets no edges.
+                let Ok(d) = params.d_of(&reserves) else {
+                    tracing::warn!(pool = %ident, "stableswap pool skipped by the router: D not derivable");
+                    continue;
+                };
+                let amp = params.amp.clone();
+                let rates = params.rates.clone();
+                (
+                    fn_num,
+                    fn_den,
+                    Box::new(move |i, j| PoolViewType::StableSwap {
+                        amp: amp.clone(),
+                        rate_in: rates[i].clone(),
+                        rate_out: rates[j].clone(),
+                        d: d.clone(),
                     }),
                 )
             }
@@ -1248,7 +1440,7 @@ pub fn find_blended_route(
         output_token,
         amount,
         limits,
-    )?;
+    );
     let single_plan = |plan: RoutingPlan| -> BlendedRoute {
         BlendedRoute {
             total_input: plan.total_input.clone(),
@@ -1261,7 +1453,7 @@ pub fn find_blended_route(
     let max_depth = 4.min(limits.max_pools.max(1)).min(limits.max_steps.max(1));
     let paths = find_paths(&graph, input_token, output_token, max_depth);
     if paths.len() < 2 {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     // Rank paths by standalone output at the full amount, then greedily keep
@@ -1272,7 +1464,12 @@ pub fn find_blended_route(
         .iter()
         .enumerate()
         .filter_map(|(i, path)| {
-            let hops = evaluate_path(path, amount, &limits);
+            let mut hops = evaluate_path(path, amount, &limits);
+            if hops.is_empty() {
+                // Too capped for the full amount: still a candidate partial
+                // branch, ranked (below full-amount paths) by one chunk's output.
+                hops = evaluate_path(path, &(amount / &BigInt::from(CHUNKS)), &limits);
+            }
             let out = hops.last().map(|h| h.total_output.clone())?;
             out.is_positive().then_some((i, out))
         })
@@ -1292,13 +1489,13 @@ pub fn find_blended_route(
         }
     }
     if chosen.len() < 2 {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     // Water-fill `amount` across the chosen paths chunk by chunk.
     let chunk = amount / &BigInt::from(CHUNKS);
     if !chunk.is_positive() {
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
     let out_at = |path_idx: usize, alloc: &BigInt| -> BigInt {
         if !alloc.is_positive() {
@@ -1348,7 +1545,7 @@ pub fn find_blended_route(
         let Some(out) = hops.last().map(|h| h.total_output.clone()) else {
             // A branch that evaluated fine during allocation must still
             // evaluate at its final size; if not, play it safe.
-            return Some(single_plan(single));
+            return single.map(single_plan);
         };
         branches.push(RoutingPlan {
             hops,
@@ -1397,19 +1594,19 @@ pub fn find_blended_route(
                 output_token,
                 amount,
                 limits,
-            ) && pruned.total_output > single.total_output
+            ) && single.as_ref().is_none_or(|s| pruned.total_output > s.total_output)
             {
                 return Some(pruned);
             }
         }
-        return Some(single_plan(single));
+        return single.map(single_plan);
     }
 
     let total_output: BigInt = branches.iter().fold(BigInt::from(0), |a, b| &a + &b.total_output);
     // Paranoia: integer flooring at chunk boundaries could in principle land
     // a hair under the all-in answer; never return a worse blend.
-    if branches.len() < 2 || total_output <= single.total_output {
-        return Some(single_plan(single));
+    if branches.len() < 2 || single.as_ref().is_some_and(|s| total_output <= s.total_output) {
+        return single.map(single_plan);
     }
 
     Some(BlendedRoute {
@@ -2247,5 +2444,197 @@ mod tests {
         // short-input pool positive (the swap rebalances it).
         assert!(tiebreak_score(&balanced, &dx).is_negative());
         assert!(tiebreak_score(&imbalanced, &dx).is_positive());
+    }
+
+    /// A budget sized from a quote must buy back the plan it was sized for.
+    ///
+    /// The client computes `base_fee + (p-1)*cpp + (s-1)*cps` from the quote and
+    /// locks it into the order; this inverts it. Before the inverse, dividing
+    /// the whole budget by `cost_per_pool` charged the first pool twice, and a
+    /// two-pool plan was routable only while `cpp <= base_fee + cps`.
+    #[test]
+    fn a_budget_buys_back_the_plan_it_was_sized_for() {
+        const BASE_FEE: u64 = 1_280_000;
+        for (cpp, cps) in [
+            (1_000_000u64, 500_000u64),
+            // Past the old ceiling of base_fee + cps = 1.78 ADA: these used to
+            // make two-pool routes unroutable at any budget.
+            (2_000_000, 500_000),
+            (5_000_000, 1_000_000),
+        ] {
+            for pools in 1u64..=4 {
+                for steps in pools..=6 {
+                    let budget = BASE_FEE + (pools - 1) * cpp + (steps - 1) * cps;
+                    let limits = RoutingLimits::from_budget(budget, BASE_FEE, cpp, cps);
+                    assert!(
+                        limits.max_pools >= pools as usize,
+                        "cpp {cpp}: a {pools}-pool/{steps}-step plan budgets {budget}, \
+                         which buys only {} pools",
+                        limits.max_pools,
+                    );
+                    assert!(
+                        limits.max_steps >= steps as usize,
+                        "cps {cps}: a {pools}-pool/{steps}-step plan budgets {budget}, \
+                         which buys only {} steps",
+                        limits.max_steps,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mainnet order that went unexecutable: quoted as two pools, budgeted
+    /// at 1_655_000 against the API's stale 250k/125k costs, then sized by a
+    /// scooper charging 1_000_000 per pool. The budget is genuinely short, so
+    /// one pool is the right answer even with the inverse - the fix for that
+    /// order was the API's constants, not this. Corrected, it buys two.
+    #[test]
+    fn mainnet_20260928_underbudgeted_order_still_buys_one_pool() {
+        const BASE_FEE: u64 = 1_280_000;
+        let stale = RoutingLimits::from_budget(1_655_000, BASE_FEE, 1_000_000, 500_000);
+        assert_eq!(
+            stale.max_pools, 1,
+            "1_655_000 really only pays for one pool"
+        );
+
+        let corrected = RoutingLimits::from_budget(2_780_000, BASE_FEE, 1_000_000, 500_000);
+        assert!(
+            corrected.max_pools >= 2,
+            "a correctly-sized two-pool budget buys two"
+        );
+    }
+
+    /// An order below the base fee still gets the one pool it needs to fill at
+    /// all, rather than zero.
+    #[test]
+    fn a_budget_under_the_base_fee_still_buys_one_pool() {
+        let limits = RoutingLimits::from_budget(10_000, 1_280_000, 1_000_000, 500_000);
+        assert_eq!(limits.max_pools, 1);
+        assert_eq!(limits.max_steps, 1);
+    }
+
+    /// A zero cost means that axis is unbounded, unchanged.
+    #[test]
+    fn zero_cost_leaves_an_axis_unlimited() {
+        let limits = RoutingLimits::from_budget(2_000_000, 1_280_000, 0, 0);
+        assert_eq!(limits.max_pools, usize::MAX);
+        assert_eq!(limits.max_steps, usize::MAX);
+    }
+
+    /// Adjacent concentrated-liquidity bands, each capped by its own reserve,
+    /// must be filled in price order: the best band first, the next one only
+    /// once the first is exhausted. Each band `k` covers √p ∈ [0.99^(k+1),
+    /// 0.99^k] (≈2 % in price) and sits just above spot, so it holds only the
+    /// output token. The order needs about three bands; the far ones must get
+    /// nothing, and adding them must never lower the output.
+    #[test]
+    fn test_split_fills_adjacent_cl_bands_in_price_order() {
+        let den: i64 = 1_000_000_000;
+        let sqrt_p = |k: i32| (den as f64 * 0.99f64.powi(k)).round() as i64;
+        let lp: i64 = 1_000_000_000_000;
+        let band = |k: i32| {
+            let (spb, spa) = (sqrt_p(k), sqrt_p(k + 1));
+            PoolView {
+                ident: Ident::new(&[k as u8 + 1]),
+                // Selling A: real A reserve 0, real B = L·(√pb − √pa).
+                reserve_in: BigInt::from(0),
+                reserve_out: BigInt::from(lp / den * (spb - spa)),
+                fee_num: 3,
+                fee_den: 1000,
+                view_type: PoolViewType::ConcentratedLiquidity {
+                    is_a_input: true,
+                    spa_num: BigInt::from(spa),
+                    spa_den: BigInt::from(den),
+                    spb_num: BigInt::from(spb),
+                    spb_den: BigInt::from(den),
+                    lp: BigInt::from(lp),
+                },
+            }
+        };
+        let bands: Vec<PoolView> = (0..14).map(band).collect();
+        let cap = |p: &PoolView| pool_absorb_cap(p).expect("CL bands are capped");
+        // Two full bands plus half of the third.
+        let dx = &(&cap(&bands[0]) + &cap(&bands[1])) + &(&cap(&bands[2]) / &BigInt::from(2));
+
+        // Reference: greedy fill in price order.
+        let mut left = dx.clone();
+        let mut greedy = BigInt::from(0);
+        for b in &bands {
+            let take = if left > cap(b) { cap(b) } else { left.clone() };
+            greedy = &greedy + &pool_output(b, &take);
+            left = &left - &take;
+        }
+        assert!(!left.is_positive());
+
+        let total = |splits: &[SplitEntry]| {
+            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.output_amount)
+        };
+        let routed = |splits: &[SplitEntry]| {
+            splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.input_amount)
+        };
+
+        let near = optimize_split(&bands[..3], &dx);
+        let all = optimize_split(&bands, &dx);
+        assert_eq!(routed(&near), dx);
+        assert_eq!(routed(&all), dx);
+
+        // Within 1e-6 of the greedy optimum.
+        let tol = &greedy / &BigInt::from(1_000_000);
+        assert!(
+            &total(&all) + &tol >= greedy,
+            "14 bands: {} vs greedy {}",
+            total(&all),
+            greedy,
+        );
+        assert!(
+            &total(&near) + &tol >= greedy,
+            "3 bands: {} vs greedy {}",
+            total(&near),
+            greedy,
+        );
+        for s in &all {
+            let k = bands.iter().position(|b| b.ident == s.pool.ident).unwrap();
+            assert!(
+                k < 3,
+                "band {} gets {} but should be untouched",
+                k,
+                s.input_amount
+            );
+        }
+    }
+
+    /// The proportional rescale of an over-allocation can land exactly on
+    /// `total_input`; the bisection must not take that for convergence. Three
+    /// constant-sum pools of 1M capacity each, priced 1.2, 1.1 and 1.0, sell
+    /// 1.5M (no pool can take it alone). The first λ is below every marginal:
+    /// all three absorb their cap, 3M, and halving it gives exactly 1.5M. The
+    /// worst pool must still end up with nothing.
+    #[test]
+    fn test_split_exact_rescale_keeps_raising_lambda() {
+        let cs = |byte: u8, price_in: i64, reserve_out: i64| PoolView {
+            ident: Ident::new(&[byte]),
+            reserve_in: BigInt::from(0),
+            reserve_out: BigInt::from(reserve_out),
+            fee_num: 0,
+            fee_den: 1000,
+            view_type: PoolViewType::ConstantSum {
+                price_in: BigInt::from(price_in),
+                price_out: BigInt::from(10),
+            },
+        };
+        let best = cs(0x01, 12, 1_200_000);
+        let mid = cs(0x02, 11, 1_100_000);
+        let worst = cs(0x03, 10, 1_000_000);
+        let dx = BigInt::from(1_500_000);
+
+        let splits = optimize_split(&[best, mid, worst.clone()], &dx);
+
+        let routed = splits.iter().fold(BigInt::from(0), |acc, s| &acc + &s.input_amount);
+        assert_eq!(routed, dx);
+        assert!(
+            splits.iter().all(|s| s.pool.ident != worst.ident),
+            "the worst pool must get nothing: {:?}",
+            splits.iter().map(|s| (&s.pool.ident, &s.input_amount)).collect::<Vec<_>>(),
+        );
     }
 }

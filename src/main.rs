@@ -23,6 +23,7 @@ mod bigint;
 mod blueprint;
 mod bootstrap;
 mod cardano_types;
+mod cbor_guard;
 mod config;
 mod datum_lookup;
 mod events;
@@ -51,8 +52,27 @@ struct Args {
     config: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack size of the tokio worker threads.
+///
+/// Block decoding (pallas, driven by acropolis) recurses once per level of
+/// nested CBOR. A transaction's metadata can nest about 16,000 levels inside
+/// the 16 KB transaction limit, and on 2026-11-03 preview block 4,821,137
+/// (slot 127,055,999) did: decoding it overflowed tokio's default 2 MiB
+/// worker stack, and this scooper crash-looped on that block for three days
+/// (8,863 restarts). 8 MiB decodes it; 64 MiB leaves an eightfold margin
+/// over the deepest nesting a transaction can carry. The stack is reserved,
+/// not committed, so idle workers cost nothing extra.
+pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_SIZE)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let config = config::load_config(&args.config)?;
     instrumentation::init(&config.log)?;
@@ -83,10 +103,43 @@ async fn main() -> Result<()> {
         v4.set_network(sundaev4::AddressNetwork::from_network_name(&network_name));
         info!(network_name, network = ?v4.network, "v4 address network");
     }
+    let observer = config.role.is_observer();
     if let Some(ref mut v4) = protocol.v4
         && let Some(ref mut exec) = v4.execution
     {
-        exec.resolve_secret_key().expect("failed to resolve scooper secret key");
+        if observer {
+            // The point of the observer role is that this instance cannot
+            // sign. Refuse to start if a key is present rather than run with
+            // one loaded and merely unused: a key on a public box is the
+            // thing the split exists to prevent, and it should be loud.
+            if !exec.scooper_secret_key.is_empty() || exec.scooper_secret_key_file.is_some() {
+                panic!(
+                    "role is observer but a scooper key is configured; \
+                     remove scooper-secret-key and scooper-secret-key-file"
+                );
+            }
+            info!("role observer: indexing and gossiping intents, no key, no execution");
+            // Gossip is the entire job of an observer: it accepts intents on
+            // a public endpoint and forwards them to the instance that can
+            // execute them. With no peers it accepts intents and drops them
+            // on the floor.
+            //
+            // Worth saying loudly because the field is easy to get wrong and
+            // impossible to notice. ScooperExecution is kebab-case and does
+            // not deny unknown fields, so `strategy_peers` instead of
+            // `strategy-peers` parses cleanly, sets nothing, and reports
+            // nothing.
+            if exec.strategy_peers.is_empty() {
+                warn!(
+                    "role is observer but strategy-peers is empty: accepted intents will be \
+                     stored and never forwarded. Check the spelling; the key is kebab-case."
+                );
+            } else {
+                info!(peers = ?exec.strategy_peers, "observer will gossip accepted intents");
+            }
+        } else {
+            exec.resolve_secret_key().expect("failed to resolve scooper secret key");
+        }
     }
     let v4_execution = protocol.v4.as_ref().and_then(|v4| v4.execution.clone());
 
@@ -223,8 +276,12 @@ async fn main() -> Result<()> {
         shutdown.child_token(),
     ));
     let v4_fee = v4_execution.as_ref().map(|e| e.fee);
+    let v4_protocol_share = v4_execution.as_ref().map(|e| e.protocol_share);
     let v4_routing_costs =
         v4_execution.as_ref().map(|e| (e.cost_per_pool_lovelace, e.cost_per_step_lovelace));
+    let v4_pool_allowlists = std::sync::Arc::new(
+        v4_execution.as_ref().map(|e| e.pool_allowlists.clone()).unwrap_or_default(),
+    );
     let v4_module_preimages = v4_execution
         .as_ref()
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
@@ -248,29 +305,40 @@ async fn main() -> Result<()> {
             shutdown.child_token(),
         ));
     }
-    let scooper_handle = tokio::spawn(
-        Scooper::new(
-            config.log.trace_directory.clone(),
-            event_tx.subscribe(),
-            v3_state.clone(),
-            v4_state.clone(),
-            v4_execution,
-            paused.clone(),
-            metrics.clone(),
-            intents.clone(),
-            scooper_provisional,
-            scooper_node_submit,
-        )?
-        .run(shutdown.child_token()),
-    );
+    // An observer never builds a transaction, so the scooper loop is not
+    // started at all. Leaving it running and gating each action would give
+    // every future action a new chance to forget the gate.
+    let scooper_handle = if observer {
+        tokio::spawn(async move {})
+    } else {
+        tokio::spawn(
+            Scooper::new(
+                config.log.trace_directory.clone(),
+                event_tx.subscribe(),
+                v3_state.clone(),
+                v4_state.clone(),
+                v4_execution,
+                paused.clone(),
+                metrics.clone(),
+                intents.clone(),
+                scooper_provisional,
+                scooper_node_submit,
+            )?
+            .run(shutdown.child_token()),
+        )
+    };
     let server_handle = tokio::spawn(server::admin_server(
         config.server.clone(),
+        config.role,
         config.network_name(),
         v3_state.clone(),
         v4_state.clone(),
         v4_fee,
         v4_routing_costs,
+        v4_pool_allowlists,
         v4_module_preimages,
+        v4_protocol_share,
+        v4_state.as_ref().map(|_| Arc::from(persistence.indexer_dao("sundae_v4"))),
         resync_tx,
         event_tx.clone(),
         paused.clone(),
@@ -479,6 +547,38 @@ async fn manager_loop(
             }
         }
 
+        // Module-config recovery used to live only inside run_bootstrap, and
+        // run_bootstrap runs only on a DB that has never indexed a block. Any
+        // scooper that started once with a bad config, stopped mid-sync, or
+        // joined after a pool was created therefore never learned that pool's
+        // config and scooped it with guessed defaults that fail eval. Recover
+        // whatever is missing on every start, then re-classify the pools that
+        // were loaded with the wrong defaults.
+        if let (Some(bootstrap_config), Some(v4_proto), Some(v4_state)) =
+            (&protocol.bootstrap, protocol.v4.as_ref(), &v4_state)
+        {
+            match bootstrap::recover_missing_module_configs(
+                bootstrap_config,
+                v4_proto,
+                v4_state,
+                &persistence,
+            )
+            .await
+            {
+                Ok(changed) if !changed.is_empty() => {
+                    if let Some((ref mut v4_index, _)) = v4_index_and_config {
+                        if let Err(e) = v4_index.rehydrate_module_configs().await {
+                            warn!("v4: module-config rehydrate after recovery failed: {e:#}");
+                        } else if let Err(e) = v4_index.reclassify_pools(v4_state, &changed).await {
+                            warn!("v4: re-classifying recovered pools failed: {e:#}");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("v4: module-config recovery failed: {e:#}"),
+            }
+        }
+
         if let Some((v3_index, v3_config)) = v3_index_and_config {
             let start = bootstrap_point.clone().unwrap_or_else(|| v3_config.starting_point.clone());
             indexer.add_index(v3_index, start, force_restart).await.unwrap();
@@ -513,5 +613,46 @@ async fn manager_loop(
         };
 
         warn!("restarting indexer — resync requested or connection lost");
+    }
+}
+
+#[cfg(test)]
+mod decode_stack_tests {
+    use super::WORKER_STACK_SIZE;
+
+    /// Preview block 4,821,137 as sync-v2 archives it: `[era, block]`, the
+    /// shape the peer network interface hands to pallas. Its eighth
+    /// transaction carries 16 KB of metadata nested ~16,000 levels deep.
+    const BLOCK: &[u8] = include_bytes!("../tests/fixtures/preview-block-4821137.cbor");
+
+    fn decodes_on_stack(stack: usize) -> bool {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(|| {
+                let block = pallas_traverse::MultiEraBlock::decode(BLOCK).expect("decode");
+                assert_eq!(block.slot(), 127_055_999);
+                assert_eq!(block.txs().len(), 9);
+            })
+            .unwrap()
+            .join()
+            .is_ok()
+    }
+
+    #[test]
+    fn deeply_nested_metadata_block_decodes_on_the_worker_stack() {
+        assert!(decodes_on_stack(WORKER_STACK_SIZE));
+    }
+
+    // Release builds only. An unoptimized build uses larger frames: it
+    // overflows at 32 MiB on this block and decodes at the 64 MiB worker
+    // stack, which the test above checks in every build. The 4x headroom
+    // claim is about the binary operators run.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn worker_stack_is_well_above_what_the_block_needs() {
+        // 8 MiB is enough; the worker gets 64. If pallas ever needs more per
+        // level, this is the test that says so before an operator does.
+        assert!(decodes_on_stack(8 * 1024 * 1024));
+        const { assert!(WORKER_STACK_SIZE >= 4 * 8 * 1024 * 1024) };
     }
 }

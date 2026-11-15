@@ -3,9 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use num_traits::Signed;
-use pallas_addresses::{
-    Address, Network, ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
-};
+use pallas_addresses::{ScriptHash, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
 use pallas_codec::utils::CborWrap;
 use pallas_primitives::conway;
 use pallas_primitives::{Bytes as PallasBytes, Hash, NonEmptyKeyValuePairs, PositiveCoin};
@@ -153,8 +151,32 @@ fn encode_bootstrap_utxo(
 trait BootstrapProvider {
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>>;
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>>;
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>>;
     async fn fetch_tip(&self) -> Result<(u64, String)>;
+
+    /// Whether this provider can enumerate a script's UTxOs by PAYMENT
+    /// CREDENTIAL, i.e. find them at addresses carrying any staking part.
+    ///
+    /// Users attach their own stake credential to an order, so real orders
+    /// sit at `addr1z...`, not at the enterprise form `addr1w...`. A provider
+    /// that only matches one full address sees none of them and reports a
+    /// healthy "0 order UTxOs".
+    ///
+    /// This matters because bootstrap does two things: it seeds state, and it
+    /// then tells the indexer to start at the bootstrap tip. The second part
+    /// discards all history before that tip. A provider that cannot enumerate
+    /// by credential has not seen the orders, so skipping the history that
+    /// contains them loses every pending order, with no error anywhere.
+    /// `run_bootstrap` refuses rather than do that. The caller already falls
+    /// back to a full replay from the configured starting point, which reads
+    /// orders from the ledger and needs no provider at all.
+    ///
+    /// Kupo matches `{credential}/*`. Blockfrost accepts a bare payment
+    /// credential (CIP-5 `script1...` / `addr_vkh1...`) wherever it accepts
+    /// an address, and `/addresses/{credential}/utxos` returns the UTxOs at
+    /// every address with that payment part. Both answer true.
+    fn enumerates_by_credential(&self) -> bool {
+        true
+    }
 
     /// Fetch pool UTxOs by discovering addresses that hold NFTs under the given policy.
     /// Pools often sit at addresses with staking credentials, so a simple script-hash-to-address
@@ -219,6 +241,22 @@ struct KupoProvider {
 }
 
 impl KupoProvider {
+    /// Datum by hash; `Ok(None)` when Kupo does not know it, an error otherwise.
+    async fn fetch_datum_opt(&self, datum_hash: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/datums/{}", self.url, datum_hash);
+        let resp = self.client.get(&url).send().await.context("kupo: fetch datum")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp: KupoDatumResponse = resp
+            .error_for_status()
+            .context("kupo: datum status")?
+            .json()
+            .await
+            .context("kupo: parse datum")?;
+        hex::decode(&resp.datum).context("kupo: invalid datum hex").map(Some)
+    }
+
     fn new(url: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -329,16 +367,19 @@ impl BootstrapProvider for KupoProvider {
 
             // Resolve datum: inline datums have datum_type="inline" and datum is the CBOR hex.
             // Hash datums have datum_type="hash" and datum_hash is set.
+            // A fetch failure is an error, not a missing datum: the bootstrap
+            // skips a pool whose datum is None, and a snapshot persisted
+            // without that pool is never repaired. Only "Kupo has no such
+            // datum" (404) is a missing datum.
             let datum_cbor = if utxo.datum_type.as_deref() == Some("inline") {
                 utxo.datum.as_deref().and_then(|d| hex::decode(d).ok())
             } else if let Some(ref dh) = utxo.datum_hash {
-                match self.fetch_datum(dh).await {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) => {
-                        warn!(datum_hash = %dh, "kupo: could not fetch datum: {e:#}");
-                        None
-                    }
-                }
+                self.fetch_datum_opt(dh).await.with_context(|| {
+                    format!(
+                        "kupo: datum {dh} for {}#{}",
+                        utxo.transaction_id, utxo.output_index
+                    )
+                })?
             } else {
                 None
             };
@@ -386,22 +427,6 @@ impl BootstrapProvider for KupoProvider {
             });
         }
         Ok(result)
-    }
-
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/datums/{}", self.url, datum_hash);
-        let resp: KupoDatumResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("kupo: fetch datum")?
-            .error_for_status()
-            .context("kupo: datum status")?
-            .json()
-            .await
-            .context("kupo: parse datum")?;
-        hex::decode(&resp.datum).context("kupo: invalid datum hex")
     }
 
     async fn fetch_tip(&self) -> Result<(u64, String)> {
@@ -459,41 +484,207 @@ impl BootstrapProvider for KupoProvider {
 // Blockfrost provider
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Blockfrost rate-limits per project as a token bucket: a burst of 500
+/// requests, refilled at 10 per second, and HTTP 429 beyond that. The
+/// provider keeps the same bucket locally so a bootstrap spends the burst
+/// and then settles at the refill rate instead of tripping 429 in a loop.
+const BLOCKFROST_BURST: f64 = 500.0;
+const BLOCKFROST_REFILL_PER_SEC: f64 = 10.0;
+/// Attempts per request before a network error or 5xx becomes an error.
+/// 429 is not counted: it clears within seconds and is retried until it does.
+const BLOCKFROST_MAX_ATTEMPTS: u32 = 6;
+/// Longest single back-off between attempts.
+const BLOCKFROST_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Local mirror of Blockfrost's token bucket.
+struct RateBucket {
+    tokens: f64,
+    refilled_at: tokio::time::Instant,
+}
+
+impl RateBucket {
+    fn full(now: tokio::time::Instant) -> Self {
+        Self {
+            tokens: BLOCKFROST_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Credit the refill since the last call, then take one token if there is
+    /// one. Returns how long to wait for the next token otherwise.
+    fn take(&mut self, now: tokio::time::Instant) -> Result<(), std::time::Duration> {
+        let elapsed = now.saturating_duration_since(self.refilled_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * BLOCKFROST_REFILL_PER_SEC).min(BLOCKFROST_BURST);
+        self.refilled_at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return Ok(());
+        }
+        Err(std::time::Duration::from_secs_f64(
+            (1.0 - self.tokens) / BLOCKFROST_REFILL_PER_SEC,
+        ))
+    }
+
+    /// The server said we are over: our mirror is ahead of it, so empty it.
+    fn drain(&mut self) {
+        self.tokens = 0.0;
+    }
+}
+
+/// How long to wait before attempt `attempt + 1`: the server's `Retry-After`
+/// when it sends one, else 1s doubling per attempt, capped.
+fn blockfrost_retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> std::time::Duration {
+    let backoff = std::time::Duration::from_secs(1u64 << attempt.min(10));
+    let wanted = match retry_after_secs {
+        Some(secs) => backoff.max(std::time::Duration::from_secs(secs)),
+        None => backoff,
+    };
+    wanted.min(BLOCKFROST_MAX_RETRY_DELAY)
+}
+
+/// Blockfrost serves `inline_datum` on a UTxO as the datum's CBOR in hex.
+/// Anything else (null, an object) yields None and the caller falls back to
+/// the datum endpoint.
+fn blockfrost_inline_datum_cbor(inline_datum: &serde_json::Value) -> Option<Vec<u8>> {
+    inline_datum.as_str().and_then(|hex_str| hex::decode(hex_str).ok())
+}
+
 struct BlockfrostProvider {
     client: reqwest::Client,
     url: String,
     project_id: String,
-    network: Network,
+    bucket: Mutex<RateBucket>,
+    /// Block hash → slot, so a page of UTxOs from the same block costs one call.
+    block_slots: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl BlockfrostProvider {
     fn new(url: &str, project_id: &str) -> Self {
-        let network = if url.contains("mainnet") {
-            Network::Mainnet
-        } else {
-            Network::Testnet
-        };
         Self {
             client: reqwest::Client::new(),
             url: url.trim_end_matches('/').to_string(),
             project_id: project_id.to_string(),
-            network,
+            bucket: Mutex::new(RateBucket::full(tokio::time::Instant::now())),
+            block_slots: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    fn script_address(&self, script_hash: &ScriptHash) -> String {
-        let shelley = ShelleyAddress::new(
-            self.network,
-            ShelleyPaymentPart::Script(*script_hash),
-            ShelleyDelegationPart::Null,
-        );
-        let addr = Address::from(shelley);
-        addr.to_bech32().unwrap_or_default()
+    /// Take one token from the bucket, sleeping until one is available.
+    /// Callers awaiting concurrently are serialised by the lock.
+    async fn throttle(&self) {
+        let mut bucket = self.bucket.lock().await;
+        loop {
+            match bucket.take(tokio::time::Instant::now()) {
+                Ok(()) => return,
+                Err(wait) => tokio::time::sleep(wait).await,
+            }
+        }
+    }
+
+    /// One paced GET with the project id. A 429 drains the local bucket and
+    /// is retried until it clears; a network error or 5xx is retried with
+    /// back-off up to BLOCKFROST_MAX_ATTEMPTS. Every other status is returned
+    /// as-is for the caller to interpret.
+    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        let mut failures = 0u32;
+        let mut rate_limited = 0u32;
+        loop {
+            self.throttle().await;
+            let sent = self.client.get(url).header("project_id", &self.project_id).send().await;
+            let (status, retry_after) = match sent {
+                Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    self.bucket.lock().await.drain();
+                    rate_limited += 1;
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let delay = blockfrost_retry_delay(rate_limited.min(4) - 1, retry_after);
+                    warn!(
+                        rate_limited,
+                        delay_ms = delay.as_millis() as u64,
+                        "blockfrost: 429 Too Many Requests; backing off and retrying {url}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(resp) if resp.status().is_server_error() => (resp.status().to_string(), None),
+                Ok(resp) => return Ok(resp),
+                Err(e) => (format!("{e:#}"), None),
+            };
+            failures += 1;
+            if failures >= BLOCKFROST_MAX_ATTEMPTS {
+                anyhow::bail!("blockfrost: {status} after {failures} attempts: GET {url}");
+            }
+            let delay = blockfrost_retry_delay(failures - 1, retry_after);
+            warn!(
+                attempt = failures,
+                delay_ms = delay.as_millis() as u64,
+                "blockfrost: {status}; retrying {url}"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Datum CBOR by hash; `Ok(None)` when Blockfrost has no such datum
+    /// (a hash-only output whose datum was never posted), an error otherwise.
+    async fn fetch_datum_opt(&self, datum_hash: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/scripts/datum/{}/cbor", self.url, datum_hash);
+        let resp = self.get(&url).await.context("blockfrost: fetch datum")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp: BlockfrostDatumCbor = resp
+            .error_for_status()
+            .context("blockfrost: datum status")?
+            .json()
+            .await
+            .context("blockfrost: parse datum")?;
+        hex::decode(&resp.cbor).context("blockfrost: invalid datum CBOR hex").map(Some)
+    }
+
+    /// Slot of a block by hash, cached for the life of the provider.
+    async fn block_slot(&self, block_hash: &str) -> Result<u64> {
+        if let Some(slot) = self.block_slots.lock().await.get(block_hash) {
+            return Ok(*slot);
+        }
+        let block_url = format!("{}/blocks/{}", self.url, block_hash);
+        let block: BlockfrostBlockForUtxo = self
+            .get(&block_url)
+            .await?
+            .error_for_status()
+            .context("blockfrost: block status")?
+            .json()
+            .await
+            .context("blockfrost: parse block")?;
+        let slot = block.slot.unwrap_or(0);
+        self.block_slots.lock().await.insert(block_hash.to_string(), slot);
+        Ok(slot)
+    }
+
+    /// The CIP-5 bech32 form of a script payment credential (`script1...`).
+    ///
+    /// Blockfrost accepts this wherever it accepts a full address, and the
+    /// UTxO query then covers every address with this payment part, whatever
+    /// staking part the user attached. Querying the enterprise address
+    /// (`addr1w...`) instead would match only outputs with no staking part,
+    /// which is none of the UI's orders.
+    fn script_credential(script_hash: &ScriptHash) -> String {
+        bech32::encode::<bech32::Bech32>(
+            bech32::Hrp::parse_unchecked("script"),
+            script_hash.as_ref(),
+        )
+        .expect("28-byte script hash is well within the bech32 limit")
     }
 }
 
 #[derive(Deserialize)]
 struct BlockfrostUtxo {
+    /// The full address holding the output. Present on current Blockfrost;
+    /// only there does a credential query learn the address the order was
+    /// actually paid to.
+    address: Option<String>,
     tx_hash: String,
     tx_index: u64,
     amount: Vec<BlockfrostAmount>,
@@ -582,9 +773,11 @@ fn parse_blockfrost_value(amounts: &[BlockfrostAmount]) -> Value {
 
 #[async_trait]
 impl BootstrapProvider for BlockfrostProvider {
+    /// Queries by payment credential, so UTxOs at every staking variant of
+    /// the script address are returned. Each row's own `address` field says
+    /// which variant.
     async fn fetch_script_utxos(&self, script_hash: &ScriptHash) -> Result<Vec<FetchedUtxo>> {
-        let bech32 = self.script_address(script_hash);
-        self.fetch_address_utxos(&bech32).await
+        self.fetch_address_utxos(&Self::script_credential(script_hash)).await
     }
 
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<FetchedUtxo>> {
@@ -595,13 +788,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 "{}/addresses/{}/utxos?page={}&count=100",
                 self.url, address, page
             );
-            let resp = self
-                .client
-                .get(&url)
-                .header("project_id", &self.project_id)
-                .send()
-                .await
-                .context("blockfrost: fetch UTxOs")?;
+            let resp = self.get(&url).await.context("blockfrost: fetch UTxOs")?;
 
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 break;
@@ -627,59 +814,35 @@ impl BootstrapProvider for BlockfrostProvider {
 
                 let value = parse_blockfrost_value(&utxo.amount);
 
-                // Resolve datum
-                let datum_cbor = if utxo.inline_datum.is_some() {
-                    // Blockfrost returns inline datum as JSON; we need the CBOR.
-                    // Fall back to the datum CBOR endpoint using data_hash.
-                    if let Some(ref dh) = utxo.data_hash {
-                        match self.fetch_datum(dh).await {
-                            Ok(bytes) => Some(bytes),
-                            Err(e) => {
-                                warn!(datum_hash = %dh, "blockfrost: could not fetch inline datum CBOR: {e:#}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else if let Some(ref dh) = utxo.data_hash {
-                    match self.fetch_datum(dh).await {
-                        Ok(bytes) => Some(bytes),
-                        Err(e) => {
-                            warn!(datum_hash = %dh, "blockfrost: could not fetch datum: {e:#}");
-                            None
-                        }
-                    }
-                } else {
-                    None
+                // Resolve the datum. The UTxO row carries an inline datum as
+                // CBOR hex, so that costs nothing; only hash-only outputs need
+                // the datum endpoint. A fetch failure is an error, not a
+                // missing datum: bootstrap_v3/v4 skip a pool whose datum is
+                // None, and a snapshot persisted without that pool is never
+                // repaired.
+                let inline = utxo.inline_datum.as_ref().and_then(blockfrost_inline_datum_cbor);
+                let datum_cbor = match (inline, &utxo.data_hash) {
+                    (Some(bytes), _) => Some(bytes),
+                    (None, Some(dh)) => self.fetch_datum_opt(dh).await.with_context(|| {
+                        format!(
+                            "blockfrost: datum {dh} for {}#{}",
+                            utxo.tx_hash, utxo.tx_index
+                        )
+                    })?,
+                    (None, None) => None,
                 };
 
-                // Get slot from block hash
-                let slot = if let Some(ref block_hash) = utxo.block {
-                    let block_url = format!("{}/blocks/{}", self.url, block_hash);
-                    match self
-                        .client
-                        .get(&block_url)
-                        .header("project_id", &self.project_id)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => resp
-                            .json::<BlockfrostBlockForUtxo>()
-                            .await
-                            .ok()
-                            .and_then(|b| b.slot)
-                            .unwrap_or(0),
-                        Err(_) => 0,
-                    }
-                } else {
-                    0
+                let slot = match utxo.block {
+                    Some(ref block_hash) => self.block_slot(block_hash).await?,
+                    None => 0,
                 };
 
                 all_utxos.push(FetchedUtxo {
                     tx_hash,
                     output_index: utxo.tx_index,
-                    address: address.to_string(),
+                    // `address` may be a bare credential; the row carries the
+                    // real address, which downstream parses as bech32.
+                    address: utxo.address.unwrap_or_else(|| address.to_string()),
                     value,
                     datum_cbor,
                     slot,
@@ -694,30 +857,10 @@ impl BootstrapProvider for BlockfrostProvider {
         Ok(all_utxos)
     }
 
-    async fn fetch_datum(&self, datum_hash: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/scripts/datum/{}/cbor", self.url, datum_hash);
-        let resp: BlockfrostDatumCbor = self
-            .client
-            .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
-            .await
-            .context("blockfrost: fetch datum")?
-            .error_for_status()
-            .context("blockfrost: datum status")?
-            .json()
-            .await
-            .context("blockfrost: parse datum")?;
-        hex::decode(&resp.cbor).context("blockfrost: invalid datum CBOR hex")
-    }
-
     async fn fetch_tip(&self) -> Result<(u64, String)> {
         let url = format!("{}/blocks/latest", self.url);
         let resp: BlockfrostBlock = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch latest block")?
             .error_for_status()
@@ -744,13 +887,7 @@ impl BootstrapProvider for BlockfrostProvider {
                 "{}/assets/policy/{}?page={}&count=100",
                 self.url, policy_hex, page
             );
-            let resp = self
-                .client
-                .get(&url)
-                .header("project_id", &self.project_id)
-                .send()
-                .await
-                .context("blockfrost: fetch policy assets")?;
+            let resp = self.get(&url).await.context("blockfrost: fetch policy assets")?;
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 break;
             }
@@ -782,7 +919,7 @@ impl BootstrapProvider for BlockfrostProvider {
         let mut addresses = std::collections::BTreeSet::new();
         for asset in &nft_assets {
             let url = format!("{}/assets/{}/addresses", self.url, asset);
-            let resp = self.client.get(&url).header("project_id", &self.project_id).send().await;
+            let resp = self.get(&url).await;
             if let Ok(resp) = resp
                 && let Ok(holders) = resp.json::<Vec<BlockfrostAssetAddress>>().await
             {
@@ -810,10 +947,7 @@ impl BootstrapProvider for BlockfrostProvider {
     async fn fetch_script_cbor(&self, script_hash: &str) -> Result<Vec<u8>> {
         let url = format!("{}/scripts/{}/cbor", self.url, script_hash);
         let resp: serde_json::Value = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch script cbor")?
             .error_for_status()
@@ -834,10 +968,7 @@ impl BootstrapProvider for BlockfrostProvider {
             self.url, asset_unit
         );
         let history: Vec<BlockfrostAssetHistory> = self
-            .client
             .get(&history_url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch asset history")?
             .error_for_status()
@@ -870,10 +1001,7 @@ impl BootstrapProvider for BlockfrostProvider {
             self.url, asset_unit,
         );
         let rows: Vec<BlockfrostAssetTx> = self
-            .client
             .get(&url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch asset transactions")?
             .error_for_status()
@@ -887,10 +1015,7 @@ impl BootstrapProvider for BlockfrostProvider {
     async fn fetch_tx_cbor(&self, tx_hash: &str) -> Result<Vec<u8>> {
         let tx_url = format!("{}/txs/{}/cbor", self.url, tx_hash);
         let resp: BlockfrostTxCbor = self
-            .client
             .get(&tx_url)
-            .header("project_id", &self.project_id)
-            .send()
             .await
             .context("blockfrost: fetch tx cbor")?
             .error_for_status()
@@ -906,6 +1031,256 @@ impl BootstrapProvider for BlockfrostProvider {
 // Orchestration
 // ──────────────────────────────────────────────────────────────────────────────
 
+fn make_provider(config: &BootstrapConfig) -> Box<dyn BootstrapProvider + Send + Sync> {
+    match config {
+        BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
+        BootstrapConfig::Blockfrost { url, project_id } => {
+            Box::new(BlockfrostProvider::new(url, project_id))
+        }
+    }
+}
+
+/// Which of a pool's module configs are still unknown: (cs, cp, cl, fee_split).
+///
+/// Pure, so the decision that gates a chain lookup can be tested without one.
+fn missing_module_configs(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    cs_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantSumConfig>,
+    cp_configs: &std::collections::BTreeMap<Ident, sundaev4::ConstantProductConfig>,
+    cl_configs: &std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig>,
+    fs_configs: &std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig>,
+    ss_configs: &std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig>,
+) -> (bool, bool, bool, bool, bool) {
+    (
+        needs_cs_lookup(pool_datum, execution, cs_configs),
+        needs_cp_lookup(pool_datum, execution, cp_configs),
+        needs_cl_lookup(pool_datum, execution, cl_configs),
+        !fs_configs.contains_key(&pool_datum.identifier),
+        needs_ss_lookup(pool_datum, execution, ss_configs),
+    )
+}
+
+/// Recover, from chain, the module config of every known pool that the DB does
+/// not yet have one for. Runs on every start, whatever the DB looks like.
+///
+/// A pool's constant-sum config is hash-pinned in its datum and lives only in
+/// its Create redeemer. Until now the only code that recovered it ran inside
+/// `run_bootstrap`, and `run_bootstrap` runs only when `tip_slot == 0` — a DB
+/// that has never indexed a block. So a scooper that started once with a bad
+/// config, or was stopped mid-sync, or simply joined after a pool was created,
+/// carried a tip and never bootstrapped again: the config was unrecoverable,
+/// the indexer fell back to guessed defaults, and every scoop against that pool
+/// failed eval. Seen in the wild on the first third-party mainnet scooper.
+///
+/// Returns the idents whose configs changed, so the caller can re-classify the
+/// pools already loaded into memory with the old defaults.
+pub async fn recover_missing_module_configs(
+    config: &BootstrapConfig,
+    protocol: &SundaeV4Protocol,
+    state: &Arc<Mutex<SundaeV4HistoricalState>>,
+    persistence: &Arc<dyn crate::persistence::Persistence>,
+) -> Result<Vec<Ident>> {
+    let Some(exec) = protocol.execution.as_ref() else {
+        return Ok(vec![]);
+    };
+    let dao = persistence.indexer_dao("sundae_v4");
+
+    let cs_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.constant_sum.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let cp_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.constant_product.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let cl_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.concentrated_liquidity.as_ref().map(|m| m.hash.as_ref().to_vec());
+    let fs_module_hash: Vec<u8> = exec.module_scripts.fee_split.hash.as_ref().to_vec();
+    let ss_module_hash: Option<Vec<u8>> =
+        exec.module_scripts.stableswap.as_ref().map(|m| m.hash.as_ref().to_vec());
+
+    // What the DB already knows.
+    let mut cs_configs = std::collections::BTreeMap::new();
+    let mut cp_configs = std::collections::BTreeMap::new();
+    let mut cl_configs = std::collections::BTreeMap::new();
+    let mut fs_configs = std::collections::BTreeMap::new();
+    let mut ss_configs = std::collections::BTreeMap::new();
+    for cfg in dao.load_module_configs().await.context("recover: load persisted module configs")? {
+        let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
+            .context("recover: persisted module config CBOR malformed")?;
+        let ident = Ident::new(&cfg.pool_id);
+        if Some(&cfg.module_hash) == cs_module_hash.as_ref() {
+            cs_configs.insert(ident, sundaev4::ConstantSumConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == cp_module_hash.as_ref() {
+            cp_configs.insert(ident, sundaev4::ConstantProductConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == cl_module_hash.as_ref() {
+            cl_configs.insert(
+                ident,
+                sundaev4::ConcentratedLiquidityConfig::from_plutus(pd)?,
+            );
+        } else if cfg.module_hash == fs_module_hash {
+            fs_configs.insert(ident, sundaev4::FeeSplitConfig::from_plutus(pd)?);
+        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
+            ss_configs.insert(ident, sundaev4::StableSwapConfig::from_plutus(pd)?);
+        }
+    }
+
+    // The pools we currently track, snapshotted so the lock is not held across
+    // network calls.
+    let pools: Vec<(Ident, sundaev4::PoolDatum, u64)> = {
+        let locked = state.lock().await;
+        let latest = locked.latest();
+        latest
+            .pools
+            .values()
+            .map(|p| {
+                (
+                    p.pool_datum.identifier.clone(),
+                    p.pool_datum.clone(),
+                    p.slot,
+                )
+            })
+            .collect()
+    };
+
+    let mut provider: Option<Box<dyn BootstrapProvider + Send + Sync>> = None;
+    let mut persisted: Vec<crate::persistence::PersistedModuleConfig> = Vec::new();
+    let mut changed: Vec<Ident> = Vec::new();
+    let mut max_slot = 0u64;
+
+    for (ident, pool_datum, slot) in pools {
+        let (need_cs, need_cp, need_cl, need_fs, need_ss) = missing_module_configs(
+            &pool_datum,
+            Some(exec),
+            &cs_configs,
+            &cp_configs,
+            &cl_configs,
+            &fs_configs,
+            &ss_configs,
+        );
+        if !(need_cs || need_cp || need_cl || need_fs || need_ss) {
+            continue;
+        }
+        let ident_hex = hex::encode(ident.to_bytes());
+        info!(pool = %ident_hex, need_cs, need_cp, need_cl, need_fs, need_ss, "v4: pool is missing module config(s); recovering from chain");
+
+        let ss_expected = if need_ss {
+            ss_slot_hash(&pool_datum, Some(exec))
+        } else {
+            None
+        };
+        let provider = provider.get_or_insert_with(|| make_provider(config));
+        let recovered = lookup_pool_module_configs(
+            &**provider,
+            protocol,
+            &ident,
+            need_cs,
+            need_cp,
+            need_cl,
+            ss_expected.as_deref(),
+        )
+        .await
+        .with_context(|| format!("v4: failed to recover module configs for pool {ident_hex}"))?;
+
+        let mut push = |module_hash: Vec<u8>, cbor: Vec<u8>| {
+            persisted.push(crate::persistence::PersistedModuleConfig {
+                pool_id: ident.to_bytes().to_vec(),
+                module_hash,
+                config_cbor: cbor,
+                created_slot: slot,
+            });
+        };
+        let mut any = false;
+        if need_cs {
+            match recovered.cs {
+                Some(cfg) => {
+                    push(
+                        cs_module_hash.clone().expect("cs hash known when need_cs"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered constant-sum config");
+                }
+                // A CS pool with no recoverable config can never be scooped.
+                // Say so once, loudly; do not fall through to defaults.
+                None => {
+                    warn!(pool = %ident_hex, "v4: constant-sum pool but no Create redeemer found in its tx history; scoops against it WILL fail eval")
+                }
+            }
+        }
+        if need_cp {
+            match recovered.cp {
+                Some(cfg) => {
+                    push(
+                        cp_module_hash.clone().expect("cp hash known when need_cp"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered constant-product config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no constant-product config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if need_cl {
+            match recovered.cl {
+                Some(cfg) => {
+                    push(
+                        cl_module_hash.clone().expect("cl hash known when need_cl"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered concentrated-liquidity config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no concentrated-liquidity config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if need_ss {
+            match recovered.ss {
+                Some(cfg) => {
+                    push(
+                        ss_module_hash.clone().expect("ss hash known when need_ss"),
+                        minicbor::to_vec(cfg.to_plutus())?,
+                    );
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered stableswap config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: stableswap pool but no redeemer in its tx history hashes to its module_state; scoops against it are refused")
+                }
+            }
+        }
+        if need_fs {
+            match recovered.fee_split {
+                Some(cfg) => {
+                    push(fs_module_hash.clone(), minicbor::to_vec(cfg.to_plutus())?);
+                    any = true;
+                    info!(pool = %ident_hex, "v4: recovered fee_split config");
+                }
+                None => {
+                    warn!(pool = %ident_hex, "v4: no fee_split config found in pool's tx history; scoops against it will use defaults")
+                }
+            }
+        }
+        if any {
+            changed.push(ident);
+            max_slot = max_slot.max(slot);
+        }
+    }
+
+    if !persisted.is_empty() {
+        // Upsert: the table keeps the earliest created_slot per (pool, module).
+        let mut changes = crate::persistence::TxChanges::new(max_slot, 0);
+        changes.module_configs = persisted;
+        dao.apply_tx_changes(changes).await.context("recover: persist recovered module configs")?;
+        info!(
+            pools = changed.len(),
+            "v4: persisted recovered module configs"
+        );
+    }
+    Ok(changed)
+}
+
 pub async fn run_bootstrap(
     config: &BootstrapConfig,
     v3_protocol: Option<&SundaeV3Protocol>,
@@ -914,12 +1289,22 @@ pub async fn run_bootstrap(
     v4_state: &Option<Arc<Mutex<SundaeV4HistoricalState>>>,
     persistence: &Arc<dyn crate::persistence::Persistence>,
 ) -> Result<BootstrapResult> {
-    let provider: Box<dyn BootstrapProvider + Send + Sync> = match config {
-        BootstrapConfig::Kupo { url } => Box::new(KupoProvider::new(url)),
-        BootstrapConfig::Blockfrost { url, project_id } => {
-            Box::new(BlockfrostProvider::new(url, project_id))
-        }
-    };
+    let provider = make_provider(config);
+
+    // Refuse to seed-and-skip with a provider that cannot see staked order
+    // addresses. Returning Err here is deliberate: the caller logs it and
+    // falls through to a chain replay from the configured starting point,
+    // which reconstructs orders, pools, module configs and reference scripts
+    // straight from the ledger. That replay is the bedrock recovery path and
+    // it is strictly more complete than any bootstrap - bootstrap only ever
+    // buys the time the replay would take.
+    anyhow::ensure!(
+        provider.enumerates_by_credential(),
+        "this bootstrap source cannot enumerate UTxOs by payment credential, so it cannot \
+         see orders at user-staked addresses (addr1z...). Seeding from it and then starting \
+         the indexer at the bootstrap tip would silently discard every pending order. \
+         Falling back to a full chain replay from the configured starting-point."
+    );
 
     let (tip_slot, tip_hash) = provider.fetch_tip().await?;
     info!(tip_slot, tip_hash = %tip_hash, "bootstrap: fetched chain tip");
@@ -1124,6 +1509,45 @@ fn needs_cs_lookup(
     true
 }
 
+/// True iff this pool is stableswap *and* the config we hold (if any) does
+/// not hash to the datum's `module_state` slot. Unlike the other modules the
+/// config changes on chain (tag-7 rate updates), so "known" means "hashes to
+/// the current datum", not "present". There is no operator override.
+fn needs_ss_lookup(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+    ss_configs: &std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig>,
+) -> bool {
+    let Some(exec) = execution else {
+        return false;
+    };
+    let Some(ss_script) = exec.module_scripts.stableswap.as_ref() else {
+        return false;
+    };
+    let is_ss = pool_datum.actions.iter().any(|a| {
+        a.enabled && a.modules.first().is_some_and(|h| h.as_slice() == ss_script.hash.as_ref())
+    });
+    if !is_ss {
+        return false;
+    }
+    !ss_configs.get(&pool_datum.identifier).is_some_and(|cfg| {
+        crate::sundaev4::ss_math::config_matches_datum(cfg, pool_datum, ss_script.hash.as_ref())
+    })
+}
+
+/// The stableswap `module_state` slot value of a pool datum, if any.
+fn ss_slot_hash(
+    pool_datum: &sundaev4::PoolDatum,
+    execution: Option<&sundaev4::ScooperExecution>,
+) -> Option<Vec<u8>> {
+    let ss_hash = execution?.module_scripts.stableswap.as_ref()?.hash;
+    pool_datum
+        .module_state
+        .iter()
+        .find(|(cred, _)| cred.as_slice() == ss_hash.as_ref())
+        .map(|(_, h)| h.clone())
+}
+
 /// True iff this pool is constant-product *and* we don't already know its
 /// config. Same logic as `needs_cs_lookup` but matched against the CP module
 /// hash.
@@ -1185,6 +1609,8 @@ struct RecoveredPoolConfigs {
     cs: Option<sundaev4::ConstantSumConfig>,
     cp: Option<sundaev4::ConstantProductConfig>,
     cl: Option<sundaev4::ConcentratedLiquidityConfig>,
+    /// The stableswap config whose hash the pool's current datum names.
+    ss: Option<sundaev4::StableSwapConfig>,
     fee_split: Option<sundaev4::FeeSplitConfig>,
 }
 
@@ -1207,6 +1633,9 @@ async fn lookup_pool_module_configs(
     need_cs: bool,
     need_cp: bool,
     need_cl: bool,
+    // `Some(slot hash)` when the stableswap config is wanted: the candidate
+    // that hashes to it is the one in force for the pool's current UTxO.
+    ss_expected: Option<&[u8]>,
 ) -> Result<RecoveredPoolConfigs> {
     let exec = protocol
         .execution
@@ -1214,6 +1643,13 @@ async fn lookup_pool_module_configs(
         .ok_or_else(|| anyhow::anyhow!("no execution config for module config lookup"))?;
     let cs_hash = exec.module_scripts.constant_sum.as_ref().map(|s| s.hash);
     let cl_hash = exec.module_scripts.concentrated_liquidity.as_ref().map(|s| s.hash);
+    let ss_hash = exec.module_scripts.stableswap.as_ref().map(|s| s.hash);
+    let pick_ss = |tx: &pallas_traverse::MultiEraTx| -> Option<sundaev4::StableSwapConfig> {
+        let (h, expected) = (ss_hash.as_ref()?, ss_expected?);
+        sundaev4::extract_ss_config_candidates(tx, h)
+            .into_iter()
+            .find(|c| crate::sundaev4::ss_math::config_hash(c) == expected)
+    };
     let cp_hash = exec.module_scripts.constant_product.as_ref().map(|s| s.hash);
     let fs_hash = exec.module_scripts.fee_split.hash;
 
@@ -1229,6 +1665,7 @@ async fn lookup_pool_module_configs(
     let want_cs = need_cs && cs_hash.is_some();
     let want_cp = need_cp;
     let want_cl = need_cl && cl_hash.is_some();
+    let want_ss = ss_expected.is_some() && ss_hash.is_some();
 
     // Step 1: first tx (mint). Pool Create + per-module Create withdrawals are
     // here, so for static configs this single call is enough.
@@ -1246,12 +1683,16 @@ async fn lookup_pool_module_configs(
     if want_cl && let Some(h) = cl_hash.as_ref() {
         out.cl = sundaev4::extract_cl_config_from_tx(&first_tx, h);
     }
+    if want_ss {
+        out.ss = pick_ss(&first_tx);
+    }
     out.fee_split = sundaev4::extract_fee_split_config_from_tx(&first_tx, &fs_hash);
 
     let still_missing = |c: &RecoveredPoolConfigs| {
         (want_cs && c.cs.is_none())
             || (want_cp && c.cp.is_none())
             || (want_cl && c.cl.is_none())
+            || (want_ss && c.ss.is_none())
             || c.fee_split.is_none()
     };
     if !still_missing(&out) {
@@ -1294,6 +1735,9 @@ async fn lookup_pool_module_configs(
             {
                 out.cl = sundaev4::extract_cl_config_from_tx(&tx, h);
             }
+            if want_ss && out.ss.is_none() {
+                out.ss = pick_ss(&tx);
+            }
             if out.fee_split.is_none() {
                 out.fee_split = sundaev4::extract_fee_split_config_from_tx(&tx, &fs_hash);
             }
@@ -1308,6 +1752,10 @@ async fn lookup_pool_module_configs(
 
     Ok(out)
 }
+
+/// A vault UTxO as fetched at bootstrap, kept in the form the persisted
+/// txo encoder takes: (input, address bytes, value, inline datum CBOR).
+type VaultSeed = (TransactionInput, Vec<u8>, Value, Option<Vec<u8>>);
 
 async fn bootstrap_v4(
     provider: &(dyn BootstrapProvider + Send + Sync),
@@ -1343,6 +1791,11 @@ async fn bootstrap_v4(
         .map(|cl| cl.hash.as_ref().to_vec());
     let fs_module_hash: Option<Vec<u8>> =
         protocol.execution.as_ref().map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+    let ss_module_hash: Option<Vec<u8>> = protocol
+        .execution
+        .as_ref()
+        .and_then(|e| e.module_scripts.stableswap.as_ref())
+        .map(|ss| ss.hash.as_ref().to_vec());
 
     let persisted_configs =
         dao.load_module_configs().await.context("bootstrap v4: load persisted module configs")?;
@@ -1353,6 +1806,8 @@ async fn bootstrap_v4(
     let mut cl_configs: std::collections::BTreeMap<Ident, sundaev4::ConcentratedLiquidityConfig> =
         std::collections::BTreeMap::new();
     let mut fs_configs: std::collections::BTreeMap<Ident, sundaev4::FeeSplitConfig> =
+        std::collections::BTreeMap::new();
+    let mut ss_configs: std::collections::BTreeMap<Ident, sundaev4::StableSwapConfig> =
         std::collections::BTreeMap::new();
     for cfg in persisted_configs {
         let pd = PlutusData::from_plutus_bytes(&cfg.config_cbor)
@@ -1373,6 +1828,10 @@ async fn bootstrap_v4(
             let parsed = sundaev4::FeeSplitConfig::from_plutus(pd)
                 .context("bootstrap v4: persisted FS config decode failed")?;
             fs_configs.insert(Ident::new(&cfg.pool_id), parsed);
+        } else if Some(&cfg.module_hash) == ss_module_hash.as_ref() {
+            let parsed = sundaev4::StableSwapConfig::from_plutus(pd)
+                .context("bootstrap v4: persisted SS config decode failed")?;
+            ss_configs.insert(Ident::new(&cfg.pool_id), parsed);
         }
         // Unknown module hashes are ignored; they may belong to modules not
         // configured in this protocol.
@@ -1429,8 +1888,14 @@ async fn bootstrap_v4(
         let need_cs = needs_cs_lookup(&pool_datum, protocol.execution.as_ref(), &cs_configs);
         let need_cp = needs_cp_lookup(&pool_datum, protocol.execution.as_ref(), &cp_configs);
         let need_cl = needs_cl_lookup(&pool_datum, protocol.execution.as_ref(), &cl_configs);
+        let need_ss = needs_ss_lookup(&pool_datum, protocol.execution.as_ref(), &ss_configs);
+        let ss_expected = if need_ss {
+            ss_slot_hash(&pool_datum, protocol.execution.as_ref())
+        } else {
+            None
+        };
         let need_fs = !fs_configs.contains_key(&pool_datum.identifier);
-        if need_cs || need_cp || need_cl || need_fs {
+        if need_cs || need_cp || need_cl || need_ss || need_fs {
             let recovered = lookup_pool_module_configs(
                 provider,
                 protocol,
@@ -1438,6 +1903,7 @@ async fn bootstrap_v4(
                 need_cs,
                 need_cp,
                 need_cl,
+                ss_expected.as_deref(),
             )
             .await
             .with_context(|| {
@@ -1467,6 +1933,33 @@ async fn bootstrap_v4(
                     pool = %hex::encode(pool_datum.identifier.to_bytes()),
                     "bootstrap v4: recovered CS pool config"
                 );
+            }
+            if need_ss {
+                match recovered.ss {
+                    Some(ss_cfg) => {
+                        let cbor = minicbor::to_vec(ss_cfg.clone().to_plutus())
+                            .context("bootstrap v4: encode StableSwapConfig CBOR")?;
+                        new_persisted_configs.push(crate::persistence::PersistedModuleConfig {
+                            pool_id: pool_datum.identifier.to_bytes().to_vec(),
+                            module_hash: ss_module_hash
+                                .clone()
+                                .expect("ss_module_hash known when need_ss"),
+                            config_cbor: cbor,
+                            created_slot: utxo.slot,
+                        });
+                        ss_configs.insert(pool_datum.identifier.clone(), ss_cfg);
+                        info!(
+                            pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                            "bootstrap v4: recovered stableswap pool config"
+                        );
+                    }
+                    // Not fatal: the pool is skipped at build time (its
+                    // placeholder config fails the module_state check).
+                    None => warn!(
+                        pool = %hex::encode(pool_datum.identifier.to_bytes()),
+                        "bootstrap v4: stableswap pool but no redeemer in its tx history hashes to its module_state; scoops against it are refused"
+                    ),
+                }
             }
             if need_cp {
                 if let Some(cp_cfg) = recovered.cp {
@@ -1545,12 +2038,19 @@ async fn bootstrap_v4(
         let resolved_cs = cs_configs.get(&pool_datum.identifier);
         let resolved_cp = cp_configs.get(&pool_datum.identifier);
         let resolved_cl = cl_configs.get(&pool_datum.identifier);
+        // Only a config that hashes to the current datum is handed on.
+        let resolved_ss = ss_configs.get(&pool_datum.identifier).filter(|cfg| {
+            ss_module_hash.as_ref().is_some_and(|h| {
+                crate::sundaev4::ss_math::config_matches_datum(cfg, &pool_datum, h)
+            })
+        });
         let pool_type = crate::sundaev4::detect_pool_type(
             &pool_datum,
             protocol.execution.as_ref(),
             resolved_cs,
             resolved_cp,
             resolved_cl,
+            resolved_ss,
         );
         let fs_cfg = fs_configs.get(&pool_datum.identifier).cloned();
         pools.insert(
@@ -1636,6 +2136,9 @@ async fn bootstrap_v4(
                 Ok((datum, constraint)) => {
                     orders.push(Arc::new(sundaev4::SundaeV4Order {
                         input,
+                        address: pallas_addresses::Address::from_bech32(&utxo.address)
+                            .map(|a| a.to_vec())
+                            .unwrap_or_default(),
                         value: utxo.value.clone(),
                         datum,
                         constraint,
@@ -1798,6 +2301,74 @@ async fn bootstrap_v4(
         }
     }
 
+    // Seed the rate guards' vault UTxOs. A guard with no vault state blocks
+    // its pool until the vault next moves, which can be hours; seeding here
+    // means a restart does not cost that.
+    let mut vault_utxos: std::collections::BTreeMap<
+        TransactionInput,
+        crate::sundaev4::rate_guard::VaultUtxo,
+    > = std::collections::BTreeMap::new();
+    let mut vault_seed_bytes: Vec<VaultSeed> = Vec::new();
+    if let Some(ref exec) = protocol.execution {
+        let mut seen_vaults = std::collections::BTreeSet::new();
+        for cfg in &exec.rate_guards {
+            let guard = match crate::sundaev4::rate_guard::RateGuard::resolve(cfg) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("bootstrap v4: {e}");
+                    continue;
+                }
+            };
+            if !seen_vaults.insert(guard.vault_address_bech32.clone()) {
+                continue;
+            }
+            info!(vault = %guard.vault_address_bech32, "bootstrap: fetching rate-guard vault UTxOs...");
+            match provider.fetch_address_utxos(&guard.vault_address_bech32).await {
+                Ok(utxos) => {
+                    for utxo in &utxos {
+                        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                        let address = match pallas_addresses::Address::from_bech32(&utxo.address) {
+                            Ok(a) => a.to_vec(),
+                            Err(e) => {
+                                warn!("bootstrap v4: vault UTxO address {}: {e}", utxo.address);
+                                continue;
+                            }
+                        };
+                        let datum = utxo
+                            .datum_cbor
+                            .as_deref()
+                            .and_then(|cbor| PlutusData::from_plutus_bytes(cbor).ok())
+                            .and_then(|pd| {
+                                crate::sundaev4::rate_guard::VaultDatumV1_1::from_plutus(pd).ok()
+                            });
+                        vault_seed_bytes.push((
+                            input.clone(),
+                            address.clone(),
+                            utxo.value.clone(),
+                            utxo.datum_cbor.clone(),
+                        ));
+                        vault_utxos.insert(
+                            input,
+                            crate::sundaev4::rate_guard::VaultUtxo {
+                                address,
+                                value: utxo.value.clone(),
+                                datum,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    // The guard fails closed on an empty vault, so this is a
+                    // halted pool, not a silent gap.
+                    warn!(
+                        "bootstrap v4: could not fetch vault UTxOs at {}: {e:#}",
+                        guard.vault_address_bech32
+                    );
+                }
+            }
+        }
+    }
+
     // Fetch reference script UTxOs if execution is configured.
     // The scooper needs these to build the ScriptStore for tx evaluation.
     let mut ref_utxo_outputs = std::collections::BTreeMap::new();
@@ -1820,6 +2391,9 @@ async fn bootstrap_v4(
         }
         if let Some(ref cl) = scripts.concentrated_liquidity {
             all_refs.push(cl);
+        }
+        if let Some(ref ss) = scripts.stableswap {
+            all_refs.push(ss);
         }
         if let Some(ref so) = scripts.swap_order {
             all_refs.push(so);
@@ -2010,6 +2584,18 @@ async fn bootstrap_v4(
             });
         }
 
+        for (input, address, value, datum_cbor) in &vault_seed_bytes {
+            persisted_txos.push(PersistedTxo {
+                txo_id: input.clone(),
+                txo_type: "vault".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(address, value, datum_cbor.as_deref()),
+                address: address.clone(),
+                datum: None,
+            });
+        }
+
         let dummy_addr = ShelleyAddress::new(
             protocol.network.pallas(),
             ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
@@ -2083,6 +2669,7 @@ async fn bootstrap_v4(
         s.fee_settings = fee_settings;
         s.order_configs = order_configs;
         s.wallet_utxos = wallet_utxos;
+        s.vault_utxos = vault_utxos;
         s.ref_utxo_outputs = ref_utxo_outputs;
         s.network_tip_slot = Some(tip_slot);
         s.tip_slot = tip_slot;
@@ -2096,6 +2683,183 @@ async fn bootstrap_v4(
         "V4 bootstrap complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod credential_enumeration_tests {
+    //! Bootstrap seeds state and then starts the indexer at the bootstrap
+    //! tip, discarding every block before it. That is only safe when the
+    //! provider could actually see everything worth keeping.
+    //!
+    //! On 2026-09-26 a mainnet bootstrap reported "0 V4 order UTxOs" and a
+    //! clean start while a live user order sat unspent on chain. Blockfrost
+    //! had been asked for `addr1w...` (the enterprise form of the order
+    //! script) while the order sat at `addr1z...`, because users attach their
+    //! own stake credential. The order became invisible: bootstrap had not
+    //! seen it, and the history containing it was skipped.
+    //!
+    //! The fix is to ask Blockfrost for the bare payment credential
+    //! (`script1...`), which its `/addresses` endpoints accept and which
+    //! matches every staking variant.
+    use super::*;
+
+    /// Preview V4 order script; the bech32 was checked against a live
+    /// `/addresses/{credential}/utxos` call that returned an order at
+    /// `addr_test1z...` where the enterprise address returned nothing.
+    #[test]
+    fn script_credential_is_cip5_bech32() {
+        let hash: ScriptHash =
+            "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b".parse().unwrap();
+        assert_eq!(
+            BlockfrostProvider::script_credential(&hash),
+            "script13flvmtanvpwa7ash2xeerssys2m77sk2q9t46y6afpxzknmwa3q"
+        );
+    }
+
+    #[test]
+    fn blockfrost_enumerates_by_credential() {
+        let p = BlockfrostProvider::new("https://example.invalid/api/v0", "tok");
+        assert!(p.enumerates_by_credential());
+    }
+
+    /// The row's own address must win over the queried string: the queried
+    /// string is a credential, and `bootstrap_v4` parses the address as bech32.
+    #[test]
+    fn utxo_row_carries_its_full_address() {
+        let row: BlockfrostUtxo = serde_json::from_str(
+            r#"{"address":"addr_test1zz98and0kds9mhmkzagm8ywzqjpt0m6zegq4whgnt4yyc2cpjqw6nx3y36p6r8z825sahmmdkdn7mq9md9qnqu3l8fnqlmqq02",
+                "tx_hash":"2595ce1b13ab0000000000000000000000000000000000000000000000000000",
+                "tx_index":0,"output_index":0,"amount":[],"block":null,
+                "data_hash":null,"inline_datum":null,"reference_script_hash":null}"#,
+        )
+        .unwrap();
+        assert!(row.address.unwrap().starts_with("addr_test1z"));
+    }
+
+    #[test]
+    fn kupo_enumerates_by_credential() {
+        // Kupo matches `{credential}/*`, so any staking part is covered.
+        let p = KupoProvider::new("https://example.invalid");
+        assert!(p.enumerates_by_credential());
+    }
+
+    /// The guard judges the *config the operator actually writes*, not just
+    /// a provider object.
+    #[test]
+    fn both_bootstrap_configs_pass_the_guard() {
+        let cfg = BootstrapConfig::Blockfrost {
+            url: "https://example.invalid/api/v0".to_string(),
+            project_id: "tok".to_string(),
+        };
+        assert!(make_provider(&cfg).enumerates_by_credential());
+
+        let cfg = BootstrapConfig::Kupo {
+            url: "https://example.invalid".to_string(),
+        };
+        assert!(make_provider(&cfg).enumerates_by_credential());
+    }
+}
+
+#[cfg(test)]
+mod blockfrost_pacing_tests {
+    //! A fresh free-tier Blockfrost key answers >10 req/s with 429. Before
+    //! these guards, a mainnet bootstrap with v3 enabled hit that within
+    //! seconds, logged "could not fetch inline datum CBOR", dropped the pool,
+    //! and persisted a snapshot that could never regain it.
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_delay_doubles_from_one_second_and_caps() {
+        assert_eq!(blockfrost_retry_delay(0, None), Duration::from_secs(1));
+        assert_eq!(blockfrost_retry_delay(1, None), Duration::from_secs(2));
+        assert_eq!(blockfrost_retry_delay(3, None), Duration::from_secs(8));
+        assert_eq!(blockfrost_retry_delay(9, None), BLOCKFROST_MAX_RETRY_DELAY);
+        assert_eq!(blockfrost_retry_delay(40, None), BLOCKFROST_MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_delay_honours_a_longer_retry_after_but_not_a_shorter_one() {
+        assert_eq!(blockfrost_retry_delay(0, Some(5)), Duration::from_secs(5));
+        assert_eq!(blockfrost_retry_delay(3, Some(2)), Duration::from_secs(8));
+        assert_eq!(
+            blockfrost_retry_delay(0, Some(600)),
+            BLOCKFROST_MAX_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn inline_datum_is_cbor_hex_not_json() {
+        // The mainnet SPRINKLES/JIMMIES pool datum starts like this on the
+        // /addresses/{addr}/utxos row; reading it here saves one call per UTxO.
+        let hex_str = serde_json::Value::String("d8799f581c9f91de10ff".to_string());
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&hex_str).as_deref(),
+            Some(&hex::decode("d8799f581c9f91de10ff").unwrap()[..])
+        );
+        assert_eq!(blockfrost_inline_datum_cbor(&serde_json::Value::Null), None);
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&serde_json::json!({"constructor": 0})),
+            None
+        );
+        assert_eq!(
+            blockfrost_inline_datum_cbor(&serde_json::Value::String("zz".into())),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_spends_the_burst_then_settles_at_the_refill_rate() {
+        let provider = BlockfrostProvider::new("https://cardano-mainnet.blockfrost.io/api/v0", "x");
+        let start = tokio::time::Instant::now();
+        for _ in 0..500 {
+            provider.throttle().await;
+        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the burst costs no waiting"
+        );
+        for _ in 0..20 {
+            provider.throttle().await;
+        }
+        // 20 more tokens at 10/s: 2s, give or take float rounding.
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1990) && waited <= Duration::from_millis(2010),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_429_drains_the_bucket_so_the_next_call_waits_a_full_token() {
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = RateBucket::full(t0);
+        assert!(bucket.take(t0).is_ok());
+        bucket.drain();
+        let wait = bucket.take(t0).unwrap_err();
+        assert!(
+            wait >= Duration::from_millis(99) && wait <= Duration::from_millis(101),
+            "{wait:?}"
+        );
+        // Half a second later, five tokens have refilled.
+        let t1 = t0 + Duration::from_millis(500);
+        for _ in 0..5 {
+            assert!(bucket.take(t1).is_ok());
+        }
+        assert!(bucket.take(t1).is_err());
+    }
+
+    #[test]
+    fn bucket_never_holds_more_than_the_burst() {
+        let t0 = tokio::time::Instant::now();
+        let mut bucket = RateBucket::full(t0);
+        let later = t0 + Duration::from_secs(3600);
+        for _ in 0..(BLOCKFROST_BURST as usize) {
+            assert!(bucket.take(later).is_ok());
+        }
+        assert!(bucket.take(later).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2119,6 +2883,37 @@ mod live_smoke_tests {
         "9a30124e1071263f8f1b5da9f39436c3e80fab3a7bf7260af7682ad1";
     const PREVIEW_CS_MODULE_HASH_HEX: &str =
         "1eb851777361b9a2de1ed6a8a9c6efe510667cdae4cb3d741ac9d4da";
+
+    /// The credential query must surface orders at user-staked addresses.
+    /// At the time of writing preview holds one V4 order at `addr_test1z...`
+    /// and none at the enterprise address.
+    #[tokio::test]
+    #[ignore]
+    async fn live_order_query_by_credential_sees_staked_addresses() -> Result<()> {
+        let provider = BlockfrostProvider::new(PREVIEW_BLOCKFROST, PREVIEW_PROJECT_ID);
+        let order_hash: ScriptHash =
+            "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b".parse()?;
+        let utxos = provider.fetch_script_utxos(&order_hash).await?;
+        assert!(
+            !utxos.is_empty(),
+            "preview should hold at least one V4 order"
+        );
+        for u in &utxos {
+            let addr = pallas_addresses::Address::from_bech32(&u.address)
+                .with_context(|| format!("row address {}", u.address))?;
+            let pallas_addresses::Address::Shelley(sh) = addr else {
+                anyhow::bail!("order at non-Shelley address {}", u.address);
+            };
+            assert_eq!(sh.payment().as_hash(), &order_hash);
+            eprintln!(
+                "{}#{} at {}",
+                hex::encode(u.tx_hash),
+                u.output_index,
+                u.address
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore]
@@ -2203,5 +2998,186 @@ mod live_smoke_tests {
             eprintln!("NOTE: no CS pools currently on preview — skipping deep verification");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recover_missing_configs_tests {
+    //! The decision that gates chain recovery of a pool's module configs.
+    //! Until this pass existed, that recovery ran only inside a first-ever
+    //! bootstrap (`tip_slot == 0`), so any DB carrying a tip could never learn
+    //! a config it lacked. These pin the decision itself; the network walk is
+    //! covered by the `#[ignore]`d live smoke tests.
+
+    use super::missing_module_configs;
+    use crate::bigint::BigInt;
+    use crate::sundaev4::test_harness::{TestEnv, make_cs_pool, token_a, token_b};
+    use crate::sundaev4::{ConstantSumConfig, PoolConfig, PoolType, Rational, SundaeV4Pool};
+    use std::collections::BTreeMap;
+
+    const BLUEPRINT_PATH: &str = "test/fixtures/devnet-blueprint.json";
+
+    fn cs_pool(env: &TestEnv) -> std::sync::Arc<SundaeV4Pool> {
+        make_cs_pool(
+            env,
+            0xCC,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            vec![BigInt::from(1_000_000), BigInt::from(1_000_000)],
+            Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+        )
+    }
+
+    /// A constant-sum pool nothing knows about needs its CS and fee-split
+    /// configs recovered — and must not ask for CP or CL, whose lookups would
+    /// come back empty and log noise for a pool that never had them.
+    #[test]
+    fn unknown_cs_pool_asks_for_cs_and_fee_split_only() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let (cs, cp, cl, fs, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!((cs, cp, cl, fs, ss), (true, false, false, true, false));
+    }
+
+    /// A stableswap pool asks for its config until the cached config hashes
+    /// to the datum's module_state; a cached config a rate update has left
+    /// behind asks again (the rates changed on chain, the hash with them).
+    #[test]
+    fn stableswap_lookup_is_gated_by_the_datum_hash() {
+        use crate::sundaev4::test_harness::{make_ss_pool, ss_config, token_a, token_b};
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let cfg = ss_config(
+            200,
+            Rational {
+                num: BigInt::from(3),
+                den: BigInt::from(1000),
+            },
+            [1, 1],
+        );
+        let pool = make_ss_pool(
+            &env,
+            0x5A,
+            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
+            cfg.clone(),
+        );
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(ss, "an unknown stableswap config must be looked up");
+
+        let mut ss_configs = BTreeMap::new();
+        ss_configs.insert(pool.pool_datum.identifier.clone(), cfg.clone());
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &ss_configs,
+        );
+        assert!(
+            !ss,
+            "a cached config that hashes to the datum suppresses the lookup"
+        );
+
+        let mut stale = cfg.clone();
+        stale.rates = vec![BigInt::from(1), BigInt::from(2)];
+        ss_configs.insert(pool.pool_datum.identifier.clone(), stale);
+        let (_, _, _, _, ss) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &ss_configs,
+        );
+        assert!(
+            ss,
+            "a cached config with other rates must be looked up again"
+        );
+    }
+
+    /// Once the cache has the pool's CS config, recovery stops asking for it.
+    /// This is the state every start after a successful recovery should be in,
+    /// so it must be cheap: no network call at all.
+    #[test]
+    fn known_cs_config_is_not_requested_again() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let mut cs_configs = BTreeMap::new();
+        if let PoolType::ConstantSum {
+            prices,
+            fee,
+            bounty_k,
+            balance_fee,
+        } = pool.pool_type.clone()
+        {
+            cs_configs.insert(
+                pool.pool_datum.identifier.clone(),
+                ConstantSumConfig {
+                    prices,
+                    fee,
+                    bounty_k,
+                    balance_fee,
+                },
+            );
+        } else {
+            panic!("make_cs_pool must yield a constant-sum pool type");
+        }
+        let (cs, _, _, _, _) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&env.exec),
+            &cs_configs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(!cs, "a cached CS config must suppress the chain lookup");
+    }
+
+    /// An operator `pool-configs` override also suppresses the lookup, as it
+    /// always has. (Whether that override can *express* a given pool is a
+    /// separate problem: it forces bounty_k to 0/1.)
+    #[test]
+    fn operator_override_suppresses_cs_lookup() {
+        let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
+        let pool = cs_pool(&env);
+        let mut exec = env.exec.clone();
+        exec.pool_configs.insert(
+            hex::encode(pool.pool_datum.identifier.to_bytes()),
+            PoolConfig::ConstantSum {
+                prices: vec![1_000_000, 1_000_000],
+                fee: (3, 1000),
+            },
+        );
+        let (cs, _, _, _, _) = missing_module_configs(
+            &pool.pool_datum,
+            Some(&exec),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(!cs, "an operator override must suppress the chain lookup");
     }
 }

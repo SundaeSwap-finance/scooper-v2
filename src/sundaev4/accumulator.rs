@@ -40,10 +40,19 @@ pub struct PoolAccum {
     /// effects. Mirrors tx_builder's running_total_lp at this point in the walk.
     pub running_total_lp: BigInt,
     pub running_circ_lp: BigInt,
+    /// The pool's LP escrow as this batch leaves it. Deposits draw from it,
+    /// withdrawals return to it, and it rides on the pool output as a Value
+    /// entry — so it is bounded by `MAX_VALUE_QUANTITY`. Mirrors tx_builder's
+    /// per_pool_running_preminted.
+    running_preminted: BigInt,
+    /// LP this batch mints under pool_mint for this pool, i.e. what the
+    /// escrow could not cover. The tx's mint field is bounded too.
+    running_minted: BigInt,
     pub swaps: Vec<ResolvedSwap>,
     pub continuations: Vec<ContinuationSwap>,
     pub deposits: Vec<crate::sundaev4::batch::ResolvedDeposit>,
     pub withdraws: Vec<crate::sundaev4::batch::ResolvedWithdraw>,
+    pub zaps: Vec<crate::sundaev4::batch::ResolvedZap>,
     /// Cumulative gross fee_budget across all swap entries in this pool.
     /// Used together with `cum_protocol_lp` for the per-entry protocol_lp
     /// distribution (cumulative-target trick).
@@ -105,6 +114,58 @@ pub struct Accumulator {
     protocol_share: (u64, u64),
 }
 
+impl PoolAccum {
+    /// The escrow and mint totals after issuing `lp_minted`, or why the batch
+    /// cannot carry it.
+    ///
+    /// Deposits take LP from the pool's preminted escrow and mint only the
+    /// shortfall — the same rule tx_builder walks. Each of the three results
+    /// lands in a Cardano `Value`, which is signed 64-bit: the depositor's own
+    /// LP output, the escrow left on the pool output, and the transaction's
+    /// mint field. A batch that would exceed any of them cannot be submitted,
+    /// so refuse the order here and let it scoop in a batch of its own rather
+    /// than building a transaction the ledger will not take.
+    fn lp_issue_after(&self, lp_minted: &BigInt) -> Result<(BigInt, BigInt), String> {
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        // The order's own LP output.
+        if lp_minted > &cap {
+            return Err(format!(
+                "deposit mints {lp_minted} LP, more than a Value entry can hold ({cap}); \
+                 it cannot be paid out in one output"
+            ));
+        }
+        let (next_preminted, minted_now) = if &self.running_preminted >= lp_minted {
+            (&self.running_preminted - lp_minted, BigInt::from(0))
+        } else {
+            (BigInt::from(0), lp_minted - &self.running_preminted)
+        };
+        let next_minted = &self.running_minted + &minted_now;
+        if next_minted > cap {
+            return Err(format!(
+                "this batch would mint {next_minted} LP for the pool, over the {cap} a \
+                 transaction's mint field can hold; leaving the order for the next batch"
+            ));
+        }
+        Ok((next_preminted, next_minted))
+    }
+
+    /// The escrow after a withdrawal returns `lp_burned` to it.
+    ///
+    /// Withdrawals do not burn: the LP goes back to the pool's escrow, which
+    /// rides on the pool output and is bounded like any other Value entry.
+    fn lp_return_after(&self, lp_burned: &BigInt) -> Result<BigInt, String> {
+        let cap = BigInt::from(crate::sundaev4::types::MAX_VALUE_QUANTITY);
+        let next = &self.running_preminted + lp_burned;
+        if next > cap {
+            return Err(format!(
+                "returning {lp_burned} LP would leave the pool holding {next}, over the {cap} \
+                 a Value entry can hold; leaving the order for the next batch"
+            ));
+        }
+        Ok(next)
+    }
+}
+
 impl Accumulator {
     pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
@@ -142,10 +203,13 @@ impl Accumulator {
             running_assets: effective_pool.pool_datum.assets.clone(),
             running_total_lp: effective_pool.pool_datum.total_lp.clone(),
             running_circ_lp: effective_pool.pool_datum.circulating_lp.clone(),
+            running_preminted: effective_pool.pool_datum.preminted_lp.clone(),
+            running_minted: BigInt::from(0),
             swaps: Vec::new(),
             continuations: Vec::new(),
             deposits: Vec::new(),
             withdraws: Vec::new(),
+            zaps: Vec::new(),
             cum_gross_fb: BigInt::from(0),
             cum_protocol_lp: BigInt::from(0),
             ps,
@@ -261,6 +325,7 @@ impl Accumulator {
         transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let deposit = batch::resolve_proportional_deposit(&transient, order)?;
+        let (next_preminted, next_minted) = accum.lp_issue_after(&deposit.lp_minted)?;
 
         // Update running reserves: each asset i grows by dx[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
@@ -268,12 +333,133 @@ impl Accumulator {
         }
         accum.running_total_lp = &accum.running_total_lp + &deposit.lp_minted;
         accum.running_circ_lp = &accum.running_circ_lp + &deposit.lp_minted;
+        accum.running_preminted = next_preminted;
+        accum.running_minted = next_minted;
 
         let dep_idx = accum.deposits.len();
         accum.deposits.push(deposit);
         let op_idx = accum.ops_order.len();
         accum.ops_order.push(BatchOp::Deposit(dep_idx));
         self.global_seq_raw.push((pool_ident.clone(), op_idx));
+        Ok(())
+    }
+
+    /// Try to add a zap: a Deposit order whose offered basket isn't
+    /// proportional to the pool, filled as a rebalancing swap followed by the
+    /// deposit the swap makes possible.
+    ///
+    /// The two steps are accumulated the way the tx-builder's streaming walk
+    /// replays them — swap, protocol_lp bump, then deposit — so the LP minted
+    /// resolved here is the LP the built transaction mints.
+    pub fn try_add_zap(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        pool_ident: &Ident,
+        effective_pool: &Arc<SundaeV4Pool>,
+    ) -> Result<(), String> {
+        use num_traits::Signed;
+
+        let crate::sundaev4::types::Constraint::Deposit {
+            offered,
+            min_received,
+        } = &order.constraint
+        else {
+            return Err("order is not a Deposit".into());
+        };
+
+        // Every fallible step runs off snapshots so a refused zap leaves the
+        // pool's running state and canonical cursor untouched.
+        let fresh = self.fresh_pool_accum(pool_ident, effective_pool);
+        let accum = self.pools.entry(pool_ident.clone()).or_insert(fresh);
+        let assets = accum.running_assets.clone();
+        let lp_before = accum.running_total_lp.clone();
+        let ps = accum.ps.clone();
+        let cum_gross_fb_before = accum.cum_gross_fb.clone();
+        let cum_protocol_lp_before = accum.cum_protocol_lp.clone();
+
+        let basket = batch::align_offered_to_pool(offered, &assets);
+        let swap_deltas =
+            batch::plan_zap_swap(&effective_pool.pool_type, &assets, &lp_before, &basket)?;
+
+        // Swap step.
+        let mut after_swap = assets.clone();
+        for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
+            *amt = &*amt + &swap_deltas[i];
+            if amt.is_negative() {
+                return Err(format!(
+                    "zap swap would drive pool {pool_ident} asset {i} negative"
+                ));
+            }
+        }
+        let fb = swap_math::compute_fee_budget(
+            &effective_pool.pool_type,
+            &assets,
+            &after_swap,
+            &lp_before,
+        );
+        if fb.is_negative() {
+            return Err(format!(
+                "zap swap would make pool {pool_ident} lose value (fee_budget={fb})"
+            ));
+        }
+        let cum_gross_fb = &cum_gross_fb_before + &fb;
+        let new_cum_protocol_lp = &cum_gross_fb * &ps.0 / &ps.1;
+        let op_protocol_lp = &new_cum_protocol_lp - &cum_protocol_lp_before;
+        let lp_at_deposit = &lp_before + &op_protocol_lp;
+
+        // Deposit step, against the post-swap reserves and the basket the swap
+        // left the order holding.
+        let remaining: Vec<BigInt> =
+            (0..basket.len()).map(|i| &basket[i] - &swap_deltas[i]).collect();
+        let (deposit_dx, lp_minted, target_delta_v) = batch::resolve_deposit_basket(
+            &effective_pool.pool_type,
+            &after_swap,
+            &lp_at_deposit,
+            &remaining,
+        )?;
+        if !lp_minted.is_positive() {
+            return Err("zap produces zero LP".into());
+        }
+        // The swap leg is the scooper's choice rather than the order author's,
+        // so a zap only runs behind the LP floor the order declares. Dispatch
+        // finds this pool through that same LP token, so an absent floor means
+        // the order was matched some other way and the fill is unbounded.
+        let Some(min_lp) = batch::declared_min_lp(min_received, pool_ident) else {
+            return Err("zap needs the order's declared LP minimum as its slippage floor".into());
+        };
+        if &lp_minted < min_lp {
+            return Err(format!(
+                "zap fill mints {lp_minted} LP, below the order's minimum {min_lp}"
+            ));
+        }
+
+        let accum = self.pools.get_mut(pool_ident).expect("pool accum was inserted above");
+        accum.check_canonical_append(&order.input)?;
+        let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
+        accum.cum_gross_fb = cum_gross_fb;
+        accum.cum_protocol_lp = new_cum_protocol_lp;
+        accum.running_assets = after_swap;
+        for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+            *amt = &*amt + &deposit_dx[i];
+        }
+        accum.running_total_lp = &lp_at_deposit + &lp_minted;
+        accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
+        accum.running_preminted = next_preminted;
+        accum.running_minted = next_minted;
+
+        let zap_idx = accum.zaps.len();
+        accum.zaps.push(batch::ResolvedZap {
+            order: order.clone(),
+            swap_deltas,
+            deposit_dx,
+            lp_minted,
+            target_delta_v,
+        });
+        let swap_op_idx = accum.ops_order.len();
+        accum.ops_order.push(BatchOp::ZapSwap(zap_idx));
+        accum.ops_order.push(BatchOp::ZapDeposit(zap_idx));
+        self.global_seq_raw.push((pool_ident.clone(), swap_op_idx));
+        self.global_seq_raw.push((pool_ident.clone(), swap_op_idx + 1));
         Ok(())
     }
 
@@ -296,6 +482,7 @@ impl Accumulator {
         transient.pool_datum.total_lp = accum.running_total_lp.clone();
 
         let withdraw = batch::resolve_proportional_withdraw(&transient, order)?;
+        let next_preminted = accum.lp_return_after(&withdraw.lp_burned)?;
 
         // Update running reserves: each asset i shrinks by dy[i].
         for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
@@ -303,6 +490,7 @@ impl Accumulator {
         }
         accum.running_total_lp = &accum.running_total_lp - &withdraw.lp_burned;
         accum.running_circ_lp = &accum.running_circ_lp - &withdraw.lp_burned;
+        accum.running_preminted = next_preminted;
 
         let w_idx = accum.withdraws.len();
         accum.withdraws.push(withdraw);
@@ -389,14 +577,14 @@ impl Accumulator {
             let (ask_asset, min_qty) = order.swap_min_received();
             let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
             if final_asset.as_ref() == Some(ask_asset) {
-                let (_, remaining) = order.swap_offered();
+                let executable = order.swap_executable();
                 let total_in =
                     blend.branches.iter().fold(crate::bigint::BigInt::from(0), |acc, b| {
                         &acc + &b.total_input
                     });
                 // Partial fills: the contract's exact pro-rata check,
                 // received·original ≥ min·fill.
-                let ok = if &total_in < remaining {
+                let ok = if total_in < executable {
                     if let crate::sundaev4::Constraint::Swap {
                         original_offered, ..
                     } = &order.constraint
@@ -411,7 +599,7 @@ impl Accumulator {
                 if !ok {
                     result = Err(format!(
                         "blended output {total_out} below min_received {min_qty} \
-                         (fill {total_in} of {remaining})"
+                         (fill {total_in} of {executable})"
                     ));
                 }
             }
@@ -703,14 +891,14 @@ impl Accumulator {
 
         // Check min_received against the final routed output. Blended
         // branches are checked as a sum by the caller instead. Partial fills
-        // (route input below remaining_offered) use the contract's exact
+        // (route input below what the order can spend) use the contract's exact
         // pro-rata cross-multiplication:
         //   received · original_offered ≥ min · offered_this_fill
         if enforce_min {
             let (ask_asset, min_qty) = order.swap_min_received();
             if final_output_asset.as_ref() == Some(ask_asset) {
-                let (_, remaining) = order.swap_offered();
-                let ok = if &route.total_input < remaining {
+                let executable = order.swap_executable();
+                let ok = if route.total_input < executable {
                     if let crate::sundaev4::Constraint::Swap {
                         original_offered, ..
                     } = &order.constraint
@@ -725,7 +913,7 @@ impl Accumulator {
                 if !ok {
                     return Err(format!(
                         "routed output {} below min_received {} (fill {} of {})",
-                        final_output_amount, min_qty, route.total_input, remaining
+                        final_output_amount, min_qty, route.total_input, executable
                     ));
                 }
             }
@@ -783,7 +971,10 @@ impl Accumulator {
 
     /// Total number of orders across all pools (swaps + deposits + withdraws).
     pub fn order_count(&self) -> usize {
-        self.pools.values().map(|a| a.swaps.len() + a.deposits.len() + a.withdraws.len()).sum()
+        self.pools
+            .values()
+            .map(|a| a.swaps.len() + a.deposits.len() + a.withdraws.len() + a.zaps.len())
+            .sum()
     }
 
     /// Collect all order inputs across all accumulated pools.
@@ -796,6 +987,7 @@ impl Accumulator {
                     .map(|s| &s.order.input)
                     .chain(p.deposits.iter().map(|d| &d.order.input))
                     .chain(p.withdraws.iter().map(|w| &w.order.input))
+                    .chain(p.zaps.iter().map(|z| &z.order.input))
             })
             .collect()
     }
@@ -824,6 +1016,7 @@ impl Accumulator {
                 && accum.continuations.is_empty()
                 && accum.deposits.is_empty()
                 && accum.withdraws.is_empty()
+                && accum.zaps.is_empty()
             {
                 continue;
             }
@@ -843,6 +1036,7 @@ impl Accumulator {
                 continuations: accum.continuations,
                 deposits: accum.deposits,
                 withdraws: accum.withdraws,
+                zaps: accum.zaps,
                 claims: Vec::new(),
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,

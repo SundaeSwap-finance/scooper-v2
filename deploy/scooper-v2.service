@@ -25,5 +25,52 @@ TasksMax=512
 # state in flight (the chain tracker tolerates a forced kill).
 TimeoutStopSec=30
 
+# Sandbox. This process holds a live signing key and parses bytes from the
+# network, so the cost of code execution inside it should be as small as the
+# service's own needs allow.
+#
+# What the scooper actually needs: its own directory under $HOME for the
+# config, the key, the SQLite database and any trace dumps; a unix socket to
+# the local cardano-node; outbound TCP. Everything below is off the path of
+# all three.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+
+# Other processes' command lines are readable through /proc, which is how a
+# secret passed in argv leaks. The scooper does not pass one, but the box
+# runs cardano-node too and this costs nothing.
+ProtectProc=invisible
+ProcSubset=pid
+
+# A unix socket for the node IPC, TCP for everything else. Nothing here
+# speaks a raw or packet socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Deliberately NOT set, with reasons, so the next person does not have to
+# rediscover them:
+#
+#   ProtectHome      the config, the key and the database all live under
+#                    /home/ec2-user/scooper-v2. read-only breaks the database.
+#   ProtectSystem=strict
+#                    would need ReadWritePaths for the working directory and
+#                    buys little over `full` once ProtectHome is unavailable.
+#   MemoryDenyWriteExecute
+#                    no JIT is involved and it would probably hold, but it is
+#                    a poor thing to discover is wrong during a launch week.
+#   SystemCallFilter untested against the Plutus evaluator and the async
+#                    runtime. Worth adding after a soak on preview.
+
 [Install]
 WantedBy=multi-user.target

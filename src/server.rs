@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use http_body_util::{Either, Full};
@@ -40,6 +41,50 @@ type V4State = Option<Arc<Mutex<SundaeV4HistoricalState>>>;
 /// Module state preimage map: state_hash bytes → config CBOR bytes.
 /// Computed at startup from the scooper's execution config.
 pub type ModuleStatePreimages = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// A reason dispatch skips a swap before pricing it. One variant per gate
+/// the scooper applies; `reason()` is the operator-facing text and
+/// `bucket()` the stable key the Protocol tab counts by.
+enum SwapGate {
+    ConfigMissing(String),
+    Restricted,
+    RouteBudget {
+        per_exec: u64,
+        cost_per_pool: u64,
+        cost_per_step: u64,
+    },
+}
+
+impl SwapGate {
+    fn bucket(&self) -> &'static str {
+        match self {
+            SwapGate::ConfigMissing(_) => "config_missing",
+            SwapGate::Restricted => "restricted",
+            SwapGate::RouteBudget { .. } => "route_budget",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            SwapGate::ConfigMissing(token) => format!(
+                "references OrderConfig token {token} which is not on chain; \
+                 the order cannot execute until that config is published"
+            ),
+            SwapGate::Restricted => "this pool is allowlist-restricted and this scooper does not \
+                                     serve the order's credentials on it"
+                .to_string(),
+            SwapGate::RouteBudget {
+                per_exec,
+                cost_per_pool,
+                cost_per_step,
+            } => format!(
+                "max_per_execution {per_exec} lovelace cannot fund any route \
+                 (scooper prices {cost_per_pool} per pool / {cost_per_step} per step); \
+                 cancel and re-place with a higher per-execution cap"
+            ),
+        }
+    }
+}
 
 /// Build the preimage map from an execution config's fee and protocol_share.
 pub fn compute_module_state_preimages(
@@ -108,9 +153,48 @@ impl hyper::body::Body for SseBody {
 
 type ResponseBody = Either<Full<Bytes>, SseBody>;
 
+/// Where the private admin surface listens.
+///
+/// A list, because the operational surface has to be reachable from an
+/// operator's machine over the tailnet AND from the box itself, and those are
+/// different addresses. Accepts a bare string for the single-address case so
+/// existing configs keep working.
+///
+/// Addresses are listed explicitly rather than matched by interface name or
+/// by subnet. A control surface that discovers where to listen can start
+/// listening somewhere new when a network interface appears; one that is
+/// told cannot. Tailscale addresses are stable per node, so naming them
+/// costs a line of config once.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AdminAddresses {
+    One(SocketAddr),
+    Many(Vec<SocketAddr>),
+}
+
+impl AdminAddresses {
+    pub fn to_vec(&self) -> Vec<SocketAddr> {
+        match self {
+            Self::One(a) => vec![*a],
+            Self::Many(a) => a.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for AdminAddresses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = self.to_vec();
+        write!(
+            f,
+            "{}",
+            all.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
-    pub address: SocketAddr,
+    pub address: AdminAddresses,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     /// Optional second listener exposing only the PUBLIC surface: the
@@ -151,12 +235,16 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
 #[allow(clippy::too_many_arguments)]
 pub async fn admin_server(
     config: ServerConfig,
+    role: crate::config::NodeRole,
     network: String,
     v3_state: V3State,
     v4_state: V4State,
     v4_fee: Option<(u64, u64)>,
     v4_routing_costs: Option<(u64, u64)>,
+    v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: ModuleStatePreimages,
+    v4_protocol_share: Option<(u64, u64)>,
+    v4_dao: Option<Arc<dyn crate::persistence::IndexerDao>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
@@ -166,12 +254,16 @@ pub async fn admin_server(
 ) {
     let base = AdminServer {
         visibility: Visibility::Private,
+        role,
         network,
         v3_state,
         v4_state,
         v4_fee,
         v4_routing_costs,
+        v4_pool_allowlists,
         v4_module_preimages: Arc::new(v4_module_preimages),
+        v4_protocol_share,
+        v4_dao,
         resync_tx,
         event_tx,
         paused,
@@ -191,7 +283,24 @@ pub async fn admin_server(
         (None, None) => None,
         _ => panic!("tls_cert and tls_key must both be set or both be absent"),
     };
-    listeners.push((config.address, private_tls, base.clone()));
+    let admin_addrs = config.address.to_vec();
+    if admin_addrs.is_empty() {
+        panic!("server.address lists no addresses; the admin surface would be unreachable");
+    }
+    for addr in &admin_addrs {
+        if addr.ip().is_unspecified() {
+            // 0.0.0.0 puts /pause, /resync-from-acropolis and the whole state
+            // dump on every interface the box has, including any public one.
+            // It is still allowed, because a devnet in a container needs it,
+            // but it is never what a deployed box wants and it should be
+            // visible in the log when it happens.
+            tracing::warn!(
+                address = %addr,
+                "admin surface bound to a wildcard address; it is reachable on every interface"
+            );
+        }
+        listeners.push((*addr, private_tls.clone(), base.clone()));
+    }
 
     if let Some(public_addr) = config.public_address {
         let public_tls = match (&config.public_tls_cert, &config.public_tls_key) {
@@ -220,6 +329,25 @@ pub async fn admin_server(
     }
 }
 
+/// Concurrent connections one listener will hold open.
+///
+/// The accept loop spawned a task per connection with no ceiling, so a client
+/// that opens sockets and never speaks costs memory without bound. The cap is
+/// generous next to the handful of operators and health checks a scooper
+/// actually serves, and a refused connection is a far better failure than an
+/// exhausted host.
+const MAX_CONNECTIONS: usize = 512;
+
+/// How long a connection may take to send its request headers.
+///
+/// Without this a peer can hold a connection by sending one byte at a time.
+/// SSE streams are unaffected: the limit covers the headers, not the life of
+/// the response.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a TLS handshake may take, for the same reason.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn run_listener(
     addr: SocketAddr,
     tls_acceptor: Option<TlsAcceptor>,
@@ -227,7 +355,18 @@ async fn run_listener(
     shutdown: CancellationToken,
 ) {
     let listener = TcpListener::bind(addr).await.unwrap();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // Take the permit BEFORE accepting. Accepting first and then waiting
+        // would drain the kernel backlog into memory, which is the thing the
+        // cap exists to stop.
+        let permit = select! {
+            p = permits.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+            _ = shutdown.cancelled() => { break; }
+        };
         let (stream, peer) = select! {
             res = listener.accept() => match res {
                 Ok(pair) => pair,
@@ -240,11 +379,21 @@ async fn run_listener(
         let tls_acceptor = tls_acceptor.clone();
         let child = shutdown.child_token();
         tokio::task::spawn(async move {
+            let _permit = permit;
             if let Some(acceptor) = tls_acceptor {
-                let tls_stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                let tls_stream = match tokio::time::timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         debug!("TLS handshake failed: {:?}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("TLS handshake timed out");
                         return;
                     }
                 };
@@ -267,9 +416,70 @@ async fn serve_connection(
     server: AdminServer,
 ) {
     let io = TokioIo::new(stream);
-    if let Err(err) = http1::Builder::new().serve_connection(io, server).await {
+    if let Err(err) = http1::Builder::new()
+        // hyper panics at request time if a timeout is configured without a
+        // timer to drive it: "header_read_timeout set, but no timer set".
+        // The panic is per connection, so the process stays up and looks
+        // healthy while every request is answered with a reset.
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(io, server)
+        .await
+    {
         debug!("Failed to serve connection: {:?}", err);
     }
+}
+
+/// Paths the public listener answers. Everything else is 404 there.
+///
+/// An allowlist, not a denylist, and every entry is a deliberate decision to
+/// publish. A route added later is private until someone adds it here.
+///
+/// What is published: the operator dashboard and the reads it needs to draw
+/// a health picture. Pools, orders and sync state are chain data that anyone
+/// can derive from the ledger, so serving them costs nothing and saves
+/// everyone else the indexing.
+///
+/// What is NOT, and why:
+///
+///   /pause, /resync-from-acropolis  controls. They change what the process
+///                                   is doing. The observer 404s them by
+///                                   role as well, so this is the second of
+///                                   two locks.
+///   /failures                       a ring buffer of internal error
+///                                   strings. Useful to an operator,
+///                                   and it describes our failures rather
+///                                   than the chain's state.
+///   /metrics                        operational internals, scraped over the
+///                                   tailnet. Nothing here needs it.
+fn public_path_allowed(path: &str) -> bool {
+    // Exact reads.
+    if matches!(
+        path,
+        "/health" | "/dashboard" | "/status" | "/events" | "/v4/strategy-intents"
+    ) {
+        return true;
+    }
+    // One intent by id.
+    if path.starts_with("/v4/strategy-intents/") {
+        return true;
+    }
+    // Per-protocol listings, and one pool by ident. Spelled out rather than
+    // matched on a "/v3/" or "/v4/" prefix, because that prefix is also where
+    // any future route lands.
+    matches!(
+        path,
+        "/v3/pools"
+            | "/v3/orders"
+            | "/v3/spent-orders"
+            | "/v3/spent-pools"
+            | "/v4/pools"
+            | "/v4/orders"
+            | "/v4/spent-orders"
+            | "/v4/spent-pools"
+            | "/v4/protocol"
+    ) || path.starts_with("/v3/pool/")
+        || path.starts_with("/v4/pool/")
 }
 
 /// Which route surface a listener serves.
@@ -284,6 +494,9 @@ enum Visibility {
 #[derive(Clone)]
 struct AdminServer {
     visibility: Visibility,
+    /// Set from the config. An observer serves no control that changes what
+    /// the process is doing, because the public box runs as one.
+    role: crate::config::NodeRole,
     /// Network name from config, e.g. "preview". Reported in `/status` so
     /// the dashboard can convert slots to wall-clock times.
     network: String,
@@ -294,7 +507,16 @@ struct AdminServer {
     /// fan-out gating knobs, mirrored here so executability reporting
     /// agrees with what dispatch will actually do.
     v4_routing_costs: Option<(u64, u64)>,
+    /// Per-pool trading allowlists, mirrored from the execution config so
+    /// listings and intent probes agree with what dispatch will do.
+    v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: Arc<ModuleStatePreimages>,
+    /// The scooper's configured protocol share of pool fees, reported on the
+    /// dashboard's Protocol tab. Pools may override it per pool on chain.
+    v4_protocol_share: Option<(u64, u64)>,
+    /// V4 indexer DAO, for scoop-record windows on the Protocol tab. The
+    /// in-memory `ScoopStats` keep only the 50 most recent scoops.
+    v4_dao: Option<Arc<dyn crate::persistence::IndexerDao>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
     event_tx: tokio::sync::broadcast::Sender<(u64, Vec<IndexEvent>)>,
     paused: Arc<AtomicBool>,
@@ -386,20 +608,28 @@ impl AdminServer {
             );
         };
 
-        // Bound the body read: an SSE is small; 64KB is generous.
+        // Bound the body read: a signed execution is small; 64KB is generous.
+        //
+        // The limit has to be enforced by the reader, not checked after it.
+        // Collecting first and measuring afterwards buffers the whole body
+        // whatever its size, so an unauthenticated post of a few gigabytes
+        // was an out-of-memory kill rather than a 413. `Limited` stops at the
+        // cap and returns an error instead.
         const MAX_BODY: usize = 64 * 1024;
-        let body = match req.into_body().collect().await {
+        let limited = http_body_util::Limited::new(req.into_body(), MAX_BODY);
+        let body = match limited.collect().await {
             Ok(b) => b.to_bytes(),
+            // `Limited` reports the cap as a boxed error and gives no way to
+            // tell it apart from a read failure, so both answer 413. A client
+            // that lost its connection gets a slightly wrong code; a client
+            // sending too much gets the right one.
             Err(e) => {
                 return Self::error_response(
-                    hyper::StatusCode::BAD_REQUEST,
-                    format!("failed to read body: {e}"),
+                    hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("body rejected (limit {MAX_BODY} bytes): {e}"),
                 );
             }
         };
-        if body.len() > MAX_BODY {
-            return Self::error_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, "body too large");
-        }
 
         #[derive(Deserialize)]
         struct PostIntentBody {
@@ -523,6 +753,14 @@ impl AdminServer {
                     o.input.0.transaction_id.as_ref() == key.0.as_slice()
                         && o.input.0.index == key.1
                 });
+                let visible = match order {
+                    Some(o) => self.v4_pool_allowlists.retain_visible(
+                        pools.clone(),
+                        o,
+                        o.constraint.strategy(),
+                    ),
+                    None => pools.clone(),
+                };
                 let probe: serde_json::Value = match (order, &i.hint) {
                     (None, _) => serde_json::json!("order-not-indexed"),
                     // The order validator's withdraw handler demands the
@@ -539,11 +777,39 @@ impl AdminServer {
                                        against an existing config)",
                         })
                     }
+                    (Some(_), Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }))
+                        if !visible.keys().any(|id| &hex::encode(id.to_bytes()) == pool)
+                            && pools.keys().any(|id| &hex::encode(id.to_bytes()) == pool) =>
+                    {
+                        serde_json::json!({
+                            "state": "not-permitted",
+                            "pool": pool,
+                            "detail": "this scooper does not serve the order's credentials \
+                                       on that pool",
+                        })
+                    }
                     (
                         Some(order),
                         Some(crate::sundaev4::intents::ExecutionHint::Claim { pool }),
-                    ) => Self::probe_claim(order, i, pool, &pools),
-                    (Some(order), None) => Self::probe_swap(order, i, &pools),
+                    ) => Self::probe_claim(order, i, pool, &visible),
+                    (Some(order), None) => {
+                        let probe = Self::probe_swap(order, i, &visible);
+                        // A route that runs only through pools this order is
+                        // barred from would otherwise read as "no-route" or
+                        // "below-floor".
+                        if visible.len() < pools.len()
+                            && probe["state"] != "dispatchable"
+                            && Self::probe_swap(order, i, &pools)["state"] == "dispatchable"
+                        {
+                            serde_json::json!({
+                                "state": "not-permitted",
+                                "detail": "a route exists, but only through pools where \
+                                           this scooper does not serve the order's credentials",
+                            })
+                        } else {
+                            probe
+                        }
+                    }
                 };
                 serde_json::json!({
                     "status": "pending",
@@ -832,12 +1098,51 @@ impl AdminServer {
         body
     }
 
+    /// Route a request, then apply the header policy the surface requires.
+    ///
+    /// The cross-origin header is set by the response helpers, which are
+    /// associated functions and cannot see which listener they answer on.
+    /// Deciding it here keeps one rule in one place instead of adding a
+    /// visibility argument to every helper.
     async fn do_call(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
+        let visibility = self.visibility;
+        let mut res = self.route(req).await;
+        if visibility == Visibility::Private {
+            // The operational surface is for operators, not for pages. Left
+            // open, any site an operator visits could read the whole pool and
+            // order state out of a box their machine can reach.
+            res.headers_mut().remove("Access-Control-Allow-Origin");
+        }
+        res
+    }
+
+    /// Whether a browser is sending this from a different origin.
+    ///
+    /// Browsers attach `Origin` to every POST, same-origin ones included, so
+    /// the signal is a mismatch against `Host`, not the presence of the
+    /// header. A request with no `Origin` did not come from a page: curl, the
+    /// deploy script and the health checker all land there.
+    fn is_cross_origin<B>(req: &Request<B>) -> bool {
+        let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        if origin.eq_ignore_ascii_case("null") {
+            return true;
+        }
+        let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        // Compare authorities only. The scheme differs whenever TLS
+        // terminates in front, and that is not what this check is about.
+        let origin_authority = origin.split("://").nth(1).unwrap_or(origin);
+        !origin_authority.eq_ignore_ascii_case(host)
+    }
+
+    async fn route(self, req: Request<IncomingBody>) -> Response<ResponseBody> {
         let path = req.uri().path().to_string();
 
-        if self.visibility == Visibility::Public
-            && !(path.starts_with("/v4/strategy-intents") || path == "/health")
-        {
+        // Allowlist the public surface by exact path. A prefix test also
+        // admits anything that merely begins with it, so a route added later
+        // whose name starts the same way would be published by accident.
+        if self.visibility == Visibility::Public && !public_path_allowed(&path) {
             return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
         }
 
@@ -861,6 +1166,24 @@ impl AdminServer {
             ),
             "/status" => Self::json_response(self.serve_status().await),
             "/resync-from-acropolis" => {
+                if self.role.is_observer() {
+                    return Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path");
+                }
+                // This restarts the indexer. It answered any method,
+                // including GET, so a link, an image tag or a prefetch was
+                // enough to trigger it, and the response carried an open
+                // cross-origin header. POST alone does not fix that, because
+                // a form post is still reachable from another page; the
+                // origin check is what closes it.
+                if *req.method() != hyper::Method::POST {
+                    return Self::error_response(hyper::StatusCode::METHOD_NOT_ALLOWED, "use POST");
+                }
+                if Self::is_cross_origin(&req) {
+                    return Self::error_response(
+                        hyper::StatusCode::FORBIDDEN,
+                        "cross-origin request refused",
+                    );
+                }
                 let _ = self.resync_tx.send(());
                 Self::text_response("resync")
             }
@@ -870,8 +1193,23 @@ impl AdminServer {
             // any stray request (scanner, browser prefetch, curl typo)
             // silently stop all scooping — which once went unnoticed for
             // days because the toggle also didn't log.
+            "/pause" if self.role.is_observer() => {
+                // There is no scooping to pause, and the control is one more
+                // way to stop a box that anyone can reach.
+                Self::error_response(hyper::StatusCode::NOT_FOUND, "unknown path")
+            }
             "/pause" => match *req.method() {
                 hyper::Method::POST => {
+                    // Halting scooping is a state change, and a plain POST
+                    // with a simple content type needs no preflight, so the
+                    // effect lands from another page even though the reply
+                    // cannot be read. Refuse the cross-origin case outright.
+                    if Self::is_cross_origin(&req) {
+                        return Self::error_response(
+                            hyper::StatusCode::FORBIDDEN,
+                            "cross-origin request refused",
+                        );
+                    }
                     let was_paused = self.paused.fetch_xor(true, Ordering::Relaxed);
                     let now_paused = !was_paused;
                     let remote =
@@ -983,7 +1321,15 @@ impl AdminServer {
         .unwrap()
     }
 
+    /// Liveness for the public surface and full operational detail for the
+    /// private one.
+    ///
+    /// The wallet balance, the UTxO count and our key hash say how much the
+    /// scooper holds and which key signs. None of it is needed to answer
+    /// whether the service is up, and all of it is useful to someone sizing
+    /// an attack, so the public answer stops at sync and pool counts.
     async fn serve_health_stats(&self) -> String {
+        let full = self.visibility == Visibility::Private;
         let Some(v4) = &self.v4_state else {
             return serde_json::to_string(&serde_json::json!({
                 "error": "v4 indexer not configured"
@@ -1022,13 +1368,13 @@ impl AdminServer {
                 "count": state.pools.len(),
                 "orders_pending": orders_pending,
             },
-            "wallet": {
+            "wallet": full.then(|| serde_json::json!({
                 "ada_balance": ada_balance,
                 "utxo_count": state.wallet_utxos.len(),
-            },
-            "our_keyhash": stats.our_keyhash,
-            "scooper_totals": stats.scooper_totals,
-            "recent_scoops": stats.recent_scoops,
+            })),
+            "our_keyhash": full.then(|| stats.our_keyhash.clone()),
+            "scooper_totals": full.then(|| stats.scooper_totals.clone()),
+            "recent_scoops": full.then(|| stats.recent_scoops.clone()),
         }))
         .unwrap()
     }
@@ -1132,6 +1478,7 @@ impl AdminServer {
             "/orders" => self.v4_list_orders().await,
             "/spent-orders" => self.v4_list_spent_orders().await,
             "/spent-pools" => self.v4_list_spent_pools().await,
+            "/protocol" => self.v4_protocol_stats().await,
             _ => "unknown".into(),
         }
     }
@@ -1141,7 +1488,12 @@ impl AdminServer {
             return "v3 indexer not configured".into();
         };
         let state = v3.lock().await.latest().into_owned();
-        let id_bytes = hex::decode(pool_id).unwrap();
+        // A path segment is caller-supplied. Unwrapping here panicked the
+        // connection task on any non-hex request and answered a reset
+        // instead of a status. The v4 twin already handled this.
+        let Ok(id_bytes) = hex::decode(pool_id) else {
+            return format!("pool id {pool_id} is not hex");
+        };
         let ident = Ident::new(&id_bytes);
         let pool = match state.pools.get(&ident).cloned() {
             Some(p) => p,
@@ -1258,12 +1610,31 @@ impl AdminServer {
         preimages: &ModuleStatePreimages,
     ) -> serde_json::Value {
         let mut pool_json = serde_json::to_value(pool).unwrap_or_default();
+        // A stableswap pool's config is per pool (and its rates move on
+        // chain), so its preimage comes from the pool record, not the
+        // startup map.
+        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> =
+            if let crate::sundaev4::PoolType::StableSwap { config } = &pool.pool_type {
+                use plutus_parser::AsPlutus;
+                let cbor = minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default();
+                Some((
+                    pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(),
+                    cbor,
+                ))
+            } else {
+                None
+            };
         if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
             let mut enriched = serde_json::Map::new();
             for (module_hash, state_bytes) in &pool.pool_datum.module_state {
                 let state_hex = hex::encode(state_bytes);
                 // Try to find a preimage whose blake2b-256 matches state_bytes
-                let value_hex = preimages.get(state_bytes).map(hex::encode);
+                let value_hex = preimages.get(state_bytes).map(hex::encode).or_else(|| {
+                    ss_preimage
+                        .as_ref()
+                        .filter(|(h, _)| h == state_bytes)
+                        .map(|(_, cbor)| hex::encode(cbor))
+                });
                 let mut entry = serde_json::Map::new();
                 entry.insert("state".into(), state_hex.into());
                 if let Some(v) = value_hex {
@@ -1303,45 +1674,12 @@ impl AdminServer {
         let mut non_executable = Vec::new();
 
         for order in &candidates {
-            // Mirror the scooper's dispatch gate: an order naming an
-            // unindexed OrderConfig can never validate on chain.
-            if !state.order_configs.contains_key(&order.datum.config_token) {
+            if let Err(gate) = self.v4_swap_gate(&state, &ident, order) {
                 non_executable.push(serde_json::json!({
                     "order": order.input.to_string(),
-                    "reason": format!(
-                        "references OrderConfig token {} which is not on chain; \
-                         the order cannot execute until that config is published",
-                        hex::encode(&order.datum.config_token),
-                    ),
+                    "reason": gate.reason(),
                 }));
                 continue;
-            }
-            // Mirror the router's fan-out gate: an order's max_per_execution
-            // buys its route budget, and one that can't afford a single pool
-            // touch will never dispatch, no matter how in-range the swap is.
-            // Without this check the dashboard calls such orders executable
-            // while dispatch logs "no route" every cycle (seen live with a
-            // max_per_execution of 10,000 lovelace against a 1 ADA/pool
-            // routing cost).
-            if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
-                use num_traits::ToPrimitive;
-                let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
-                let limits = crate::sundaev4::router::RoutingLimits::from_budget(
-                    per_exec,
-                    cost_per_pool,
-                    cost_per_step,
-                );
-                if limits.max_pools < 1 || limits.max_steps < 1 {
-                    non_executable.push(serde_json::json!({
-                        "order": order.input.to_string(),
-                        "reason": format!(
-                            "max_per_execution {per_exec} lovelace cannot fund any route \
-                             (scooper prices {cost_per_pool} per pool / {cost_per_step} per step); \
-                             cancel and re-place with a higher per-execution cap"
-                        ),
-                    }));
-                    continue;
-                }
             }
             match batch::check_order_executability(
                 order,
@@ -1372,6 +1710,305 @@ impl AdminServer {
         serde_json::to_string_pretty(&response).unwrap()
     }
 
+    /// Why dispatch would skip a swap before even pricing it. Mirrors the
+    /// scooper's own gates so the dashboard agrees with what dispatch does.
+    fn v4_swap_gate(
+        &self,
+        state: &crate::sundaev4::SundaeV4State,
+        ident: &Ident,
+        order: &crate::sundaev4::SundaeV4Order,
+    ) -> Result<(), SwapGate> {
+        // An order naming an unindexed OrderConfig can never validate on chain.
+        if !state.order_configs.contains_key(&order.datum.config_token) {
+            return Err(SwapGate::ConfigMissing(hex::encode(
+                &order.datum.config_token,
+            )));
+        }
+        if !self.v4_pool_allowlists.permits(ident, order, order.constraint.strategy()) {
+            return Err(SwapGate::Restricted);
+        }
+        // The router's fan-out gate: an order's max_per_execution buys its
+        // route budget, and one that can't afford a single pool touch will
+        // never dispatch, no matter how in-range the swap is. Without this
+        // check the dashboard calls such orders executable while dispatch
+        // logs "no route" every cycle (seen live with a max_per_execution of
+        // 10,000 lovelace against a 1 ADA/pool routing cost).
+        if let Some((cost_per_pool, cost_per_step)) = self.v4_routing_costs {
+            use num_traits::ToPrimitive;
+            let per_exec = order.datum.max_per_execution.clone().unwrap().to_u64().unwrap_or(0);
+            let base_fee = state.fee_settings.as_ref().map(|f| f.base_fee).unwrap_or(0);
+            let limits = crate::sundaev4::router::RoutingLimits::from_budget(
+                per_exec,
+                base_fee,
+                cost_per_pool,
+                cost_per_step,
+            );
+            if limits.max_pools < 1 || limits.max_steps < 1 {
+                return Err(SwapGate::RouteBudget {
+                    per_exec,
+                    cost_per_pool,
+                    cost_per_step,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Protocol-wide aggregates for the dashboard's Protocol tab: pools by
+    /// type, reserves, accrued protocol equity, open orders and their
+    /// executability, and scoop activity over recent windows. Everything
+    /// here is derived from indexed state plus the scoop-record table; no
+    /// prices are involved, the client prices assets itself.
+    async fn v4_protocol_stats(&self) -> String {
+        use crate::cardano_types::AssetClass;
+        use crate::sundaev4::{Constraint, PoolType};
+        use num_traits::{Signed, Zero};
+
+        let Some(v4) = &self.v4_state else {
+            return serde_json::to_string(&serde_json::json!({
+                "error": "v4 indexer not configured"
+            }))
+            .unwrap();
+        };
+        let state = v4.lock().await.latest().into_owned();
+
+        fn asset_list(map: BTreeMap<AssetClass, crate::bigint::BigInt>) -> Vec<serde_json::Value> {
+            map.into_iter()
+                .filter(|(_, amount)| amount.is_positive())
+                .map(|(asset, amount)| {
+                    serde_json::json!({ "asset": asset, "amount": amount.to_string() })
+                })
+                .collect()
+        }
+        fn add_to(
+            map: &mut BTreeMap<AssetClass, crate::bigint::BigInt>,
+            asset: &AssetClass,
+            amount: crate::bigint::BigInt,
+        ) {
+            *map.entry(asset.clone()).or_insert_with(crate::bigint::BigInt::zero) += amount;
+        }
+
+        // ── Pools: counts by type, reserves, accrued protocol equity ──
+        let mut by_type: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut tvl: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut equity_total: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut pool_rows = Vec::new();
+        // Lovelace on each pool UTxO above its ADA reserve. Base fees are
+        // delivered as an exact surplus on the designated pool (ADR-0010),
+        // outside the datum's reserve accounting, so this is where base-fee
+        // income accumulates. It also holds each pool's create-time ADA
+        // buffer, which the datum does not record (only the min_surplus
+        // floor), so it overstates fees collected by that deposit.
+        let mut surplus_total = crate::bigint::BigInt::zero();
+        let mut empty_pools = 0u64;
+        let mut restricted_pools = 0u64;
+        for (ident, pool) in &state.pools {
+            let kind = match &pool.pool_type {
+                PoolType::ConstantProduct { .. } => "cp",
+                PoolType::ConstantSum { .. } => "cs",
+                PoolType::ConcentratedLiquidity { .. } => "cl",
+                PoolType::StableSwap { .. } => "ss",
+            };
+            *by_type.entry(kind).or_default() += 1;
+            if self.v4_pool_allowlists.is_restricted(ident) {
+                restricted_pools += 1;
+            }
+            let pd = &pool.pool_datum;
+            if pd.assets.iter().any(|(_, r)| !r.is_positive()) {
+                empty_pools += 1;
+            }
+            // The protocol's fee accrues as LP minted into total_lp but not
+            // into circulation. Its share of every reserve is the accrued,
+            // unclaimed protocol equity — the same figure the V4 pool table
+            // shows per pool.
+            let protocol_lp = pd.total_lp.clone() - &pd.circulating_lp;
+            let mut equity: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+            for (asset, reserve) in &pd.assets {
+                add_to(&mut tvl, asset, reserve.clone());
+                if pd.total_lp.is_positive() && protocol_lp.is_positive() {
+                    let share = reserve.clone() * &protocol_lp / &pd.total_lp;
+                    add_to(&mut equity_total, asset, share.clone());
+                    add_to(&mut equity, asset, share);
+                }
+            }
+            let reserve_ada = pd
+                .assets
+                .iter()
+                .find(|(a, _)| *a == crate::cardano_types::ADA_ASSET_CLASS)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(crate::bigint::BigInt::zero);
+            let surplus = pool.value.get(&crate::cardano_types::ADA_ASSET_CLASS) - &reserve_ada;
+            surplus_total += &surplus;
+            let protocol_share = pool
+                .fee_split_config
+                .as_ref()
+                .map(|c| serde_json::to_value(&c.protocol_share).unwrap_or_default());
+            pool_rows.push(serde_json::json!({
+                "pool_id": hex::encode(ident.to_bytes()),
+                "pool_type": kind,
+                "reserves": asset_list(pd.assets.iter().cloned().collect()),
+                "total_lp": pd.total_lp.to_string(),
+                "protocol_lp": protocol_lp.to_string(),
+                "protocol_equity": asset_list(equity),
+                "surplus_lovelace": surplus.to_string(),
+                "min_surplus": pd.min_surplus.to_string(),
+                "protocol_share": protocol_share,
+                "restricted": self.v4_pool_allowlists.is_restricted(ident),
+            }));
+        }
+
+        // ── Orders: by kind, and swap executability against current pools ──
+        let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut oldest_slot: Option<u64> = None;
+        for order in &state.orders {
+            let kind = match &order.constraint {
+                Constraint::Swap { .. } => "swap",
+                Constraint::Deposit { .. } => "deposit",
+                Constraint::Withdraw { .. } => "withdraw",
+                Constraint::Claim { .. } => "claim",
+                Constraint::Strategy { .. } => "strategy",
+            };
+            *by_kind.entry(kind).or_default() += 1;
+            oldest_slot = Some(oldest_slot.map_or(order.slot, |s| s.min(order.slot)));
+        }
+        let groups = batch::group_orders_by_pool(&state.orders, &state.pools);
+        let matched_swaps: u64 = groups.values().map(|v| v.len() as u64).sum();
+        let unmatched_swaps =
+            by_kind.get("swap").copied().unwrap_or(0).saturating_sub(matched_swaps);
+        let mut executable = 0u64;
+        let mut blocked: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut executable_volume: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        let mut executable_output: BTreeMap<AssetClass, crate::bigint::BigInt> = BTreeMap::new();
+        for (ident, candidates) in &groups {
+            let Some(pool) = state.pools.get(ident) else {
+                continue;
+            };
+            for order in candidates {
+                if let Err(gate) = self.v4_swap_gate(&state, ident, order) {
+                    *blocked.entry(gate.bucket()).or_default() += 1;
+                    continue;
+                }
+                match batch::check_order_executability(
+                    order,
+                    &pool.pool_datum.assets,
+                    &pool.pool_datum.total_lp,
+                    &pool.pool_type,
+                ) {
+                    Ok(swap) => {
+                        executable += 1;
+                        let (offered, _) = order.swap_offered();
+                        add_to(&mut executable_volume, offered, swap.dx.clone());
+                        add_to(
+                            &mut executable_output,
+                            &pool.pool_datum.assets[swap.output_idx].0,
+                            swap.dy.clone(),
+                        );
+                    }
+                    Err(reason) => {
+                        // Stable keys for check_order_executability's messages.
+                        let bucket = if reason.starts_with("below min_received") {
+                            "below_min_received"
+                        } else if reason.starts_with("swap would take")
+                            || reason.starts_with("swap of")
+                            || reason.starts_with("stableswap")
+                        {
+                            "zero_output"
+                        } else if reason.starts_with("no matching pool asset") {
+                            "asset_mismatch"
+                        } else {
+                            "other"
+                        };
+                        *blocked.entry(bucket).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Activity: scoop records over recent windows, from the DB ──
+        // Slots are seconds on every post-Byron network, so a window in
+        // seconds is a window in slots off the indexed tip.
+        const WINDOWS: [(&str, u64); 3] = [("1h", 3_600), ("24h", 86_400), ("7d", 604_800)];
+        let horizon = state.tip_slot.saturating_sub(WINDOWS[WINDOWS.len() - 1].1);
+        let records = match &self.v4_dao {
+            Some(dao) => dao.load_scoop_records_since(horizon).await.unwrap_or_else(|e| {
+                tracing::warn!("protocol stats: scoop record window query failed: {e:#}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        let windows: Vec<serde_json::Value> = WINDOWS
+            .iter()
+            .map(|(label, secs)| {
+                let since = state.tip_slot.saturating_sub(*secs);
+                let mut txs = std::collections::BTreeSet::new();
+                let mut pools = std::collections::BTreeSet::new();
+                let mut scoopers = std::collections::BTreeSet::new();
+                let mut orders = 0u64;
+                for r in records.iter().filter(|r| r.slot >= since) {
+                    txs.insert(&r.tx_id);
+                    pools.insert(&r.pool_id);
+                    scoopers.insert(&r.scooper);
+                    orders += r.n_orders as u64;
+                }
+                serde_json::json!({
+                    "label": label,
+                    "seconds": secs,
+                    "scoop_txs": txs.len(),
+                    "orders": orders,
+                    "pools": pools.len(),
+                    "scoopers": scoopers.len(),
+                })
+            })
+            .collect();
+        let stats = &state.scoop_stats;
+        let all_time = serde_json::json!({
+            "scoop_txs": stats.scooper_totals.iter().map(|t| t.scoop_txs).sum::<u64>(),
+            "orders": stats.scooper_totals.iter().map(|t| t.orders_processed).sum::<u64>(),
+            "scoopers": stats.scooper_totals.len(),
+        });
+
+        serde_json::to_string(&serde_json::json!({
+            "tip_slot": state.tip_slot,
+            "network_tip_slot": state.network_tip_slot,
+            "pools": {
+                "total": state.pools.len(),
+                "by_type": by_type,
+                "empty": empty_pools,
+                "restricted": restricted_pools,
+                "tvl": asset_list(tvl),
+            },
+            "protocol_equity": {
+                "total": asset_list(equity_total),
+                "surplus_lovelace": surplus_total.to_string(),
+                "pools": pool_rows,
+            },
+            "orders": {
+                "open": state.orders.len(),
+                "by_kind": by_kind,
+                "invalid": state.invalid_orders.len(),
+                "oldest_slot": oldest_slot,
+                "swaps": {
+                    "matched": matched_swaps,
+                    "unmatched": unmatched_swaps,
+                    "executable": executable,
+                    "blocked": blocked,
+                    "executable_volume": asset_list(executable_volume),
+                    "executable_output": asset_list(executable_output),
+                },
+            },
+            "activity": {
+                "windows": windows,
+                "all_time": all_time,
+                "records_available": self.v4_dao.is_some(),
+            },
+            "fees": {
+                "scooper_base_fee_lovelace": state.fee_settings.as_ref().map(|f| f.base_fee),
+                "protocol_share": self.v4_protocol_share,
+            },
+        }))
+        .unwrap()
+    }
+
     async fn v4_list_pools(&self) -> String {
         let Some(v4) = &self.v4_state else {
             return "v4 indexer not configured".into();
@@ -1380,10 +2017,14 @@ impl AdminServer {
         let mut json_map = serde_json::Map::new();
 
         for (ident, pool) in &state.pools {
-            json_map.insert(
-                hex::encode(ident.to_bytes()),
-                Self::v4_pool_json(pool, &self.v4_module_preimages),
-            );
+            let ident_hex = hex::encode(ident.to_bytes());
+            let mut json = Self::v4_pool_json(pool, &self.v4_module_preimages);
+            if self.v4_pool_allowlists.is_restricted(ident)
+                && let Some(obj) = json.as_object_mut()
+            {
+                obj.insert("restricted".into(), true.into());
+            }
+            json_map.insert(ident_hex, json);
         }
 
         serde_json::to_string_pretty(&json_map).unwrap()
@@ -1542,5 +2183,337 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "rollback",
             serde_json::json!({ "to_slot": to_slot }).to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod protocol_stats_tests {
+    //! The Protocol tab's numbers come from one aggregate endpoint. This
+    //! exercises it against a real pool and order from the test harness so
+    //! the counts, reserves, equity and executability buckets line up with
+    //! the state they were derived from.
+    use super::*;
+    use crate::sundaev4::test_harness::*;
+
+    fn server_over(state: crate::sundaev4::SundaeV4State) -> AdminServer {
+        let mut hist = SundaeV4HistoricalState::new();
+        let slot = state.tip_slot;
+        *hist.update_slot(slot).unwrap() = state;
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+        AdminServer {
+            visibility: Visibility::Private,
+            role: crate::config::NodeRole::Scooper,
+            network: "devnet".into(),
+            v3_state: None,
+            v4_state: Some(Arc::new(Mutex::new(hist))),
+            v4_fee: Some((1, 1)),
+            v4_routing_costs: None,
+            v4_pool_allowlists: Arc::default(),
+            v4_module_preimages: Arc::default(),
+            v4_protocol_share: Some((1, 2)),
+            v4_dao: None,
+            resync_tx,
+            event_tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+            intents: None,
+            remote_addr: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregates_pools_orders_and_equity() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        // 1000 A / 2000 B, with a quarter of the LP held by the protocol.
+        let pool = make_pool(&env, 0xA1, token_a(), 1_000_000, token_b(), 2_000_000);
+        let mut pool = (*pool).clone();
+        pool.pool_datum.total_lp = 400.into();
+        pool.pool_datum.circulating_lp = 300.into();
+        // 7 ADA on the UTxO with no ADA reserve: all of it is surplus.
+        pool.value.insert(&ada(), 7_000_000.into());
+        let pool = Arc::new(pool);
+
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.tip_slot = 5_000;
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool.clone());
+        // One swap that fits, one that asks for more than the pool can pay,
+        // one whose assets match no pool.
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1, 100));
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1_000_000_000, 200));
+        state.orders.push(make_order(token_e(), 10_000, token_f(), 1, 300));
+        // Index the harness's OrderConfigs so the config gate passes and the
+        // pricing check is what decides.
+        state.order_configs = env.order_configs.clone();
+
+        let body = server_over(state).v4_protocol_stats().await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(v["pools"]["total"], 1);
+        assert_eq!(v["pools"]["by_type"]["cp"], 1);
+        assert_eq!(v["pools"]["empty"], 0);
+        let tvl = v["pools"]["tvl"].as_array().unwrap();
+        assert_eq!(tvl.len(), 2);
+        assert!(tvl.iter().any(|e| e["amount"] == "1000000"));
+        assert!(tvl.iter().any(|e| e["amount"] == "2000000"));
+
+        // Protocol equity = reserve × (400 − 300) / 400 = a quarter of each.
+        let eq = v["protocol_equity"]["total"].as_array().unwrap();
+        assert!(eq.iter().any(|e| e["amount"] == "250000"), "{eq:?}");
+        assert!(eq.iter().any(|e| e["amount"] == "500000"), "{eq:?}");
+        assert_eq!(v["protocol_equity"]["pools"][0]["protocol_lp"], "100");
+        assert_eq!(
+            v["protocol_equity"]["pools"][0]["surplus_lovelace"],
+            "7000000"
+        );
+        assert_eq!(v["protocol_equity"]["surplus_lovelace"], "7000000");
+
+        assert_eq!(v["orders"]["open"], 3);
+        assert_eq!(v["orders"]["by_kind"]["swap"], 3);
+        assert_eq!(v["orders"]["oldest_slot"], 100);
+        let swaps = &v["orders"]["swaps"];
+        assert_eq!(swaps["matched"], 2);
+        assert_eq!(swaps["unmatched"], 1);
+        assert_eq!(swaps["executable"], 1);
+        assert_eq!(swaps["blocked"]["below_min_received"], 1);
+        assert_eq!(swaps["executable_volume"][0]["amount"], "10000");
+
+        assert_eq!(v["activity"]["records_available"], false);
+        assert_eq!(v["fees"]["protocol_share"], serde_json::json!([1, 2]));
+    }
+
+    #[tokio::test]
+    async fn unindexed_order_config_is_counted_not_priced() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        let pool = make_pool(&env, 0xA2, token_a(), 1_000_000, token_b(), 2_000_000);
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool);
+        state.orders.push(make_order(token_a(), 10_000, token_b(), 1, 100));
+
+        let body = server_over(state).v4_protocol_stats().await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["orders"]["swaps"]["executable"], 0);
+        assert_eq!(v["orders"]["swaps"]["blocked"]["config_missing"], 1);
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    //! What each listener is allowed to answer, and what a page on another
+    //! site is allowed to make it do.
+    use super::*;
+
+    fn req_with(origin: Option<&str>, host: &str) -> Request<()> {
+        let mut b = Request::builder().header("host", host);
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn the_public_surface_serves_the_dashboard_and_the_chain_reads() {
+        for allowed in [
+            "/health",
+            "/dashboard",
+            "/status",
+            "/events",
+            "/v4/strategy-intents",
+            "/v4/strategy-intents/abcd",
+            "/v3/pools",
+            "/v3/orders",
+            "/v3/spent-orders",
+            "/v3/spent-pools",
+            "/v4/pools",
+            "/v4/orders",
+            "/v4/spent-orders",
+            "/v4/spent-pools",
+            "/v4/protocol",
+            "/v4/pool/abcd",
+            "/v3/pool/abcd",
+        ] {
+            assert!(public_path_allowed(allowed), "{allowed} should be public");
+        }
+    }
+
+    #[test]
+    fn the_public_surface_withholds_the_controls_and_our_own_internals() {
+        // The controls change what the process is doing. /failures is a log
+        // of our errors rather than the chain's state, and /metrics is
+        // operational internals scraped over the tailnet.
+        for denied in ["/pause", "/resync-from-acropolis", "/failures", "/metrics"] {
+            assert!(!public_path_allowed(denied), "{denied} must not be public");
+        }
+    }
+
+    #[test]
+    fn a_new_route_under_a_published_prefix_is_private_until_it_is_listed() {
+        // The listings are named one by one rather than matched on "/v4/",
+        // because that prefix is also where the next route lands.
+        for unlisted in [
+            "/v4/admin",
+            "/v4/keys",
+            "/v3/secrets",
+            "/v4/strategy-intents-admin",
+            "/dashboard-admin",
+            "/statuses",
+        ] {
+            assert!(
+                !public_path_allowed(unlisted),
+                "{unlisted} must not be public"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_merely_starts_with_the_public_prefix_is_not_public() {
+        // The gate used to be a prefix test, so a route named like this one
+        // would have been served publicly the day it was added.
+        assert!(!public_path_allowed("/v4/strategy-intents-admin"));
+        assert!(!public_path_allowed("/v4/strategy-intentsX"));
+    }
+
+    #[test]
+    fn a_request_with_no_origin_is_not_cross_origin() {
+        // curl, the deploy script and the health checker send no Origin.
+        // Treating that as cross-origin would lock operators out of /pause.
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            None,
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn the_dashboard_posting_to_its_own_host_is_allowed() {
+        // Browsers attach Origin to same-origin POSTs too, so the check has
+        // to compare it against Host rather than test for its presence.
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            Some("http://localhost:9999"),
+            "localhost:9999"
+        )));
+        assert!(!AdminServer::is_cross_origin(&req_with(
+            Some("https://localhost:9999"),
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn another_site_is_cross_origin() {
+        assert!(AdminServer::is_cross_origin(&req_with(
+            Some("https://evil.example"),
+            "localhost:9999"
+        )));
+    }
+
+    #[test]
+    fn an_opaque_origin_is_cross_origin() {
+        // A sandboxed iframe or a data: document sends "null". It is not the
+        // dashboard, so it does not get to pause scooping.
+        assert!(AdminServer::is_cross_origin(&req_with(
+            Some("null"),
+            "localhost:9999"
+        )));
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    //! Exercises the real listener: bind a port, speak HTTP to it, read the
+    //! response.
+    //!
+    //! The predicate tests above cover routing decisions and say nothing
+    //! about how a connection is served. That gap shipped a panic: hyper
+    //! aborts the connection task at request time when a timeout is set
+    //! without a timer to drive it, so every request came back as a reset
+    //! while the process stayed up and looked healthy.
+    use super::*;
+
+    fn bare_server(visibility: Visibility) -> AdminServer {
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let (resync_tx, _) = tokio::sync::broadcast::channel(1);
+        AdminServer {
+            visibility,
+            role: crate::config::NodeRole::Scooper,
+            network: "devnet".into(),
+            v3_state: None,
+            v4_state: None,
+            v4_fee: None,
+            v4_routing_costs: None,
+            v4_pool_allowlists: Arc::default(),
+            v4_module_preimages: Arc::default(),
+            v4_protocol_share: None,
+            v4_dao: None,
+            resync_tx,
+            event_tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(Metrics::new()),
+            intents: None,
+            remote_addr: None,
+        }
+    }
+
+    async fn start(visibility: Visibility) -> (SocketAddr, CancellationToken) {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let server = bare_server(visibility);
+        tokio::spawn(async move { run_listener(addr, None, server, token).await });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (addr, shutdown)
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let res = reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("request should get a response, not a connection reset");
+        let status = res.status().as_u16();
+        (status, res.text().await.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_request_gets_a_response_rather_than_a_reset() {
+        let (addr, shutdown) = start(Visibility::Private).await;
+        let (status, body) = get(addr, "/health").await;
+        assert_eq!(status, 200);
+        assert!(!body.is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_public_listener_serves_the_dashboard_and_refuses_the_controls() {
+        let (addr, shutdown) = start(Visibility::Public).await;
+        for denied in ["/metrics", "/failures", "/pause", "/resync-from-acropolis"] {
+            let (status, _) = get(addr, denied).await;
+            assert_eq!(status, 404, "{denied} must not be served publicly");
+        }
+        let (status, body) = get(addr, "/dashboard").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("<html") || body.contains("<!DOCTYPE") || body.contains("<body"));
+        assert_eq!(get(addr, "/health").await.0, 200);
+        assert_eq!(get(addr, "/status").await.0, 200);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_private_listener_sends_no_cross_origin_header() {
+        let (addr, shutdown) = start(Visibility::Private).await;
+        let res = reqwest::Client::new()
+            .get(format!("http://{addr}/health"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+        shutdown.cancel();
     }
 }

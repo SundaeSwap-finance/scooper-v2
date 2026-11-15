@@ -1,3 +1,4 @@
+pub mod access;
 pub mod accumulator;
 pub mod batch;
 pub mod butane;
@@ -7,8 +8,10 @@ pub mod conversions;
 pub mod evaluator;
 mod indexer;
 pub mod intents;
+pub mod rate_guard;
 pub mod router;
 pub mod script_context;
+pub mod ss_math;
 pub mod submit;
 pub mod swap_math;
 pub mod tx_builder;
