@@ -2867,12 +2867,20 @@ mod boundary_block_replay_tests {
         let mut node = start(&env, &state, &*persistence).await;
         node.handle_block(&block(SLOT)).await.unwrap();
         node.handle_onchain_tx_bytes(&block(SLOT), &tx).await.unwrap();
-        assert_eq!(state.lock().await.latest().orders.len(), 1, "the tx creates one order");
+        assert_eq!(
+            state.lock().await.latest().orders.len(),
+            1,
+            "the tx creates one order"
+        );
 
         // Restart: load() restores SLOT, and the driver re-delivers SLOT.
         let state = Arc::new(Mutex::new(SundaeV4HistoricalState::new()));
         let mut node = start(&env, &state, &*persistence).await;
-        assert_eq!(state.lock().await.latest().orders.len(), 1, "load restores the order");
+        assert_eq!(
+            state.lock().await.latest().orders.len(),
+            1,
+            "load restores the order"
+        );
         node.handle_block(&block(SLOT)).await.unwrap();
         node.handle_onchain_tx_bytes(&block(SLOT), &tx).await.unwrap();
 

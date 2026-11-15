@@ -149,11 +149,7 @@ pub fn build_index(cfg: &BandedCLConfig) -> Vec<(BigInt, BigInt)> {
 /// does not match its bands fails `Create` and bricks every spend of a pool
 /// that already has one. `BandedCLConfig::with_void_ext` gives the
 /// revision-2 form of the same ladder.
-pub fn with_index(
-    bands: Vec<BandSpec>,
-    closing: Rational,
-    weight_total: BigInt,
-) -> BandedCLConfig {
+pub fn with_index(bands: Vec<BandSpec>, closing: Rational, weight_total: BigInt) -> BandedCLConfig {
     let mut cfg = BandedCLConfig {
         bands,
         index: vec![],
@@ -502,7 +498,12 @@ fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> 
     None
 }
 
-pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32) -> Option<Witness> {
+pub fn find_witness_scan(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    scan: u32,
+) -> Option<Witness> {
     let n = cfg.bands.len();
     let Some(range) = candidate_bands(cfg, a, b) else {
         return (0..n).find_map(|k| find_witness_in_band(cfg, a, b, k, scan));
@@ -525,9 +526,7 @@ pub fn find_witness_scan(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, scan: u32
     // The counter bounds are a hint, not a proof: they drop the rounding
     // slack in `ca`, `cb`, `a_sat` and `b_sat`. A miss costs the bands the
     // hint excluded, which is what an unpruned search pays anyway.
-    (0..n)
-        .filter(|k| !range.contains(k))
-        .find_map(|k| find_witness_in_band(cfg, a, b, k, scan))
+    (0..n).filter(|k| !range.contains(k)).find_map(|k| find_witness_in_band(cfg, a, b, k, scan))
 }
 
 // ── Narrowing the band search ───────────────────────────────────────────
@@ -574,11 +573,7 @@ const SLACK: i64 = 4;
 /// `None` when the ladder index is not monotone, which means the caller
 /// must search every band: the binary searches below assume monotonicity
 /// and a malformed config would make them drop the right band.
-fn candidate_bands(
-    cfg: &BandedCLConfig,
-    a: &BigInt,
-    b: &BigInt,
-) -> Option<std::ops::Range<usize>> {
+fn candidate_bands(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<std::ops::Range<usize>> {
     let n = cfg.bands.len();
     if n == 0 || cfg.index.len() != n {
         return None;
@@ -609,11 +604,7 @@ fn candidate_bands(
 
     let lo = first_true(n, b_lo_under_a_hi);
     let hi = first_false(n, a_lo_under_b_hi);
-    if lo >= hi {
-        None
-    } else {
-        Some(lo..hi)
-    }
+    if lo >= hi { None } else { Some(lo..hi) }
 }
 
 /// A lower bound on band `k`'s ladder counter, from the same P4 and P5
@@ -649,7 +640,13 @@ fn counter_floor(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize) -> Opti
         (None, None) => None,
     };
     // P1: the counter is never below the total weight.
-    best.map(|x| if x < cfg.weight_total { cfg.weight_total.clone() } else { x })
+    best.map(|x| {
+        if x < cfg.weight_total {
+            cfg.weight_total.clone()
+        } else {
+            x
+        }
+    })
 }
 
 /// The least `k` in `0..n` where `pred` holds, for a `pred` that is false
@@ -688,7 +685,13 @@ pub fn find_witness_scan_every_band(
 /// The witness for `(a, b)` with band `k` active, if one exists. A state that
 /// sits on a band edge can have a witness in both neighbouring bands; the
 /// step planner uses this to continue in the band it is crossing into.
-pub fn find_witness_in_band(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize, scan: u32) -> Option<Witness> {
+pub fn find_witness_in_band(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    k: usize,
+    scan: u32,
+) -> Option<Witness> {
     find_witness_in_band_from(cfg, a, b, k, scan, None)
 }
 
@@ -719,7 +722,9 @@ pub fn find_witness_in_band_from(
                 Ok(st) => {
                     let ra = a - &st.ca;
                     let rb = b - &st.cb;
-                    !ra.is_negative() && !rb.is_negative() && !g_of(&st, &ra, &rb, &st.l_k).is_negative()
+                    !ra.is_negative()
+                        && !rb.is_negative()
+                        && !g_of(&st, &ra, &rb, &st.l_k).is_negative()
                 }
                 Err(_) => false,
             }
@@ -813,7 +818,11 @@ pub fn find_witness_in_band_from(
         }
         let span = BigInt::from(scan as i64);
         for seed in seeds {
-            let from = if seed > span { &seed - &span } else { one.clone() };
+            let from = if seed > span {
+                &seed - &span
+            } else {
+                one.clone()
+            };
             let to = &seed + &span;
             let mut x = from;
             while x <= to {
@@ -905,8 +914,16 @@ pub fn swap_steps_from(
         };
         let v = band_view(cfg, &ca, &cb, &before)?;
         let cap_dx = max_dx_in_band(&v, is_a_input);
-        let step_dx = if remaining <= cap_dx { remaining.clone() } else { cap_dx };
-        let dy = if step_dx.is_positive() { band_output(&v, is_a_input, &step_dx) } else { BigInt::zero() };
+        let step_dx = if remaining <= cap_dx {
+            remaining.clone()
+        } else {
+            cap_dx
+        };
+        let dy = if step_dx.is_positive() {
+            band_output(&v, is_a_input, &step_dx)
+        } else {
+            BigInt::zero()
+        };
         if !dy.is_positive() {
             // This band pays nothing more: cross to the next one, once.
             let Some(k_next) = next_band(before.k, is_a_input, n) else {
@@ -925,7 +942,11 @@ pub fn swap_steps_from(
             prefer = Some(k_next);
             continue;
         }
-        let (na, nb) = if is_a_input { (&ca + &step_dx, &cb - &dy) } else { (&ca - &dy, &cb + &step_dx) };
+        let (na, nb) = if is_a_input {
+            (&ca + &step_dx, &cb - &dy)
+        } else {
+            (&ca - &dy, &cb + &step_dx)
+        };
         let crossing = step_dx < remaining;
         let after = if crossing {
             next_band(before.k, is_a_input, n)
@@ -947,7 +968,12 @@ pub fn swap_steps_from(
             ));
         }
         remaining = &remaining - &step_dx;
-        steps.push(SwapStepPlan { dx: step_dx, dy, before, after: after.clone() });
+        steps.push(SwapStepPlan {
+            dx: step_dx,
+            dy,
+            before,
+            after: after.clone(),
+        });
         ca = na;
         cb = nb;
         prefer = Some(after.k);
@@ -976,7 +1002,12 @@ pub struct BandView {
     pub fee_rounds_up: bool,
 }
 
-pub fn band_view(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, w: &Witness) -> Result<BandView, String> {
+pub fn band_view(
+    cfg: &BandedCLConfig,
+    a: &BigInt,
+    b: &BigInt,
+    w: &Witness,
+) -> Result<BandView, String> {
     let st = ladder_at(cfg, &w.x, w.k)?;
     Ok(BandView {
         fee_rounds_up: cfg.rules.band_fee_rounds_up,
@@ -1009,7 +1040,11 @@ pub fn band_fee(dx: &BigInt, fee_r: &Rational) -> BigInt {
 /// The band fee under a revision's rounding: `band_fee` when `rounds_up`,
 /// else the floor `dx * num / den` of revision 1.
 pub fn band_fee_rounded(dx: &BigInt, fee_r: &Rational, rounds_up: bool) -> BigInt {
-    if rounds_up { band_fee(dx, fee_r) } else { &(dx * &fee_r.num) / &fee_r.den }
+    if rounds_up {
+        band_fee(dx, fee_r)
+    } else {
+        &(dx * &fee_r.num) / &fee_r.den
+    }
 }
 
 /// The output the active band pays for `dx` of the input asset, before the
@@ -1165,7 +1200,11 @@ pub fn ladder_capacity_from(
             break;
         };
         let cap_dx = max_dx_in_band(&v, is_a_input);
-        let dy = if cap_dx.is_positive() { band_output(&v, is_a_input, &cap_dx) } else { BigInt::zero() };
+        let dy = if cap_dx.is_positive() {
+            band_output(&v, is_a_input, &cap_dx)
+        } else {
+            BigInt::zero()
+        };
         if dy.is_positive() {
             total = &total + &cap_dx;
             if is_a_input {
@@ -1246,7 +1285,11 @@ pub fn swap_fee_budget(
     }
     let st = ladder_at(cfg, &before.x, before.k)?;
     let dx = if fee_in_a { a1 - a0 } else { b1 - b0 };
-    let fee_r = if fee_in_a { &st.band.fee_sell } else { &st.band.fee_buy };
+    let fee_r = if fee_in_a {
+        &st.band.fee_sell
+    } else {
+        &st.band.fee_buy
+    };
     let fee = band_fee_rounded(&dx, fee_r, cfg.rules.band_fee_rounds_up);
     Ok(fee_value_budget(&st, a1, b1, &fee, fee_in_a, lp_before))
 }
@@ -1256,7 +1299,12 @@ pub fn swap_fee_budget(
 /// `fee_budget = bp - lp_after`. For a swap `lp_after == lp_before`, so the
 /// budget is the LP the counter's growth is worth. Negative when the
 /// counter falls, which the module rejects.
-pub fn counter_fee_budget(lp_before: &BigInt, x_before: &BigInt, x_after: &BigInt, lp_after: &BigInt) -> BigInt {
+pub fn counter_fee_budget(
+    lp_before: &BigInt,
+    x_before: &BigInt,
+    x_after: &BigInt,
+    lp_after: &BigInt,
+) -> BigInt {
     &(&(lp_before * x_after) / x_before) - lp_after
 }
 
@@ -1278,7 +1326,9 @@ pub fn step_fee_budget(
     if cfg.rules.fee_budget_is_fee_value {
         swap_fee_budget(cfg, a0, b0, a1, b1, before, lp_before)
     } else {
-        Ok(counter_fee_budget(lp_before, &before.x, &after.x, lp_before))
+        Ok(counter_fee_budget(
+            lp_before, &before.x, &after.x, lp_before,
+        ))
     }
 }
 
@@ -1316,7 +1366,10 @@ pub fn swap_step(
     let v = band_view(cfg, a, b, &before)?;
     let dy = band_output(&v, is_a_input, dx);
     if !dy.is_positive() {
-        return Err(format!("swap of {dx} yields no output in band {}", before.k));
+        return Err(format!(
+            "swap of {dx} yields no output in band {}",
+            before.k
+        ));
     }
     let cap = band_capacity(&v, is_a_input);
     if &dy > cap {
@@ -1327,7 +1380,11 @@ pub fn swap_step(
             max_dx_in_band(&v, is_a_input)
         ));
     }
-    let (a_after, b_after) = if is_a_input { (a + dx, b - &dy) } else { (a - &dy, b + dx) };
+    let (a_after, b_after) = if is_a_input {
+        (a + dx, b - &dy)
+    } else {
+        (a - &dy, b + dx)
+    };
     let after = find_witness(cfg, &a_after, &b_after).ok_or_else(|| {
         format!("no ladder witness for the after reserves ({a_after}, {b_after})")
     })?;
@@ -1376,7 +1433,10 @@ fn rational_bound() -> BigInt {
 fn check_fee(f: &Rational, what: &str) -> Result<(), String> {
     let cap = rational_bound();
     if f.num.is_negative() || !f.den.is_positive() || f.num >= f.den || f.num > cap || f.den > cap {
-        return Err(format!("{what} {}/{} must satisfy 0 <= num < den <= 2^64", f.num, f.den));
+        return Err(format!(
+            "{what} {}/{} must satisfy 0 <= num < den <= 2^64",
+            f.num, f.den
+        ));
     }
     Ok(())
 }
@@ -1389,11 +1449,15 @@ pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
     if cfg.bands.is_empty() {
         return Err("empty ladder".into());
     }
-    let edge_ok = |r: &Rational| r.num.is_positive() && r.den.is_positive() && r.num <= cap && r.den <= cap;
+    let edge_ok =
+        |r: &Rational| r.num.is_positive() && r.den.is_positive() && r.num <= cap && r.den <= cap;
     let mut wt = BigInt::zero();
     for (i, band) in cfg.bands.iter().enumerate() {
         if !edge_ok(&band.start) {
-            return Err(format!("band {i}: start {}/{} out of (0, 2^64]", band.start.num, band.start.den));
+            return Err(format!(
+                "band {i}: start {}/{} out of (0, 2^64]",
+                band.start.num, band.start.den
+            ));
         }
         if band.weight < BigInt::from(1) {
             return Err(format!("band {i}: weight {} < 1", band.weight));
@@ -1413,7 +1477,10 @@ pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
         return Err("closing edge out of (0, 2^64]".into());
     }
     if wt != cfg.weight_total {
-        return Err(format!("weight_total {} != sum of weights {wt}", cfg.weight_total));
+        return Err(format!(
+            "weight_total {} != sum of weights {wt}",
+            cfg.weight_total
+        ));
     }
     // V13: the index is exactly the cumulative coefficients of these bands.
     // A spend reads one entry of it instead of walking, so a wrong entry is
@@ -1459,7 +1526,10 @@ mod tests {
     use super::*;
 
     fn r(n: i64, d: i64) -> Rational {
-        Rational { num: BigInt::from(n), den: BigInt::from(d) }
+        Rational {
+            num: BigInt::from(n),
+            den: BigInt::from(d),
+        }
     }
 
     fn band(n: i64, d: i64, curve: i64, fee: (i64, i64)) -> BandSpec {
@@ -1575,10 +1645,22 @@ mod tests {
     #[test]
     fn the_band_fee_rounds_by_revision() {
         let f = r(3, 1000);
-        assert_eq!(band_fee_rounded(&BigInt::from(624), &f, false), BigInt::from(1));
-        assert_eq!(band_fee_rounded(&BigInt::from(624), &f, true), BigInt::from(2));
-        assert_eq!(band_fee_rounded(&BigInt::from(1000), &f, false), BigInt::from(3));
-        assert_eq!(band_fee_rounded(&BigInt::from(1000), &f, true), BigInt::from(3));
+        assert_eq!(
+            band_fee_rounded(&BigInt::from(624), &f, false),
+            BigInt::from(1)
+        );
+        assert_eq!(
+            band_fee_rounded(&BigInt::from(624), &f, true),
+            BigInt::from(2)
+        );
+        assert_eq!(
+            band_fee_rounded(&BigInt::from(1000), &f, false),
+            BigInt::from(3)
+        );
+        assert_eq!(
+            band_fee_rounded(&BigInt::from(1000), &f, true),
+            BigInt::from(3)
+        );
     }
 
     /// The governor's `with_void_ext`: the five-field form encodes the four
@@ -1618,9 +1700,20 @@ mod tests {
         assert_eq!(st.cb, BigInt::from(0));
         assert_eq!(st.l_k, BigInt::from(124_999_976i64));
         assert_eq!(st.a_sat_k, BigInt::from(1_237_624i64));
-        assert!(band_proof(&BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B), &st, true));
+        assert!(band_proof(
+            &BigInt::from(RESERVE_A),
+            &BigInt::from(RESERVE_B),
+            &st,
+            true
+        ));
         // The far band at the counter a dishonest scooper would name.
-        assert!(!is_witness(&cfg, &BigInt::from(RESERVE_A), &BigInt::from(RESERVE_B), &BigInt::from(71_428_457i64), 7));
+        assert!(!is_witness(
+            &cfg,
+            &BigInt::from(RESERVE_A),
+            &BigInt::from(RESERVE_B),
+            &BigInt::from(71_428_457i64),
+            7
+        ));
     }
 
     /// `cl_check_unit.ak`, the swap path (sundae-v4 SV4-006 and SV4-001b):
@@ -1654,7 +1747,12 @@ mod tests {
     #[test]
     fn doubled_pool_has_the_aiken_counter() {
         let cfg = eq8();
-        let w = find_witness(&cfg, &BigInt::from(17_273_504i64), &BigInt::from(1_251_246i64)).unwrap();
+        let w = find_witness(
+            &cfg,
+            &BigInt::from(17_273_504i64),
+            &BigInt::from(1_251_246i64),
+        )
+        .unwrap();
         assert_eq!(w.x, BigInt::from(2_000_000_000i64));
         assert_eq!(w.k, 0);
     }
@@ -1665,7 +1763,11 @@ mod tests {
     /// worth at the bin's price (SV4-001b). The counter ratio booked 3 and 18.
     #[test]
     fn cs_bin_matches_the_aiken_vectors() {
-        let cfg = r2(with_index(vec![band(2, 1, 1, (3, 1000))], r(3, 1), BigInt::from(1)));
+        let cfg = r2(with_index(
+            vec![band(2, 1, 1, (3, 1000))],
+            r(3, 1),
+            BigInt::from(1),
+        ));
         let (a, b) = (BigInt::from(41_666_666i64), BigInt::from(750_000_004i64));
         let lp = BigInt::from(1_000_000i64);
         let w = find_witness(&cfg, &a, &b).unwrap();
@@ -1691,11 +1793,20 @@ mod tests {
     #[test]
     fn mixed_ladder_witness_is_in_the_bin() {
         let cfg = with_index(
-            vec![band(1, 1, 0, (3, 1000)), band(2, 1, 1, (3, 1000)), band(3, 1, 0, (3, 1000))],
+            vec![
+                band(1, 1, 0, (3, 1000)),
+                band(2, 1, 1, (3, 1000)),
+                band(3, 1, 0, (3, 1000)),
+            ],
             r(4, 1),
             BigInt::from(3),
         );
-        let w = find_witness(&cfg, &BigInt::from(41_666_666i64), &BigInt::from(583_333_339i64)).unwrap();
+        let w = find_witness(
+            &cfg,
+            &BigInt::from(41_666_666i64),
+            &BigInt::from(583_333_339i64),
+        )
+        .unwrap();
         assert_eq!(w.k, 1);
         assert_eq!(w.x, BigInt::from(1_000_000_001i64));
         assert!(check_shape(&cfg).is_ok());
@@ -1708,13 +1819,31 @@ mod tests {
     #[test]
     fn mixed_ladder_cs_bin_swap_matches_the_aiken_vector() {
         let cfg = r2(with_index(
-            vec![band(1, 1, 0, (3, 1000)), band(2, 1, 1, (3, 1000)), band(3, 1, 0, (3, 1000))],
+            vec![
+                band(1, 1, 0, (3, 1000)),
+                band(2, 1, 1, (3, 1000)),
+                band(3, 1, 0, (3, 1000)),
+            ],
             r(4, 1),
             BigInt::from(3),
         ));
         let (a, b) = (BigInt::from(41_666_666i64), BigInt::from(583_333_339i64));
-        let s = swap_step(&cfg, &a, &b, &BigInt::from(1_000_000i64), false, &BigInt::from(12_500_000i64)).unwrap();
-        assert_eq!(s.before, Witness { x: BigInt::from(1_000_000_001i64), k: 1 });
+        let s = swap_step(
+            &cfg,
+            &a,
+            &b,
+            &BigInt::from(1_000_000i64),
+            false,
+            &BigInt::from(12_500_000i64),
+        )
+        .unwrap();
+        assert_eq!(
+            s.before,
+            Witness {
+                x: BigInt::from(1_000_000_001i64),
+                k: 1
+            }
+        );
         assert_eq!(s.dy, BigInt::from(2_077_083i64));
         assert_eq!(s.a_after, BigInt::from(39_589_583i64));
         assert_eq!(s.b_after, BigInt::from(595_833_339i64));
@@ -1737,11 +1866,24 @@ mod tests {
         ));
         let (a, b) = (BigInt::from(RESERVE_A), BigInt::from(RESERVE_B));
         let w = find_witness(&cfg, &a, &b).unwrap();
-        assert_eq!(find_witness(&free, &a, &b).unwrap(), w, "the fee does not move the ladder");
+        assert_eq!(
+            find_witness(&free, &a, &b).unwrap(),
+            w,
+            "the fee does not move the ladder"
+        );
         let v = band_view(&cfg, &a, &b, &w).unwrap();
         let vf = band_view(&free, &a, &b, &w).unwrap();
         // (dx, ceil(3 * dx / 1000))
-        let cases = [(1i64, 1i64), (100, 1), (333, 1), (334, 2), (624, 2), (1000, 3), (1001, 4), (5000, 15)];
+        let cases = [
+            (1i64, 1i64),
+            (100, 1),
+            (333, 1),
+            (334, 2),
+            (624, 2),
+            (1000, 3),
+            (1001, 4),
+            (5000, 15),
+        ];
         for (dx, fee) in cases {
             for is_a_input in [true, false] {
                 assert_eq!(
@@ -1808,9 +1950,23 @@ mod tests {
                 r(1_000_000 + 10_000 * n, 1_000_000),
                 BigInt::from(n),
             ));
-            let s = swap_step(&cfg, &BigInt::from(a), &BigInt::from(b), &lp, false, &BigInt::from(b1 - b))
-                .unwrap_or_else(|e| panic!("n={n}: {e}"));
-            assert_eq!(s.before, Witness { x: BigInt::from(x), k }, "n={n} before");
+            let s = swap_step(
+                &cfg,
+                &BigInt::from(a),
+                &BigInt::from(b),
+                &lp,
+                false,
+                &BigInt::from(b1 - b),
+            )
+            .unwrap_or_else(|e| panic!("n={n}: {e}"));
+            assert_eq!(
+                s.before,
+                Witness {
+                    x: BigInt::from(x),
+                    k
+                },
+                "n={n} before"
+            );
             assert_eq!(s.a_after, BigInt::from(a1), "n={n} A'");
             assert_eq!(s.b_after, BigInt::from(b1), "n={n} B'");
             assert_eq!(s.after.x, BigInt::from(x1), "n={n} X'");
@@ -1873,8 +2029,16 @@ mod tests {
                 let one = BigInt::from(1);
                 assert!(st.ca >= floor_a, "ca {} below the exact sum", st.ca);
                 assert!(st.cb >= floor_b, "cb {} below the exact sum", st.cb);
-                assert!(st.ca <= &(&floor_a + &n) + &one, "ca {} over its bound", st.ca);
-                assert!(st.cb <= &(&floor_b + &n) + &one, "cb {} over its bound", st.cb);
+                assert!(
+                    st.ca <= &(&floor_a + &n) + &one,
+                    "ca {} over its bound",
+                    st.ca
+                );
+                assert!(
+                    st.cb <= &(&floor_b + &n) + &one,
+                    "cb {} over its bound",
+                    st.cb
+                );
             }
         }
     }
@@ -1914,7 +2078,10 @@ mod tests {
         assert_eq!(steps.len(), 2, "steps: {steps:?}");
         assert_eq!(steps[0].before.k, 0);
         assert_eq!(steps[0].dx, cap);
-        assert_eq!(steps[1].before, steps[0].after, "witness chains across the edge");
+        assert_eq!(
+            steps[1].before, steps[0].after,
+            "witness chains across the edge"
+        );
         assert_eq!(steps[1].before.k, 1);
         assert_eq!(steps[1].dx, BigInt::from(50_000));
         assert!(steps[1].dy.is_positive());
@@ -1955,7 +2122,11 @@ mod tests {
         eprintln!("max_dx_in_band: {:?} -> {cap}", t.elapsed());
         let t = std::time::Instant::now();
         let st = swap_steps(&cfg, &a, &b, false, &(&cap * &BigInt::from(3))).unwrap();
-        eprintln!("swap_steps x3 bands: {:?} -> {} steps", t.elapsed(), st.len());
+        eprintln!(
+            "swap_steps x3 bands: {:?} -> {} steps",
+            t.elapsed(),
+            st.len()
+        );
         let t = std::time::Instant::now();
         let lc = ladder_capacity(&cfg, &a, &b, false);
         eprintln!("ladder_capacity: {:?} -> {lc}", t.elapsed());
@@ -1968,7 +2139,10 @@ mod tests {
     /// fixture (4 bands 1.00..1.04 at 1e6, counter 1e9, band 2).
     #[test]
     fn flow_fixture_vectors() {
-        let r = |n: i64, d: i64| Rational { num: BigInt::from(n), den: BigInt::from(d) };
+        let r = |n: i64, d: i64| Rational {
+            num: BigInt::from(n),
+            den: BigInt::from(d),
+        };
         let cfg = with_index(
             [1_000_000i64, 1_010_000, 1_020_000, 1_030_000]
                 .iter()
@@ -1986,18 +2160,41 @@ mod tests {
         let (a, b) = (BigInt::from(4_689_396i64), BigInt::from(5_025_000i64));
         let w = find_witness(&cfg, &a, &b).unwrap();
         let v = band_view(&cfg, &a, &b, &w).unwrap();
-        eprintln!("witness x={} k={} ra={} rb={} l={}", w.x, w.k, v.ra, v.rb, v.l);
+        eprintln!(
+            "witness x={} k={} ra={} rb={} l={}",
+            w.x, w.k, v.ra, v.rb, v.l
+        );
         // B-input: the step takes A out of band 2's residual `ra`.
         let cap = max_dx_in_band(&v, false);
         let dy_cap = band_output(&v, false, &cap);
         let over = &cap + &BigInt::from(1);
         let dy_over = band_output(&v, false, &over);
-        eprintln!("B-in cap dx={cap} dy={dy_cap}; over dx={over} dy={dy_over} (ra={})", v.ra);
+        eprintln!(
+            "B-in cap dx={cap} dy={dy_cap}; over dx={over} dy={dy_over} (ra={})",
+            v.ra
+        );
         let capped = swap_step(&cfg, &a, &b, &BigInt::from(1_000_000i64), false, &cap).unwrap();
-        eprintln!("cap step: dy={} after x={} k={} fb={}", capped.dy, capped.after.x, capped.after.k, capped.fee_budget);
-        eprintln!("over as plan: {:?}", swap_steps(&cfg, &a, &b, false, &over).map(|s| s.len()));
-        let one = swap_step(&cfg, &a, &b, &BigInt::from(1_000_000i64), false, &BigInt::from(5_000)).unwrap();
-        eprintln!("flow vector: dy={} after x={} k={} fb={}", one.dy, one.after.x, one.after.k, one.fee_budget);
+        eprintln!(
+            "cap step: dy={} after x={} k={} fb={}",
+            capped.dy, capped.after.x, capped.after.k, capped.fee_budget
+        );
+        eprintln!(
+            "over as plan: {:?}",
+            swap_steps(&cfg, &a, &b, false, &over).map(|s| s.len())
+        );
+        let one = swap_step(
+            &cfg,
+            &a,
+            &b,
+            &BigInt::from(1_000_000i64),
+            false,
+            &BigInt::from(5_000),
+        )
+        .unwrap();
+        eprintln!(
+            "flow vector: dy={} after x={} k={} fb={}",
+            one.dy, one.after.x, one.after.k, one.fee_budget
+        );
     }
 
     #[test]
@@ -2031,7 +2228,10 @@ mod witness_cost {
     use crate::sundaev4::types::BandSpec;
 
     fn ladder(n: i64, lo: i64, hi: i64, den: i64, weights: &[i64]) -> BandedCLConfig {
-        let r = |num: i64, d: i64| Rational { num: BigInt::from(num), den: BigInt::from(d) };
+        let r = |num: i64, d: i64| Rational {
+            num: BigInt::from(num),
+            den: BigInt::from(d),
+        };
         let step = (hi - lo) / n;
         let w_total: i64 = weights.iter().sum();
         with_index(
@@ -2061,8 +2261,13 @@ mod witness_cost {
             ),
             (
                 "tight 8 bands bell, X=8.03e13",
-                ladder(8, 997_997_996, 1_001_998_004, 1_000_000_000,
-                       &[2, 9, 40, 87, 87, 40, 9, 2]),
+                ladder(
+                    8,
+                    997_997_996,
+                    1_001_998_004,
+                    1_000_000_000,
+                    &[2, 9, 40, 87, 87, 40, 9, 2],
+                ),
                 BigInt::from(80_279_049_977_900u64),
             ),
         ];
@@ -2129,7 +2334,10 @@ mod witness_cost {
                 let aa = &a + &BigInt::from(i as i64 * 7);
                 let _ = find_witness(&cfg, &aa, &b);
             }
-            println!("    WARM find_witness, nearby states: {:?}", t.elapsed() / reps);
+            println!(
+                "    WARM find_witness, nearby states: {:?}",
+                t.elapsed() / reps
+            );
 
             // ── What the two optimisations buy, separately ──────────────
             //
@@ -2168,11 +2376,13 @@ mod witness_cost {
             let hits = drain_witness_memo_hits();
             // `hits` can exceed `reps`: the drain also collects hits from
             // the calls above that primed the memo.
-            println!("    MEMO: repeat call {:?}, {hits} hits over {reps} repeats", memo);
+            println!(
+                "    MEMO: repeat call {:?}, {hits} hits over {reps} repeats",
+                memo
+            );
         }
     }
 }
-
 
 #[cfg(test)]
 mod witness_pruning_tests {
@@ -2183,12 +2393,22 @@ mod witness_pruning_tests {
     use crate::sundaev4::types::BandSpec;
 
     fn r(num: i64, den: i64) -> Rational {
-        Rational { num: BigInt::from(num), den: BigInt::from(den) }
+        Rational {
+            num: BigInt::from(num),
+            den: BigInt::from(den),
+        }
     }
 
     /// An `n`-band ladder over `[lo, hi]/den` with the given weights and
     /// curves. Mirrors the creamery's archetypes.
-    fn ladder(n: usize, lo: i64, hi: i64, den: i64, weights: &[i64], cs_at: Option<usize>) -> BandedCLConfig {
+    fn ladder(
+        n: usize,
+        lo: i64,
+        hi: i64,
+        den: i64,
+        weights: &[i64],
+        cs_at: Option<usize>,
+    ) -> BandedCLConfig {
         let step = (hi - lo) / n as i64;
         let w_total: i64 = weights.iter().take(n).sum();
         with_index(
@@ -2209,14 +2429,80 @@ mod witness_pruning_tests {
     /// The ladders the creamery provisions, by archetype.
     fn archetypes() -> Vec<(&'static str, BandedCLConfig)> {
         vec![
-            ("tight 8 bell", ladder(8, 996_000_000, 1_004_000_000, 1_000_000_000, &[2, 9, 40, 87, 87, 40, 9, 2], None)),
-            ("core 12 bell", ladder(12, 980_000_000, 1_020_000_000, 1_000_000_000, &[2, 5, 12, 28, 60, 96, 96, 60, 28, 12, 5, 2], None)),
-            ("wide 16 flat", ladder(16, 880_000_000, 1_120_000_000, 1_000_000_000, &[1; 16], None)),
-            ("tail 8 skewed", ladder(8, 550_000_000, 1_450_000_000, 1_000_000_000, &[96, 60, 28, 12, 5, 3, 2, 1], None)),
-            ("split 12 bimodal", ladder(12, 920_000_000, 1_080_000_000, 1_000_000_000, &[40, 87, 40, 9, 2, 1, 1, 2, 9, 40, 87, 40], None)),
-            ("pegged 10 with a cs bin", ladder(10, 990_000_000, 1_010_000_000, 1_000_000_000, &[4, 12, 30, 70, 96, 96, 70, 30, 12, 4], Some(4))),
-            ("two bands", ladder(2, 900_000_000, 1_100_000_000, 1_000_000_000, &[1, 1], None)),
-            ("one band", ladder(1, 950_000_000, 1_050_000_000, 1_000_000_000, &[1], None)),
+            (
+                "tight 8 bell",
+                ladder(
+                    8,
+                    996_000_000,
+                    1_004_000_000,
+                    1_000_000_000,
+                    &[2, 9, 40, 87, 87, 40, 9, 2],
+                    None,
+                ),
+            ),
+            (
+                "core 12 bell",
+                ladder(
+                    12,
+                    980_000_000,
+                    1_020_000_000,
+                    1_000_000_000,
+                    &[2, 5, 12, 28, 60, 96, 96, 60, 28, 12, 5, 2],
+                    None,
+                ),
+            ),
+            (
+                "wide 16 flat",
+                ladder(
+                    16,
+                    880_000_000,
+                    1_120_000_000,
+                    1_000_000_000,
+                    &[1; 16],
+                    None,
+                ),
+            ),
+            (
+                "tail 8 skewed",
+                ladder(
+                    8,
+                    550_000_000,
+                    1_450_000_000,
+                    1_000_000_000,
+                    &[96, 60, 28, 12, 5, 3, 2, 1],
+                    None,
+                ),
+            ),
+            (
+                "split 12 bimodal",
+                ladder(
+                    12,
+                    920_000_000,
+                    1_080_000_000,
+                    1_000_000_000,
+                    &[40, 87, 40, 9, 2, 1, 1, 2, 9, 40, 87, 40],
+                    None,
+                ),
+            ),
+            (
+                "pegged 10 with a cs bin",
+                ladder(
+                    10,
+                    990_000_000,
+                    1_010_000_000,
+                    1_000_000_000,
+                    &[4, 12, 30, 70, 96, 96, 70, 30, 12, 4],
+                    Some(4),
+                ),
+            ),
+            (
+                "two bands",
+                ladder(2, 900_000_000, 1_100_000_000, 1_000_000_000, &[1, 1], None),
+            ),
+            (
+                "one band",
+                ladder(1, 950_000_000, 1_050_000_000, 1_000_000_000, &[1], None),
+            ),
         ]
     }
 
@@ -2236,7 +2522,12 @@ mod witness_pruning_tests {
     /// ladders, counters, bands and small reserve offsets. The unpruned
     /// side costs 90-160ms per state in a debug build, so the always-run
     /// test takes a slice and the ignored one takes the lot.
-    fn sweep(archs: &[(&str, BandedCLConfig)], counters: &[u64], deltas: &[(i64, i64)], band_step: usize) {
+    fn sweep(
+        archs: &[(&str, BandedCLConfig)],
+        counters: &[u64],
+        deltas: &[(i64, i64)],
+        band_step: usize,
+    ) {
         let mut checked = 0usize;
         let mut pruned_none = 0usize;
         for (name, cfg) in archs {
@@ -2247,7 +2538,9 @@ mod witness_pruning_tests {
                     continue;
                 }
                 for k in (0..n).step_by(band_step) {
-                    let Some((a, b)) = on_ladder(cfg, &x, k) else { continue };
+                    let Some((a, b)) = on_ladder(cfg, &x, k) else {
+                        continue;
+                    };
                     // On-ladder states with a small offset, then states
                     // off the ladder. The pruned search must agree on
                     // both: a state with no witness is what sends it down
@@ -2327,7 +2620,13 @@ mod witness_pruning_tests {
     fn pruning_never_changes_the_witness_exhaustively() {
         sweep(
             &archetypes(),
-            &[1_000_000_000, 80_279_049_977_900, 1_452_199_123_434, 7_000_000_000_000_000, 123_456_789],
+            &[
+                1_000_000_000,
+                80_279_049_977_900,
+                1_452_199_123_434,
+                7_000_000_000_000_000,
+                123_456_789,
+            ],
             &[(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (7, -5)],
             1,
         );
@@ -2341,14 +2640,19 @@ mod witness_pruning_tests {
                 continue;
             }
             for k in 0..cfg.bands.len() {
-                let Some((a, b)) = on_ladder(&cfg, &x, k) else { continue };
+                let Some((a, b)) = on_ladder(&cfg, &x, k) else {
+                    continue;
+                };
                 clear_witness_seeds();
                 let cold = find_witness(&cfg, &a, &b);
                 // Second call must come from the memo, and agree.
                 let before = drain_witness_memo_hits();
                 let warm = find_witness(&cfg, &a, &b);
                 let hits = drain_witness_memo_hits();
-                assert_eq!(cold, warm, "{name}: memo disagrees with the cold search at band {k}");
+                assert_eq!(
+                    cold, warm,
+                    "{name}: memo disagrees with the cold search at band {k}"
+                );
                 assert_eq!(before, 0, "{name}: unexpected memo hit before the repeat");
                 assert_eq!(hits, 1, "{name}: repeat did not come from the memo");
             }
@@ -2359,8 +2663,22 @@ mod witness_pruning_tests {
     fn the_memo_does_not_confuse_two_ladders() {
         // Two ladders that a cheap fingerprint could conflate: same band
         // count, same weight_total, same first edge, different shape.
-        let left = ladder(8, 990_000_000, 1_010_000_000, 1_000_000_000, &[1, 1, 1, 1, 1, 1, 1, 1], None);
-        let right = ladder(8, 990_000_000, 1_030_000_000, 1_000_000_000, &[1, 1, 1, 1, 1, 1, 1, 1], None);
+        let left = ladder(
+            8,
+            990_000_000,
+            1_010_000_000,
+            1_000_000_000,
+            &[1, 1, 1, 1, 1, 1, 1, 1],
+            None,
+        );
+        let right = ladder(
+            8,
+            990_000_000,
+            1_030_000_000,
+            1_000_000_000,
+            &[1, 1, 1, 1, 1, 1, 1, 1],
+            None,
+        );
         assert_eq!(left.bands.len(), right.bands.len());
         assert_eq!(left.weight_total, right.weight_total);
         assert_eq!(left.bands[0].start, right.bands[0].start);
@@ -2368,7 +2686,9 @@ mod witness_pruning_tests {
 
         let x = BigInt::from(80_279_049_977_900u64);
         for k in 0..8 {
-            let (Some((la, lb)), Some((ra, rb))) = (on_ladder(&left, &x, k), on_ladder(&right, &x, k)) else {
+            let (Some((la, lb)), Some((ra, rb))) =
+                (on_ladder(&left, &x, k), on_ladder(&right, &x, k))
+            else {
                 continue;
             };
             clear_witness_seeds();
@@ -2381,8 +2701,14 @@ mod witness_pruning_tests {
             let l_mixed = find_witness(&left, &la, &lb);
             let r_mixed = find_witness(&right, &ra, &rb);
             let l_again = find_witness(&left, &la, &lb);
-            assert_eq!(l_alone, l_mixed, "left changed when right shared the memo (band {k})");
-            assert_eq!(r_alone, r_mixed, "right changed when left shared the memo (band {k})");
+            assert_eq!(
+                l_alone, l_mixed,
+                "left changed when right shared the memo (band {k})"
+            );
+            assert_eq!(
+                r_alone, r_mixed,
+                "right changed when left shared the memo (band {k})"
+            );
             assert_eq!(l_alone, l_again, "left changed on a memo hit (band {k})");
         }
     }
@@ -2437,7 +2763,10 @@ mod witness_pruning_tests {
         // Cold, the search takes the lower band.
         clear_witness_seeds();
         let cold = find_witness(&cfg, &a, &b).expect("a witness exists");
-        assert_eq!(cold, admitted[0], "a cold search no longer takes the first band");
+        assert_eq!(
+            cold, admitted[0],
+            "a cold search no longer takes the first band"
+        );
 
         // The memo returns that same answer, and does not search again.
         let _ = drain_witness_memo_hits();
@@ -2475,24 +2804,40 @@ mod witness_pruning_tests {
                 }
             }
         }
-        println!("  {found} of {} probed states have no witness", (120 / 3) * (120 / 3));
+        println!(
+            "  {found} of {} probed states have no witness",
+            (120 / 3) * (120 / 3)
+        );
     }
 
     #[test]
     fn pruning_survives_a_malformed_index() {
         // A config whose index does not match its bands must fall back to
         // the full scan, not drop bands by a broken binary search.
-        let good = ladder(8, 990_000_000, 1_010_000_000, 1_000_000_000, &[2, 9, 40, 87, 87, 40, 9, 2], None);
+        let good = ladder(
+            8,
+            990_000_000,
+            1_010_000_000,
+            1_000_000_000,
+            &[2, 9, 40, 87, 87, 40, 9, 2],
+            None,
+        );
         let x = BigInt::from(80_279_049_977_900u64);
         let (a, b) = on_ladder(&good, &x, 4).expect("state on the ladder");
 
         let mut scrambled = good.clone();
         scrambled.index.reverse();
-        assert!(candidate_bands(&scrambled, &a, &b).is_none(), "a non-monotone index must not be pruned");
+        assert!(
+            candidate_bands(&scrambled, &a, &b).is_none(),
+            "a non-monotone index must not be pruned"
+        );
 
         let mut truncated = good.clone();
         truncated.index.pop();
-        assert!(candidate_bands(&truncated, &a, &b).is_none(), "a short index must not be pruned");
+        assert!(
+            candidate_bands(&truncated, &a, &b).is_none(),
+            "a short index must not be pruned"
+        );
     }
 
     #[test]
@@ -2507,7 +2852,9 @@ mod witness_pruning_tests {
             let n = cfg.bands.len();
             let mut kept = Vec::new();
             for k in 0..n {
-                let Some((a, b)) = on_ladder(&cfg, &x, k) else { continue };
+                let Some((a, b)) = on_ladder(&cfg, &x, k) else {
+                    continue;
+                };
                 kept.push(candidate_bands(&cfg, &a, &b).map(|r| r.len()).unwrap_or(n));
             }
             if kept.is_empty() {

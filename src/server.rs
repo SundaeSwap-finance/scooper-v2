@@ -1625,7 +1625,12 @@ impl AdminServer {
                 }
                 _ => None,
             };
-            cbor.map(|cbor| (pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(), cbor))
+            cbor.map(|cbor| {
+                (
+                    pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(),
+                    cbor,
+                )
+            })
         };
         if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
             let mut enriched = serde_json::Map::new();
@@ -2272,7 +2277,8 @@ mod protocol_stats_tests {
 
     #[tokio::test]
     async fn aggregates_pools_orders_and_equity() {
-        let env = TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
+        let env =
+            TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
         // 1000 A / 2000 B, with a quarter of the LP held by the protocol.
         let pool = make_pool(&env, 0xA1, token_a(), 1_000_000, token_b(), 2_000_000);
         let mut pool = (*pool).clone();
@@ -2332,7 +2338,8 @@ mod protocol_stats_tests {
 
     #[tokio::test]
     async fn unindexed_order_config_is_counted_not_priced() {
-        let env = TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
+        let env =
+            TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
         let pool = make_pool(&env, 0xA2, token_a(), 1_000_000, token_b(), 2_000_000);
         let mut state = crate::sundaev4::SundaeV4State::default();
         state.pools.insert(pool.pool_datum.identifier.clone(), pool);

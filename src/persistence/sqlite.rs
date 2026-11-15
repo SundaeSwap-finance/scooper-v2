@@ -851,7 +851,7 @@ mod tests {
         // The spend from the replayed transaction must be recorded. If it
         // is not, the indexer believes a spent pool UTxO is still current
         // and every scoop built on it is rejected by the node.
-        let unspent = dao.load_txos().await?;  // WHERE spent_slot IS NULL
+        let unspent = dao.load_txos().await?; // WHERE spent_slot IS NULL
         assert!(
             !unspent.iter().any(|t| t.txo_id == pool.txo_id),
             "the pool UTxO is still believed unspent after the replay"

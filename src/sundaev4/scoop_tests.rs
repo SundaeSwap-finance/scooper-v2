@@ -1749,7 +1749,10 @@ mod tests {
         let cap = ladder_capacity(&cfg, &a, &b, true);
         let steps = swap_steps(&cfg, &a, &b, true, &cap).expect("the ladder absorbs its capacity");
         let dy = steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy);
-        assert_eq!(dy, b, "the ladder's capacity takes all of B: paid {dy} of {b}");
+        assert_eq!(
+            dy, b,
+            "the ladder's capacity takes all of B: paid {dy} of {b}"
+        );
 
         let dx: i64 = cap.to_string().parse().unwrap();
         let orders = vec![make_order(token_a(), dx, token_b(), 1, 1)];
@@ -1769,7 +1772,11 @@ mod tests {
             .expect("a scoop draining the ladder must conserve value and evaluate");
         let after = &result.predicted_pools[0].2;
         assert_eq!(after.pool_datum.assets[1].1, BigInt::from(0));
-        assert_eq!(after.value.get(&token_b()), BigInt::from(0), "no B copied from the input");
+        assert_eq!(
+            after.value.get(&token_b()),
+            BigInt::from(0),
+            "no B copied from the input"
+        );
     }
 
     /// A banded pool that also lists the oracle module: the scoop carries the

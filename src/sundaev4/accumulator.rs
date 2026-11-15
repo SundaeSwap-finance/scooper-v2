@@ -192,11 +192,16 @@ pub fn accrue_banded_swap(
     let mut total_dy = BigInt::from(0);
     for st in &steps {
         let (a0, b0) = (assets[0].1.clone(), assets[1].1.clone());
-        let (a1, b1) = if is_a_input { (&a0 + &st.dx, &b0 - &st.dy) } else { (&a0 - &st.dy, &b0 + &st.dx) };
+        let (a1, b1) = if is_a_input {
+            (&a0 + &st.dx, &b0 - &st.dy)
+        } else {
+            (&a0 - &st.dy, &b0 + &st.dx)
+        };
         // The same number `tx_builder::walk_banded_swap` declares: the fee's
         // LP worth from revision 2 (sundae-v4 SV4-001b), the counter ratio
         // in revision 1.
-        let fb = banded_math::step_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, &st.after, total_lp)?;
+        let fb =
+            banded_math::step_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, &st.after, total_lp)?;
         if fb.is_negative() {
             return Err(if cfg.rules.fee_budget_is_fee_value {
                 format!("banded step books a negative fee budget ({fb})")
@@ -466,7 +471,7 @@ impl Accumulator {
                 ));
             }
         } else {
-                for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
+            for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
                 *amt = &*amt + &swap_deltas[i];
                 if amt.is_negative() {
                     return Err(format!(
@@ -594,7 +599,7 @@ impl Accumulator {
     ///
     /// Fee budget computed here is router-projected; tx_builder recomputes
     /// fresh per-pool fee budgets during its streaming walk.
-#[cfg(test)]
+    #[cfg(test)]
     /// Add a movement: one burn leg and one mint leg.
     pub fn try_add_move(
         &mut self,
@@ -607,10 +612,13 @@ impl Accumulator {
         if from_ident == to_ident {
             return Err("movement must name two different pools".into());
         }
-        let (burns, mints) = batch::lp_legs(order, &BTreeMap::from([
-            (from_ident.clone(), from_pool.clone()),
-            (to_ident.clone(), to_pool.clone()),
-        ]));
+        let (burns, mints) = batch::lp_legs(
+            order,
+            &BTreeMap::from([
+                (from_ident.clone(), from_pool.clone()),
+                (to_ident.clone(), to_pool.clone()),
+            ]),
+        );
         let pools = BTreeMap::from([
             (from_ident.clone(), from_pool.clone()),
             (to_ident.clone(), to_pool.clone()),
@@ -753,7 +761,11 @@ impl Accumulator {
                     let n = BigInt::from(deficit.len() as i64);
                     let mut spent = BigInt::from(0);
                     for (di, to) in deficit.iter().enumerate() {
-                        let dx = if di + 1 == deficit.len() { &total - &spent } else { &total / &n };
+                        let dx = if di + 1 == deficit.len() {
+                            &total - &spent
+                        } else {
+                            &total / &n
+                        };
                         if !dx.is_positive() {
                             continue;
                         }
@@ -769,9 +781,12 @@ impl Accumulator {
                             let probe = |a: &AssetClass, b: &AssetClass| -> String {
                                 let mut found = Vec::new();
                                 for (ident, p) in pools {
-                                    let has = |x: &AssetClass| p.pool_datum.assets.iter().any(|(q, _)| q == x);
+                                    let has = |x: &AssetClass| {
+                                        p.pool_datum.assets.iter().any(|(q, _)| q == x)
+                                    };
                                     if has(a) && has(b) {
-                                        let one: BTreeMap<_, _> = [(ident.clone(), p.clone())].into_iter().collect();
+                                        let one: BTreeMap<_, _> =
+                                            [(ident.clone(), p.clone())].into_iter().collect();
                                         let ok = crate::sundaev4::router::find_blended_route(
                                             &one,
                                             &[],
@@ -781,7 +796,10 @@ impl Accumulator {
                                             crate::sundaev4::router::RoutingLimits::unlimited(),
                                         )
                                         .is_some();
-                                        found.push(format!("{ident}:{}", if ok { "ok" } else { "no" }));
+                                        found.push(format!(
+                                            "{ident}:{}",
+                                            if ok { "ok" } else { "no" }
+                                        ));
                                     }
                                 }
                                 found.join(",")
@@ -789,7 +807,15 @@ impl Accumulator {
                             let via: Vec<String> = needed
                                 .iter()
                                 .filter(|x| *x != to)
-                                .map(|mid| format!("{}->{}: [{}] then [{}]", hex::encode(&from.token), hex::encode(&mid.token), probe(&from, mid), probe(mid, to)))
+                                .map(|mid| {
+                                    format!(
+                                        "{}->{}: [{}] then [{}]",
+                                        hex::encode(&from.token),
+                                        hex::encode(&mid.token),
+                                        probe(&from, mid),
+                                        probe(mid, to)
+                                    )
+                                })
                                 .collect();
                             return Err(format!(
                                 "liquidity op: no route for {dx} {}->{} across {} pools (max_pools {}, max_steps {}); direct [{}]; via {:?}",
@@ -805,7 +831,8 @@ impl Accumulator {
                         let first_route = self.routes.len();
                         let mut dy = BigInt::from(0);
                         for branch in &blend.branches {
-                            dy = &dy + &self.add_route_branch(order, branch, pools, false, false)?;
+                            dy =
+                                &dy + &self.add_route_branch(order, branch, pools, false, false)?;
                         }
                         if !dy.is_positive() {
                             return Err("liquidity op: swap leg pays nothing".into());

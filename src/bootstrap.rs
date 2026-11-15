@@ -1871,16 +1871,42 @@ async fn lookup_pool_module_configs(
             // better. Walking on from here is one fetch per tx through the
             // pool's whole history (7050069).
             let bears = |kind: ModuleKind| {
-                scripts.modules.of_kind(kind).any(|e| {
-                    sundaev4::withdrawal_index_of_script(&tx, &e.hash).is_some()
-                })
+                scripts
+                    .modules
+                    .of_kind(kind)
+                    .any(|e| sundaev4::withdrawal_index_of_script(&tx, &e.hash).is_some())
             };
             for (kind, want, found, flag) in [
-                (ModuleKind::ConstantSum, wanted.cs.is_some(), out.cs.is_some(), &mut settled.cs),
-                (ModuleKind::ConstantProduct, wanted.cp.is_some(), out.cp.is_some(), &mut settled.cp),
-                (ModuleKind::Stableswap, wanted.ss.is_some(), out.ss.is_some(), &mut settled.ss),
-                (ModuleKind::ConcentratedLiquidity, wanted.bcl.is_some(), out.bcl.is_some(), &mut settled.bcl),
-                (ModuleKind::FeeSplit, wanted.fs.is_some(), out.fee_split.is_some(), &mut settled.fs),
+                (
+                    ModuleKind::ConstantSum,
+                    wanted.cs.is_some(),
+                    out.cs.is_some(),
+                    &mut settled.cs,
+                ),
+                (
+                    ModuleKind::ConstantProduct,
+                    wanted.cp.is_some(),
+                    out.cp.is_some(),
+                    &mut settled.cp,
+                ),
+                (
+                    ModuleKind::Stableswap,
+                    wanted.ss.is_some(),
+                    out.ss.is_some(),
+                    &mut settled.ss,
+                ),
+                (
+                    ModuleKind::ConcentratedLiquidity,
+                    wanted.bcl.is_some(),
+                    out.bcl.is_some(),
+                    &mut settled.bcl,
+                ),
+                (
+                    ModuleKind::FeeSplit,
+                    wanted.fs.is_some(),
+                    out.fee_split.is_some(),
+                    &mut settled.fs,
+                ),
             ] {
                 if want && !found && !*flag && bears(kind) {
                     *flag = true;

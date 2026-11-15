@@ -2074,10 +2074,10 @@ impl Scooper {
         };
 
         // checkpoints[i] has (i+1) orders.
-        let (best, last_bail) = crate::sundaev4::batch::largest_fitting_checkpoint(
-            checkpoints.len(),
-            |idx| within_limits(&checkpoints[idx]),
-        );
+        let (best, last_bail) =
+            crate::sundaev4::batch::largest_fitting_checkpoint(checkpoints.len(), |idx| {
+                within_limits(&checkpoints[idx])
+            });
 
         // If we found a valid prefix but had to drop a failing suffix, note it.
         if let (Some(idx), Some(reason)) = (best, &last_bail)
@@ -2510,8 +2510,13 @@ impl Scooper {
                         }
                     }
                     Err(why) => {
-                        let holds_pair = pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.offer)
-                            && pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.ask);
+                        let holds_pair =
+                            pool.pool_datum.assets.iter().any(|(a, _)| *a == leg.order.datum.offer)
+                                && pool
+                                    .pool_datum
+                                    .assets
+                                    .iter()
+                                    .any(|(a, _)| *a == leg.order.datum.ask);
                         if holds_pair {
                             *reasons.entry(why).or_default() += 1;
                         }

@@ -9,10 +9,10 @@ use std::sync::Arc;
 use num_traits::Signed;
 
 use crate::bigint::BigInt;
-use crate::sundaev4::types::ScooperExecution;
 use crate::cardano_types::AssetClass;
 use crate::sundaev3::Ident;
 use crate::sundaev4::swap_math;
+use crate::sundaev4::types::ScooperExecution;
 use crate::sundaev4::types::*;
 
 /// A resolved swap with precomputed math.
@@ -272,15 +272,27 @@ pub fn lp_legs(
 ) -> (Vec<(Ident, BigInt)>, Vec<(Ident, BigInt)>) {
     let (offered, min_received): (Vec<(AssetClass, BigInt)>, &[(AssetClass, BigInt)]) =
         match &order.constraint {
-            Constraint::Deposit { offered, min_received }
-            | Constraint::Withdraw { offered, min_received }
-            | Constraint::Claim { offered, min_received } => (offered.clone(), min_received),
+            Constraint::Deposit {
+                offered,
+                min_received,
+            }
+            | Constraint::Withdraw {
+                offered,
+                min_received,
+            }
+            | Constraint::Claim {
+                offered,
+                min_received,
+            } => (offered.clone(), min_received),
             Constraint::Swap {
                 offered,
                 remaining_offered,
                 min_received,
                 ..
-            } => (vec![(offered.clone(), remaining_offered.clone())], min_received),
+            } => (
+                vec![(offered.clone(), remaining_offered.clone())],
+                min_received,
+            ),
             _ => return (Vec::new(), Vec::new()),
         };
     let classify = |list: &[(AssetClass, BigInt)]| -> Vec<(Ident, BigInt)> {
@@ -1648,7 +1660,11 @@ impl ScoopTxCost {
         let fits = self.mem <= exec.max_tx_ex_mem
             && self.steps <= exec.max_tx_ex_steps
             && self.bytes <= exec.max_tx_size;
-        if fits { Fitness::Fits } else { Fitness::Overbudget }
+        if fits {
+            Fitness::Fits
+        } else {
+            Fitness::Overbudget
+        }
     }
 }
 
@@ -1815,7 +1831,6 @@ mod tests {
             slot,
         ))
     }
-
 
     #[test]
     fn test_single_order_batch() {

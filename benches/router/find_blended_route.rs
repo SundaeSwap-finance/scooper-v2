@@ -23,7 +23,9 @@ use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::sundaev3::Ident;
 use crate::sundaev4::banded_math::{build_index, check_shape, find_witness};
 use crate::sundaev4::router::{RoutingLimits, find_blended_route};
-use crate::sundaev4::{BandSpec, BandedCLConfig, PoolDatum, PoolType, Rational, SundaeV4Pool, plutus_void};
+use crate::sundaev4::{
+    BandSpec, BandedCLConfig, PoolDatum, PoolType, Rational, SundaeV4Pool, plutus_void,
+};
 
 /// Shape of the synthetic market. Every token has the same reference price
 /// (1 raw unit = 1 raw unit), so every pool sits at price 1 and the market has
@@ -206,7 +208,11 @@ fn summary(blend: &Option<crate::sundaev4::router::BlendedRoute>) -> String {
         Some(b) => {
             let splits: usize =
                 b.branches.iter().flat_map(|r| &r.hops).map(|h| h.splits.len()).sum();
-            format!("{} branches, {splits} splits, output {}", b.branches.len(), b.total_output)
+            format!(
+                "{} branches, {splits} splits, output {}",
+                b.branches.len(),
+                b.total_output
+            )
         }
         None => "no route".to_string(),
     }
@@ -228,14 +234,36 @@ fn bench_find_blended_route(c: &mut Criterion) {
 
     let cases = [
         ("unlimited", RoutingLimits::unlimited()),
-        ("K=15", RoutingLimits { max_pools: 15, max_steps: 15 }),
-        ("K=4", RoutingLimits { max_pools: 4, max_steps: 4 }),
-        ("K=3", RoutingLimits { max_pools: 3, max_steps: 3 }),
+        (
+            "K=15",
+            RoutingLimits {
+                max_pools: 15,
+                max_steps: 15,
+            },
+        ),
+        (
+            "K=4",
+            RoutingLimits {
+                max_pools: 4,
+                max_steps: 4,
+            },
+        ),
+        (
+            "K=3",
+            RoutingLimits {
+                max_pools: 3,
+                max_steps: 3,
+            },
+        ),
     ];
 
     // What each case routes to, so a change of route shows next to a change
     // of time.
-    eprintln!("{} pools, T0 → T{}, amount {amount}", pools.len(), shape.tokens - 1);
+    eprintln!(
+        "{} pools, T0 → T{}, amount {amount}",
+        pools.len(),
+        shape.tokens - 1
+    );
     for (name, limits) in &cases {
         let t0 = std::time::Instant::now();
         let blend = find_blended_route(&pools, &[], &from, &to, &amount, *limits);
@@ -245,19 +273,41 @@ fn bench_find_blended_route(c: &mut Criterion) {
     let crowded_amount = BigInt::from(CROWDED_AMOUNT);
     eprintln!("{} pools, T0 → T1, amount {crowded_amount}", crowded.len());
     let t0 = std::time::Instant::now();
-    let blend =
-        find_blended_route(&crowded, &[], &token(0), &token(1), &crowded_amount, RoutingLimits::unlimited());
-    eprintln!("  {:<9} {:>8.2?}  {}", "crowded", t0.elapsed(), summary(&blend));
+    let blend = find_blended_route(
+        &crowded,
+        &[],
+        &token(0),
+        &token(1),
+        &crowded_amount,
+        RoutingLimits::unlimited(),
+    );
+    eprintln!(
+        "  {:<9} {:>8.2?}  {}",
+        "crowded",
+        t0.elapsed(),
+        summary(&blend)
+    );
 
     let mut group = c.benchmark_group("find_blended_route");
     // The slow cases take seconds per call: criterion's minimum sample count.
     group.sample_size(10);
     for (name, limits) in cases {
-        group.bench_with_input(BenchmarkId::from_parameter(name), &limits, |bench, limits| {
-            bench.iter(|| {
-                find_blended_route(black_box(&pools), &[], &from, &to, black_box(&amount), *limits)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(name),
+            &limits,
+            |bench, limits| {
+                bench.iter(|| {
+                    find_blended_route(
+                        black_box(&pools),
+                        &[],
+                        &from,
+                        &to,
+                        black_box(&amount),
+                        *limits,
+                    )
+                })
+            },
+        );
     }
     group.bench_function("crowded", |bench| {
         bench.iter(|| {

@@ -239,11 +239,11 @@ const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 
 /// Buckets span microseconds to a tenth of a second because the seeded
 /// path is ~0.4ms and the cold path is ~160ms — four orders of magnitude,
 /// and the whole point is seeing which one we are on.
-const ROUTE_LATENCY_BOUNDARIES: &[f64] = &[0.001, 0.005, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
-const ROUTE_EVALS_BOUNDARIES: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0];
-const WITNESS_LATENCY_BOUNDARIES: &[f64] = &[
-    0.0002, 0.0005, 0.001, 0.005, 0.02, 0.05, 0.1, 0.25,
+const ROUTE_LATENCY_BOUNDARIES: &[f64] = &[
+    0.001, 0.005, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
 ];
+const ROUTE_EVALS_BOUNDARIES: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0];
+const WITNESS_LATENCY_BOUNDARIES: &[f64] = &[0.0002, 0.0005, 0.001, 0.005, 0.02, 0.05, 0.1, 0.25];
 
 /// Point-in-time operator health, refreshed by the scooper each batch cycle.
 /// Everything an operator needs to answer "why is nothing happening":
@@ -362,8 +362,10 @@ impl Metrics {
             self.scoop_mem_peak.store(mem, Ordering::Relaxed);
             self.scoop_steps_peak.store(steps, Ordering::Relaxed);
             self.scoop_size_peak.store(size_bytes, Ordering::Relaxed);
-            self.scoop_peak_shape
-                .store(pools.saturating_mul(1000) + transcript_steps, Ordering::Relaxed);
+            self.scoop_peak_shape.store(
+                pools.saturating_mul(1000) + transcript_steps,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -876,13 +878,41 @@ pub async fn render_metrics(
         metrics.mempool_confirmed.load(Ordering::Relaxed),
     );
     for (name, help, v) in [
-        ("scooper_scoop_mem", "Execution memory of the last built scoop, in memory units", &metrics.scoop_mem_last),
-        ("scooper_scoop_steps", "Execution steps of the last built scoop, in steps", &metrics.scoop_steps_last),
-        ("scooper_scoop_size_bytes", "Size of the last built scoop, in bytes", &metrics.scoop_size_last),
-        ("scooper_scoop_mem_peak", "Highest scoop execution memory seen, in memory units", &metrics.scoop_mem_peak),
-        ("scooper_scoop_steps_peak", "Execution steps of the highest-memory scoop, in steps", &metrics.scoop_steps_peak),
-        ("scooper_scoop_size_peak_bytes", "Size of the highest-memory scoop, in bytes", &metrics.scoop_size_peak),
-        ("scooper_scoop_peak_shape", "Shape of the highest-memory scoop, as pools*1000 + transcript steps", &metrics.scoop_peak_shape),
+        (
+            "scooper_scoop_mem",
+            "Execution memory of the last built scoop, in memory units",
+            &metrics.scoop_mem_last,
+        ),
+        (
+            "scooper_scoop_steps",
+            "Execution steps of the last built scoop, in steps",
+            &metrics.scoop_steps_last,
+        ),
+        (
+            "scooper_scoop_size_bytes",
+            "Size of the last built scoop, in bytes",
+            &metrics.scoop_size_last,
+        ),
+        (
+            "scooper_scoop_mem_peak",
+            "Highest scoop execution memory seen, in memory units",
+            &metrics.scoop_mem_peak,
+        ),
+        (
+            "scooper_scoop_steps_peak",
+            "Execution steps of the highest-memory scoop, in steps",
+            &metrics.scoop_steps_peak,
+        ),
+        (
+            "scooper_scoop_size_peak_bytes",
+            "Size of the highest-memory scoop, in bytes",
+            &metrics.scoop_size_peak,
+        ),
+        (
+            "scooper_scoop_peak_shape",
+            "Shape of the highest-memory scoop, as pools*1000 + transcript steps",
+            &metrics.scoop_peak_shape,
+        ),
     ] {
         write_gauge(&mut out, name, help, v.load(Ordering::Relaxed));
     }
@@ -935,15 +965,51 @@ pub async fn render_metrics(
         // router itself, read here as totals.
         let p = &crate::sundaev4::router::ROUTER_PROFILE;
         for (name, help, v) in [
-            ("scooper_router_split_calls_total", "optimize_split calls", p.split_calls.load(Ordering::Relaxed)),
-            ("scooper_router_split_rounds_total", "λ-bisection rounds inside optimize_split", p.split_rounds.load(Ordering::Relaxed)),
-            ("scooper_router_pool_outputs_total", "pool_output calls", p.pool_outputs.load(Ordering::Relaxed)),
-            ("scooper_router_split_millis_total", "milliseconds inside optimize_split", p.split_ns.load(Ordering::Relaxed) / 1_000_000),
-            ("scooper_router_ladder_builds_total", "banded ladders built (ladder cache misses)", p.ladder_builds.load(Ordering::Relaxed)),
-            ("scooper_router_ladder_build_millis_total", "milliseconds spent building ladders", p.ladder_build_ns.load(Ordering::Relaxed) / 1_000_000),
-            ("scooper_router_fill_curve_builds_total", "banded fill curves built", p.fill_curve_builds.load(Ordering::Relaxed)),
-            ("scooper_router_fill_curve_millis_total", "milliseconds spent building fill curves", p.fill_curve_ns.load(Ordering::Relaxed) / 1_000_000),
-            ("scooper_router_fill_curve_empty_total", "fill curves that came back empty (state off the ladder; every λ-round then re-solves max_dx_in_band)", p.fill_curve_empty.load(Ordering::Relaxed)),
+            (
+                "scooper_router_split_calls_total",
+                "optimize_split calls",
+                p.split_calls.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_split_rounds_total",
+                "λ-bisection rounds inside optimize_split",
+                p.split_rounds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_pool_outputs_total",
+                "pool_output calls",
+                p.pool_outputs.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_split_millis_total",
+                "milliseconds inside optimize_split",
+                p.split_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_ladder_builds_total",
+                "banded ladders built (ladder cache misses)",
+                p.ladder_builds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_ladder_build_millis_total",
+                "milliseconds spent building ladders",
+                p.ladder_build_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_fill_curve_builds_total",
+                "banded fill curves built",
+                p.fill_curve_builds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_fill_curve_millis_total",
+                "milliseconds spent building fill curves",
+                p.fill_curve_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_fill_curve_empty_total",
+                "fill curves that came back empty (state off the ladder; every λ-round then re-solves max_dx_in_band)",
+                p.fill_curve_empty.load(Ordering::Relaxed),
+            ),
         ] {
             write_counter(&mut out, name, help, v);
         }

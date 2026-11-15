@@ -78,7 +78,10 @@ pub struct BandedLadder {
     pub witness: crate::sundaev4::banded_math::Witness,
     capacity: [std::sync::OnceLock<BigInt>; 2],
     after: std::sync::Mutex<
-        std::collections::BTreeMap<(bool, BigInt), Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>>,
+        std::collections::BTreeMap<
+            (bool, BigInt),
+            Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>,
+        >,
     >,
     fill: [std::sync::OnceLock<Vec<FillStep>>; 2],
 }
@@ -146,7 +149,10 @@ impl BandedLadder {
             let t0 = std::time::Instant::now();
             let out = self.build_fill_curve(is_a_input);
             bump(&ROUTER_PROFILE.fill_curve_builds, 1);
-            bump(&ROUTER_PROFILE.fill_curve_ns, t0.elapsed().as_nanos() as u64);
+            bump(
+                &ROUTER_PROFILE.fill_curve_ns,
+                t0.elapsed().as_nanos() as u64,
+            );
             if out.is_empty() {
                 bump(&ROUTER_PROFILE.fill_curve_empty, 1);
             }
@@ -195,7 +201,11 @@ impl BandedLadder {
                 break;
             };
             let cap = bm::max_dx_in_band(&view, is_a_input);
-            let dy = if cap.is_positive() { bm::band_output(&view, is_a_input, &cap) } else { BigInt::from(0) };
+            let dy = if cap.is_positive() {
+                bm::band_output(&view, is_a_input, &cap)
+            } else {
+                BigInt::from(0)
+            };
             if cap.is_positive() && dy.is_positive() {
                 out.push(FillStep {
                     marginal_open: banded_marginal(&view, is_a_input, &BigInt::from(0)),
@@ -275,7 +285,11 @@ impl BandedLadder {
     pub fn output_walked(&self, is_a_input: bool, dx: &BigInt) -> BigInt {
         match self.view_after(is_a_input, dx) {
             Some((na, nb, _)) => {
-                if is_a_input { &self.b - &nb } else { &self.a - &na }
+                if is_a_input {
+                    &self.b - &nb
+                } else {
+                    &self.a - &na
+                }
             }
             None => BigInt::from(0),
         }
@@ -375,14 +389,28 @@ fn banded_alloc_in_band(
         } else {
             &fee_mult * &pd * &sc / &(&fee_den * &pn)
         };
-        return if lambda <= &marginal { (cap.clone(), cap) } else { (BigInt::from(0), cap) };
+        return if lambda <= &marginal {
+            (cap.clone(), cap)
+        } else {
+            (BigInt::from(0), cap)
+        };
     }
     let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
     let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
     let (numerator, denom, v0, sp_input) = if is_a_input {
-        (&fee_mult * &vb0 * &va0 * spb_num * &sc, &fee_den * spa_den * lambda, &va0, spb_num)
+        (
+            &fee_mult * &vb0 * &va0 * spb_num * &sc,
+            &fee_den * spa_den * lambda,
+            &va0,
+            spb_num,
+        )
     } else {
-        (&fee_mult * &va0 * &vb0 * spa_den * &sc, &fee_den * spb_num * lambda, &vb0, spa_den)
+        (
+            &fee_mult * &va0 * &vb0 * spa_den * &sc,
+            &fee_den * spb_num * lambda,
+            &vb0,
+            spa_den,
+        )
     };
     if !denom.is_positive() || !sp_input.is_positive() {
         return (BigInt::from(0), cap);
@@ -397,7 +425,11 @@ fn banded_alloc_in_band(
         return (BigInt::from(0), cap);
     }
     let raw = &dx_eff * &fee_den / &fee_mult;
-    if raw > cap { (cap.clone(), cap) } else { (raw, cap) }
+    if raw > cap {
+        (cap.clone(), cap)
+    } else {
+        (raw, cap)
+    }
 }
 
 /// The stableswap swap for a view: `dx` of the in asset against the out
@@ -1269,9 +1301,17 @@ fn ladder_for(
         return l.clone();
     }
     let t0 = std::time::Instant::now();
-    let built = std::sync::Arc::new(BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w.clone()));
+    let built = std::sync::Arc::new(BandedLadder::new(
+        cfg.clone(),
+        a.clone(),
+        b.clone(),
+        w.clone(),
+    ));
     bump(&ROUTER_PROFILE.ladder_builds, 1);
-    bump(&ROUTER_PROFILE.ladder_build_ns, t0.elapsed().as_nanos() as u64);
+    bump(
+        &ROUTER_PROFILE.ladder_build_ns,
+        t0.elapsed().as_nanos() as u64,
+    );
     if let Ok(mut m) = cache.lock() {
         let stale: Vec<Key> = m
             .range((ident.clone(), BigInt::from(0), BigInt::from(0))..)
@@ -1325,8 +1365,11 @@ fn build_graph(
                 // Full reserves, not the band residuals: `pool_output` clips
                 // at `reserve_out`, and a crossing swap pays out of several
                 // bands. The ladder itself bounds what each direction absorbs.
-                let (reserve_in, reserve_out) =
-                    if is_a_input { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+                let (reserve_in, reserve_out) = if is_a_input {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
                 graph
                     .entry(assets[i].0.clone())
                     .or_default()
@@ -1633,13 +1676,18 @@ struct PathEval {
 /// Evaluate every path at `amount`. This is the expensive pass — one
 /// `optimize_split` per hop per path — and it is made ONCE per route call
 /// and shared by the single-route pick and the blend's ranking.
-fn evaluate_paths_at(paths: &[Vec<PathHop>], amount: &BigInt, limits: &RoutingLimits) -> Vec<PathEval> {
+fn evaluate_paths_at(
+    paths: &[Vec<PathHop>],
+    amount: &BigInt,
+    limits: &RoutingLimits,
+) -> Vec<PathEval> {
     paths
         .iter()
         .enumerate()
         .map(|(idx, path)| {
             let hops = evaluate_path(path, amount, limits);
-            let out = hops.last().map(|h| h.total_output.clone()).unwrap_or_else(|| BigInt::from(0));
+            let out =
+                hops.last().map(|h| h.total_output.clone()).unwrap_or_else(|| BigInt::from(0));
             // Final safety check (evaluate_path enforces budgets but pool count
             // is only known once every hop has split).
             let distinct_pools: std::collections::BTreeSet<_> =
@@ -1647,7 +1695,12 @@ fn evaluate_paths_at(paths: &[Vec<PathHop>], amount: &BigInt, limits: &RoutingLi
             let total_steps: usize = hops.iter().map(|h| h.splits.len()).sum();
             let within_limits =
                 distinct_pools.len() <= limits.max_pools && total_steps <= limits.max_steps;
-            PathEval { idx, hops, out, within_limits }
+            PathEval {
+                idx,
+                hops,
+                out,
+                within_limits,
+            }
         })
         .collect()
 }
@@ -1886,7 +1939,14 @@ pub fn find_blended_route(
 ) -> Option<BlendedRoute> {
     let before = EVAL_COUNT.with(|c| c.get());
     let t0 = std::time::Instant::now();
-    let out = find_blended_route_inner(pools, conversions, input_token, output_token, amount, limits);
+    let out = find_blended_route_inner(
+        pools,
+        conversions,
+        input_token,
+        output_token,
+        amount,
+        limits,
+    );
     let stat = RouteStat {
         secs: t0.elapsed().as_secs_f64(),
         evals: EVAL_COUNT.with(|c| c.get()) - before,
@@ -2132,11 +2192,8 @@ fn find_blended_route_inner(
     // The single route's path: the one that absorbs the whole amount on
     // its own. Ranked by one chunk's output it may have lost its slot to
     // cheaper paths that, together, lack the depth for the order.
-    let single_idx = evals
-        .iter()
-        .filter(|e| e.within_limits)
-        .max_by(|a, b| a.out.cmp(&b.out))
-        .map(|e| e.idx);
+    let single_idx =
+        evals.iter().filter(|e| e.within_limits).max_by(|a, b| a.out.cmp(&b.out)).map(|e| e.idx);
     let mut paths = paths;
     let mut branches: Vec<RoutingPlan>;
     let mut gave_single_a_slot = false;
@@ -3226,7 +3283,11 @@ mod split_cost {
             reserve_out: b,
             fee_num: 3,
             fee_den: 1000,
-            view_type: PoolViewType::Banded { is_a_input: true, band: view, ladder },
+            view_type: PoolViewType::Banded {
+                is_a_input: true,
+                band: view,
+                ladder,
+            },
         })
     }
 
@@ -3251,10 +3312,21 @@ mod split_cost {
                 pools
                     .iter()
                     .map(|p| {
-                        let PoolViewType::Banded { is_a_input, band, ladder } = &p.view_type else {
+                        let PoolViewType::Banded {
+                            is_a_input,
+                            band,
+                            ladder,
+                        } = &p.view_type
+                        else {
                             unreachable!()
                         };
-                        let l = ladder_for(&p.ident, &ladder.cfg, &ladder.a, &ladder.b, &ladder.witness);
+                        let l = ladder_for(
+                            &p.ident,
+                            &ladder.cfg,
+                            &ladder.a,
+                            &ladder.b,
+                            &ladder.witness,
+                        );
                         PoolView {
                             ident: p.ident.clone(),
                             reserve_in: p.reserve_in.clone(),
@@ -3289,8 +3361,13 @@ mod split_cost {
     fn fill_curve_output_equals_the_ladder_walk() {
         let mut checked = 0u64;
         for i in 0..1usize {
-            let Some(pool) = banded_pool(i, 12) else { continue };
-            let PoolViewType::Banded { ladder, is_a_input, .. } = &pool.view_type else {
+            let Some(pool) = banded_pool(i, 12) else {
+                continue;
+            };
+            let PoolViewType::Banded {
+                ladder, is_a_input, ..
+            } = &pool.view_type
+            else {
                 continue;
             };
             for dir in [*is_a_input, !*is_a_input] {
@@ -3320,11 +3397,13 @@ mod split_cost {
     fn split_cost_against_banded_pool_count() {
         let bands = 12;
         println!("  optimize_split, {bands}-band ladders, MAX_ITER={}", 200);
-        println!("  {:>6} {:>12} {:>14} {:>12}", "pools", "time", "per pool", "vs 4 pools");
+        println!(
+            "  {:>6} {:>12} {:>14} {:>12}",
+            "pools", "time", "per pool", "vs 4 pools"
+        );
         let mut base: Option<f64> = None;
         for n in [4usize, 8, 12, 16, 24, 31, 48] {
-            let pools: Vec<PoolView> =
-                (0..n).filter_map(|i| banded_pool(i, bands)).collect();
+            let pools: Vec<PoolView> = (0..n).filter_map(|i| banded_pool(i, bands)).collect();
             if pools.len() < n {
                 println!("  {n:>6}  (could not build {n} pools)");
                 continue;
@@ -3425,7 +3504,12 @@ mod depth_fallback {
     /// The bench's `banded_pool`: the pair's `value` split evenly at price 1.
     /// Idents use their own prefix: the router caches ladders by (ident,
     /// reserves), not by config, so they must not collide with other tests'.
-    fn banded_pool(index: u16, a: &AssetClass, b: &AssetClass, shape: &PairShape) -> Arc<SundaeV4Pool> {
+    fn banded_pool(
+        index: u16,
+        a: &AssetClass,
+        b: &AssetClass,
+        shape: &PairShape,
+    ) -> Arc<SundaeV4Pool> {
         let config = ladder(shape);
         let half = BigInt::from((shape.value / 2.0) as u64);
         find_witness(&config, &half, &half).expect("balanced reserves sit on the ladder");
@@ -3456,9 +3540,16 @@ mod depth_fallback {
     }
 
     fn route_output(pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>, amount: &BigInt) -> BigInt {
-        find_blended_route(pools, &[], &token(0), &token(1), amount, RoutingLimits::unlimited())
-            .expect("the deep pool can absorb the order")
-            .total_output
+        find_blended_route(
+            pools,
+            &[],
+            &token(0),
+            &token(1),
+            amount,
+            RoutingLimits::unlimited(),
+        )
+        .expect("the deep pool can absorb the order")
+        .total_output
     }
 
     /// Fee tiers only, every pool at price 1: a deep T0/T1 pool on the 1 %

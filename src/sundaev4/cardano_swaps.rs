@@ -927,7 +927,10 @@ impl CardanoSwapsRuntime {
         let dx = argmax_unimodal(1, hi.max(2), surplus_of);
         let gross = surplus_of(dx);
         if gross <= 0 {
-            return Err(format!("no dx releases lovelace (best dx={dx}, dy={})", dy_of(dx)));
+            return Err(format!(
+                "no dx releases lovelace (best dx={dx}, dy={})",
+                dy_of(dx)
+            ));
         }
         let gross = gross as u64;
         if gross < cfg.fee_estimate_lovelace + cfg.min_revenue_lovelace {
