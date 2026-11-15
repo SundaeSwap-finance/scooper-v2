@@ -352,8 +352,6 @@ pub fn evaluate_scoop_tx(
     Ok(EvalResult { budgets })
 }
 
-/// Determine which script hash to evaluate and build the ScriptPurpose.
-
 /// Write the V3 ScriptContext this evaluator builds for every redeemer of a
 /// tx to `/tmp/ctx-<tx>-<purpose><index>.cbor`, for diffing against the
 /// context the node builds for the same tx. Returns the paths written.
@@ -396,6 +394,7 @@ pub fn dump_script_contexts(
     paths
 }
 
+/// Determine which script hash to evaluate and build the ScriptPurpose.
 pub(crate) fn resolve_script_and_purpose(
     key: &RedeemersKey,
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,

@@ -2695,8 +2695,7 @@ mod preview_banded_recovery_tests {
     fn recovers_the_migrated_config_from_the_legacy_create_redeemer() {
         let cbor = hex::decode(CREATE_TX_HEX.trim()).expect("fixture is hex");
         let tx = MultiEraTx::decode(&cbor).expect("fixture decodes");
-        let configured: ScriptHash =
-            hex::decode(NEW_BCL_HASH).expect("hex").as_slice().try_into().expect("28 bytes");
+        let configured: ScriptHash = hex::decode(NEW_BCL_HASH).expect("hex").as_slice().into();
 
         let candidates = extract_bcl_config_candidates(&tx, &configured);
         assert!(
@@ -2733,8 +2732,7 @@ mod steelswap_quote_dump {
             hex::decode("33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18")
                 .unwrap()
                 .as_slice()
-                .try_into()
-                .unwrap();
+                .into();
         let want = hex::decode("361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9")
             .unwrap();
         let cfg = extract_bcl_config_candidates(&tx, &configured)

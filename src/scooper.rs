@@ -2301,11 +2301,6 @@ impl Scooper {
         .await
     }
 
-    /// Build the tx for `final_plan`, evaluate, compute the exact fee,
-    /// rebuild, sign, submit, and record the outcome. Shared by the
-    /// normal accumulation path and the dedicated claim path.
-    #[allow(clippy::too_many_arguments)]
-
     /// After a rejection: per redeemer, what the tx declared, what our
     /// evaluator measured on the final tx, and what the node measures
     /// (ogmios `evaluateTransaction`), with a flag on any redeemer whose
@@ -2330,7 +2325,7 @@ impl Scooper {
         // (ogmios evaluateTransaction, when the submit endpoint
         // is ogmios). A declared budget below the node's number
         // is a phase-2 rejection the local check cannot see.
-        let node = crate::sundaev4::submit::evaluate_ogmios(&evaluate_url, &final_tx.cbor)
+        let node = crate::sundaev4::submit::evaluate_ogmios(evaluate_url, &final_tx.cbor)
             .await
             .unwrap_or_default();
         // The tx itself, for the node-side context tool, then the
@@ -2561,6 +2556,10 @@ impl Scooper {
         })
     }
 
+    /// Build the tx for `final_plan`, evaluate, compute the exact fee,
+    /// rebuild, sign, submit, and record the outcome. Shared by the
+    /// normal accumulation path and the dedicated claim path.
+    #[allow(clippy::too_many_arguments)]
     async fn build_and_submit_plan(
         &mut self,
         final_plan: crate::sundaev4::batch::ScoopPlan,

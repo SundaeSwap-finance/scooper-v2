@@ -760,7 +760,7 @@ pub fn find_witness_in_band_from(
             // crosses a band. The window above `lo` is kept as a backstop
             // in case the predicate is not monotone for some state.
             let sp = BigInt::from(scan as i64);
-            let from = if &lo > &sp { &lo - &sp } else { one.clone() };
+            let from = if lo > sp { &lo - &sp } else { one.clone() };
             let to = &lo + &sp;
             let mut x = lo.clone();
             while x >= from {
@@ -1139,6 +1139,7 @@ pub fn max_dx_in_band(v: &BandView, is_a_input: bool) -> BigInt {
 /// The state a swap of `dx` leaves behind: the reserves and the band view
 /// at the final step's after-witness. `None` when the ladder cannot absorb
 /// `dx`.
+#[cfg(test)]
 pub fn view_after_from(
     cfg: &BandedCLConfig,
     a: &BigInt,
@@ -1165,6 +1166,7 @@ pub fn view_after_from(
 
 /// The largest input the whole ladder absorbs in one direction: the sum of
 /// every band's capacity from the active band to the ladder's end.
+#[cfg(test)]
 pub fn ladder_capacity(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, is_a_input: bool) -> BigInt {
     ladder_capacity_from(cfg, a, b, is_a_input, None)
 }

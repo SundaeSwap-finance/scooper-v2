@@ -642,6 +642,7 @@ impl Accumulator {
     /// proportional step (fee_budget 0 on every curve). `plain_floors` are
     /// checked against what is left for the user. The caller works on a
     /// cloned accumulator and drops it on `Err`.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_add_liquidity_op(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,

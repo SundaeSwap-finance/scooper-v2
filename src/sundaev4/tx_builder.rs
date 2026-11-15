@@ -1204,7 +1204,7 @@ pub fn build_multi_pool_scoop_tx(
                     let in_idx = z
                         .swap_deltas
                         .iter()
-                        .position(|d| num_traits::Signed::is_positive(d))
+                        .position(num_traits::Signed::is_positive)
                         .context("zap swap pays nothing in")?;
                     let mut wst = WalkPoolState {
                         running_assets,
@@ -3865,7 +3865,6 @@ pub fn build_multi_pool_scoop_tx(
     // The first was lovelace, the second was not, which is why this covers
     // every asset rather than just the coin.
     {
-        use num_traits::ToPrimitive;
         let big = |v: &crate::bigint::BigInt| v.to_string().parse::<i128>().unwrap_or(0);
         let mut net: BTreeMap<(Vec<u8>, Vec<u8>), i128> = BTreeMap::new();
         let ada_key = (Vec::new(), Vec::new());

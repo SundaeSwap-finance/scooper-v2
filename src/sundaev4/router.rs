@@ -18,6 +18,9 @@ use crate::sundaev4::types::SundaeV4Pool;
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// Pool-type-specific parameters for the router.
+// The banded variant is large; boxing it would change every construction
+// site for no measured gain, so the size difference is accepted.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum PoolViewType {
     ConstantProduct,
@@ -67,6 +70,16 @@ pub enum PoolViewType {
     },
 }
 
+/// The state after each input amount, keyed by (direction, input). Only the
+/// ladder-walk reference (`output_walked`, tests) reads it.
+#[cfg(test)]
+type AfterCache = std::sync::Mutex<
+    std::collections::BTreeMap<
+        (bool, BigInt),
+        Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>,
+    >,
+>;
+
 /// A banded pool's ladder and reserves, enough to plan multi-band swaps.
 /// Caches what the route search asks for repeatedly: the ladder capacity per
 /// direction and the state after each input amount.
@@ -77,12 +90,8 @@ pub struct BandedLadder {
     pub b: BigInt,
     pub witness: crate::sundaev4::banded_math::Witness,
     capacity: [std::sync::OnceLock<BigInt>; 2],
-    after: std::sync::Mutex<
-        std::collections::BTreeMap<
-            (bool, BigInt),
-            Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>,
-        >,
-    >,
+    #[cfg(test)]
+    after: AfterCache,
     fill: [std::sync::OnceLock<Vec<FillStep>>; 2],
 }
 
@@ -132,6 +141,7 @@ impl BandedLadder {
             b,
             witness,
             capacity: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+            #[cfg(test)]
             after: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             fill: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
         }
@@ -295,6 +305,7 @@ impl BandedLadder {
         }
     }
 
+    #[cfg(test)]
     pub fn view_after(
         &self,
         is_a_input: bool,
@@ -1027,6 +1038,7 @@ pub fn optimize_split(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEntr
 
 /// Read and reset the split profile counters:
 /// (optimize_split calls, bisection rounds, pool_output calls, ns in optimize_split).
+#[cfg(test)]
 pub fn drain_split_profile() -> (u64, u64, u64, u64) {
     let p = &ROUTER_PROFILE;
     (
@@ -1358,7 +1370,7 @@ fn build_graph(
             let Ok(view) = band_view(config, a, b, &w) else {
                 continue;
             };
-            let ladder = ladder_for(&ident, config, a, b, &w);
+            let ladder = ladder_for(ident, config, a, b, &w);
             for (i, j) in [(0usize, 1usize), (1, 0)] {
                 let is_a_input = i == 0;
                 let fee = fee_for(&view, is_a_input);
@@ -1902,7 +1914,11 @@ const ROUTE_STATS_CAP: usize = 4096;
 pub struct RouteStat {
     pub secs: f64,
     pub evals: u64,
+    /// Kept for the `Debug` form of a stat; no metric reads it.
+    #[allow(dead_code)]
     pub pools: usize,
+    /// Kept for the `Debug` form of a stat; the router tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub branches: usize,
     /// Paths `find_paths` enumerated — every one is fully evaluated to be
     /// ranked, so this is the multiplier on the ranking pass.
@@ -2045,7 +2061,6 @@ fn water_fill(
             let mut rounds = 0;
             'refine: while rounds < 64 {
                 rounds += 1;
-                let mut improved = false;
                 for from in 0..alloc.len() {
                     if alloc[from] < delta {
                         continue;
@@ -2063,14 +2078,12 @@ fn water_fill(
                             alloc[to] = &alloc[to] + &delta;
                             cur_out[from] = new_from;
                             cur_out[to] = new_to;
-                            improved = true;
                             continue 'refine;
                         }
                     }
                 }
-                if !improved {
-                    break;
-                }
+                // No move improved the total: the split is at a local optimum.
+                break;
             }
         }
     }

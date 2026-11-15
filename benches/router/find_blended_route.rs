@@ -100,9 +100,9 @@ fn ladder(shape: &MarketShape) -> BandedCLConfig {
     cfg
 }
 
-/// One banded pool for the pair (a, b), holding `value` split evenly at price
-/// 1. The witness search must place the reserves on the ladder, as the
-/// router's own ladder view will.
+/// One banded pool for the pair (a, b), holding `value` split evenly at
+/// price 1. The witness search must place the reserves on the ladder, as
+/// the router's own ladder view will.
 fn banded_pool(index: usize, a: &AssetClass, b: &AssetClass, shape: &MarketShape) -> SundaeV4Pool {
     let cfg = ladder(shape);
     let half = BigInt::from((shape.pair_value / 2.0) as u64);

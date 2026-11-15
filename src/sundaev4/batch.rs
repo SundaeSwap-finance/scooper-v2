@@ -229,7 +229,9 @@ pub struct SwapLeg {
     pub dx: BigInt,
     pub to: AssetClass,
     /// Output predicted at accumulate time; the walk's route state is the
-    /// authority for the fulfillment.
+    /// authority for the fulfillment, so nothing reads this (kept for
+    /// `Debug`).
+    #[allow(dead_code)]
     pub dy: BigInt,
     /// Indices into `ScoopPlan.routes` of the branches that carry it.
     pub route_idxs: Vec<usize>,
@@ -262,39 +264,39 @@ impl ResolvedMove {
     }
 }
 
+/// An order's LP-token legs: `(burns, mints)` as `(pool, amount)`.
+pub type LpLegs = (Vec<(Ident, BigInt)>, Vec<(Ident, BigInt)>);
+
 /// The LP legs an order asks for: `(burns, mints)` as `(pool, amount)`
 /// pairs read from the LP tokens in its offered and min_received lists.
 /// Plain assets are left to the caller. Works on any constraint tag: the
 /// tag is a dispatch hint, the chain only checks consumption and floors.
-pub fn lp_legs(
-    order: &SundaeV4Order,
-    pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
-) -> (Vec<(Ident, BigInt)>, Vec<(Ident, BigInt)>) {
-    let (offered, min_received): (Vec<(AssetClass, BigInt)>, &[(AssetClass, BigInt)]) =
-        match &order.constraint {
-            Constraint::Deposit {
-                offered,
-                min_received,
-            }
-            | Constraint::Withdraw {
-                offered,
-                min_received,
-            }
-            | Constraint::Claim {
-                offered,
-                min_received,
-            } => (offered.clone(), min_received),
-            Constraint::Swap {
-                offered,
-                remaining_offered,
-                min_received,
-                ..
-            } => (
-                vec![(offered.clone(), remaining_offered.clone())],
-                min_received,
-            ),
-            _ => return (Vec::new(), Vec::new()),
-        };
+pub fn lp_legs(order: &SundaeV4Order, pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>) -> LpLegs {
+    type Amounts = [(AssetClass, BigInt)];
+    let (offered, min_received): (Vec<(AssetClass, BigInt)>, &Amounts) = match &order.constraint {
+        Constraint::Deposit {
+            offered,
+            min_received,
+        }
+        | Constraint::Withdraw {
+            offered,
+            min_received,
+        }
+        | Constraint::Claim {
+            offered,
+            min_received,
+        } => (offered.clone(), min_received),
+        Constraint::Swap {
+            offered,
+            remaining_offered,
+            min_received,
+            ..
+        } => (
+            vec![(offered.clone(), remaining_offered.clone())],
+            min_received,
+        ),
+        _ => return (Vec::new(), Vec::new()),
+    };
     let classify = |list: &[(AssetClass, BigInt)]| -> Vec<(Ident, BigInt)> {
         list.iter()
             .filter_map(|(a, q)| {

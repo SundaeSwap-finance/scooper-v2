@@ -804,6 +804,7 @@ impl CardanoSwapsRuntime {
     /// released, and return it only if that clears the configured fee
     /// estimate plus revenue floor. The real fee is re-checked after the
     /// transaction is built.
+    #[cfg(test)]
     pub fn plan_foreign_fill(
         &self,
         pool: &crate::sundaev4::types::SundaeV4Pool,

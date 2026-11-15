@@ -1,5 +1,5 @@
 use crate::bigint::BigInt;
-use num_traits::{One, Signed, Zero};
+use num_traits::{Signed, Zero};
 use tracing::warn;
 
 /// Integer square root via Newton's method (floor).
@@ -307,7 +307,7 @@ pub fn compute_protocol_lp(fee_budget: &BigInt, ps_num: u64, ps_den: u64) -> Big
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_traits::{Signed, Zero};
+    use num_traits::{One, Signed, Zero};
     use proptest::prelude::*;
 
     proptest! {
