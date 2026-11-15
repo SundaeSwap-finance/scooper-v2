@@ -209,6 +209,31 @@ A blacklisted pool is left out of every batch: swaps (including as a hop inside 
 
 The scooper refuses to start if an entry isn't 28-byte hex or a pool is listed twice. Hex case doesn't matter. A misspelled `blacklisted-pools` key is ignored like any other unknown key, so check that the blacklist is live: at startup, each blacklisted pool logs `pool is blacklisted`. A blacklisted pool that isn't indexed logs a warning instead, usually because the ident is mistyped.
 
+### Rate guards
+
+A stableswap pool that holds a yield-bearing asset prices it by the `rates` in its config, and a keeper (sundae-v4's `test/devnet/ops/rate-keeper.mjs`) updates them from the asset's backing vault. Between updates the on-chain rate goes stale. Once the gap passes the swap fee a stale rate is free money for whoever trades first, and nothing on chain stops a scoop against it. `protocol.v4.execution.rate-guards` makes the scooper derive the true rate from the vault itself and withhold the pool while the rate is stale:
+
+```json
+{
+  "protocol": { "v4": { "execution": { "rate-guards": [
+    {
+      "pool": "10aceb43bb0127e40b4696bb0e06174c830bec3f7ee6063b1d104546",
+      "vault-address": "addr1wyh04daelcpkgahkuz2ld885w2y3wa27r7w82gzdeagsazgtwduhf",
+      "backing-asset": "7d9e4a0ee1a3f5d5ff8159ea91a83310cf2795ee7a87170c7aea05ae.55534472",
+      "share-asset-index": 1,
+      "base-asset-index": 0,
+      "refuse-at": 1.0
+    }
+  ] } } }
+}
+```
+
+`vault-address` is the script address holding the backing asset and the `VaultDatumV1_1` (circulating shares, pending yield, diffusion window); the indexer tracks its UTxOs by payment credential and bootstrap seeds them. `backing-asset` is what the vault holds. `share-asset-index` and `base-asset-index` name the pool assets whose rate ratio the keeper moves. The true rate is settled backing over circulating shares, with pending yield released linearly across the diffusion window exactly as the vault contract does it, so the reading matches the keeper's.
+
+Each batch cycle the guard compares that with the pool's `rates`. While `|drift|` is at or past `refuse-at` of the fee, the pool is withheld like a blacklisted one and its orders wait. The default of `1.0` is the fee itself, where arbitrage turns profitable; the keeper acts at half the fee, so a live keeper never trips the guard. The guard also withholds the pool when it has no vault UTxO, no datum, or no such pool: with no facts it fails closed. It never updates the rate itself; the rate manager's key stays off the scooper.
+
+The scooper refuses to start if a guard does not resolve. A block logs when it starts, every five minutes while it lasts, and when it clears. `/metrics` exports `scooper_v4_rate_guard_blocked{pool}`, the alarm target, plus `scooper_v4_rate_guard_readable{pool}` (0 means the vault could not be read, an indexing problem rather than a keeper one), `scooper_v4_rate_guard_drift_bp{pool}` and `scooper_v4_rate_guard_refuse_bp{pool}`.
+
 ### Docker
 
 Images are published to `ghcr.io/sundaeswap-finance/scooper-v2`, tagged with the version.

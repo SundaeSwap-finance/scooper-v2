@@ -1753,6 +1753,10 @@ async fn lookup_pool_module_configs(
     Ok(out)
 }
 
+/// A vault UTxO as fetched at bootstrap, kept in the form the persisted
+/// txo encoder takes: (input, address bytes, value, inline datum CBOR).
+type VaultSeed = (TransactionInput, Vec<u8>, Value, Option<Vec<u8>>);
+
 async fn bootstrap_v4(
     provider: &(dyn BootstrapProvider + Send + Sync),
     protocol: &SundaeV4Protocol,
@@ -2297,6 +2301,74 @@ async fn bootstrap_v4(
         }
     }
 
+    // Seed the rate guards' vault UTxOs. A guard with no vault state blocks
+    // its pool until the vault next moves, which can be hours; seeding here
+    // means a restart does not cost that.
+    let mut vault_utxos: std::collections::BTreeMap<
+        TransactionInput,
+        crate::sundaev4::rate_guard::VaultUtxo,
+    > = std::collections::BTreeMap::new();
+    let mut vault_seed_bytes: Vec<VaultSeed> = Vec::new();
+    if let Some(ref exec) = protocol.execution {
+        let mut seen_vaults = std::collections::BTreeSet::new();
+        for cfg in &exec.rate_guards {
+            let guard = match crate::sundaev4::rate_guard::RateGuard::resolve(cfg) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("bootstrap v4: {e}");
+                    continue;
+                }
+            };
+            if !seen_vaults.insert(guard.vault_address_bech32.clone()) {
+                continue;
+            }
+            info!(vault = %guard.vault_address_bech32, "bootstrap: fetching rate-guard vault UTxOs...");
+            match provider.fetch_address_utxos(&guard.vault_address_bech32).await {
+                Ok(utxos) => {
+                    for utxo in &utxos {
+                        let input = TransactionInput::new(utxo.tx_hash.into(), utxo.output_index);
+                        let address = match pallas_addresses::Address::from_bech32(&utxo.address) {
+                            Ok(a) => a.to_vec(),
+                            Err(e) => {
+                                warn!("bootstrap v4: vault UTxO address {}: {e}", utxo.address);
+                                continue;
+                            }
+                        };
+                        let datum = utxo
+                            .datum_cbor
+                            .as_deref()
+                            .and_then(|cbor| PlutusData::from_plutus_bytes(cbor).ok())
+                            .and_then(|pd| {
+                                crate::sundaev4::rate_guard::VaultDatumV1_1::from_plutus(pd).ok()
+                            });
+                        vault_seed_bytes.push((
+                            input.clone(),
+                            address.clone(),
+                            utxo.value.clone(),
+                            utxo.datum_cbor.clone(),
+                        ));
+                        vault_utxos.insert(
+                            input,
+                            crate::sundaev4::rate_guard::VaultUtxo {
+                                address,
+                                value: utxo.value.clone(),
+                                datum,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    // The guard fails closed on an empty vault, so this is a
+                    // halted pool, not a silent gap.
+                    warn!(
+                        "bootstrap v4: could not fetch vault UTxOs at {}: {e:#}",
+                        guard.vault_address_bech32
+                    );
+                }
+            }
+        }
+    }
+
     // Fetch reference script UTxOs if execution is configured.
     // The scooper needs these to build the ScriptStore for tx evaluation.
     let mut ref_utxo_outputs = std::collections::BTreeMap::new();
@@ -2512,6 +2584,18 @@ async fn bootstrap_v4(
             });
         }
 
+        for (input, address, value, datum_cbor) in &vault_seed_bytes {
+            persisted_txos.push(PersistedTxo {
+                txo_id: input.clone(),
+                txo_type: "vault".to_string(),
+                created_slot: tip_slot,
+                era: 7,
+                txo: encode_bootstrap_utxo(address, value, datum_cbor.as_deref()),
+                address: address.clone(),
+                datum: None,
+            });
+        }
+
         let dummy_addr = ShelleyAddress::new(
             protocol.network.pallas(),
             ShelleyPaymentPart::Key(Hash::new([0u8; 28])),
@@ -2585,6 +2669,7 @@ async fn bootstrap_v4(
         s.fee_settings = fee_settings;
         s.order_configs = order_configs;
         s.wallet_utxos = wallet_utxos;
+        s.vault_utxos = vault_utxos;
         s.ref_utxo_outputs = ref_utxo_outputs;
         s.network_tip_slot = Some(tip_slot);
         s.tip_slot = tip_slot;

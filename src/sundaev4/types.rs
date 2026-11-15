@@ -1209,6 +1209,12 @@ pub struct ScooperExecution {
     /// [`crate::sundaev4::access::PoolBlacklist`].
     #[serde(default)]
     pub blacklisted_pools: crate::sundaev4::access::PoolBlacklist,
+    /// Stableswap pools whose `rates` a keeper maintains from a backing
+    /// vault. Each is withheld from scooping while its on-chain rate has
+    /// drifted from the vault's past the configured share of the fee, or
+    /// while the vault cannot be read; see [`crate::sundaev4::rate_guard`].
+    #[serde(default)]
+    pub rate_guards: Vec<crate::sundaev4::rate_guard::RateGuardConfig>,
     /// Per-pool trading allowlists, keyed by pool ident (hex). A pool named
     /// here is closed: only the listed credentials may trade on it. Absent =
     /// unrestricted.

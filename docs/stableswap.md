@@ -34,7 +34,9 @@ StableSwapConfig {
 }
 ```
 
-`rates` changes on chain. A manager-signed tag-7 transcript entry (rate
+`rates` changes on chain. The scooper can be told to withhold a pool whose
+`rates` have gone stale against the asset's vault; see "Rate guards" in the
+README. A manager-signed tag-7 transcript entry (rate
 update) replaces it and the module rewrites the hash. The other fields
 change only through an Upgrade. So, unlike the other modules, "known
 config" means "hashes to the pool's current datum", not "present".
