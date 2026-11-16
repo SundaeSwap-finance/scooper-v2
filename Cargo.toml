@@ -63,6 +63,17 @@ name = "router"
 path = "src/router_bench.rs"
 harness = false
 
+[features]
+# Benchmarks in bench/: route quality (`route-bench` example,
+# bench/route-quality/README.md). Not part of the scooper: only builds those
+# examples.
+bench = []
+
+[[example]]
+name = "route-bench"
+path = "src/route_bench.rs"
+required-features = ["bench"]
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"

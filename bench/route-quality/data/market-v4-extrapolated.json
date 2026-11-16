@@ -1,0 +1,4911 @@
+{
+ "source": {
+  "snapshot": "data/market-mainnet-selected.json",
+  "snapshot_block": 14032848
+ },
+ "params": {
+  "snapshot": "data/market-mainnet-selected.json",
+  "out": "data/market-v4-extrapolated.json",
+  "tvl_usd": 350000000.0,
+  "volatile_sigma": 0.1,
+  "stable_sigma": 0.005,
+  "cut": 2.5,
+  "bands": [
+   3,
+   4,
+   5
+  ],
+  "spread_factor": 2.0,
+  "min_band_ada": 10000,
+  "volatile_fee": 0.003,
+  "stable_fee": 0.0005,
+  "snapshot_fees": false
+ },
+ "model": "projected sundae-v4 CL market: one banded pool (ladder) per snapshot pool, each with its own random band count, spread and band edges, Gaussian log-price spread, all pools at the reference price",
+ "ada_usd": 0.27754225758541784,
+ "price": {
+  "ada.lovelace": 1.0,
+  "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854": 0.17965735977002362,
+  "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378": 3.5821683575451293,
+  "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d": 3.6030549318863083,
+  "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344": 3.605482664100253,
+  "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441": 3.630815505192622,
+  "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b": 2924.4407207137933,
+  "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344": 3.547638119226393,
+  "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e": 0.015250365945612642
+ },
+ "ticker": {
+  "ada.lovelace": "ADA",
+  "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854": "NIGHT",
+  "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378": "USDCx",
+  "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d": "USDM",
+  "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344": "DJED",
+  "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441": "USDA",
+  "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b": "SNEK",
+  "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344": "iUSD",
+  "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e": "MIN"
+ },
+ "decimals": {
+  "ada.lovelace": 6,
+  "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854": 6,
+  "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378": 6,
+  "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d": 6,
+  "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344": 6,
+  "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441": 6,
+  "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b": 0,
+  "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344": 6,
+  "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e": 6
+ },
+ "pools": [
+  {
+   "id": "cl:ADA/NIGHT:minswap-v2:-2",
+   "ladder": "minswap-v2:e74c52975908a612d5ce68327040d449aae99f8b463bb6de046a1b23c5713169",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 138961202590490,
+   "tvl_ada": 24965402.767874833,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 3.3428561145951723,
+   "pb": 4.276921811153089,
+   "sqrt_pa": [
+    1828347919460,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2068072003377,
+    1000000000000
+   ],
+   "L": 579671430253969
+  },
+  {
+   "id": "cl:ADA/NIGHT:minswap-v2:-1",
+   "ladder": "minswap-v2:e74c52975908a612d5ce68327040d449aae99f8b463bb6de046a1b23c5713169",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 606809172865145,
+   "tvl_ada": 109017733.88118395,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.276921811153089,
+   "pb": 5.471985497327406,
+   "sqrt_pa": [
+    2068072003377,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2339227542871,
+    1000000000000
+   ],
+   "L": 2237863825306700
+  },
+  {
+   "id": "cl:ADA/NIGHT:minswap-v2:+0",
+   "ladder": "minswap-v2:e74c52975908a612d5ce68327040d449aae99f8b463bb6de046a1b23c5713169",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 111160454296933,
+   "rb": 48513569353063,
+   "tvl_ada": 119876274.07992491,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.471985497327406,
+   "pb": 7.00097560934571,
+   "sqrt_pa": [
+    2339227542871,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2645935677477,
+    1000000000000
+   ],
+   "L": 2420639640947083
+  },
+  {
+   "id": "cl:ADA/NIGHT:minswap-v2:+1",
+   "ladder": "minswap-v2:e74c52975908a612d5ce68327040d449aae99f8b463bb6de046a1b23c5713169",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 33279638649888,
+   "rb": 0,
+   "tvl_ada": 33279638.649888996,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 7.00097560934571,
+   "pb": 8.957198352698942,
+   "sqrt_pa": [
+    2645935677477,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2992857890495,
+    1000000000000
+   ],
+   "L": 759647078729261
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v2:-1",
+   "ladder": "minswap-v2:82e2b1fd27a7712a1a9cf750dfbea1a5778611b20e06dd6a611df7a643f8cb75",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 0,
+   "rb": 4071516042241417,
+   "tvl_ada": 62092109.59761407,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 48.777960362438,
+   "pb": 60.5486546638812,
+   "sqrt_pa": [
+    6984122018009,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    7781301604737,
+    1000000000000
+   ],
+   "L": 5107401280748838
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v2:+0",
+   "ladder": "minswap-v2:82e2b1fd27a7712a1a9cf750dfbea1a5778611b20e06dd6a611df7a643f8cb75",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 88239269235704,
+   "rb": 3427308313822856,
+   "tvl_ada": 140506975.22994393,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 60.5486546638812,
+   "pb": 75.15975564302383,
+   "sqrt_pa": [
+    7781301604737,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    8669472627734,
+    1000000000000
+   ],
+   "L": 10833414873057537
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v2:+1",
+   "ladder": "minswap-v2:82e2b1fd27a7712a1a9cf750dfbea1a5778611b20e06dd6a611df7a643f8cb75",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 34415217434037,
+   "rb": 0,
+   "tvl_ada": 34415217.43403731,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 75.15975564302383,
+   "pb": 93.29668676666431,
+   "sqrt_pa": [
+    8669472627734,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    9659021004567,
+    1000000000000
+   ],
+   "L": 2912321237431004
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v2:-1",
+   "ladder": "minswap-v2:2ffadbb87144e875749122e0bbb9f535eeaa7f5660c6c4a91bcc4121e477f08d",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 20610331772,
+   "tvl_ada": 60273693.50288874,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.0002800914993398009,
+   "pb": 0.0003322317973583384,
+   "sqrt_pa": [
+    16735934373,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    18227226815,
+    1000000000000
+   ],
+   "L": 13820449424634
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v2:+0",
+   "ladder": "minswap-v2:2ffadbb87144e875749122e0bbb9f535eeaa7f5660c6c4a91bcc4121e477f08d",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 72392889671869,
+   "rb": 5170696726,
+   "tvl_ada": 87514285.73189022,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.0003322317973583384,
+   "pb": 0.0003940782474160129,
+   "sqrt_pa": [
+    18227226815,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19851404167,
+    1000000000000
+   ],
+   "L": 19545424200796
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v2:+1",
+   "ladder": "minswap-v2:2ffadbb87144e875749122e0bbb9f535eeaa7f5660c6c4a91bcc4121e477f08d",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 13570097637469,
+   "rb": 0,
+   "tvl_ada": 13570097.637472881,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0003940782474160129,
+   "pb": 0.00046743769356602353,
+   "sqrt_pa": [
+    19851404167,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    21620307435,
+    1000000000000
+   ],
+   "L": 3292547013704
+  },
+  {
+   "id": "cl:NIGHT/SNEK:minswap-v2:-2",
+   "ladder": "minswap-v2:3b3318a251bb71f8345c5affcd29645af2f56859eea740bec2a27c91027cb01d",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 287144117,
+   "tvl_ada": 839735.9493576174,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 3.767480616490721e-05,
+   "pb": 4.473094378895715e-05,
+   "sqrt_pa": [
+    6137980626,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    6688119600,
+    1000000000000
+   ],
+   "L": 521948326824
+  },
+  {
+   "id": "cl:NIGHT/SNEK:minswap-v2:-1",
+   "ladder": "minswap-v2:3b3318a251bb71f8345c5affcd29645af2f56859eea740bec2a27c91027cb01d",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 3755221403,
+   "tvl_ada": 10981922.387056217,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.473094378895715e-05,
+   "pb": 5.310862976952949e-05,
+   "sqrt_pa": [
+    6688119600,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    7287566793,
+    1000000000000
+   ],
+   "L": 6264474080204
+  },
+  {
+   "id": "cl:NIGHT/SNEK:minswap-v2:+0",
+   "ladder": "minswap-v2:3b3318a251bb71f8345c5affcd29645af2f56859eea740bec2a27c91027cb01d",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 30572091033454,
+   "rb": 10185178036,
+   "tvl_ada": 35278450.55496584,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.310862976952949e-05,
+   "pb": 6.305537771132978e-05,
+   "sqrt_pa": [
+    7287566793,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    7940741635,
+    1000000000000
+   ],
+   "L": 18506457509110
+  },
+  {
+   "id": "cl:NIGHT/SNEK:minswap-v2:+1",
+   "ladder": "minswap-v2:3b3318a251bb71f8345c5affcd29645af2f56859eea740bec2a27c91027cb01d",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 159455359963531,
+   "rb": 0,
+   "tvl_ada": 28647328.972227585,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 6.305537771132978e-05,
+   "pb": 7.486505819435848e-05,
+   "sqrt_pa": [
+    7940741635,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    8652459662,
+    1000000000000
+   ],
+   "L": 15393302543628
+  },
+  {
+   "id": "cl:USDM/NIGHT:wingriders-v2:-2",
+   "ladder": "wingriders-v2:e3b40db2724918f3b0193f6576f5191bca4ff7dbbb2a12212b829af19023c313",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 7618502514108,
+   "tvl_ada": 1368720.047085969,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 16.646504712986623,
+   "pb": 17.783260355026744,
+   "sqrt_pa": [
+    4080012832454,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4217020317123,
+    1000000000000
+   ],
+   "L": 55606469475107
+  },
+  {
+   "id": "cl:USDM/NIGHT:wingriders-v2:-1",
+   "ladder": "wingriders-v2:e3b40db2724918f3b0193f6576f5191bca4ff7dbbb2a12212b829af19023c313",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 40914833145732,
+   "tvl_ada": 7350650.8983934,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 17.783260355026744,
+   "pb": 18.99764270681705,
+   "sqrt_pa": [
+    4217020317123,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4358628535080,
+    1000000000000
+   ],
+   "L": 288929793312955
+  },
+  {
+   "id": "cl:USDM/NIGHT:wingriders-v2:+0",
+   "ladder": "wingriders-v2:e3b40db2724918f3b0193f6576f5191bca4ff7dbbb2a12212b829af19023c313",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 787740417483,
+   "rb": 71244108956651,
+   "tvl_ada": 15637800.510579964,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 18.99764270681705,
+   "pb": 20.294952737047538,
+   "sqrt_pa": [
+    4358628535080,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4504991979687,
+    1000000000000
+   ],
+   "L": 595343537470784
+  },
+  {
+   "id": "cl:USDM/NIGHT:wingriders-v2:+1",
+   "ladder": "wingriders-v2:e3b40db2724918f3b0193f6576f5191bca4ff7dbbb2a12212b829af19023c313",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 3678138252837,
+   "rb": 0,
+   "tvl_ada": 13252534.172045782,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 20.294952737047538,
+   "pb": 21.6808534066805,
+   "sqrt_pa": [
+    4504991979687,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4656270332217,
+    1000000000000
+   ],
+   "L": 510015613541490
+  },
+  {
+   "id": "cl:USDM/NIGHT:wingriders-v2:+2",
+   "ladder": "wingriders-v2:e3b40db2724918f3b0193f6576f5191bca4ff7dbbb2a12212b829af19023c313",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 1240126758568,
+   "rb": 0,
+   "tvl_ada": 4468244.833624457,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 21.6808534066805,
+   "pb": 23.161394388659833,
+   "sqrt_pa": [
+    4656270332217,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4812628636064,
+    1000000000000
+   ],
+   "L": 177732015246738
+  },
+  {
+   "id": "cl:USDCx/USDM:sundae-stable:-1",
+   "ladder": "sundae-stable:d7c7a7db47ab71ef07f0aa65e6b0bcf9409977c183e85fe6f0a5feb6",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 2700426125389,
+   "tvl_ada": 9729783.669279747,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.9882232210477873,
+   "pb": 0.9924618189261655,
+   "sqrt_pa": [
+    994094171116,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    996223779543,
+    1000000000000
+   ],
+   "L": 1268038805233841
+  },
+  {
+   "id": "cl:USDCx/USDM:sundae-stable:+0",
+   "ladder": "sundae-stable:d7c7a7db47ab71ef07f0aa65e6b0bcf9409977c183e85fe6f0a5feb6",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 3975152783218,
+   "rb": 2742108176010,
+   "tvl_ada": 24119632.903795443,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.9924618189261655,
+   "pb": 0.9967185966161407,
+   "sqrt_pa": [
+    996223779543,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    998357950144,
+    1000000000000
+   ],
+   "L": 3139024575700739
+  },
+  {
+   "id": "cl:USDCx/USDM:sundae-stable:+1",
+   "ladder": "sundae-stable:d7c7a7db47ab71ef07f0aa65e6b0bcf9409977c183e85fe6f0a5feb6",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 1809118256852,
+   "rb": 0,
+   "tvl_ada": 6480566.174754008,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.9967185966161407,
+   "pb": 1.000993632092921,
+   "sqrt_pa": [
+    998357950144,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1000496692695,
+    1000000000000
+   ],
+   "L": 844909871901229
+  },
+  {
+   "id": "cl:USDCx/NIGHT:minswap-v2:-2",
+   "ladder": "minswap-v2:70cabd53edd98d4ffc20d46d9f246ed14b61b3fa7c681c268e86c2a196b0947d",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 1989501038059,
+   "tvl_ada": 357428.50375742,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 14.677983517705874,
+   "pb": 16.30685310368822,
+   "sqrt_pa": [
+    3831185654299,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4038174476628,
+    1000000000000
+   ],
+   "L": 9611635138909
+  },
+  {
+   "id": "cl:USDCx/NIGHT:minswap-v2:-1",
+   "ladder": "minswap-v2:70cabd53edd98d4ffc20d46d9f246ed14b61b3fa7c681c268e86c2a196b0947d",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 28449740844830,
+   "tvl_ada": 5111205.32632361,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 16.30685310368822,
+   "pb": 18.11648431301874,
+   "sqrt_pa": [
+    4038174476628,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4256346357267,
+    1000000000000
+   ],
+   "L": 130400584903535
+  },
+  {
+   "id": "cl:USDCx/NIGHT:minswap-v2:+0",
+   "ladder": "minswap-v2:70cabd53edd98d4ffc20d46d9f246ed14b61b3fa7c681c268e86c2a196b0947d",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 454748015267,
+   "rb": 90613262148120,
+   "tvl_ada": 17908323.3886297,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 18.11648431301874,
+   "pb": 20.12693692504175,
+   "sqrt_pa": [
+    4256346357267,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4486305487263,
+    1000000000000
+   ],
+   "L": 433655708635229
+  },
+  {
+   "id": "cl:USDCx/NIGHT:minswap-v2:+1",
+   "ladder": "minswap-v2:70cabd53edd98d4ffc20d46d9f246ed14b61b3fa7c681c268e86c2a196b0947d",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 4423731384532,
+   "rb": 0,
+   "tvl_ada": 15846550.58795037,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 20.12693692504175,
+   "pb": 22.36049682628012,
+   "sqrt_pa": [
+    4486305487263,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4728688700505,
+    1000000000000
+   ],
+   "L": 387182550879962
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v1:-2",
+   "ladder": "minswap-v1:6aa2153e1ae896a95539c9d62f76cedcdabdcdf144e564b8955f609d660cf6a2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 0,
+   "rb": 37737309407414,
+   "tvl_ada": 575507.778265881,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 36.04630535511311,
+   "pb": 44.82574618997089,
+   "sqrt_pa": [
+    6003857539542,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    6695203222455,
+    1000000000000
+   ],
+   "L": 54585296965198
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v1:-1",
+   "ladder": "minswap-v1:6aa2153e1ae896a95539c9d62f76cedcdabdcdf144e564b8955f609d660cf6a2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 0,
+   "rb": 426138835566908,
+   "tvl_ada": 6498773.186032602,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 44.82574618997089,
+   "pb": 55.743508292803924,
+   "sqrt_pa": [
+    6695203222455,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    7466157532011,
+    1000000000000
+   ],
+   "L": 552742011147619
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v1:+0",
+   "ladder": "minswap-v1:6aa2153e1ae896a95539c9d62f76cedcdabdcdf144e564b8955f609d660cf6a2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 4707158629678,
+   "rb": 878157437272783,
+   "tvl_ada": 18099380.905949887,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 55.743508292803924,
+   "pb": 69.32040135196056,
+   "sqrt_pa": [
+    7466157532011,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    8325887421288,
+    1000000000000
+   ],
+   "L": 1390570800561821
+  },
+  {
+   "id": "cl:ADA/MIN:minswap-v1:+1",
+   "ladder": "minswap-v1:6aa2153e1ae896a95539c9d62f76cedcdabdcdf144e564b8955f609d660cf6a2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 12757128973791,
+   "rb": 0,
+   "tvl_ada": 12757128.973791216,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 69.32040135196056,
+   "pb": 86.20408350253093,
+   "sqrt_pa": [
+    8325887421288,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    9284615420282,
+    1000000000000
+   ],
+   "L": 1028612953430497
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v2:-1",
+   "ladder": "minswap-v2:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 1332336695780,
+   "tvl_ada": 4803716.859381203,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.21415628140077972,
+   "pb": 0.25104271175608234,
+   "sqrt_pa": [
+    462770225275,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    501041626770,
+    1000000000000
+   ],
+   "L": 34812853559963
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v2:+0",
+   "ladder": "minswap-v2:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 7289585405894,
+   "rb": 3367846674654,
+   "tvl_ada": 19432298.206708346,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.25104271175608234,
+   "pb": 0.29428248713333327,
+   "sqrt_pa": [
+    501041626770,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    542478098298,
+    1000000000000
+   ],
+   "L": 131537129727591
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v2:+1",
+   "ladder": "minswap-v2:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 8510001326184,
+   "rb": 0,
+   "tvl_ada": 8510001.326184196,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.29428248713333327,
+   "pb": 0.34496991220173207,
+   "sqrt_pa": [
+    542478098298,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    587341393230,
+    1000000000000
+   ],
+   "L": 60438166267396
+  },
+  {
+   "id": "cl:USDM/MIN:minswap-v2:-1",
+   "ladder": "minswap-v2:b950921763ce10c2600579460a4a40ba0c286bfab6497acd09ae0cd8b2ef687d",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 0,
+   "rb": 597228600524990,
+   "tvl_ada": 9107954.71119221,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 205.8919257358655,
+   "pb": 228.80370138006788,
+   "sqrt_pa": [
+    14348934655084,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    15126258670936,
+    1000000000000
+   ],
+   "L": 768313583969725
+  },
+  {
+   "id": "cl:USDM/MIN:minswap-v2:+0",
+   "ladder": "minswap-v2:b950921763ce10c2600579460a4a40ba0c286bfab6497acd09ae0cd8b2ef687d",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 3436197289443,
+   "rb": 358160894280765,
+   "tvl_ada": 17842892.29585386,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 228.80370138006788,
+   "pb": 254.26511301069414,
+   "sqrt_pa": [
+    15126258670936,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    15945692616211,
+    1000000000000
+   ],
+   "L": 1464869632143152
+  },
+  {
+   "id": "cl:USDM/MIN:minswap-v2:+1",
+   "ladder": "minswap-v2:b950921763ce10c2600579460a4a40ba0c286bfab6497acd09ae0cd8b2ef687d",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 1046820203865,
+   "rb": 0,
+   "tvl_ada": 3771750.698335875,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 254.26511301069414,
+   "pb": 282.5598856329213,
+   "sqrt_pa": [
+    15945692616211,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    16809517709706,
+    1000000000000
+   ],
+   "L": 324821614935843
+  },
+  {
+   "id": "cl:ADA/USDCx:minswap-v2:-1",
+   "ladder": "minswap-v2:4c414a51eac26e5f913a91265c2882e013e1d74dab9a5fe2f875f7df7c9bb4c1",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 0,
+   "rb": 641431898348,
+   "tvl_ada": 2297717.0497849006,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.23658794352938659,
+   "pb": 0.2585095101909703,
+   "sqrt_pa": [
+    486403066941,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    508438305196,
+    1000000000000
+   ],
+   "L": 29109369770597
+  },
+  {
+   "id": "cl:ADA/USDCx:minswap-v2:+0",
+   "ladder": "minswap-v2:4c414a51eac26e5f913a91265c2882e013e1d74dab9a5fe2f875f7df7c9bb4c1",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 2167592882337,
+   "rb": 3891579776306,
+   "tvl_ada": 16107886.817886323,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.2585095101909703,
+   "pb": 0.2824622669365854,
+   "sqrt_pa": [
+    508438305196,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    531471793171,
+    1000000000000
+   ],
+   "L": 195378747927845
+  },
+  {
+   "id": "cl:ADA/USDCx:minswap-v2:+1",
+   "ladder": "minswap-v2:4c414a51eac26e5f913a91265c2882e013e1d74dab9a5fe2f875f7df7c9bb4c1",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 12016454306839,
+   "rb": 0,
+   "tvl_ada": 12016454.30683938,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.2824622669365854,
+   "pb": 0.308634418068468,
+   "sqrt_pa": [
+    531471793171,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    555548753998,
+    1000000000000
+   ],
+   "L": 147359137604617
+  },
+  {
+   "id": "cl:ADA/USDM:minswap-v2:-1",
+   "ladder": "minswap-v2:7dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 1438153970731,
+   "tvl_ada": 5181747.7570548095,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.1910332133626751,
+   "pb": 0.24349857839869174,
+   "sqrt_pa": [
+    437073464492,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    493455751206,
+    1000000000000
+   ],
+   "L": 25507194804390
+  },
+  {
+   "id": "cl:ADA/USDM:minswap-v2:+0",
+   "ladder": "minswap-v2:7dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 7936778966037,
+   "rb": 2566198973869,
+   "tvl_ada": 17182934.83503795,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.24349857839869174,
+   "pb": 0.31037303219948065,
+   "sqrt_pa": [
+    493455751206,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    557111328371,
+    1000000000000
+   ],
+   "L": 76908190345152
+  },
+  {
+   "id": "cl:ADA/USDM:minswap-v2:+1",
+   "ladder": "minswap-v2:7dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 6181897863781,
+   "rb": 0,
+   "tvl_ada": 6181897.863781927,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.31037303219948065,
+   "pb": 0.39561388715367307,
+   "sqrt_pa": [
+    557111328371,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    628978447289,
+    1000000000000
+   ],
+   "L": 30141811137003
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v2:-2",
+   "ladder": "minswap-v2:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 263459399513,
+   "tvl_ada": 934658.6085830238,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.23667427464625623,
+   "pb": 0.25203917094635914,
+   "sqrt_pa": [
+    486491803267,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    502035029601,
+    1000000000000
+   ],
+   "L": 16950110218539
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v2:-1",
+   "ladder": "minswap-v2:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 1361662544372,
+   "tvl_ada": 4830685.947938388,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.25203917094635914,
+   "pb": 0.26840155646942787,
+   "sqrt_pa": [
+    502035029601,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    518074856048,
+    1000000000000
+   ],
+   "L": 84892598362663
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v2:+0",
+   "ladder": "minswap-v2:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 2202973879033,
+   "rb": 2167813107767,
+   "tvl_ada": 9893590.295507645,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.26840155646942787,
+   "pb": 0.2858261882258907,
+   "sqrt_pa": [
+    518074856048,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    534627148792,
+    1000000000000
+   ],
+   "L": 168744984239815
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v2:+1",
+   "ladder": "minswap-v2:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 8072559948571,
+   "rb": 0,
+   "tvl_ada": 8072559.948571643,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.2858261882258907,
+   "pb": 0.3043820272519467,
+   "sqrt_pa": [
+    534627148792,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    551708280935,
+    1000000000000
+   ],
+   "L": 139397549022340
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v2:+2",
+   "ladder": "minswap-v2:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 2619962563405,
+   "rb": 0,
+   "tvl_ada": 2619962.563405864,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.3043820272519467,
+   "pb": 0.3241425115349614,
+   "sqrt_pa": [
+    551708280935,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    569335148691,
+    1000000000000
+   ],
+   "L": 46687158072434
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:-1",
+   "ladder": "sundae-v3:5b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 27693201906667,
+   "tvl_ada": 4975287.538130032,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.914657539330104,
+   "pb": 5.342008949894892,
+   "sqrt_pa": [
+    2216902690541,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2311278639605,
+    1000000000000
+   ],
+   "L": 293434950125769
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:+0",
+   "ladder": "sundae-v3:5b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 7536627019727,
+   "rb": 40795367034755,
+   "tvl_ada": 14865814.952040644,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.342008949894892,
+   "pb": 5.8065204731735784,
+   "sqrt_pa": [
+    2311278639605,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2409672275056,
+    1000000000000
+   ],
+   "L": 850071095172176
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:+1",
+   "ladder": "sundae-v3:5b5d1f9da977498b5faf3efb83693b0442ed5f49d00d9b986a409c0b",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 4820135780351,
+   "rb": 0,
+   "tvl_ada": 4820135.780351048,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 5.8065204731735784,
+   "pb": 6.311423346837952,
+   "sqrt_pa": [
+    2409672275056,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2512254634156,
+    1000000000000
+   ],
+   "L": 284451498959365
+  },
+  {
+   "id": "cl:USDCx/USDM:minswap-v2:-2",
+   "ladder": "minswap-v2:1448500d5be7904281807b569bf2c7bb2204514a3d6a62441d1a5fc4f94f8d52",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 114721567083,
+   "tvl_ada": 413348.1080736727,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.9702734881738753,
+   "pb": 0.9792685019286038,
+   "sqrt_pa": [
+    985024612979,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    989579962372,
+    1000000000000
+   ],
+   "L": 25183922721556
+  },
+  {
+   "id": "cl:USDCx/USDM:minswap-v2:-1",
+   "ladder": "minswap-v2:1448500d5be7904281807b569bf2c7bb2204514a3d6a62441d1a5fc4f94f8d52",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 1116589610832,
+   "tvl_ada": 4023133.704204142,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.9792685019286038,
+   "pb": 0.9883469048240582,
+   "sqrt_pa": [
+    989579962372,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    994156378456,
+    1000000000000
+   ],
+   "L": 243987782215827
+  },
+  {
+   "id": "cl:USDCx/USDM:minswap-v2:+0",
+   "ladder": "minswap-v2:1448500d5be7904281807b569bf2c7bb2204514a3d6a62441d1a5fc4f94f8d52",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 974222324768,
+   "rb": 1722338024686,
+   "tvl_ada": 9695506.89922506,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.9883469048240582,
+   "pb": 0.9975094699272928,
+   "sqrt_pa": [
+    994156378456,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    998753958654,
+    1000000000000
+   ],
+   "L": 585638965186670
+  },
+  {
+   "id": "cl:USDCx/USDM:minswap-v2:+1",
+   "ladder": "minswap-v2:1448500d5be7904281807b569bf2c7bb2204514a3d6a62441d1a5fc4f94f8d52",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 1652071216552,
+   "rb": 0,
+   "tvl_ada": 5917997.23634644,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.9975094699272928,
+   "pb": 1.0067569774721554,
+   "sqrt_pa": [
+    998753958654,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1003372800843,
+    1000000000000
+   ],
+   "L": 358440008097357
+  },
+  {
+   "id": "cl:ADA/NIGHT:cswap:-2",
+   "ladder": "cswap:3bcd70a4e1128f4cd0979a75ca2ca20c2636212c1d0952d6c5fd4cdd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 8438113337354,
+   "tvl_ada": 1515969.16362937,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 4.418154420828263,
+   "pb": 4.8909967120587785,
+   "sqrt_pa": [
+    2101940632089,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2211559791654,
+    1000000000000
+   ],
+   "L": 76976628637172
+  },
+  {
+   "id": "cl:ADA/NIGHT:cswap:-1",
+   "ladder": "cswap:3bcd70a4e1128f4cd0979a75ca2ca20c2636212c1d0952d6c5fd4cdd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 27246126400625,
+   "tvl_ada": 4894967.133096638,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.8909967120587785,
+   "pb": 5.41444380590147,
+   "sqrt_pa": [
+    2211559791654,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2326895744528,
+    1000000000000
+   ],
+   "L": 236232724676843
+  },
+  {
+   "id": "cl:ADA/NIGHT:cswap:+0",
+   "ladder": "cswap:3bcd70a4e1128f4cd0979a75ca2ca20c2636212c1d0952d6c5fd4cdd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 4562574269882,
+   "rb": 9588514996643,
+   "tvl_ada": 6285221.55829453,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.41444380590147,
+   "pb": 5.9939115589641565,
+   "sqrt_pa": [
+    2326895744528,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2448246629522,
+    1000000000000
+   ],
+   "L": 296184705731386
+  },
+  {
+   "id": "cl:ADA/NIGHT:cswap:+1",
+   "ladder": "cswap:3bcd70a4e1128f4cd0979a75ca2ca20c2636212c1d0952d6c5fd4cdd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 3215467434649,
+   "rb": 0,
+   "tvl_ada": 3215467.4346499457,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 5.9939115589641565,
+   "pb": 6.6353954468094285,
+   "sqrt_pa": [
+    2448246629522,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2575926133803,
+    1000000000000
+   ],
+   "L": 158822306281868
+  },
+  {
+   "id": "cl:ADA/NIGHT:cswap:+2",
+   "ladder": "cswap:3bcd70a4e1128f4cd0979a75ca2ca20c2636212c1d0952d6c5fd4cdd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 652134085300,
+   "rb": 0,
+   "tvl_ada": 652134.0853005495,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 6.6353954468094285,
+   "pb": 7.3455325962714255,
+   "sqrt_pa": [
+    2575926133803,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2710264303767,
+    1000000000000
+   ],
+   "L": 33890854798115
+  },
+  {
+   "id": "cl:USDCx/SNEK:minswap-v2:-2",
+   "ladder": "minswap-v2:e9246667ee78541ed0a08cea0eacb6c91d12128708704ac00df4fd00605e9a2f",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 115524720,
+   "tvl_ada": 337845.1976130142,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.0008759673790649543,
+   "pb": 0.0009810287498717677,
+   "sqrt_pa": [
+    29596746089,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    31321378480,
+    1000000000000
+   ],
+   "L": 66985127151
+  },
+  {
+   "id": "cl:USDCx/SNEK:minswap-v2:-1",
+   "ladder": "minswap-v2:e9246667ee78541ed0a08cea0eacb6c91d12128708704ac00df4fd00605e9a2f",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 706817561,
+   "tvl_ada": 2067046.0601420284,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.0009810287498717677,
+   "pb": 0.0010986909228312698,
+   "sqrt_pa": [
+    31321378480,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    33146506948,
+    1000000000000
+   ],
+   "L": 387270032434
+  },
+  {
+   "id": "cl:USDCx/SNEK:minswap-v2:+0",
+   "ladder": "minswap-v2:e9246667ee78541ed0a08cea0eacb6c91d12128708704ac00df4fd00605e9a2f",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 57233938291,
+   "rb": 1640856411,
+   "tvl_ada": 5003608.90995451,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.0010986909228312698,
+   "pb": 0.0012304652071303851,
+   "sqrt_pa": [
+    33146506948,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    35077987501,
+    1000000000000
+   ],
+   "L": 885911868692
+  },
+  {
+   "id": "cl:USDCx/SNEK:minswap-v2:+1",
+   "ladder": "minswap-v2:e9246667ee78541ed0a08cea0eacb6c91d12128708704ac00df4fd00605e9a2f",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 1346396417614,
+   "rb": 0,
+   "tvl_ada": 4823018.643890579,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0012304652071303851,
+   "pb": 0.001378044174659063,
+   "sqrt_pa": [
+    35077987501,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    37122017384,
+    1000000000000
+   ],
+   "L": 857732656836
+  },
+  {
+   "id": "cl:USDCx/SNEK:minswap-v2:+2",
+   "ladder": "minswap-v2:e9246667ee78541ed0a08cea0eacb6c91d12128708704ac00df4fd00605e9a2f",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 516638256159,
+   "rb": 0,
+   "tvl_ada": 1850685.2135101527,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.001378044174659063,
+   "pb": 0.001543323400212609,
+   "sqrt_pa": [
+    37122017384,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    39285154960,
+    1000000000000
+   ],
+   "L": 348307206853
+  },
+  {
+   "id": "cl:ADA/SNEK:wingriders-v2:-2",
+   "ladder": "wingriders-v2:e3b382a85249ef92357e00bd42c088c69c1eac2a736ae2df34dd2b89de11de1a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 327556449,
+   "tvl_ada": 957919.4183959669,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.0002683390407667426,
+   "pb": 0.00029633642085538127,
+   "sqrt_pa": [
+    16381057376,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    17214424790,
+    1000000000000
+   ],
+   "L": 393051664244
+  },
+  {
+   "id": "cl:ADA/SNEK:wingriders-v2:-1",
+   "ladder": "wingriders-v2:e3b382a85249ef92357e00bd42c088c69c1eac2a736ae2df34dd2b89de11de1a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 1238788383,
+   "tvl_ada": 3622763.1934407474,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.00029633642085538127,
+   "pb": 0.00032725493120366433,
+   "sqrt_pa": [
+    17214424790,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    18090188811,
+    1000000000000
+   ],
+   "L": 1414523037365
+  },
+  {
+   "id": "cl:ADA/SNEK:wingriders-v2:+0",
+   "ladder": "wingriders-v2:e3b382a85249ef92357e00bd42c088c69c1eac2a736ae2df34dd2b89de11de1a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 3030708307285,
+   "rb": 824805890,
+   "tvl_ada": 5442804.2405337095,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.00032725493120366433,
+   "pb": 0.0003613993504004025,
+   "sqrt_pa": [
+    18090188811,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19010506316,
+    1000000000000
+   ],
+   "L": 2053872717083
+  },
+  {
+   "id": "cl:ADA/SNEK:wingriders-v2:+1",
+   "ladder": "wingriders-v2:e3b382a85249ef92357e00bd42c088c69c1eac2a736ae2df34dd2b89de11de1a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 3258631796655,
+   "rb": 0,
+   "tvl_ada": 3258631.796655268,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0003613993504004025,
+   "pb": 0.000399106256365467,
+   "sqrt_pa": [
+    19010506316,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19977643914,
+    1000000000000
+   ],
+   "L": 1279631656764
+  },
+  {
+   "id": "cl:ADA/SNEK:wingriders-v2:+2",
+   "ladder": "wingriders-v2:e3b382a85249ef92357e00bd42c088c69c1eac2a736ae2df34dd2b89de11de1a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 774426559771,
+   "rb": 0,
+   "tvl_ada": 774426.5597720891,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.000399106256365467,
+   "pb": 0.00044074734415980966,
+   "sqrt_pa": [
+    19977643914,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    20993983523,
+    1000000000000
+   ],
+   "L": 319580673544
+  },
+  {
+   "id": "cl:NIGHT/MIN:minswap-v2:-1",
+   "ladder": "minswap-v2:9c5c5cbc113be07ff0bf1fe31ffb204f9589bb89c87819076dc8269406afb10f",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 0,
+   "rb": 250261493991698,
+   "tvl_ada": 3816579.365469136,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 9.320626857526603,
+   "pb": 11.098357288810844,
+   "sqrt_pa": [
+    3052970169773,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    3331419710696,
+    1000000000000
+   ],
+   "L": 898767845556991
+  },
+  {
+   "id": "cl:NIGHT/MIN:minswap-v2:+0",
+   "ladder": "minswap-v2:9c5c5cbc113be07ff0bf1fe31ffb204f9589bb89c87819076dc8269406afb10f",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 29657499744356,
+   "rb": 183861599042525,
+   "tvl_ada": 8132144.770195258,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 11.098357288810844,
+   "pb": 13.215155632009399,
+   "sqrt_pa": [
+    3331419710696,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    3635265551787,
+    1000000000000
+   ],
+   "L": 1822981441513751
+  },
+  {
+   "id": "cl:NIGHT/MIN:minswap-v2:+1",
+   "ladder": "minswap-v2:9c5c5cbc113be07ff0bf1fe31ffb204f9589bb89c87819076dc8269406afb10f",
+   "venue": "sundae-v4-cl",
+   "a": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "b": "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6.4d494e",
+   "ra": 10427493735044,
+   "rb": 0,
+   "tvl_ada": 1873375.993456591,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 13.215155632009399,
+   "pb": 15.73569257445864,
+   "sqrt_pa": [
+    3635265551787,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    3966823990860,
+    1000000000000
+   ],
+   "L": 453522589169596
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v2:-2",
+   "ladder": "wingriders-v2:c0bccd3384ea1094fcee3cb77d4770647df096517648214fdfaa21ac21c7b7fc",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 87581082522,
+   "tvl_ada": 315772.07473968185,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.20334352217554974,
+   "pb": 0.23029048221737133,
+   "sqrt_pa": [
+    450936272854,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    479885905416,
+    1000000000000
+   ],
+   "L": 3025291679762
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v2:-1",
+   "ladder": "wingriders-v2:c0bccd3384ea1094fcee3cb77d4770647df096517648214fdfaa21ac21c7b7fc",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 693662681889,
+   "tvl_ada": 2500988.774285689,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.23029048221737133,
+   "pb": 0.26080843703555295,
+   "sqrt_pa": [
+    479885905416,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    510694073821,
+    1000000000000
+   ],
+   "L": 22515544344285
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v2:+0",
+   "ladder": "wingriders-v2:c0bccd3384ea1094fcee3cb77d4770647df096517648214fdfaa21ac21c7b7fc",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 2492521160084,
+   "rb": 675977575730,
+   "tvl_ada": 4929746.590699947,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.26080843703555295,
+   "pb": 0.2953706126887297,
+   "sqrt_pa": [
+    510694073821,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    543480094105,
+    1000000000000
+   ],
+   "L": 42377519065839
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v2:+1",
+   "ladder": "wingriders-v2:c0bccd3384ea1094fcee3cb77d4770647df096517648214fdfaa21ac21c7b7fc",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 2462081284286,
+   "rb": 0,
+   "tvl_ada": 2462081.284286789,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.2953706126887297,
+   "pb": 0.3345129468653756,
+   "sqrt_pa": [
+    543480094105,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    578370942273,
+    1000000000000
+   ],
+   "L": 22180992114979
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v1:-1",
+   "ladder": "minswap-v1:63f2cbfa5bf8b68828839a2575c8c70f14a32f50ebbfa7c654043269793be896",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 627574343,
+   "tvl_ada": 1835303.966821886,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.00024772811288452194,
+   "pb": 0.00030533443406588153,
+   "sqrt_pa": [
+    15739380956,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    17473821393,
+    1000000000000
+   ],
+   "L": 361831014552
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v1:+0",
+   "ladder": "minswap-v1:63f2cbfa5bf8b68828839a2575c8c70f14a32f50ebbfa7c654043269793be896",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 2811031740196,
+   "rb": 1130985377,
+   "tvl_ada": 6118531.4315726,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.00030533443406588153,
+   "pb": 0.0003763364421614545,
+   "sqrt_pa": [
+    17473821393,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19399392830,
+    1000000000000
+   ],
+   "L": 1111038778737
+  },
+  {
+   "id": "cl:ADA/SNEK:minswap-v1:+1",
+   "ladder": "minswap-v1:63f2cbfa5bf8b68828839a2575c8c70f14a32f50ebbfa7c654043269793be896",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 2212979508194,
+   "rb": 0,
+   "tvl_ada": 2212979.5081983935,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0003763364421614545,
+   "pb": 0.00046384914997233057,
+   "sqrt_pa": [
+    19399392830,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    21537157426,
+    1000000000000
+   ],
+   "L": 432507887616
+  },
+  {
+   "id": "cl:ADA/NIGHT:wingriders-v2:-2",
+   "ladder": "wingriders-v2:9098d8f2a436c6637776c82b3efa5a1eaa1517bec1077b7d86b4b04a96cec27f",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 3513761377128,
+   "tvl_ada": 631273.0918767554,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 3.581761354967263,
+   "pb": 4.459752313727999,
+   "sqrt_pa": [
+    1892554188119,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2111812565956,
+    1000000000000
+   ],
+   "L": 16025665298592
+  },
+  {
+   "id": "cl:ADA/NIGHT:wingriders-v2:-1",
+   "ladder": "wingriders-v2:9098d8f2a436c6637776c82b3efa5a1eaa1517bec1077b7d86b4b04a96cec27f",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 14145721676231,
+   "tvl_ada": 2541383.008393289,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.459752313727999,
+   "pb": 5.552963675879526,
+   "sqrt_pa": [
+    2111812565956,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2356472719104,
+    1000000000000
+   ],
+   "L": 57817840356185
+  },
+  {
+   "id": "cl:ADA/NIGHT:wingriders-v2:+0",
+   "ladder": "wingriders-v2:9098d8f2a436c6637776c82b3efa5a1eaa1517bec1077b7d86b4b04a96cec27f",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 2549954135693,
+   "rb": 163715028016,
+   "tvl_ada": 2579366.745381623,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.552963675879526,
+   "pb": 6.914152046229111,
+   "sqrt_pa": [
+    2356472719104,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2629477523431,
+    1000000000000
+   ],
+   "L": 58543753373811
+  },
+  {
+   "id": "cl:ADA/NIGHT:wingriders-v2:+1",
+   "ladder": "wingriders-v2:9098d8f2a436c6637776c82b3efa5a1eaa1517bec1077b7d86b4b04a96cec27f",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 660272433919,
+   "rb": 0,
+   "tvl_ada": 660272.4339192352,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 6.914152046229111,
+   "pb": 8.609006164767024,
+   "sqrt_pa": [
+    2629477523431,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2934110796266,
+    1000000000000
+   ],
+   "L": 16722137953947
+  },
+  {
+   "id": "cl:ADA/SNEK:vyfi:-1",
+   "ladder": "vyfi:96c31772282e6ae5c629120471c5bbcdef538226b31b97d74c50ca3c",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 626214370,
+   "tvl_ada": 1831326.805792335,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.00026058240334523794,
+   "pb": 0.0003201617630296873,
+   "sqrt_pa": [
+    16142564956,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    17893064663,
+    1000000000000
+   ],
+   "L": 357734632857
+  },
+  {
+   "id": "cl:ADA/SNEK:vyfi:+0",
+   "ladder": "vyfi:96c31772282e6ae5c629120471c5bbcdef538226b31b97d74c50ca3c",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 2512775937560,
+   "rb": 411261512,
+   "tvl_ada": 3715485.851021962,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.0003201617630296873,
+   "pb": 0.00039336330155215324,
+   "sqrt_pa": [
+    17893064663,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19833388554,
+    1000000000000
+   ],
+   "L": 686912903127
+  },
+  {
+   "id": "cl:ADA/SNEK:vyfi:+1",
+   "ladder": "vyfi:96c31772282e6ae5c629120471c5bbcdef538226b31b97d74c50ca3c",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 814098798587,
+   "rb": 0,
+   "tvl_ada": 814098.7985872915,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.00039336330155215324,
+   "pb": 0.0004833015833738469,
+   "sqrt_pa": [
+    19833388554,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    21984121164,
+    1000000000000
+   ],
+   "L": 165042853194
+  },
+  {
+   "id": "cl:DJED/iUSD:minswap-stable:-1",
+   "ladder": "minswap-stable:5d4b6afd3344adcf37ccef5558bb87f522874578c32f17160512e398",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 91031432316,
+   "tvl_ada": 322946.5793346569,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 1.0058838308653313,
+   "pb": 1.0112524871194193,
+   "sqrt_pa": [
+    1002937600684,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1005610504678,
+    1000000000000
+   ],
+   "L": 34057127573733
+  },
+  {
+   "id": "cl:DJED/iUSD:minswap-stable:+0",
+   "ladder": "minswap-stable:5d4b6afd3344adcf37ccef5558bb87f522874578c32f17160512e398",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 47003062823,
+   "rb": 701230767716,
+   "tvl_ada": 2657181.730093988,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 1.0112524871194193,
+   "pb": 1.0166497972489252,
+   "sqrt_pa": [
+    1005610504678,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1008290532163,
+    1000000000000
+   ],
+   "L": 279477850234675
+  },
+  {
+   "id": "cl:DJED/iUSD:minswap-stable:+1",
+   "ladder": "minswap-stable:5d4b6afd3344adcf37ccef5558bb87f522874578c32f17160512e398",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 640289382114,
+   "rb": 0,
+   "tvl_ada": 2308552.267222489,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0166497972489252,
+   "pb": 1.0220759141868245,
+   "sqrt_pa": [
+    1008290532163,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1010977702121,
+    1000000000000
+   ],
+   "L": 242889326507679
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v2:-2",
+   "ladder": "wingriders-v2:894002a7801e011c2b3b27f65ac9c7f1ef2a6958d7681208b3ffe0535d7dd2c5",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 112908381010,
+   "tvl_ada": 400558.0764531079,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.999397564814267,
+   "pb": 1.0064691764840423,
+   "sqrt_pa": [
+    999698737027,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1003229373814,
+    1000000000000
+   ],
+   "L": 31979608161829
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v2:-1",
+   "ladder": "wingriders-v2:894002a7801e011c2b3b27f65ac9c7f1ef2a6958d7681208b3ffe0535d7dd2c5",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 402724455260,
+   "tvl_ada": 1428720.6290273813,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 1.0064691764840423,
+   "pb": 1.0135908259899786,
+   "sqrt_pa": [
+    1003229373814,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1006772479754,
+    1000000000000
+   ],
+   "L": 113664243203521
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v2:+0",
+   "ladder": "wingriders-v2:894002a7801e011c2b3b27f65ac9c7f1ef2a6958d7681208b3ffe0535d7dd2c5",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 348606205648,
+   "rb": 216574841136,
+   "tvl_ada": 2025222.7931469644,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 1.0135908259899786,
+   "pb": 1.0207628673935216,
+   "sqrt_pa": [
+    1006772479754,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1010328098883,
+    1000000000000
+   ],
+   "L": 160771228631184
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v2:+1",
+   "ladder": "wingriders-v2:894002a7801e011c2b3b27f65ac9c7f1ef2a6958d7681208b3ffe0535d7dd2c5",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 317283045557,
+   "rb": 0,
+   "tvl_ada": 1143958.5203711633,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0207628673935216,
+   "pb": 1.0279856572614106,
+   "sqrt_pa": [
+    1010328098883,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1013896275396,
+    1000000000000
+   ],
+   "L": 91087020149323
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v2:+2",
+   "ladder": "wingriders-v2:894002a7801e011c2b3b27f65ac9c7f1ef2a6958d7681208b3ffe0535d7dd2c5",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 71107643309,
+   "rb": 0,
+   "tvl_ada": 256377.3752357657,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 1.0279856572614106,
+   "pb": 1.0352595546834062,
+   "sqrt_pa": [
+    1013896275396,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1017477053640,
+    1000000000000
+   ],
+   "L": 20485992548631
+  },
+  {
+   "id": "cl:ADA/USDM:sundae-v3:-2",
+   "ladder": "sundae-v3:64f35d26b237ad58e099041bc14c687ea7fdc58969d7d5b66e2540ef",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 43096423264,
+   "tvl_ada": 155278.78038829003,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.23967516255955199,
+   "pb": 0.25244219176173793,
+   "sqrt_pa": [
+    489566300474,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    502436256416,
+    1000000000000
+   ],
+   "L": 3348606899527
+  },
+  {
+   "id": "cl:ADA/USDM:sundae-v3:-1",
+   "ladder": "sundae-v3:64f35d26b237ad58e099041bc14c687ea7fdc58969d7d5b66e2540ef",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 232837413366,
+   "tvl_ada": 838925.9905585119,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.25244219176173793,
+   "pb": 0.26588929574893194,
+   "sqrt_pa": [
+    502436256416,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    515644543992,
+    1000000000000
+   ],
+   "L": 17628130219474
+  },
+  {
+   "id": "cl:ADA/USDM:sundae-v3:+0",
+   "ladder": "sundae-v3:64f35d26b237ad58e099041bc14c687ea7fdc58969d7d5b66e2540ef",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 313688148690,
+   "rb": 411224836502,
+   "tvl_ada": 1795353.8239628754,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.26588929574893194,
+   "pb": 0.280052700780656,
+   "sqrt_pa": [
+    515644543992,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    529200057427,
+    1000000000000
+   ],
+   "L": 36787940022548
+  },
+  {
+   "id": "cl:ADA/USDM:sundae-v3:+1",
+   "ladder": "sundae-v3:64f35d26b237ad58e099041bc14c687ea7fdc58969d7d5b66e2540ef",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 1530535145657,
+   "rb": 0,
+   "tvl_ada": 1530535.1456573831,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.280052700780656,
+   "pb": 0.29497056281873557,
+   "sqrt_pa": [
+    529200057427,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    543111924762,
+    1000000000000
+   ],
+   "L": 31620381127523
+  },
+  {
+   "id": "cl:ADA/USDM:sundae-v3:+2",
+   "ladder": "sundae-v3:64f35d26b237ad58e099041bc14c687ea7fdc58969d7d5b66e2540ef",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 519116310842,
+   "rb": 0,
+   "tvl_ada": 519116.3108422819,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.29497056281873557,
+   "pb": 0.31068307031878284,
+   "sqrt_pa": [
+    543111924762,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    557389514001,
+    1000000000000
+   ],
+   "L": 11006720139941
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v3:-1",
+   "ladder": "sundae-v3:cacb7fd5f5b84bf876d40dc60d4991c72112d78d76132b1fb769e6ad",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 316693251,
+   "tvl_ada": 926150.6395978575,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.00027940435985031916,
+   "pb": 0.00031962586987269875,
+   "sqrt_pa": [
+    16715392901,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    17878083507,
+    1000000000000
+   ],
+   "L": 272379641983
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v3:+0",
+   "ladder": "sundae-v3:cacb7fd5f5b84bf876d40dc60d4991c72112d78d76132b1fb769e6ad",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 1406462454088,
+   "rb": 484538219,
+   "tvl_ada": 2823465.754745224,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.00031962586987269875,
+   "pb": 0.00036563744655455016,
+   "sqrt_pa": [
+    17878083507,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19121648636,
+    1000000000000
+   ],
+   "L": 789547548827
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v3:+1",
+   "ladder": "sundae-v3:cacb7fd5f5b84bf876d40dc60d4991c72112d78d76132b1fb769e6ad",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 934085037191,
+   "rb": 0,
+   "tvl_ada": 934085.0371923562,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.00036563744655455016,
+   "pb": 0.0004182725959453098,
+   "sqrt_pa": [
+    19121648636,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    20451713765,
+    1000000000000
+   ],
+   "L": 274643008229
+  },
+  {
+   "id": "cl:USDM/NIGHT:minswap-v2:-2",
+   "ladder": "minswap-v2:126bbf31110c7232ca88cfc1463ecbc7fe3256ea37876975d0dc42b8f156f6a0",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 1557937120408,
+   "tvl_ada": 279894.86974031886,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 14.772221135482225,
+   "pb": 17.03730601107679,
+   "sqrt_pa": [
+    3843464730615,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4127627164737,
+    1000000000000
+   ],
+   "L": 5482558330490
+  },
+  {
+   "id": "cl:USDM/NIGHT:minswap-v2:-1",
+   "ladder": "minswap-v2:126bbf31110c7232ca88cfc1463ecbc7fe3256ea37876975d0dc42b8f156f6a0",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 7541470029915,
+   "tvl_ada": 1354880.594359338,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 17.03730601107679,
+   "pb": 19.649705582720944,
+   "sqrt_pa": [
+    4127627164737,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4432798843025,
+    1000000000000
+   ],
+   "L": 24712221239606
+  },
+  {
+   "id": "cl:USDM/NIGHT:minswap-v2:+0",
+   "ladder": "minswap-v2:126bbf31110c7232ca88cfc1463ecbc7fe3256ea37876975d0dc42b8f156f6a0",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 390661993844,
+   "rb": 1342628487807,
+   "tvl_ada": 1648789.7128938385,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 19.649705582720944,
+   "pb": 22.662675028351604,
+   "sqrt_pa": [
+    4432798843025,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4760533061365,
+    1000000000000
+   ],
+   "L": 29509228594731
+  },
+  {
+   "id": "cl:USDM/NIGHT:minswap-v2:+1",
+   "ladder": "minswap-v2:126bbf31110c7232ca88cfc1463ecbc7fe3256ea37876975d0dc42b8f156f6a0",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 140750897089,
+   "rb": 0,
+   "tvl_ada": 507133.2139268307,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 22.662675028351604,
+   "pb": 26.137635359397187,
+   "sqrt_pa": [
+    4760533061365,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    5112497956909,
+    1000000000000
+   ],
+   "L": 9732861758605
+  },
+  {
+   "id": "cl:ADA/NIGHT:vyfi:-2",
+   "ladder": "vyfi:7d9d4d9a7bb53785415d4180c633079240579b021b2d609b1216bfe4",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 2016992731690,
+   "tvl_ada": 362367.58885081264,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 4.635542338112337,
+   "pb": 5.036943422049425,
+   "sqrt_pa": [
+    2153030965433,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2244313574804,
+    1000000000000
+   ],
+   "L": 22096133596404
+  },
+  {
+   "id": "cl:ADA/NIGHT:vyfi:-1",
+   "ladder": "vyfi:7d9d4d9a7bb53785415d4180c633079240579b021b2d609b1216bfe4",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 6111195796835,
+   "tvl_ada": 1097921.3018971435,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 5.036943422049425,
+   "pb": 5.4731026461206564,
+   "sqrt_pa": [
+    2244313574804,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2339466316518,
+    1000000000000
+   ],
+   "L": 64225115185891
+  },
+  {
+   "id": "cl:ADA/NIGHT:vyfi:+0",
+   "ladder": "vyfi:7d9d4d9a7bb53785415d4180c633079240579b021b2d609b1216bfe4",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 1052035076760,
+   "rb": 1509913745148,
+   "tvl_ada": 1323302.193694343,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.4731026461206564,
+   "pb": 5.947029788709625,
+   "sqrt_pa": [
+    2339466316518,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2438653273573,
+    1000000000000
+   ],
+   "L": 76247262065146
+  },
+  {
+   "id": "cl:ADA/NIGHT:vyfi:+1",
+   "ladder": "vyfi:7d9d4d9a7bb53785415d4180c633079240579b021b2d609b1216bfe4",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 635393295856,
+   "rb": 0,
+   "tvl_ada": 635393.2958567733,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 5.947029788709625,
+   "pb": 6.461995251060741,
+   "sqrt_pa": [
+    2438653273573,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2542045485640,
+    1000000000000
+   ],
+   "L": 38096771694076
+  },
+  {
+   "id": "cl:ADA/NIGHT:vyfi:+2",
+   "ladder": "vyfi:7d9d4d9a7bb53785415d4180c633079240579b021b2d609b1216bfe4",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 120878659999,
+   "rb": 0,
+   "tvl_ada": 120878.65999971882,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 6.461995251060741,
+   "pb": 7.021552625145332,
+   "sqrt_pa": [
+    2542045485640,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2649821243998,
+    1000000000000
+   ],
+   "L": 7554895202094
+  },
+  {
+   "id": "cl:USDA/NIGHT:wingriders-v2:-1",
+   "ladder": "wingriders-v2:90f28dc2b914f6e337261b87469cc3dfb4b09ed7f41328635ea599997eb2184b",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 3389350093291,
+   "tvl_ada": 608921.6890970801,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 15.243428788680404,
+   "pb": 18.476494230620332,
+   "sqrt_pa": [
+    3904283389904,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4298429274819,
+    1000000000000
+   ],
+   "L": 8599227400336
+  },
+  {
+   "id": "cl:USDA/NIGHT:wingriders-v2:+0",
+   "ladder": "wingriders-v2:90f28dc2b914f6e337261b87469cc3dfb4b09ed7f41328635ea599997eb2184b",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 251521238936,
+   "rb": 4452662211380,
+   "tvl_ada": 1713180.7510605562,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 18.476494230620332,
+   "pb": 22.39527889602187,
+   "sqrt_pa": [
+    4298429274819,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4732365042558,
+    1000000000000
+   ],
+   "L": 22592357122106
+  },
+  {
+   "id": "cl:USDA/NIGHT:wingriders-v2:+1",
+   "ladder": "wingriders-v2:90f28dc2b914f6e337261b87469cc3dfb4b09ed7f41328635ea599997eb2184b",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 144035569918,
+   "rb": 0,
+   "tvl_ada": 522966.58055850834,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 22.39527889602187,
+   "pb": 27.145220872009734,
+   "sqrt_pa": [
+    4732365042558,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    5210107568180,
+    1000000000000
+   ],
+   "L": 7433627276393
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v1:-1",
+   "ladder": "minswap-v1:d944eda9d4fd8c26171a4362539bfd4ccf35f5a4d0cc7525b22327b997a4f4b9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 210471731175,
+   "tvl_ada": 758852.178035111,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.24243983950002645,
+   "pb": 0.27104315368426984,
+   "sqrt_pa": [
+    492381802568,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    520618049710,
+    1000000000000
+   ],
+   "L": 7453955552823
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v1:+0",
+   "ladder": "minswap-v1:d944eda9d4fd8c26171a4362539bfd4ccf35f5a4d0cc7525b22327b997a4f4b9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 947064830917,
+   "rb": 69449741564,
+   "tvl_ada": 1197464.670154883,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.27104315368426984,
+   "pb": 0.30302111777757845,
+   "sqrt_pa": [
+    520618049710,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    550473539580,
+    1000000000000
+   ],
+   "L": 11522435694924
+  },
+  {
+   "id": "cl:ADA/DJED:minswap-v1:+1",
+   "ladder": "minswap-v1:d944eda9d4fd8c26171a4362539bfd4ccf35f5a4d0cc7525b22327b997a4f4b9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 202481423839,
+   "rb": 0,
+   "tvl_ada": 202481.42383911062,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.30302111777757845,
+   "pb": 0.3387718766220289,
+   "sqrt_pa": [
+    550473539580,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    582041129665,
+    1000000000000
+   ],
+   "L": 2055104359364
+  },
+  {
+   "id": "cl:ADA/SNEK:cswap:-1",
+   "ladder": "cswap:8e50527b8cc1763348b393dca349bf04385ee12d4568afa0c8a457a9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 280936714,
+   "tvl_ada": 821582.7680198005,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.000292725686631184,
+   "pb": 0.0003353746154218512,
+   "sqrt_pa": [
+    17109228113,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    18313236072,
+    1000000000000
+   ],
+   "L": 233334598745
+  },
+  {
+   "id": "cl:ADA/SNEK:cswap:+0",
+   "ladder": "cswap:8e50527b8cc1763348b393dca349bf04385ee12d4568afa0c8a457a9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 961892656495,
+   "rb": 56070743,
+   "tvl_ada": 1125868.2225776848,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.0003353746154218512,
+   "pb": 0.0003842373177556758,
+   "sqrt_pa": [
+    18313236072,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19601972292,
+    1000000000000
+   ],
+   "L": 314054202207
+  },
+  {
+   "id": "cl:ADA/SNEK:cswap:+1",
+   "ladder": "cswap:8e50527b8cc1763348b393dca349bf04385ee12d4568afa0c8a457a9",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 164347826528,
+   "rb": 0,
+   "tvl_ada": 164347.82652859195,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0003842373177556758,
+   "pb": 0.00044021911488551147,
+   "sqrt_pa": [
+    19601972292,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    20981399259,
+    1000000000000
+   ],
+   "L": 49000382721
+  },
+  {
+   "id": "cl:USDCx/iUSD:sundae-stable:-1",
+   "ladder": "sundae-stable:f8a2125d27c30abc547b6dc064dec0615a2ccdd88cde4227e4617d98",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 30401738745,
+   "tvl_ada": 107854.36726558203,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.9996825210398989,
+   "pb": 1.0048554938270529,
+   "sqrt_pa": [
+    999841247919,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1002424807069,
+    1000000000000
+   ],
+   "L": 11767386376657
+  },
+  {
+   "id": "cl:USDCx/iUSD:sundae-stable:+0",
+   "ladder": "sundae-stable:f8a2125d27c30abc547b6dc064dec0615a2ccdd88cde4227e4617d98",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 15386537184,
+   "rb": 235742819146,
+   "tvl_ada": 891447.378172752,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 1.0048554938270529,
+   "pb": 1.0100552347599865,
+   "sqrt_pa": [
+    1002424807069,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1005015042057,
+    1000000000000
+   ],
+   "L": 97011119005110
+  },
+  {
+   "id": "cl:USDCx/iUSD:sundae-stable:+1",
+   "ladder": "sundae-stable:f8a2125d27c30abc547b6dc064dec0615a2ccdd88cde4227e4617d98",
+   "venue": "sundae-v4-cl",
+   "a": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 217136772246,
+   "rb": 0,
+   "tvl_ada": 777820.4747996491,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0100552347599865,
+   "pb": 1.0152818823535652,
+   "sqrt_pa": [
+    1005015042057,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1007611970132,
+    1000000000000
+   ],
+   "L": 84671906044624
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v1:-1",
+   "ladder": "wingriders-v1:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 29741571884,
+   "tvl_ada": 107232.72183325258,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.22863088089857245,
+   "pb": 0.2525751905093886,
+   "sqrt_pa": [
+    478153616423,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    502568592840,
+    1000000000000
+   ],
+   "L": 1218169183374
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v1:+0",
+   "ladder": "wingriders-v1:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 54764699408,
+   "rb": 231451785383,
+   "tvl_ada": 889260.0991821074,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.2525751905093886,
+   "pb": 0.2790271664533147,
+   "sqrt_pa": [
+    502568592840,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    528230221072,
+    1000000000000
+   ],
+   "L": 9613060236261
+  },
+  {
+   "id": "cl:ADA/DJED:wingriders-v1:+1",
+   "ladder": "wingriders-v1:a939812d08cfb6066e17d2914a7272c6b8c0197acdf68157d02c73649cc3efc0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 778360419911,
+   "rb": 0,
+   "tvl_ada": 778360.4199115705,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.2790271664533147,
+   "pb": 0.3082494344038583,
+   "sqrt_pa": [
+    528230221072,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    555202156339,
+    1000000000000
+   ],
+   "L": 8463364073996
+  },
+  {
+   "id": "cl:ADA/DJED:vyfi:-2",
+   "ladder": "vyfi:7fe95f7516f5a53f835f80ce1053eec933efba9c1b49fab0f7398bc2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 10158765500,
+   "tvl_ada": 36627.252899050436,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.2009756130061592,
+   "pb": 0.22729443713805414,
+   "sqrt_pa": [
+    448303037025,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    476754063578,
+    1000000000000
+   ],
+   "L": 357061474779
+  },
+  {
+   "id": "cl:ADA/DJED:vyfi:-1",
+   "ladder": "vyfi:7fe95f7516f5a53f835f80ce1053eec933efba9c1b49fab0f7398bc2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 0,
+   "rb": 95748138546,
+   "tvl_ada": 345218.2536503101,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.22729443713805414,
+   "pb": 0.25705985109905627,
+   "sqrt_pa": [
+    476754063578,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    507010701168,
+    1000000000000
+   ],
+   "L": 3164533344499
+  },
+  {
+   "id": "cl:ADA/DJED:vyfi:+0",
+   "ladder": "vyfi:7fe95f7516f5a53f835f80ce1053eec933efba9c1b49fab0f7398bc2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 309785457962,
+   "rb": 137711963542,
+   "tvl_ada": 806303.5551541107,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.25705985109905627,
+   "pb": 0.29072320413602315,
+   "sqrt_pa": [
+    507010701168,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    539187540783,
+    1000000000000
+   ],
+   "L": 7013704339682
+  },
+  {
+   "id": "cl:ADA/DJED:vyfi:+1",
+   "ladder": "vyfi:7fe95f7516f5a53f835f80ce1053eec933efba9c1b49fab0f7398bc2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "ra": 477036111185,
+   "rb": 0,
+   "tvl_ada": 477036.1111859386,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.29072320413602315,
+   "pb": 0.32879495207731435,
+   "sqrt_pa": [
+    539187540783,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    573406445793,
+    1000000000000
+   ],
+   "L": 4310102185001
+  },
+  {
+   "id": "cl:ADA/USDM:wingriders-v2:-2",
+   "ladder": "wingriders-v2:93237c26780971289912e3fc907bd7b2cc1ca33ff248616e13299a1219be3ed0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 11346108889,
+   "tvl_ada": 40880.65359247789,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.2196827222647722,
+   "pb": 0.24072883685742705,
+   "sqrt_pa": [
+    468703234750,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    490641250668,
+    1000000000000
+   ],
+   "L": 517189381729
+  },
+  {
+   "id": "cl:ADA/USDM:wingriders-v2:-1",
+   "ladder": "wingriders-v2:93237c26780971289912e3fc907bd7b2cc1ca33ff248616e13299a1219be3ed0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 97958444454,
+   "tvl_ada": 352949.65640999563,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.24072883685742705,
+   "pb": 0.26379121806805156,
+   "sqrt_pa": [
+    490641250668,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    513606092320,
+    1000000000000
+   ],
+   "L": 4265583274573
+  },
+  {
+   "id": "cl:ADA/USDM:wingriders-v2:+0",
+   "ladder": "wingriders-v2:93237c26780971289912e3fc907bd7b2cc1ca33ff248616e13299a1219be3ed0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 336914014178,
+   "rb": 116534453059,
+   "tvl_ada": 756794.0500106253,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.26379121806805156,
+   "pb": 0.28906302891763186,
+   "sqrt_pa": [
+    513606092320,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    537645821073,
+    1000000000000
+   ],
+   "L": 8817210597665
+  },
+  {
+   "id": "cl:ADA/USDM:wingriders-v2:+1",
+   "ladder": "wingriders-v2:93237c26780971289912e3fc907bd7b2cc1ca33ff248616e13299a1219be3ed0",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 411132415978,
+   "rb": 0,
+   "tvl_ada": 411132.41597824305,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.28906302891763186,
+   "pb": 0.3167559378928223,
+   "sqrt_pa": [
+    537645821073,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    562810747848,
+    1000000000000
+   ],
+   "L": 4943615739763
+  },
+  {
+   "id": "cl:USDM/iUSD:minswap-stable:-2",
+   "ladder": "minswap-stable:96402c6f5e7a04f16b4d6f500ab039ff5eac5d0226d4f88bf5523ce8",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 11718246838,
+   "tvl_ada": 41572.0991737855,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 1.0004451590276247,
+   "pb": 1.0056605943150974,
+   "sqrt_pa": [
+    1000222554749,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1002826303163,
+    1000000000000
+   ],
+   "L": 4500529611460
+  },
+  {
+   "id": "cl:USDM/iUSD:minswap-stable:-1",
+   "ladder": "minswap-stable:96402c6f5e7a04f16b4d6f500ab039ff5eac5d0226d4f88bf5523ce8",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 67506737898,
+   "tvl_ada": 239489.47667174056,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 1.0056605943150974,
+   "pb": 1.0109032182645297,
+   "sqrt_pa": [
+    1002826303163,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1005436829574,
+    1000000000000
+   ],
+   "L": 25859434945207
+  },
+  {
+   "id": "cl:USDM/iUSD:minswap-stable:+0",
+   "ladder": "minswap-stable:96402c6f5e7a04f16b4d6f500ab039ff5eac5d0226d4f88bf5523ce8",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 15867114019,
+   "rb": 137837134947,
+   "tvl_ada": 546166.3576086934,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 1.0109032182645297,
+   "pb": 1.0161731726135328,
+   "sqrt_pa": [
+    1005436829574,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1008054151628,
+    1000000000000
+   ],
+   "L": 58822141177504
+  },
+  {
+   "id": "cl:USDM/iUSD:minswap-stable:+1",
+   "ladder": "minswap-stable:96402c6f5e7a04f16b4d6f500ab039ff5eac5d0226d4f88bf5523ce8",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 137683326753,
+   "rb": 0,
+   "tvl_ada": 496080.5894989488,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0161731726135328,
+   "pb": 1.0214705998386122,
+   "sqrt_pa": [
+    1008054151628,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1010678287013,
+    1000000000000
+   ],
+   "L": 53455440377306
+  },
+  {
+   "id": "cl:USDM/iUSD:minswap-stable:+2",
+   "ladder": "minswap-stable:96402c6f5e7a04f16b4d6f500ab039ff5eac5d0226d4f88bf5523ce8",
+   "venue": "sundae-v4-cl",
+   "a": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 49770529550,
+   "rb": 0,
+   "tvl_ada": 179325.9519595662,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 1.0214705998386122,
+   "pb": 1.02679564315902,
+   "sqrt_pa": [
+    1010678287013,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1013309253466,
+    1000000000000
+   ],
+   "L": 19373669882105
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v1:-2",
+   "ladder": "sundae-v1:1f04",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 36427709,
+   "tvl_ada": 106530.67592178826,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.00023510014292256673,
+   "pb": 0.00027970861611672636,
+   "sqrt_pa": [
+    15332975671,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    16724491505,
+    1000000000000
+   ],
+   "L": 26178436572
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v1:-1",
+   "ladder": "sundae-v1:1f04",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 0,
+   "rb": 179613526,
+   "tvl_ada": 525269.1122199735,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.00027970861611672636,
+   "pb": 0.00033278120956184415,
+   "sqrt_pa": [
+    16724491505,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    18242291785,
+    1000000000000
+   ],
+   "L": 118338050379
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v1:+0",
+   "ladder": "sundae-v1:1f04",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 546545346035,
+   "rb": 35681773,
+   "tvl_ada": 650894.5772453143,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.00033278120956184415,
+   "pb": 0.0003959239260303274,
+   "sqrt_pa": [
+    18242291785,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    19897837220,
+    1000000000000
+   ],
+   "L": 143023028036
+  },
+  {
+   "id": "cl:ADA/SNEK:sundae-v1:+1",
+   "ladder": "sundae-v1:1f04",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f.534e454b",
+   "ra": 203896211365,
+   "rb": 0,
+   "tvl_ada": 203896.2113652286,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.0003959239260303274,
+   "pb": 0.0004710474951685536,
+   "sqrt_pa": [
+    19897837220,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    21703628618,
+    1000000000000
+   ],
+   "L": 48761807909
+  },
+  {
+   "id": "cl:DJED/USDM:minswap-stable:-2",
+   "ladder": "minswap-stable:07b0869ed7488657e24ac9b27b3f0fb4f76757f444197b2a38a15c3c",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 15742618650,
+   "tvl_ada": 56721.51976947326,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.9834137019711413,
+   "pb": 0.9906008994137837,
+   "sqrt_pa": [
+    991672174648,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    995289354617,
+    1000000000000
+   ],
+   "L": 4352180091927
+  },
+  {
+   "id": "cl:DJED/USDM:minswap-stable:-1",
+   "ladder": "minswap-stable:07b0869ed7488657e24ac9b27b3f0fb4f76757f444197b2a38a15c3c",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 107567231518,
+   "tvl_ada": 387570.6440319612,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.9906008994137837,
+   "pb": 0.9978406238925819,
+   "sqrt_pa": [
+    995289354617,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    998919728453,
+    1000000000000
+   ],
+   "L": 29629794720126
+  },
+  {
+   "id": "cl:DJED/USDM:minswap-stable:+0",
+   "ladder": "minswap-stable:07b0869ed7488657e24ac9b27b3f0fb4f76757f444197b2a38a15c3c",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 111980687619,
+   "rb": 71479733729,
+   "tvl_ada": 661289.835067128,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.9978406238925819,
+   "pb": 1.0051332592970212,
+   "sqrt_pa": [
+    998919728453,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1002563344282,
+    1000000000000
+   ],
+   "L": 50440356931706
+  },
+  {
+   "id": "cl:DJED/USDM:minswap-stable:+1",
+   "ladder": "minswap-stable:07b0869ed7488657e24ac9b27b3f0fb4f76757f444197b2a38a15c3c",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 79273960302,
+   "rb": 0,
+   "tvl_ada": 285820.88958371745,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0051332592970212,
+   "pb": 1.0124791923222112,
+   "sqrt_pa": [
+    1002563344282,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1006220250404,
+    1000000000000
+   ],
+   "L": 21868632107441
+  },
+  {
+   "id": "cl:ADA/USDA:minswap-v2:-1",
+   "ladder": "minswap-v2:ee5cfbc5b0dc10c873a0bcc69e49b9af21b899f59337a894874c6b596c2da136",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 0,
+   "rb": 75608409060,
+   "tvl_ada": 274520.1839394118,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.20343254085079615,
+   "pb": 0.24972550237202026,
+   "sqrt_pa": [
+    451034966328,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    499725426982,
+    1000000000000
+   ],
+   "L": 1552838236575
+  },
+  {
+   "id": "cl:ADA/USDA:minswap-v2:+0",
+   "ladder": "minswap-v2:ee5cfbc5b0dc10c873a0bcc69e49b9af21b899f59337a894874c6b596c2da136",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 413545689780,
+   "rb": 104397015875,
+   "tvl_ada": 792591.9937177945,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.24972550237202026,
+   "pb": 0.3065528566577594,
+   "sqrt_pa": [
+    499725426982,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    553672156296,
+    1000000000000
+   ],
+   "L": 4162642293848
+  },
+  {
+   "id": "cl:ADA/USDA:minswap-v2:+1",
+   "ladder": "minswap-v2:ee5cfbc5b0dc10c873a0bcc69e49b9af21b899f59337a894874c6b596c2da136",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 248311042727,
+   "rb": 0,
+   "tvl_ada": 248311.04272717182,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.3065528566577594,
+   "pb": 0.3763118024887871,
+   "sqrt_pa": [
+    553672156296,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    613442582879,
+    1000000000000
+   ],
+   "L": 1411030111629
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v1:-2",
+   "ladder": "minswap-v1:8fde43a3f0b9f0e6f63bec7335e0b855c6b62a4dc51f1b762ccb6dfbbafcfe47",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 3763850067,
+   "tvl_ada": 13352.777972976573,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.1606712612145536,
+   "pb": 0.19587370206231056,
+   "sqrt_pa": [
+    400838198298,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    442576210457,
+    1000000000000
+   ],
+   "L": 90177990572
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v1:-1",
+   "ladder": "minswap-v1:8fde43a3f0b9f0e6f63bec7335e0b855c6b62a4dc51f1b762ccb6dfbbafcfe47",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 48472152043,
+   "tvl_ada": 171961.65430981625,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.19587370206231056,
+   "pb": 0.23878885912497935,
+   "sqrt_pa": [
+    442576210457,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    488660269640,
+    1000000000000
+   ],
+   "L": 1051820367006
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v1:+0",
+   "ladder": "minswap-v1:8fde43a3f0b9f0e6f63bec7335e0b855c6b62a4dc51f1b762ccb6dfbbafcfe47",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 90983522478,
+   "rb": 127757061582,
+   "tvl_ada": 544219.3441496011,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.23878885912497935,
+   "pb": 0.29110655816404707,
+   "sqrt_pa": [
+    488660269640,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    539542915961,
+    1000000000000
+   ],
+   "L": 3023029529880
+  },
+  {
+   "id": "cl:ADA/iUSD:minswap-v1:+1",
+   "ladder": "minswap-v1:8fde43a3f0b9f0e6f63bec7335e0b855c6b62a4dc51f1b762ccb6dfbbafcfe47",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 435433269501,
+   "rb": 0,
+   "tvl_ada": 435433.2695010962,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.29110655816404707,
+   "pb": 0.3548868591133232,
+   "sqrt_pa": [
+    539542915961,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    595723811102,
+    1000000000000
+   ],
+   "L": 2491173112207
+  },
+  {
+   "id": "cl:USDA/NIGHT:minswap-v2:-2",
+   "ladder": "minswap-v2:1f2f0d16482b653218cfdf59fd5bec105d0ddd9ae31dd4eb9ee90250f6d56378",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 284147021541,
+   "tvl_ada": 51049.10367665609,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 12.99541588575232,
+   "pb": 15.349365791049754,
+   "sqrt_pa": [
+    3604915517145,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    3917826666795,
+    1000000000000
+   ],
+   "L": 908075732868
+  },
+  {
+   "id": "cl:USDA/NIGHT:minswap-v2:-1",
+   "ladder": "minswap-v2:1f2f0d16482b653218cfdf59fd5bec105d0ddd9ae31dd4eb9ee90250f6d56378",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 1305722770595,
+   "tvl_ada": 234582.70555676756,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 15.349365791049754,
+   "pb": 18.129702985939424,
+   "sqrt_pa": [
+    3917826666795,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4257898893344,
+    1000000000000
+   ],
+   "L": 3839545451403
+  },
+  {
+   "id": "cl:USDA/NIGHT:minswap-v2:+0",
+   "ladder": "minswap-v2:1f2f0d16482b653218cfdf59fd5bec105d0ddd9ae31dd4eb9ee90250f6d56378",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 41273594419,
+   "rb": 1545927855560,
+   "tvl_ada": 427594.12349925906,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 18.129702985939424,
+   "pb": 21.413661960550737,
+   "sqrt_pa": [
+    4257898893344,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    4627489812042,
+    1000000000000
+   ],
+   "L": 6505951613995
+  },
+  {
+   "id": "cl:USDA/NIGHT:minswap-v2:+1",
+   "ladder": "minswap-v2:1f2f0d16482b653218cfdf59fd5bec105d0ddd9ae31dd4eb9ee90250f6d56378",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 85538489866,
+   "rb": 0,
+   "tvl_ada": 310574.47529729694,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 21.413661960550737,
+   "pb": 25.292467224441804,
+   "sqrt_pa": [
+    4627489812042,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    5029161682074,
+    1000000000000
+   ],
+   "L": 4955999224929
+  },
+  {
+   "id": "cl:USDA/NIGHT:minswap-v2:+2",
+   "ladder": "minswap-v2:1f2f0d16482b653218cfdf59fd5bec105d0ddd9ae31dd4eb9ee90250f6d56378",
+   "venue": "sundae-v4-cl",
+   "a": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 24695705722,
+   "rb": 0,
+   "tvl_ada": 89665.55125022234,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 25.292467224441804,
+   "pb": 29.873867415949917,
+   "sqrt_pa": [
+    5029161682074,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    5465699169910,
+    1000000000000
+   ],
+   "L": 1555038762130
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:-2",
+   "ladder": "sundae-v3:b9d93a895fdfc7dd0a1ca7e5b95a1031668f6f723e2a671859ecaa4a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 119436230106,
+   "tvl_ada": 21457.597761774578,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 3.8785631353621146,
+   "pb": 4.447027634891912,
+   "sqrt_pa": [
+    1969406797836,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2108797675191,
+    1000000000000
+   ],
+   "L": 856843951141
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:-1",
+   "ladder": "sundae-v3:b9d93a895fdfc7dd0a1ca7e5b95a1031668f6f723e2a671859ecaa4a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 0,
+   "rb": 1164102929315,
+   "tvl_ada": 209139.65878138732,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 4.447027634891912,
+   "pb": 5.098809557897269,
+   "sqrt_pa": [
+    2108797675191,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2258054374433,
+    1000000000000
+   ],
+   "L": 7799334537256
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:+0",
+   "ladder": "sundae-v3:b9d93a895fdfc7dd0a1ca7e5b95a1031668f6f723e2a671859ecaa4a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 182206296463,
+   "rb": 1795050454392,
+   "tvl_ada": 504700.3217533298,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 5.098809557897269,
+   "pb": 5.846120384708704,
+   "sqrt_pa": [
+    2258054374433,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2417875179721,
+    1000000000000
+   ],
+   "L": 17735058936169
+  },
+  {
+   "id": "cl:ADA/NIGHT:sundae-v3:+1",
+   "ladder": "sundae-v3:b9d93a895fdfc7dd0a1ca7e5b95a1031668f6f723e2a671859ecaa4a",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa.4e49474854",
+   "ra": 308479705035,
+   "rb": 0,
+   "tvl_ada": 308479.705035873,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 5.846120384708704,
+   "pb": 6.7029613803817325,
+   "sqrt_pa": [
+    2417875179721,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    2589007798440,
+    1000000000000
+   ],
+   "L": 11283946971952
+  },
+  {
+   "id": "cl:iUSD/USDA:sundae-stable:-1",
+   "ladder": "sundae-stable:5a61dcd83e9711bbbf283a6b8f4f5e2e0c0393d1ce6a82f38b27003c",
+   "venue": "sundae-v4-cl",
+   "a": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 0,
+   "rb": 23569326653,
+   "tvl_ada": 85575.87666214572,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.9643180706402148,
+   "pb": 0.9715344603179384,
+   "sqrt_pa": [
+    981996980973,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    985664476543,
+    1000000000000
+   ],
+   "L": 6426545364034
+  },
+  {
+   "id": "cl:iUSD/USDA:sundae-stable:+0",
+   "ladder": "sundae-stable:5a61dcd83e9711bbbf283a6b8f4f5e2e0c0393d1ce6a82f38b27003c",
+   "venue": "sundae-v4-cl",
+   "a": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 31420335027,
+   "rb": 99828504773,
+   "tvl_ada": 473926.86125200323,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.9715344603179384,
+   "pb": 0.9788048532146894,
+   "sqrt_pa": [
+    985664476543,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    989345669225,
+    1000000000000
+   ],
+   "L": 35465665596158
+  },
+  {
+   "id": "cl:iUSD/USDA:sundae-stable:+1",
+   "ladder": "sundae-stable:5a61dcd83e9711bbbf283a6b8f4f5e2e0c0393d1ce6a82f38b27003c",
+   "venue": "sundae-v4-cl",
+   "a": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 79460588005,
+   "rb": 0,
+   "tvl_ada": 281897.4109859028,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.9788048532146894,
+   "pb": 0.9861296534588192,
+   "sqrt_pa": [
+    989345669225,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    993040610176,
+    1000000000000
+   ],
+   "L": 21128046228529
+  },
+  {
+   "id": "cl:ADA/USDA:wingriders-v2:-1",
+   "ladder": "wingriders-v2:8b90036bbb5b4fd95f607a140bffd8ad296af9f784f7eacbec79aec8d9198ee2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 0,
+   "rb": 39060687404,
+   "tvl_ada": 141822.1494708738,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.19136228591384066,
+   "pb": 0.24336519803727444,
+   "sqrt_pa": [
+    437449752445,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    493320583432,
+    1000000000000
+   ],
+   "L": 699124869166
+  },
+  {
+   "id": "cl:ADA/USDA:wingriders-v2:+0",
+   "ladder": "wingriders-v2:8b90036bbb5b4fd95f607a140bffd8ad296af9f784f7eacbec79aec8d9198ee2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 216145461835,
+   "rb": 63030618242,
+   "tvl_ada": 444998.0078520578,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.24336519803727444,
+   "pb": 0.3094999588497188,
+   "sqrt_pa": [
+    493320583432,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    556327204844,
+    1000000000000
+   ],
+   "L": 2001966610840
+  },
+  {
+   "id": "cl:ADA/USDA:wingriders-v2:+1",
+   "ladder": "wingriders-v2:8b90036bbb5b4fd95f607a140bffd8ad296af9f784f7eacbec79aec8d9198ee2",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 151516972127,
+   "rb": 0,
+   "tvl_ada": 151516.9721278583,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.3094999588497188,
+   "pb": 0.39360691380904084,
+   "sqrt_pa": [
+    556327204844,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    627380995735,
+    1000000000000
+   ],
+   "L": 744278864453
+  },
+  {
+   "id": "cl:ADA/USDA:vyfi:-2",
+   "ladder": "vyfi:f7f9777979a2a96777823f149e6696954f43967fc56cfc7095a33f98",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 0,
+   "rb": 8357215301,
+   "tvl_ada": 30343.50689611486,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.21581759901697967,
+   "pb": 0.2366674632756547,
+   "sqrt_pa": [
+    464561727887,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    486484802718,
+    1000000000000
+   ],
+   "L": 381206348353
+  },
+  {
+   "id": "cl:ADA/USDA:vyfi:-1",
+   "ladder": "vyfi:f7f9777979a2a96777823f149e6696954f43967fc56cfc7095a33f98",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 0,
+   "rb": 38115842647,
+   "tvl_ada": 138391.5924782946,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.2366674632756547,
+   "pb": 0.2595316064512728,
+   "sqrt_pa": [
+    486484802718,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    509442446652,
+    1000000000000
+   ],
+   "L": 1660268046519
+  },
+  {
+   "id": "cl:ADA/USDA:vyfi:+0",
+   "ladder": "vyfi:f7f9777979a2a96777823f149e6696954f43967fc56cfc7095a33f98",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 89441084062,
+   "rb": 44327210229,
+   "tvl_ada": 250385.00626638887,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.2595316064512728,
+   "pb": 0.28460462547285487,
+   "sqrt_pa": [
+    509442446652,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    533483481912,
+    1000000000000
+   ],
+   "L": 2885418861084
+  },
+  {
+   "id": "cl:ADA/USDA:vyfi:+1",
+   "ladder": "vyfi:f7f9777979a2a96777823f149e6696954f43967fc56cfc7095a33f98",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 180513223522,
+   "rb": 0,
+   "tvl_ada": 180513.22352241704,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.28460462547285487,
+   "pb": 0.31209991703169204,
+   "sqrt_pa": [
+    533483481912,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    558659034682,
+    1000000000000
+   ],
+   "L": 2136966974132
+  },
+  {
+   "id": "cl:ADA/USDA:vyfi:+2",
+   "ladder": "vyfi:f7f9777979a2a96777823f149e6696954f43967fc56cfc7095a33f98",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "fe7c786ab321f41c654ef6c1af7b3250a613c24e4213e0425a7ae456.55534441",
+   "ra": 51726706415,
+   "rb": 0,
+   "tvl_ada": 51726.70641575906,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.31209991703169204,
+   "pb": 0.3422514938025121,
+   "sqrt_pa": [
+    558659034682,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    585022643837,
+    1000000000000
+   ],
+   "L": 641253081045
+  },
+  {
+   "id": "cl:ADA/USDCx:sundae-v3:-2",
+   "ladder": "sundae-v3:bdf5e1ccc9aea3c8d587cc6b6fb74ea531538e96ab8cb7d56238698e",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 0,
+   "rb": 9125394073,
+   "tvl_ada": 32688.697900314557,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.1798040752430903,
+   "pb": 0.21337564899697678,
+   "sqrt_pa": [
+    424033106305,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    461926021130,
+    1000000000000
+   ],
+   "L": 240820589156
+  },
+  {
+   "id": "cl:ADA/USDCx:sundae-v3:-1",
+   "ladder": "sundae-v3:bdf5e1ccc9aea3c8d587cc6b6fb74ea531538e96ab8cb7d56238698e",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 0,
+   "rb": 38838478289,
+   "tvl_ada": 139125.9679851654,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.21337564899697678,
+   "pb": 0.2532154375440424,
+   "sqrt_pa": [
+    461926021130,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    503205164465,
+    1000000000000
+   ],
+   "L": 940874135245
+  },
+  {
+   "id": "cl:ADA/USDCx:sundae-v3:+0",
+   "ladder": "sundae-v3:bdf5e1ccc9aea3c8d587cc6b6fb74ea531538e96ab8cb7d56238698e",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 101443598310,
+   "rb": 37290480882,
+   "tvl_ada": 235024.37896642444,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.2532154375440424,
+   "pb": 0.30049379163940726,
+   "sqrt_pa": [
+    503205164465,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    548173140202,
+    1000000000000
+   ],
+   "L": 1482647841932
+  },
+  {
+   "id": "cl:ADA/USDCx:sundae-v3:+1",
+   "ladder": "sundae-v3:bdf5e1ccc9aea3c8d587cc6b6fb74ea531538e96ab8cb7d56238698e",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 158214017197,
+   "rb": 0,
+   "tvl_ada": 158214.01719716596,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.30049379163940726,
+   "pb": 0.35659958053750973,
+   "sqrt_pa": [
+    548173140202,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    597159593859,
+    1000000000000
+   ],
+   "L": 1057248611649
+  },
+  {
+   "id": "cl:ADA/USDCx:sundae-v3:+2",
+   "ladder": "sundae-v3:bdf5e1ccc9aea3c8d587cc6b6fb74ea531538e96ab8cb7d56238698e",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 42313900857,
+   "rb": 0,
+   "tvl_ada": 42313.9008572756,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.35659958053750973,
+   "pb": 0.42318099201238696,
+   "sqrt_pa": [
+    597159593859,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    650523629096,
+    1000000000000
+   ],
+   "L": 308026365870
+  },
+  {
+   "id": "cl:ADA/USDM:vyfi:-2",
+   "ladder": "vyfi:6693ff109ef34fe7487fb4afb4eb66bc15fb6f5b7a5c84606a66f7bd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 13787489384,
+   "tvl_ada": 49677.081626633284,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.21094011381920388,
+   "pb": 0.23768547368287563,
+   "sqrt_pa": [
+    459282172329,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    487529972087,
+    1000000000000
+   ],
+   "L": 488090736344
+  },
+  {
+   "id": "cl:ADA/USDM:vyfi:-1",
+   "ladder": "vyfi:6693ff109ef34fe7487fb4afb4eb66bc15fb6f5b7a5c84606a66f7bd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 0,
+   "rb": 45639605128,
+   "tvl_ada": 164442.0043463657,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.23768547368287563,
+   "pb": 0.2678219110485269,
+   "sqrt_pa": [
+    487529972087,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    517515131227,
+    1000000000000
+   ],
+   "L": 1522073133409
+  },
+  {
+   "id": "cl:ADA/USDM:vyfi:+0",
+   "ladder": "vyfi:6693ff109ef34fe7487fb4afb4eb66bc15fb6f5b7a5c84606a66f7bd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 151249743642,
+   "rb": 18090198655,
+   "tvl_ada": 216429.7231257183,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.2678219110485269,
+   "pb": 0.30177938485793476,
+   "sqrt_pa": [
+    517515131227,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    549344504713,
+    1000000000000
+   ],
+   "L": 1943580970208
+  },
+  {
+   "id": "cl:ADA/USDM:vyfi:+1",
+   "ladder": "vyfi:6693ff109ef34fe7487fb4afb4eb66bc15fb6f5b7a5c84606a66f7bd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 113498984323,
+   "rb": 0,
+   "tvl_ada": 113498.98432309166,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.30177938485793476,
+   "pb": 0.34004236908283547,
+   "sqrt_pa": [
+    549344504713,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    583131519542,
+    1000000000000
+   ],
+   "L": 1076102037826
+  },
+  {
+   "id": "cl:ADA/USDM:vyfi:+2",
+   "ladder": "vyfi:6693ff109ef34fe7487fb4afb4eb66bc15fb6f5b7a5c84606a66f7bd",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad.0014df105553444d",
+   "ra": 23600947796,
+   "rb": 0,
+   "tvl_ada": 23600.947796987213,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 2,
+   "pa": 0.34004236908283547,
+   "pb": 0.38315676475349886,
+   "sqrt_pa": [
+    583131519542,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    618996578951,
+    1000000000000
+   ],
+   "L": 237526820347
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v1:-2",
+   "ladder": "wingriders-v1:fed9b5cf643ca2fc64fe57f94a6255b460f57a0c31030005601c1785b6b910e7",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 13447415986,
+   "tvl_ada": 47706.56555921081,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -2,
+   "pa": 0.993228411786855,
+   "pb": 1.0046045762374007,
+   "sqrt_pa": [
+    996608454603,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1002299643938,
+    1000000000000
+   ],
+   "L": 2362848113890
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v1:-1",
+   "ladder": "wingriders-v1:fed9b5cf643ca2fc64fe57f94a6255b460f57a0c31030005601c1785b6b910e7",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 54586256084,
+   "tvl_ada": 193652.28287088952,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 1.0046045762374007,
+   "pb": 1.0161110401397846,
+   "sqrt_pa": [
+    1002299643938,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1008023333133,
+    1000000000000
+   ],
+   "L": 9536900803713
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v1:+0",
+   "ladder": "wingriders-v1:fed9b5cf643ca2fc64fe57f94a6255b460f57a0c31030005601c1785b6b910e7",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 54035653843,
+   "rb": 939059223,
+   "tvl_ada": 198156.05547620513,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 1.0161110401397846,
+   "pb": 1.0277492959080115,
+   "sqrt_pa": [
+    1008023333133,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1013779707781,
+    1000000000000
+   ],
+   "L": 9756852984076
+  },
+  {
+   "id": "cl:DJED/iUSD:wingriders-v1:+1",
+   "ladder": "wingriders-v1:fed9b5cf643ca2fc64fe57f94a6255b460f57a0c31030005601c1785b6b910e7",
+   "venue": "sundae-v4-cl",
+   "a": "8db269c3ec630e06ae29f74bc39edd1f87c819f1056206e879a1cd61.446a65644d6963726f555344",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 14185451389,
+   "rb": 0,
+   "tvl_ada": 51145.39906720503,
+   "fee": 0.0005,
+   "fee_source": "stable tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 1.0277492959080115,
+   "pb": 1.039520853049785,
+   "sqrt_pa": [
+    1013779707781,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    1019568954534,
+    1000000000000
+   ],
+   "L": 2532685686614
+  },
+  {
+   "id": "cl:ADA/USDCx:cswap:-1",
+   "ladder": "cswap:37834c1d8615d6e5d2ec1c631f00d6f352ffd1ef16541204b9717661",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 0,
+   "rb": 15527855130,
+   "tvl_ada": 55623.391308977356,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.19405117526734092,
+   "pb": 0.23357910327216422,
+   "sqrt_pa": [
+    440512400810,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    483300220642,
+    1000000000000
+   ],
+   "L": 362903629840
+  },
+  {
+   "id": "cl:ADA/USDCx:cswap:+0",
+   "ladder": "cswap:37834c1d8615d6e5d2ec1c631f00d6f352ffd1ef16541204b9717661",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 8379605941,
+   "rb": 56034555596,
+   "tvl_ada": 209104.81793012554,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.23357910327216422,
+   "pb": 0.2811588098359265,
+   "sqrt_pa": [
+    483300220642,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    530244104009,
+    1000000000000
+   ],
+   "L": 1243658685508
+  },
+  {
+   "id": "cl:ADA/USDCx:cswap:+1",
+   "ladder": "cswap:37834c1d8615d6e5d2ec1c631f00d6f352ffd1ef16541204b9717661",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378",
+   "ra": 198359739636,
+   "rb": 0,
+   "tvl_ada": 198359.73963621748,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.2811588098359265,
+   "pb": 0.3384304299526573,
+   "sqrt_pa": [
+    530244104009,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    581747737385,
+    1000000000000
+   ],
+   "L": 1188026731401
+  },
+  {
+   "id": "cl:ADA/iUSD:wingriders-v1:-1",
+   "ladder": "wingriders-v1:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 0,
+   "rb": 30455832102,
+   "tvl_ada": 108046.27092105216,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": -1,
+   "pa": 0.2425087849823591,
+   "pb": 0.27097919170182444,
+   "sqrt_pa": [
+    492451809807,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    520556617191,
+    1000000000000
+   ],
+   "L": 1083652048771
+  },
+  {
+   "id": "cl:ADA/iUSD:wingriders-v1:+0",
+   "ladder": "wingriders-v1:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 152540657958,
+   "rb": 23878716084,
+   "tvl_ada": 237253.70137756102,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 0,
+   "pa": 0.27097919170182444,
+   "pb": 0.3027920095377808,
+   "sqrt_pa": [
+    520556617191,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    550265399183,
+    1000000000000
+   ],
+   "L": 2303801158935
+  },
+  {
+   "id": "cl:ADA/iUSD:wingriders-v1:+1",
+   "ladder": "wingriders-v1:452089abb5bf8cc59b678a2cd7b9ee952346c6c0aa1cf27df324310a70d02fc3",
+   "venue": "sundae-v4-cl",
+   "a": "ada.lovelace",
+   "b": "f66d78b4a3cb3d37afa0ec36461e51ecbde00f26c8f0a68f94b69880.69555344",
+   "ra": 56359619405,
+   "rb": 0,
+   "tvl_ada": 56359.61940516062,
+   "fee": 0.003,
+   "fee_source": "volatile tier (parameter)",
+   "curve": "concentrated_liquidity",
+   "band": 1,
+   "pa": 0.3027920095377808,
+   "pb": 0.33833963583747106,
+   "sqrt_pa": [
+    550265399183,
+    1000000000000
+   ],
+   "sqrt_pb": [
+    581669696510,
+    1000000000000
+   ],
+   "L": 574417437284
+  }
+ ]
+}
