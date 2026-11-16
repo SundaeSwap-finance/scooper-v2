@@ -1849,6 +1849,7 @@ pub(crate) mod replay_tests {
                 tx_hash,
                 &mainnet_slots(),
                 None,
+                crate::sundaev4::evaluator::SCRIPT_BUDGET,
             )?;
             Ok(result.budgets)
         }
