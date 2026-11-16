@@ -531,20 +531,37 @@ pub enum NodeSubmitError {
 pub async fn submit_via_node(
     socket_path: &str,
     network_magic: u64,
+    node_era: &tokio::sync::OnceCell<u16>,
     cbor: &[u8],
 ) -> Result<(), NodeSubmitError> {
     use pallas_network::miniprotocols::localtxsubmission::{EraTx, Response};
-    const CONWAY_ERA: u16 = 6;
     let mut client = pallas_network::facades::NodeClient::connect(socket_path, network_magic)
         .await
         .map_err(|e| NodeSubmitError::Transport(e.to_string()))?;
-    let result = client.submission().submit_tx(EraTx(CONWAY_ERA, cbor.to_vec())).await;
+    let era = match node_era.get_or_try_init(|| current_era(&mut client)).await {
+        Ok(era) => *era,
+        Err(e) => {
+            client.abort().await;
+            return Err(NodeSubmitError::Transport(e.to_string()));
+        }
+    };
+    let result = client.submission().submit_tx(EraTx(era, cbor.to_vec())).await;
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
         Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(format!("{reason:?}"))),
         Err(e) => Err(NodeSubmitError::Transport(e.to_string())),
     }
+}
+
+/// The node's current hard-fork era index, the era its ledger validates a
+/// submitted tx in.
+async fn current_era(client: &mut pallas_network::facades::NodeClient) -> anyhow::Result<u16> {
+    use pallas_network::miniprotocols::localstate::queries_v16;
+    client.statequery().acquire(None).await?;
+    let era = queries_v16::get_current_era(client.statequery()).await?;
+    client.statequery().send_release().await?;
+    Ok(era)
 }
 
 struct SeenTx {

@@ -90,6 +90,9 @@ pub struct Scooper {
     /// (socket path, network magic) for local-node submission of scoops
     /// that chain on provisional parents.
     v4_node_submit: Option<(String, u64)>,
+    /// The node's era, read on the first local-node submission: it does not
+    /// change while the scooper runs.
+    v4_node_era: tokio::sync::OnceCell<u16>,
     /// (tx hash, consecutive node-reject count) — a tx rejected repeatedly
     /// is structurally stuck, not transiently contested.
     last_node_reject: Option<(String, u32)>,
@@ -177,6 +180,7 @@ impl Scooper {
             quarantine: BTreeMap::new(),
             v4_provisional,
             v4_node_submit,
+            v4_node_era: tokio::sync::OnceCell::new(),
             last_node_reject: None,
             v4_butane,
             v4_intents,
@@ -2553,7 +2557,14 @@ impl Scooper {
                         "chained scoop: submitting via local node",
                     );
                 }
-                match crate::mempool::submit_via_node(socket, *magic, &final_tx.cbor).await {
+                match crate::mempool::submit_via_node(
+                    socket,
+                    *magic,
+                    &self.v4_node_era,
+                    &final_tx.cbor,
+                )
+                .await
+                {
                     Ok(()) => Ok(final_tx.tx_hash_hex.clone()),
                     Err(e @ crate::mempool::NodeSubmitError::Rejected(_)) => Err(e.into()),
                     Err(crate::mempool::NodeSubmitError::Transport(e)) if !is_chained => {
