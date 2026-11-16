@@ -33,6 +33,9 @@ mod server;
 mod sundaev3;
 mod sundaev4;
 
+#[path = "../bench/common/bench_common.rs"]
+mod bench_common;
+
 #[path = "../bench/route-quality/route_quality.rs"]
 mod route_quality;
 

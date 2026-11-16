@@ -44,7 +44,7 @@ The rust command accepts the following options:
 | option | default | meaning |
 |---|---|---|
 | `--market` | `bench/route-quality/data/market-v4-extrapolated.json` | market file (see below) |
-| `--blueprint` | `bench/route-quality/data/devnet-blueprint-without-traces.json` | scooper-format blueprint |
+| `--blueprint` | `bench/common/devnet-blueprint-without-traces.json` | scooper-format blueprint (shared by the benches) |
 | `--pairs` | `ADA-USDM,ADA-NIGHT,ADA-SNEK,SNEK-USDM,NIGHT-USDCx` | trades, A-Z tickers |
 | `--sizes` | `500000,1000000,2000000,5000000` | order sizes, USD |
 | `--mainnet-limit` | `16384,16500000,10000000000` | lower tx limit, bytes,mem,steps |
