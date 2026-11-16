@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pallas_traverse::MultiEraTx;
+use pallas_traverse::{Era, MultiEraTx};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -653,6 +653,13 @@ async fn monitor_loop(
     }
 }
 
+/// Decode a mempool transaction in the era the node reports for it
+/// (hard-fork index; pallas tags are one higher).
+fn decode_mempool_tx(era: u8, raw: &[u8]) -> anyhow::Result<MultiEraTx<'_>> {
+    let era = Era::try_from(u16::from(era) + 1)?;
+    Ok(MultiEraTx::decode_for_era(era, raw)?)
+}
+
 async fn watch_mempool(
     client: &mut pallas_network::facades::NodeClient,
     watch: &ProtocolWatch,
@@ -717,7 +724,7 @@ async fn watch_mempool(
         let mut current: BTreeSet<Vec<u8>> = BTreeSet::new();
         while let Some((era, body)) = monitor.query_next_tx().await? {
             let raw: &[u8] = body.0.as_ref();
-            let tx = match MultiEraTx::decode(raw) {
+            let tx = match decode_mempool_tx(era, raw) {
                 Ok(tx) => tx,
                 Err(e) => {
                     debug!(era, error = %e, "mempool tx failed to decode; skipping");
