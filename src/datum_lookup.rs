@@ -25,7 +25,7 @@ impl DatumLookup {
         self.datums.contains_key(&hash)
     }
 
-    pub fn for_tx<'a>(&'a self, tx: &MultiEraTx<'a>) -> ScopedDatumLookup<'a> {
+    pub fn for_tx<'a, 'tx: 'a>(&'a self, tx: &MultiEraTx<'tx>) -> ScopedDatumLookup<'a> {
         let data = tx
             .plutus_data()
             .iter()
