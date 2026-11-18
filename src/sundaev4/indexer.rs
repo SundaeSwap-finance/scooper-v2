@@ -748,20 +748,15 @@ impl SundaeV4Indexer {
         extract_cs_config_from_tx(tx, cs_hash)
     }
 
-    /// Scans the outputs one transaction body produces: pools, orders,
-    /// settings, wallet and reference UTxOs. Every output is keyed by
-    /// `view.hash()`, and datum hashes resolve from the metadata and witness
-    /// set of `view` itself. Spends are not handled here.
-    fn scan_outputs(
+    /// Records the datums `view` publishes in its metadata. They resolve
+    /// datum hashes in every body of the transaction, and after a restart.
+    fn record_metadata_datums(
         &self,
         view: &MultiEraTx,
         slot: u64,
         state: &mut SundaeV4State,
-        module_cache: &mut PoolModuleConfigCache,
         changes: &mut TxChanges,
-        out: &mut ProducedOutputs,
-    ) -> Result<()> {
-        let this_tx_hash = view.hash();
+    ) {
         for new_datum in self.extract_metadata_datums(view) {
             let persisted = PersistedDatum {
                 hash: Hasher::<256>::hash(&new_datum.0).to_vec(),
@@ -772,7 +767,25 @@ impl SundaeV4Indexer {
             changes.metadata_datums.push(persisted);
             state.datums.add_metadata_datum(new_datum);
         }
+    }
 
+    /// Scans the outputs one transaction body produces: pools, orders,
+    /// settings, wallet and reference UTxOs. Every output is keyed by
+    /// `body_id`, the id of `view`. Datum hashes resolve from the witness set
+    /// of `view` itself and from the metadata datums already recorded.
+    /// Spends are not handled here.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_outputs(
+        &self,
+        view: &MultiEraTx,
+        body_id: pallas_crypto::hash::Hash<32>,
+        slot: u64,
+        state: &mut SundaeV4State,
+        module_cache: &mut PoolModuleConfigCache,
+        changes: &mut TxChanges,
+        out: &mut ProducedOutputs,
+    ) -> Result<()> {
+        let this_tx_hash = body_id;
         let datums = state.datums.for_tx(view);
 
         // Try to extract per-module configs from this tx's Create/Operate
@@ -1589,9 +1602,18 @@ impl ChainIndex for SundaeV4Indexer {
         } else {
             vec![]
         };
-        for view in std::iter::once(&tx).chain(&sub_transactions) {
+        let bodies: Vec<_> = std::iter::once((this_tx_hash, &tx))
+            .chain(sub_transactions.iter().map(|sub| (sub.hash(), sub)))
+            .collect();
+        // Metadata datums of all bodies first: an output can use a datum
+        // that a later body publishes, as it can after a restart.
+        for (_, view) in &bodies {
+            self.record_metadata_datums(view, slot, state, &mut changes);
+        }
+        for (body_id, view) in &bodies {
             self.scan_outputs(
                 view,
+                *body_id,
                 slot,
                 state,
                 &mut module_cache,
@@ -1843,10 +1865,12 @@ impl ChainIndex for SundaeV4Indexer {
                 }
             }
             if known_pool_idents.contains(id) {
+                // The body that produced the pool output, which is a
+                // sub-transaction when the pool moved inside one.
                 events.push(IndexEvent::V4PoolUpdated {
                     id: id.clone(),
                     pool: pool.clone(),
-                    tx_id: tx_id_hex.clone(),
+                    tx_id: hex::encode(pool.input.0.transaction_id),
                 });
             } else {
                 events.push(IndexEvent::V4PoolCreated {
@@ -2476,6 +2500,8 @@ mod sub_transaction_tests {
     const ORDER_SCRIPT_HASH: &str = "c323b9545afa6826b4121c048634ec168d78fa6f2349198169ff76f7";
     const DATUM_DECODED: &str = "constraint decode:";
     const DATUM_MISSING: &str = "no datum";
+    const POOL_SCRIPT_HASH: [u8; 28] = [0x11; 28];
+    const POOL_NFT_POLICY: [u8; 28] = [0x22; 28];
 
     fn fixture() -> Vec<u8> {
         hex::decode(include_str!("../../testdata/musashi-ca89430c.hex").trim()).unwrap()
@@ -2484,11 +2510,11 @@ mod sub_transaction_tests {
     fn protocol() -> SundaeV4Protocol {
         let unused = ScriptHash::from([0u8; 28]);
         SundaeV4Protocol {
-            pool_script_hash: unused,
+            pool_script_hash: ScriptHash::from(POOL_SCRIPT_HASH),
             order_script_hashes: vec![ORDER_SCRIPT_HASH.parse().unwrap()],
             settings_script_hash: unused,
             settings_nft: AssetClass::from_pair((vec![], vec![])),
-            pool_nft_policy: unused,
+            pool_nft_policy: ScriptHash::from(POOL_NFT_POLICY),
             fee_settings_token: None,
             starting_point: Point::Origin,
             execution: None,
@@ -2639,53 +2665,152 @@ mod sub_transaction_tests {
         }
     }
 
-    /// A block-form Dijkstra transaction whose one sub-transaction pays an
-    /// order output carrying a datum hash. The datum preimage goes in the
+    /// `{103251: {hash(datum): [64-byte chunks]}}` when `datum` is given,
+    /// otherwise null.
+    fn auxiliary_data(out: &mut Vec<u8>, datum: Option<&[u8]>) {
+        let Some(datum) = datum else {
+            out.push(0xf6);
+            return;
+        };
+        head(out, 5, 1);
+        head(out, 0, METADATA_DATUM_KEY as usize);
+        head(out, 5, 1);
+        bytes(out, Hasher::<256>::hash(datum).as_ref());
+        head(out, 4, datum.chunks(64).count());
+        for chunk in datum.chunks(64) {
+            bytes(out, chunk);
+        }
+    }
+
+    /// A script address with no stake part.
+    fn script_address(script_hash: &[u8]) -> Vec<u8> {
+        let mut address = vec![0x70];
+        address.extend_from_slice(script_hash);
+        address
+    }
+
+    /// An order output that carries the hash of `datum`.
+    fn order_output(datum: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        head(&mut out, 5, 3);
+        head(&mut out, 0, 0);
+        bytes(
+            &mut out,
+            &script_address(&hex::decode(ORDER_SCRIPT_HASH).unwrap()),
+        );
+        head(&mut out, 0, 1);
+        head(&mut out, 0, 2_000_000);
+        head(&mut out, 0, 2);
+        head(&mut out, 4, 2);
+        head(&mut out, 0, 0);
+        bytes(&mut out, Hasher::<256>::hash(datum).as_ref());
+        out
+    }
+
+    /// A pool output: the pool NFT of `ident` and an inline pool datum.
+    fn pool_output(ident: &[u8]) -> Vec<u8> {
+        let ada = AssetClass::from_pair((vec![], vec![]));
+        let datum = PoolDatum {
+            assets: vec![
+                (ada.clone(), crate::bigint::BigInt::from(1_000_000i64)),
+                (ada, crate::bigint::BigInt::from(1_000_000i64)),
+            ],
+            total_lp: crate::bigint::BigInt::from(1_000_000i64),
+            circulating_lp: crate::bigint::BigInt::from(1_000_000i64),
+            preminted_lp: crate::bigint::BigInt::from(0i64),
+            identifier: Ident::new(ident),
+            actions: vec![],
+            module_state: vec![],
+            min_surplus: crate::bigint::BigInt::from(0i64),
+            extension: crate::sundaev4::types::plutus_void(),
+        };
+        let datum = minicbor::to_vec(datum.to_plutus()).unwrap();
+        let mut nft = CIP_67_ASSET_LABEL_222.to_vec();
+        nft.extend_from_slice(ident);
+
+        let mut out = vec![];
+        head(&mut out, 5, 3);
+        head(&mut out, 0, 0);
+        bytes(&mut out, &script_address(&POOL_SCRIPT_HASH));
+        head(&mut out, 0, 1);
+        head(&mut out, 4, 2);
+        head(&mut out, 0, 2_000_000);
+        head(&mut out, 5, 1);
+        bytes(&mut out, &POOL_NFT_POLICY);
+        head(&mut out, 5, 1);
+        bytes(&mut out, &nft);
+        head(&mut out, 0, 1);
+        head(&mut out, 0, 2);
+        head(&mut out, 4, 2);
+        head(&mut out, 0, 1);
+        out.extend([0xd8, 24]); // tag 24: encoded CBOR
+        bytes(&mut out, &datum);
+        out
+    }
+
+    /// One body of a synthetic transaction.
+    #[derive(Default)]
+    struct Body {
+        /// Encoded outputs.
+        outputs: Vec<Vec<u8>>,
+        /// A datum in the body's witness set.
+        witness_datum: Option<Vec<u8>>,
+        /// A datum the body publishes in its metadata.
+        metadata_datum: Option<Vec<u8>>,
+    }
+
+    /// `0: [], 1: [outputs]`: no inputs.
+    fn inputs_and_outputs(out: &mut Vec<u8>, outputs: &[Vec<u8>]) {
+        head(out, 0, 0);
+        head(out, 4, 0);
+        head(out, 0, 1);
+        head(out, 4, outputs.len());
+        for output in outputs {
+            out.extend_from_slice(output);
+        }
+    }
+
+    /// A block-form Dijkstra transaction: `parent` with fee 0 and the
+    /// sub-transactions `subs` in body field 23.
+    fn dijkstra_tx(parent: Body, subs: Vec<Body>, valid: bool) -> Vec<u8> {
+        let mut tx = vec![];
+        head(&mut tx, 4, 4);
+        head(&mut tx, 5, if subs.is_empty() { 3 } else { 4 });
+        inputs_and_outputs(&mut tx, &parent.outputs);
+        head(&mut tx, 0, 2);
+        head(&mut tx, 0, 0);
+        if !subs.is_empty() {
+            head(&mut tx, 0, 23);
+            head(&mut tx, 4, subs.len());
+            for sub in &subs {
+                head(&mut tx, 4, 3);
+                head(&mut tx, 5, 2);
+                inputs_and_outputs(&mut tx, &sub.outputs);
+                witnesses(&mut tx, sub.witness_datum.as_deref());
+                auxiliary_data(&mut tx, sub.metadata_datum.as_deref());
+            }
+        }
+        witnesses(&mut tx, parent.witness_datum.as_deref());
+        auxiliary_data(&mut tx, parent.metadata_datum.as_deref());
+        tx.push(if valid { 0xf5 } else { 0xf4 });
+        tx
+    }
+
+    /// A transaction whose one sub-transaction pays an order output that
+    /// carries a datum hash. The datum preimage goes in the
     /// sub-transaction's witness set, the parent's, or neither.
     fn sub_tx_with_hashed_order(in_sub: bool, in_parent: bool, valid: bool) -> Vec<u8> {
         let datum = order_datum();
-        let datum_hash = Hasher::<256>::hash(&datum);
-        let mut address = vec![0x70];
-        address.extend_from_slice(&hex::decode(ORDER_SCRIPT_HASH).unwrap());
-
-        let mut tx = vec![];
-        head(&mut tx, 4, 4);
-        // Parent body: no inputs, no outputs, fee 0, one sub-transaction.
-        head(&mut tx, 5, 4);
-        head(&mut tx, 0, 0);
-        head(&mut tx, 4, 0);
-        head(&mut tx, 0, 1);
-        head(&mut tx, 4, 0);
-        head(&mut tx, 0, 2);
-        head(&mut tx, 0, 0);
-        head(&mut tx, 0, 23);
-        head(&mut tx, 4, 1);
-        {
-            head(&mut tx, 4, 3);
-            // Sub-transaction body: one order output.
-            head(&mut tx, 5, 2);
-            head(&mut tx, 0, 0);
-            head(&mut tx, 4, 0);
-            head(&mut tx, 0, 1);
-            head(&mut tx, 4, 1);
-            {
-                head(&mut tx, 5, 3);
-                head(&mut tx, 0, 0);
-                bytes(&mut tx, &address);
-                head(&mut tx, 0, 1);
-                head(&mut tx, 0, 2_000_000);
-                head(&mut tx, 0, 2);
-                head(&mut tx, 4, 2);
-                head(&mut tx, 0, 0);
-                bytes(&mut tx, datum_hash.as_ref());
-            }
-            witnesses(&mut tx, in_sub.then_some(&datum[..]));
-            tx.push(0xf6); // no auxiliary data
-        }
-        witnesses(&mut tx, in_parent.then_some(&datum[..]));
-        tx.push(0xf6); // no auxiliary data
-        tx.push(if valid { 0xf5 } else { 0xf4 });
-        tx
+        let parent = Body {
+            witness_datum: in_parent.then(|| datum.clone()),
+            ..Default::default()
+        };
+        let sub = Body {
+            outputs: vec![order_output(&datum)],
+            witness_datum: in_sub.then(|| datum.clone()),
+            ..Default::default()
+        };
+        dijkstra_tx(parent, vec![sub], valid)
     }
 
     fn sub_tx_id(tx: &[u8]) -> String {
@@ -2719,5 +2844,70 @@ mod sub_transaction_tests {
         let (invalid, valid) = index(&sub_tx_with_hashed_order(true, false, false)).await;
         assert!(invalid.is_empty(), "{invalid:?}");
         assert!(valid.is_empty(), "{valid:?}");
+    }
+
+    /// Metadata datums are shared by all bodies of a transaction, as they
+    /// are after a restart: a parent order resolves a datum that its
+    /// sub-transaction publishes.
+    #[tokio::test]
+    async fn a_datum_hash_resolves_from_a_later_bodys_metadata() {
+        let datum = order_datum();
+        let parent = Body {
+            outputs: vec![order_output(&datum)],
+            ..Default::default()
+        };
+        let sub = Body {
+            metadata_datum: Some(datum),
+            ..Default::default()
+        };
+        let tx = dijkstra_tx(parent, vec![sub], true);
+        let parent_id = hex::encode(MultiEraTx::decode(&tx).unwrap().hash());
+
+        let (invalid, _) = index(&tx).await;
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, format!("{parent_id}#0"));
+        assert!(invalid[0].1.starts_with(DATUM_DECODED), "{}", invalid[0].1);
+    }
+
+    /// `v4_pool_updated` names the body that holds the new pool output, so
+    /// a subscriber can find the output there.
+    #[tokio::test]
+    async fn a_pool_moved_by_a_sub_transaction_is_reported_under_its_id() {
+        let ident = [0xab; 28];
+        let create = dijkstra_tx(
+            Body {
+                outputs: vec![pool_output(&ident)],
+                ..Default::default()
+            },
+            vec![],
+            true,
+        );
+        let moved = dijkstra_tx(
+            Body::default(),
+            vec![Body {
+                outputs: vec![pool_output(&ident)],
+                ..Default::default()
+            }],
+            true,
+        );
+
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+        let (mut node, _) = start(&*persistence).await;
+        let mut events = node.event_tx.subscribe();
+        for (slot, tx) in [(1000, &create), (1001, &moved)] {
+            let at = block(slot);
+            node.handle_block(&at).await.unwrap();
+            node.handle_onchain_tx_bytes(&at, tx).await.unwrap();
+        }
+
+        let mut updated = vec![];
+        while let Ok((_, batch)) = events.try_recv() {
+            for event in batch {
+                if let IndexEvent::V4PoolUpdated { tx_id, .. } = event {
+                    updated.push(tx_id);
+                }
+            }
+        }
+        assert_eq!(updated, vec![sub_tx_id(&moved)]);
     }
 }
