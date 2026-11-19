@@ -1212,8 +1212,8 @@ impl SundaeV4Indexer {
     }
 }
 
-/// What the output scan of one transaction body found, before it is applied
-/// to the state.
+/// What the output scans of a transaction's bodies found, before it is
+/// applied to the state. Every body adds to the same value.
 #[derive(Default)]
 struct ProducedOutputs {
     updated_pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
@@ -2770,9 +2770,16 @@ mod sub_transaction_tests {
         }
     }
 
+    /// The phase-2 result of a whole transaction.
+    #[derive(Clone, Copy)]
+    enum Phase2 {
+        Valid,
+        Failed,
+    }
+
     /// A block-form Dijkstra transaction: `parent` with fee 0 and the
     /// sub-transactions `subs` in body field 23.
-    fn dijkstra_tx(parent: Body, subs: Vec<Body>, valid: bool) -> Vec<u8> {
+    fn dijkstra_tx(parent: Body, subs: Vec<Body>, phase2: Phase2) -> Vec<u8> {
         let mut tx = vec![];
         head(&mut tx, 4, 4);
         head(&mut tx, 5, if subs.is_empty() { 3 } else { 4 });
@@ -2792,25 +2799,34 @@ mod sub_transaction_tests {
         }
         witnesses(&mut tx, parent.witness_datum.as_deref());
         auxiliary_data(&mut tx, parent.metadata_datum.as_deref());
-        tx.push(if valid { 0xf5 } else { 0xf4 });
+        tx.push(match phase2 {
+            Phase2::Valid => 0xf5,
+            Phase2::Failed => 0xf4,
+        });
         tx
     }
 
+    /// The body whose witness set carries the order datum.
+    enum DatumIn {
+        Sub,
+        Parent,
+    }
+
     /// A transaction whose one sub-transaction pays an order output that
-    /// carries a datum hash. The datum preimage goes in the
-    /// sub-transaction's witness set, the parent's, or neither.
-    fn sub_tx_with_hashed_order(in_sub: bool, in_parent: bool, valid: bool) -> Vec<u8> {
+    /// carries a datum hash. The datum preimage goes in the witness set of
+    /// `datum_in`.
+    fn sub_tx_with_hashed_order(datum_in: DatumIn, phase2: Phase2) -> Vec<u8> {
         let datum = order_datum();
         let parent = Body {
-            witness_datum: in_parent.then(|| datum.clone()),
+            witness_datum: matches!(datum_in, DatumIn::Parent).then(|| datum.clone()),
             ..Default::default()
         };
         let sub = Body {
             outputs: vec![order_output(&datum)],
-            witness_datum: in_sub.then(|| datum.clone()),
+            witness_datum: matches!(datum_in, DatumIn::Sub).then(|| datum.clone()),
             ..Default::default()
         };
-        dijkstra_tx(parent, vec![sub], valid)
+        dijkstra_tx(parent, vec![sub], phase2)
     }
 
     fn sub_tx_id(tx: &[u8]) -> String {
@@ -2819,7 +2835,7 @@ mod sub_transaction_tests {
 
     #[tokio::test]
     async fn a_datum_hash_resolves_from_the_sub_transactions_own_witnesses() {
-        let tx = sub_tx_with_hashed_order(true, false, true);
+        let tx = sub_tx_with_hashed_order(DatumIn::Sub, Phase2::Valid);
         let (invalid, _) = index(&tx).await;
         assert_eq!(invalid.len(), 1, "{invalid:?}");
         assert_eq!(invalid[0].0, format!("{}#0", sub_tx_id(&tx)));
@@ -2830,7 +2846,7 @@ mod sub_transaction_tests {
     /// does not decode an output of the sub-transaction.
     #[tokio::test]
     async fn a_datum_hash_does_not_resolve_from_the_parents_witnesses() {
-        let tx = sub_tx_with_hashed_order(false, true, true);
+        let tx = sub_tx_with_hashed_order(DatumIn::Parent, Phase2::Valid);
         let (invalid, _) = index(&tx).await;
         assert_eq!(invalid.len(), 1, "{invalid:?}");
         assert_eq!(invalid[0].0, format!("{}#0", sub_tx_id(&tx)));
@@ -2841,7 +2857,7 @@ mod sub_transaction_tests {
     /// parent's collateral return; its sub-transactions produce nothing.
     #[tokio::test]
     async fn a_failed_transaction_indexes_no_sub_transaction_output() {
-        let (invalid, valid) = index(&sub_tx_with_hashed_order(true, false, false)).await;
+        let (invalid, valid) = index(&sub_tx_with_hashed_order(DatumIn::Sub, Phase2::Failed)).await;
         assert!(invalid.is_empty(), "{invalid:?}");
         assert!(valid.is_empty(), "{valid:?}");
     }
@@ -2860,7 +2876,7 @@ mod sub_transaction_tests {
             metadata_datum: Some(datum),
             ..Default::default()
         };
-        let tx = dijkstra_tx(parent, vec![sub], true);
+        let tx = dijkstra_tx(parent, vec![sub], Phase2::Valid);
         let parent_id = hex::encode(MultiEraTx::decode(&tx).unwrap().hash());
 
         let (invalid, _) = index(&tx).await;
@@ -2880,7 +2896,7 @@ mod sub_transaction_tests {
                 ..Default::default()
             },
             vec![],
-            true,
+            Phase2::Valid,
         );
         let moved = dijkstra_tx(
             Body::default(),
@@ -2888,7 +2904,7 @@ mod sub_transaction_tests {
                 outputs: vec![pool_output(&ident)],
                 ..Default::default()
             }],
-            true,
+            Phase2::Valid,
         );
 
         let persistence = connect(&PersistenceConfig::default()).await.unwrap();
