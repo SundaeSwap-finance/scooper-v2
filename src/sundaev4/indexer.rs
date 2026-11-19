@@ -2632,7 +2632,15 @@ mod sub_transaction_tests {
         minicbor::to_vec(&datum).unwrap()
     }
 
-    /// Minimal CBOR writer for the synthetic transactions below.
+    // CBOR major types: the first argument of `head`.
+    const UINT: u8 = 0;
+    const BYTES: u8 = 2;
+    const ARRAY: u8 = 4;
+    const MAP: u8 = 5;
+
+    /// Minimal CBOR writer for the synthetic transactions below: the head of
+    /// an item of type `major`. `n` is the value of a `UINT`, the length of
+    /// `BYTES`, or the number of entries of an `ARRAY` or `MAP`.
     fn head(out: &mut Vec<u8>, major: u8, n: usize) {
         let major = major << 5;
         match n {
@@ -2649,19 +2657,19 @@ mod sub_transaction_tests {
         }
     }
     fn bytes(out: &mut Vec<u8>, b: &[u8]) {
-        head(out, 2, b.len());
+        head(out, BYTES, b.len());
         out.extend_from_slice(b);
     }
     /// `{4: [datum]}` when `datum` is given, otherwise `{}`.
     fn witnesses(out: &mut Vec<u8>, datum: Option<&[u8]>) {
         match datum {
             Some(d) => {
-                head(out, 5, 1);
-                head(out, 0, 4);
-                head(out, 4, 1);
+                head(out, MAP, 1);
+                head(out, UINT, 4);
+                head(out, ARRAY, 1);
                 out.extend_from_slice(d);
             }
-            None => head(out, 5, 0),
+            None => head(out, MAP, 0),
         }
     }
 
@@ -2672,11 +2680,11 @@ mod sub_transaction_tests {
             out.push(0xf6);
             return;
         };
-        head(out, 5, 1);
-        head(out, 0, METADATA_DATUM_KEY as usize);
-        head(out, 5, 1);
+        head(out, MAP, 1);
+        head(out, UINT, METADATA_DATUM_KEY as usize);
+        head(out, MAP, 1);
         bytes(out, Hasher::<256>::hash(datum).as_ref());
-        head(out, 4, datum.chunks(64).count());
+        head(out, ARRAY, datum.chunks(64).count());
         for chunk in datum.chunks(64) {
             bytes(out, chunk);
         }
@@ -2692,17 +2700,17 @@ mod sub_transaction_tests {
     /// An order output that carries the hash of `datum`.
     fn order_output(datum: &[u8]) -> Vec<u8> {
         let mut out = vec![];
-        head(&mut out, 5, 3);
-        head(&mut out, 0, 0);
+        head(&mut out, MAP, 3);
+        head(&mut out, UINT, 0);
         bytes(
             &mut out,
             &script_address(&hex::decode(ORDER_SCRIPT_HASH).unwrap()),
         );
-        head(&mut out, 0, 1);
-        head(&mut out, 0, 2_000_000);
-        head(&mut out, 0, 2);
-        head(&mut out, 4, 2);
-        head(&mut out, 0, 0);
+        head(&mut out, UINT, 1);
+        head(&mut out, UINT, 2_000_000);
+        head(&mut out, UINT, 2);
+        head(&mut out, ARRAY, 2);
+        head(&mut out, UINT, 0);
         bytes(&mut out, Hasher::<256>::hash(datum).as_ref());
         out
     }
@@ -2729,20 +2737,20 @@ mod sub_transaction_tests {
         nft.extend_from_slice(ident);
 
         let mut out = vec![];
-        head(&mut out, 5, 3);
-        head(&mut out, 0, 0);
+        head(&mut out, MAP, 3);
+        head(&mut out, UINT, 0);
         bytes(&mut out, &script_address(&POOL_SCRIPT_HASH));
-        head(&mut out, 0, 1);
-        head(&mut out, 4, 2);
-        head(&mut out, 0, 2_000_000);
-        head(&mut out, 5, 1);
+        head(&mut out, UINT, 1);
+        head(&mut out, ARRAY, 2);
+        head(&mut out, UINT, 2_000_000);
+        head(&mut out, MAP, 1);
         bytes(&mut out, &POOL_NFT_POLICY);
-        head(&mut out, 5, 1);
+        head(&mut out, MAP, 1);
         bytes(&mut out, &nft);
-        head(&mut out, 0, 1);
-        head(&mut out, 0, 2);
-        head(&mut out, 4, 2);
-        head(&mut out, 0, 1);
+        head(&mut out, UINT, 1);
+        head(&mut out, UINT, 2);
+        head(&mut out, ARRAY, 2);
+        head(&mut out, UINT, 1);
         out.extend([0xd8, 24]); // tag 24: encoded CBOR
         bytes(&mut out, &datum);
         out
@@ -2761,10 +2769,10 @@ mod sub_transaction_tests {
 
     /// `0: [], 1: [outputs]`: no inputs.
     fn inputs_and_outputs(out: &mut Vec<u8>, outputs: &[Vec<u8>]) {
-        head(out, 0, 0);
-        head(out, 4, 0);
-        head(out, 0, 1);
-        head(out, 4, outputs.len());
+        head(out, UINT, 0);
+        head(out, ARRAY, 0);
+        head(out, UINT, 1);
+        head(out, ARRAY, outputs.len());
         for output in outputs {
             out.extend_from_slice(output);
         }
@@ -2781,17 +2789,17 @@ mod sub_transaction_tests {
     /// sub-transactions `subs` in body field 23.
     fn dijkstra_tx(parent: Body, subs: Vec<Body>, phase2: Phase2) -> Vec<u8> {
         let mut tx = vec![];
-        head(&mut tx, 4, 4);
-        head(&mut tx, 5, if subs.is_empty() { 3 } else { 4 });
+        head(&mut tx, ARRAY, 4);
+        head(&mut tx, MAP, if subs.is_empty() { 3 } else { 4 });
         inputs_and_outputs(&mut tx, &parent.outputs);
-        head(&mut tx, 0, 2);
-        head(&mut tx, 0, 0);
+        head(&mut tx, UINT, 2);
+        head(&mut tx, UINT, 0);
         if !subs.is_empty() {
-            head(&mut tx, 0, 23);
-            head(&mut tx, 4, subs.len());
+            head(&mut tx, UINT, 23);
+            head(&mut tx, ARRAY, subs.len());
             for sub in &subs {
-                head(&mut tx, 4, 3);
-                head(&mut tx, 5, 2);
+                head(&mut tx, ARRAY, 3);
+                head(&mut tx, MAP, 2);
                 inputs_and_outputs(&mut tx, &sub.outputs);
                 witnesses(&mut tx, sub.witness_datum.as_deref());
                 auxiliary_data(&mut tx, sub.metadata_datum.as_deref());
