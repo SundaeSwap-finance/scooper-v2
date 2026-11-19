@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "acropolis_codec"
 version = "0.1.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -19,7 +19,7 @@ dependencies = [
 [[package]]
 name = "acropolis_common"
 version = "0.3.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",
@@ -58,7 +58,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_block_unpacker"
 version = "0.2.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_custom_indexer"
 version = "0.1.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_genesis_bootstrapper"
 version = "0.1.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "acropolis_common",
  "anyhow",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "acropolis_module_mithril_snapshot_fetcher"
 version = "0.1.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
  "acropolis_codec",
  "acropolis_common",
@@ -130,8 +130,9 @@ dependencies = [
 [[package]]
 name = "acropolis_module_peer_network_interface"
 version = "0.2.0"
-source = "git+https://github.com/SundaeSwap-finance/acropolis.git?rev=64da0a851031aee210fbc7053d7d7d803d5e644c#64da0a851031aee210fbc7053d7d7d803d5e644c"
+source = "git+https://github.com/SundaeSwap-finance/acropolis.git?branch=fetch_certified_eb#4316355249b7180e6883e1a66097555b5db69aef"
 dependencies = [
+ "acropolis_codec",
  "acropolis_common",
  "anyhow",
  "caryatid_sdk",
@@ -4211,8 +4212,8 @@ dependencies = [
 
 [[package]]
 name = "pallas"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "pallas-addresses",
  "pallas-codec",
@@ -4228,8 +4229,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-addresses"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "base58",
  "bech32 0.11.1",
@@ -4243,8 +4244,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-codec"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "hex",
  "minicbor 0.26.5",
@@ -4254,8 +4255,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-configs"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "base64 0.22.1",
  "num-rational",
@@ -4269,8 +4270,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-crypto"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "cryptoxide 0.4.4",
  "hex",
@@ -4282,8 +4283,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-hardano"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "binary-layout",
  "hex",
@@ -4302,8 +4303,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-network"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "byteorder",
  "hex",
@@ -4319,8 +4320,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-network2"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "byteorder",
  "chrono",
@@ -4338,8 +4339,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-primitives"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "hex",
  "pallas-codec",
@@ -4350,8 +4351,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-traverse"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "hex",
  "itertools 0.14.0",
@@ -4366,8 +4367,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-txbuilder"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "hex",
  "pallas-addresses",
@@ -4382,8 +4383,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-utxorpc"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "pallas-codec",
  "pallas-crypto",
@@ -4396,8 +4397,8 @@ dependencies = [
 
 [[package]]
 name = "pallas-validate"
-version = "1.5.0-rc.2"
-source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=f64f47880fd33e156adb7c29ea230259f28c6b36#f64f47880fd33e156adb7c29ea230259f28c6b36"
+version = "1.5.0"
+source = "git+https://github.com/SundaeSwap-finance/pallas.git?rev=a41ee10356105b7ebb439c505edf09f1dbed17a5#a41ee10356105b7ebb439c505edf09f1dbed17a5"
 dependencies = [
  "chrono",
  "hex",
