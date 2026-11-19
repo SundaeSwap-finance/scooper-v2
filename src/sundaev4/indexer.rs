@@ -2610,7 +2610,6 @@ mod sub_transaction_tests {
         let at = block(1000);
         node.handle_block(&at).await.unwrap();
         node.handle_onchain_tx_bytes(&at, &fixture()).await.unwrap();
-        node.handle_block(&block(1001)).await.unwrap();
 
         let (_, state) = start(&*persistence).await;
         let history = state.lock().await;
