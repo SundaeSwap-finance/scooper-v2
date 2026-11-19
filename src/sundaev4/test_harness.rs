@@ -292,6 +292,7 @@ impl TestEnv {
             plutus_v2_cost_model: None,
             partial_fill_margin: None,
             partial_fill_fee_estimate: 2_500_000,
+            validity_range: crate::sundaev4::tx_builder::VALIDITY_RANGE,
         };
 
         // Collateral: deterministic UTxO with enough ADA
@@ -408,7 +409,7 @@ impl TestEnv {
             &self.exec,
             // Tests have no wall clock worth consulting: tip and "now"
             // are the same slot, which is the tip-anchored behaviour.
-            crate::sundaev4::tx_builder::ValidityWindow::new(slot, slot),
+            crate::sundaev4::tx_builder::ValidityWindow::new(slot, slot, self.exec.validity_range),
             &self.language_views,
             &self.collateral_utxo,
             &self.collateral_value,

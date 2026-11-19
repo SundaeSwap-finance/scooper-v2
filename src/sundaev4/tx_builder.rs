@@ -240,8 +240,9 @@ pub fn compute_tx_fee(
     size_fee + mem_fee + step_fee + ref_fee
 }
 const POOL_MIN_ADA: u64 = 2_000_000;
-/// How long a scoop stays valid, in slots (= seconds), measured from wall
-/// clock. Five minutes: long enough to survive a multi-block gap on preview.
+/// How long a scoop stays valid by default, in slots (= seconds), measured
+/// from wall clock (`validity-range` in the execution config). Five minutes:
+/// long enough to survive a multi-block gap on preview.
 pub const VALIDITY_RANGE: u64 = 300;
 
 /// A transaction's validity interval, in slots.
@@ -274,10 +275,11 @@ impl ValidityWindow {
     /// behaviour rather than shortening the window; a `now` ahead of `tip`
     /// (the normal case, mid-block-gap) extends the TTL without ever moving
     /// `start` past a slot the chain has reached.
-    pub fn new(tip: u64, now: u64) -> Self {
+    /// `range`: how many slots the tx stays valid after `now` (or `tip`).
+    pub fn new(tip: u64, now: u64, range: u64) -> Self {
         Self {
             start: tip.min(now),
-            ttl: tip.max(now) + VALIDITY_RANGE,
+            ttl: tip.max(now) + range,
         }
     }
 }
@@ -4097,7 +4099,7 @@ mod validity_tests {
         let old_ttl = tip + 180;
         assert!(old_ttl < next_block, "the bug being fixed");
 
-        let w = ValidityWindow::new(tip, now);
+        let w = ValidityWindow::new(tip, now, VALIDITY_RANGE);
         assert!(
             w.ttl > next_block,
             "wall-clock TTL {} must outlive the next block at {next_block}",
@@ -4111,7 +4113,7 @@ mod validity_tests {
     fn start_never_leads_the_chain() {
         // A clock running fast must not stamp a start the chain hasn't hit —
         // the tx would be rejected as not-yet-valid until it caught up.
-        let w = ValidityWindow::new(1_000, 1_500);
+        let w = ValidityWindow::new(1_000, 1_500, VALIDITY_RANGE);
         assert_eq!(w.start, 1_000);
         assert_eq!(w.ttl, 1_500 + VALIDITY_RANGE);
     }
@@ -4120,7 +4122,7 @@ mod validity_tests {
     fn slow_clock_degrades_to_tip_anchoring() {
         // A clock running slow (or a tip we somehow read from the future)
         // must never yield a *shorter* window than tip-anchoring gave us.
-        let w = ValidityWindow::new(2_000, 1_400);
+        let w = ValidityWindow::new(2_000, 1_400, VALIDITY_RANGE);
         assert_eq!(w.start, 1_400);
         assert_eq!(w.ttl, 2_000 + VALIDITY_RANGE);
         assert!(w.ttl >= 2_000 + VALIDITY_RANGE);
@@ -4135,7 +4137,7 @@ mod validity_tests {
                 "TTL must outlast a multi-block preview gap",
             )
         };
-        let w = ValidityWindow::new(500, 500);
+        let w = ValidityWindow::new(500, 500, VALIDITY_RANGE);
         assert_eq!(w.ttl - w.start, VALIDITY_RANGE);
     }
 }

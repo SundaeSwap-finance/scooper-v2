@@ -596,7 +596,7 @@ impl Scooper {
                     // retires the entry silently instead), so its predicted
                     // pool state is never going to exist. Without this the
                     // pool stays pinned behind that prediction until TTL —
-                    // five minutes, since VALIDITY_RANGE went to 300.
+                    // `validity-range`, five minutes by default.
                     let own = <[u8; 32]>::try_from(tx_hash.as_slice())
                         .ok()
                         .map(|h| self.v4_chain_tracker.discard_by_tx_hash(&h.into()))
@@ -704,7 +704,11 @@ impl Scooper {
         // anchors everything that means "now", including the TTL.
         let tip_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
         let current_slot = self.now_slot(tip_slot);
-        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(tip_slot, current_slot);
+        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(
+            tip_slot,
+            current_slot,
+            exec.validity_range,
+        );
 
         // Select collateral. Must cover total_collateral (= final tx_fee * 1.5)
         // plus min UTxO on the collateral return output. We size against
@@ -2199,8 +2203,11 @@ impl Scooper {
         // be stale. Wall clock moves even when the tip doesn't, so this is
         // where a long search pass actually buys back its TTL.
         let tip_slot = v4_state.network_tip_slot.unwrap_or(v4_state.tip_slot);
-        let validity =
-            crate::sundaev4::tx_builder::ValidityWindow::new(tip_slot, self.now_slot(tip_slot));
+        let validity = crate::sundaev4::tx_builder::ValidityWindow::new(
+            tip_slot,
+            self.now_slot(tip_slot),
+            exec.validity_range,
+        );
 
         // Build → evaluate → rebuild with exact budgets.
         //
