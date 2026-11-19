@@ -1256,6 +1256,15 @@ pub struct ScooperExecution {
     /// (conservative; the real fee is known only after building).
     #[serde(default = "default_partial_fill_fee_estimate")]
     pub partial_fill_fee_estimate: u64,
+    /// How long a scoop stays valid, in slots, from wall clock. Default:
+    /// [`crate::sundaev4::tx_builder::VALIDITY_RANGE`]. Must outlast the
+    /// network's inclusion latency, or every scoop expires in the mempool.
+    #[serde(default = "default_validity_range")]
+    pub validity_range: u64,
+}
+
+fn default_validity_range() -> u64 {
+    crate::sundaev4::tx_builder::VALIDITY_RANGE
 }
 
 fn default_partial_fill_fee_estimate() -> u64 {

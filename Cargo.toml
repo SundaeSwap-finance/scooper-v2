@@ -8,12 +8,12 @@ license-file = "LICENSE"
 publish = false
 
 [dependencies]
-acropolis_common = { version = "0.3.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
-acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/input-output-hk/acropolis.git", rev = "2c0a32c" }
+acropolis_common = { version = "0.3.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
+acropolis_module_block_unpacker = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
+acropolis_module_custom_indexer = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
+acropolis_module_genesis_bootstrapper = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
+acropolis_module_mithril_snapshot_fetcher = { version = "0.1.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
+acropolis_module_peer_network_interface = { version = "0.2.0", git = "https://github.com/SundaeSwap-finance/acropolis.git", branch = "fetch_certified_eb" }
 anyhow = "1"
 bech32 = "0.11"
 async-trait = "0.1"
@@ -26,19 +26,23 @@ hex = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-minicbor = { version = "0.25.0", features = ["alloc", "derive"] }
+minicbor = { version = "0.26", features = ["alloc", "derive"] }
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-pallas-addresses = "0.34"
-pallas-codec = "0.34"
-pallas-crypto = "0.34"
-pallas-primitives = "0.34"
-pallas-network = "0.34"
-pallas-traverse = "0.34"
+pallas-addresses = "1.5.0-rc.2"
+pallas-codec = "1.5.0-rc.2"
+pallas-crypto = "1.5.0-rc.2"
+pallas-primitives = { version = "1.5.0-rc.2", features = ["unstable"] }
+pallas-network = { version = "1.5.0-rc.2", features = ["unstable"] }
+# Not used directly: acropolis pulls it, and it must follow pallas-network's
+# `unstable` or its matches on the network types stop being exhaustive.
+pallas-hardano = { version = "1.5.0-rc.2", features = ["unstable"] }
+pallas-traverse = { version = "1.5.0-rc.2", features = ["unstable"] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 rustls-pemfile = "2"
 url = "2"
-plutus-parser = { version = "0.6", features = ["derive"] }
+# SundaeSwap-finance/plutus-parser#12 (pallas 1.5 support), until it is released.
+plutus-parser = { git = "https://github.com/SundaeSwap-finance/plutus-parser.git", branch = "dijkstra", default-features = false, features = ["derive", "pallas-v1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3"
@@ -55,6 +59,23 @@ tracing-subscriber = { version = "0.3", features = [
   "std",
   "json",
 ] }
+
+# Sundae integration branch `leios-musashi`: txpipe/pallas#860 (Dijkstra tx rejections) and
+# #846 (N2N v16, which opens the Leios mini-protocols), until they are released.
+[patch.crates-io]
+pallas = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-addresses = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-codec = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-configs = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-crypto = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-hardano = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-network = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-network2 = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-primitives = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-traverse = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-txbuilder = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-utxorpc = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
+pallas-validate = { git = "https://github.com/SundaeSwap-finance/pallas.git", rev = "a41ee10356105b7ebb439c505edf09f1dbed17a5" }
 
 [dev-dependencies]
 proptest = "1"

@@ -293,6 +293,7 @@ impl TestEnv {
             plutus_v2_cost_model: None,
             partial_fill_margin: None,
             partial_fill_fee_estimate: 2_500_000,
+            validity_range: crate::sundaev4::tx_builder::VALIDITY_RANGE,
         };
 
         // Collateral: deterministic UTxO with enough ADA
@@ -409,7 +410,7 @@ impl TestEnv {
             &self.exec,
             // Tests have no wall clock worth consulting: tip and "now"
             // are the same slot, which is the tip-anchored behaviour.
-            crate::sundaev4::tx_builder::ValidityWindow::new(slot, slot),
+            crate::sundaev4::tx_builder::ValidityWindow::new(slot, slot, self.exec.validity_range),
             &self.language_views,
             &self.collateral_utxo,
             &self.collateral_value,
@@ -462,13 +463,11 @@ impl TestEnv {
                 .outputs
                 .iter()
                 .map(|o| match o {
-                    pallas_primitives::conway::PseudoTransactionOutput::PostAlonzo(b) => {
-                        match &b.value {
-                            pallas_primitives::conway::Value::Coin(c) => *c,
-                            pallas_primitives::conway::Value::Multiasset(c, _) => *c,
-                        }
-                    }
-                    pallas_primitives::conway::PseudoTransactionOutput::Legacy(_) => 0,
+                    pallas_primitives::conway::TransactionOutput::PostAlonzo(b) => match &b.value {
+                        pallas_primitives::conway::Value::Coin(c) => *c,
+                        pallas_primitives::conway::Value::Multiasset(c, _) => *c,
+                    },
+                    pallas_primitives::conway::TransactionOutput::Legacy(_) => 0,
                 })
                 .sum();
             anyhow::ensure!(
@@ -484,7 +483,7 @@ impl TestEnv {
         // Native assets likewise: inputs + mint == outputs, per asset.
         {
             use num_traits::ToPrimitive;
-            use pallas_primitives::conway::{PseudoTransactionOutput, Value as TxValue};
+            use pallas_primitives::conway::{TransactionOutput, Value as TxValue};
             let mut net: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), i128> =
                 std::collections::BTreeMap::new();
             for i in &build.tx_body.inputs {
@@ -511,7 +510,7 @@ impl TestEnv {
                 }
             }
             for o in &build.tx_body.outputs {
-                if let PseudoTransactionOutput::PostAlonzo(b) = o
+                if let TransactionOutput::PostAlonzo(b) = o
                     && let TxValue::Multiasset(_, ma) = &b.value
                 {
                     for (policy, assets) in ma.iter() {

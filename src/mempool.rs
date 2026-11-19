@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pallas_traverse::MultiEraTx;
+use pallas_traverse::{Era, MultiEraTx};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -531,20 +531,37 @@ pub enum NodeSubmitError {
 pub async fn submit_via_node(
     socket_path: &str,
     network_magic: u64,
+    node_era: &tokio::sync::OnceCell<u16>,
     cbor: &[u8],
 ) -> Result<(), NodeSubmitError> {
     use pallas_network::miniprotocols::localtxsubmission::{EraTx, Response};
-    const CONWAY_ERA: u16 = 6;
     let mut client = pallas_network::facades::NodeClient::connect(socket_path, network_magic)
         .await
         .map_err(|e| NodeSubmitError::Transport(e.to_string()))?;
-    let result = client.submission().submit_tx(EraTx(CONWAY_ERA, cbor.to_vec())).await;
+    let era = match node_era.get_or_try_init(|| current_era(&mut client)).await {
+        Ok(era) => *era,
+        Err(e) => {
+            client.abort().await;
+            return Err(NodeSubmitError::Transport(e.to_string()));
+        }
+    };
+    let result = client.submission().submit_tx(EraTx(era, cbor.to_vec())).await;
     client.abort().await;
     match result {
         Ok(Response::Accepted) => Ok(()),
-        Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(hex::encode(&reason.0))),
+        Ok(Response::Rejected(reason)) => Err(NodeSubmitError::Rejected(format!("{reason:?}"))),
         Err(e) => Err(NodeSubmitError::Transport(e.to_string())),
     }
+}
+
+/// The node's current hard-fork era index, the era its ledger validates a
+/// submitted tx in.
+async fn current_era(client: &mut pallas_network::facades::NodeClient) -> anyhow::Result<u16> {
+    use pallas_network::miniprotocols::localstate::queries_v16;
+    client.statequery().acquire(None).await?;
+    let era = queries_v16::get_current_era(client.statequery()).await?;
+    client.statequery().send_release().await?;
+    Ok(era)
 }
 
 struct SeenTx {
@@ -636,6 +653,13 @@ async fn monitor_loop(
     }
 }
 
+/// Decode a mempool transaction in the era the node reports for it
+/// (hard-fork index; pallas tags are one higher).
+fn decode_mempool_tx(era: u8, raw: &[u8]) -> anyhow::Result<MultiEraTx<'_>> {
+    let era = Era::try_from(u16::from(era) + 1)?;
+    Ok(MultiEraTx::decode_for_era(era, raw)?)
+}
+
 async fn watch_mempool(
     client: &mut pallas_network::facades::NodeClient,
     watch: &ProtocolWatch,
@@ -700,7 +724,7 @@ async fn watch_mempool(
         let mut current: BTreeSet<Vec<u8>> = BTreeSet::new();
         while let Some((era, body)) = monitor.query_next_tx().await? {
             let raw: &[u8] = body.0.as_ref();
-            let tx = match MultiEraTx::decode(raw) {
+            let tx = match decode_mempool_tx(era, raw) {
                 Ok(tx) => tx,
                 Err(e) => {
                     debug!(era, error = %e, "mempool tx failed to decode; skipping");
