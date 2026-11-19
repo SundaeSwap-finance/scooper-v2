@@ -1630,6 +1630,13 @@ impl ChainIndex for SundaeV4Indexer {
             mut new_order_configs,
         } = produced;
 
+        // These are the parent tx's inputs only. We can't simply add sub-txs
+        // inputs here because sub-tx redeemers point at positions in their own
+        // sorted input list. Mixing inputs from sub-txs with the parent's
+        // inputs would shift the positions of the inputs so the redeemers would
+        // match the wrong inputs. For now, we shouldn't be seeing orders spent
+        // in sub-txs so this should be enough until Sundae's scripts are
+        // PlutusV4.
         let mut spent_inputs = tx
             .inputs()
             .into_iter()
