@@ -770,22 +770,20 @@ impl SundaeV4Indexer {
     }
 
     /// Scans the outputs one transaction body produces: pools, orders,
-    /// settings, wallet and reference UTxOs. Every output is keyed by
-    /// `body_id`, the id of `view`. Datum hashes resolve from the witness set
-    /// of `view` itself and from the metadata datums already recorded.
-    /// Spends are not handled here.
-    #[allow(clippy::too_many_arguments)]
+    /// settings, wallet and reference UTxOs. Every output is keyed by the id
+    /// of `view`. Datum hashes resolve from the witness set of `view` itself
+    /// and from the metadata datums already recorded. Spends are not handled
+    /// here.
     fn scan_outputs(
         &self,
         view: &MultiEraTx,
-        body_id: pallas_crypto::hash::Hash<32>,
         slot: u64,
         state: &mut SundaeV4State,
         module_cache: &mut PoolModuleConfigCache,
         changes: &mut TxChanges,
         out: &mut ProducedOutputs,
     ) -> Result<()> {
-        let this_tx_hash = body_id;
+        let this_tx_hash = view.hash();
         let datums = state.datums.for_tx(view);
 
         // Try to extract per-module configs from this tx's Create/Operate
@@ -1602,18 +1600,15 @@ impl ChainIndex for SundaeV4Indexer {
         } else {
             vec![]
         };
-        let bodies: Vec<_> = std::iter::once((this_tx_hash, &tx))
-            .chain(sub_transactions.iter().map(|sub| (sub.hash(), sub)))
-            .collect();
+        let bodies: Vec<&MultiEraTx> = std::iter::once(&tx).chain(&sub_transactions).collect();
         // Metadata datums of all bodies first: an output can use a datum
         // that a later body publishes, as it can after a restart.
-        for (_, view) in &bodies {
+        for view in &bodies {
             self.record_metadata_datums(view, slot, state, &mut changes);
         }
-        for (body_id, view) in &bodies {
+        for view in &bodies {
             self.scan_outputs(
                 view,
-                *body_id,
                 slot,
                 state,
                 &mut module_cache,
