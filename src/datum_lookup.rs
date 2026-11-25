@@ -25,10 +25,20 @@ impl DatumLookup {
         self.datums.contains_key(&hash)
     }
 
-    pub fn for_tx<'a, 'tx: 'a>(&'a self, tx: &MultiEraTx<'tx>) -> ScopedDatumLookup<'a> {
+    /// Resolves datum hashes from the witness datums of `tx`, then from the
+    /// metadata datums. Pass `parent` when `tx` is a Dijkstra
+    /// sub-transaction: CIP-118 lets the top-level transaction carry
+    /// supplemental datums for the outputs of its sub-transactions.
+    pub fn for_tx<'a, 'tx: 'a>(
+        &'a self,
+        tx: &MultiEraTx<'tx>,
+        parent: Option<&MultiEraTx<'tx>>,
+    ) -> ScopedDatumLookup<'a> {
+        let parent_data = parent.map(|p| p.plutus_data()).unwrap_or_default();
         let data = tx
             .plutus_data()
             .iter()
+            .chain(parent_data)
             .map(|datum| {
                 let hash = Hasher::<256>::hash(datum.raw_cbor());
                 (hash, datum.clone())

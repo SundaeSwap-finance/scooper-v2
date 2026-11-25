@@ -748,20 +748,15 @@ impl SundaeV4Indexer {
         extract_cs_config_from_tx(tx, cs_hash)
     }
 
-    /// Scans the outputs one transaction body produces: pools, orders,
-    /// settings, wallet and reference UTxOs. Every output is keyed by
-    /// `view.hash()`, and datum hashes resolve from the metadata and witness
-    /// set of `view` itself. Spends are not handled here.
-    fn scan_outputs(
+    /// Records the datums `view` publishes in its metadata. They resolve
+    /// datum hashes in every body of the transaction, and after a restart.
+    fn record_metadata_datums(
         &self,
         view: &MultiEraTx,
         slot: u64,
         state: &mut SundaeV4State,
-        module_cache: &mut PoolModuleConfigCache,
         changes: &mut TxChanges,
-        out: &mut ProducedOutputs,
-    ) -> Result<()> {
-        let this_tx_hash = view.hash();
+    ) {
         for new_datum in self.extract_metadata_datums(view) {
             let persisted = PersistedDatum {
                 hash: Hasher::<256>::hash(&new_datum.0).to_vec(),
@@ -772,8 +767,27 @@ impl SundaeV4Indexer {
             changes.metadata_datums.push(persisted);
             state.datums.add_metadata_datum(new_datum);
         }
+    }
 
-        let datums = state.datums.for_tx(view);
+    /// Scans the outputs one transaction body produces: pools, orders,
+    /// settings, wallet and reference UTxOs. Every output is keyed by the id
+    /// of `view`. Datum hashes resolve from the witness set of `view`, then
+    /// from the witness set of `parent` when `view` is a sub-transaction
+    /// (CIP-118), then from the metadata datums already recorded. Spends are
+    /// not handled here.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_outputs<'tx>(
+        &self,
+        view: &MultiEraTx<'tx>,
+        parent: Option<&MultiEraTx<'tx>>,
+        slot: u64,
+        state: &mut SundaeV4State,
+        module_cache: &mut PoolModuleConfigCache,
+        changes: &mut TxChanges,
+        out: &mut ProducedOutputs,
+    ) -> Result<()> {
+        let this_tx_hash = view.hash();
+        let datums = state.datums.for_tx(view, parent);
 
         // Try to extract per-module configs from this tx's Create/Operate
         // redeemers (if any). For scoop txs without a Create redeemer for a
@@ -1199,8 +1213,8 @@ impl SundaeV4Indexer {
     }
 }
 
-/// What the output scan of one transaction body found, before it is applied
-/// to the state.
+/// What the output scans of a transaction's bodies found, before it is
+/// applied to the state. Every body adds to the same value.
 #[derive(Default)]
 struct ProducedOutputs {
     updated_pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
@@ -1208,7 +1222,7 @@ struct ProducedOutputs {
     new_invalid_orders: Vec<InvalidOrder>,
     new_settings: Option<Arc<SundaeV4Settings>>,
     new_fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>>,
-    /// (token_name, OrderConfig) for settings entries the body creates.
+    /// (token_name, OrderConfig) for settings entries the bodies create.
     new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)>,
 }
 
@@ -1579,14 +1593,46 @@ impl ChainIndex for SundaeV4Indexer {
         // pool outputs read from it, and Create writes a new entry.
         let mut module_cache = self.module_configs.lock().await;
         let mut produced = ProducedOutputs::default();
+        // The parent body first, then each sub-transaction in body order.
+        // Every body's outputs are keyed by its own id. Sub-transaction
+        // outputs exist only if the whole transaction passed phase-2
+        // validation: a failed one produces only the parent's collateral
+        // return. Spends below still read the parent body only (#114).
+        // TODO: a phase-2 invalid transaction is still handled as valid for
+        // the parent body: its regular outputs are scanned and its regular
+        // inputs spent, where the ledger only consumes the collateral inputs
+        // and produces the collateral return.
+        let sub_transactions = if tx.is_valid() {
+            tx.sub_transactions()
+        } else {
+            vec![]
+        };
+        let bodies: Vec<&MultiEraTx> = std::iter::once(&tx).chain(&sub_transactions).collect();
+        // Metadata datums of all bodies first: an output can use a datum
+        // that a later body publishes, as it can after a restart.
+        for view in &bodies {
+            self.record_metadata_datums(view, slot, state, &mut changes);
+        }
         self.scan_outputs(
             &tx,
+            None,
             slot,
             state,
             &mut module_cache,
             &mut changes,
             &mut produced,
         )?;
+        for sub_tx in &sub_transactions {
+            self.scan_outputs(
+                sub_tx,
+                Some(&tx),
+                slot,
+                state,
+                &mut module_cache,
+                &mut changes,
+                &mut produced,
+            )?;
+        }
         let ProducedOutputs {
             mut updated_pools,
             mut new_orders,
@@ -1596,6 +1642,13 @@ impl ChainIndex for SundaeV4Indexer {
             mut new_order_configs,
         } = produced;
 
+        // These are the parent tx's inputs only. We can't simply add sub-txs
+        // inputs here because sub-tx redeemers point at positions in their own
+        // sorted input list. Mixing inputs from sub-txs with the parent's
+        // inputs would shift the positions of the inputs so the redeemers would
+        // match the wrong inputs. For now, we shouldn't be seeing orders spent
+        // in sub-txs so this should be enough until Sundae's scripts are
+        // PlutusV4.
         let mut spent_inputs = tx
             .inputs()
             .into_iter()
@@ -2439,5 +2492,365 @@ mod mainnet_create_tx_tests {
             tracked.contains(&fee_constraint_ref),
             "fee_constraint is invoked by every scoop and must be in the store"
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_transaction_tests {
+    //! Dijkstra sub-transactions (#113). The fixture is Musashi transaction
+    //! ca89430c…, copied unchanged from sundae-portfolio
+    //! (functions/kinesis-v4-order/testdata), which took it from
+    //! sundae-go-utils at b6420b9. Its sub-transaction ede49f69… places an
+    //! order with an inline datum at output #0; the parent body places none.
+    //!
+    //! The test protocol has no execution config, so no order constraint
+    //! module is known and every order lands in `invalid_orders`. The reason
+    //! still tells a decoded datum ("constraint decode: …") from a datum that
+    //! did not resolve ("no datum …").
+    use super::*;
+    use crate::persistence::{PersistenceConfig, connect};
+
+    const SUB_TX_ID: &str = "ede49f69c8e99d253d82b0b06d024be6435168cfeb1b960761370fe1bf5f8377";
+    /// The order spend script of the preview cs-launch deployment the
+    /// fixture's order was placed against.
+    const ORDER_SCRIPT_HASH: &str = "c323b9545afa6826b4121c048634ec168d78fa6f2349198169ff76f7";
+    const DATUM_DECODED: &str = "constraint decode:";
+
+    fn fixture() -> Vec<u8> {
+        hex::decode(include_str!("../../testdata/musashi-ca89430c.hex").trim()).unwrap()
+    }
+
+    fn protocol() -> SundaeV4Protocol {
+        let unused = ScriptHash::from([0u8; 28]);
+        SundaeV4Protocol {
+            pool_script_hash: unused,
+            order_script_hashes: vec![ORDER_SCRIPT_HASH.parse().unwrap()],
+            settings_script_hash: unused,
+            settings_nft: AssetClass::from_pair((vec![], vec![])),
+            pool_nft_policy: unused,
+            fee_settings_token: None,
+            starting_point: Point::Origin,
+            execution: None,
+            mempool: None,
+            blueprint: None,
+            network: Default::default(),
+        }
+    }
+
+    fn block(slot: u64) -> BlockInfo {
+        BlockInfo {
+            status: acropolis_common::BlockStatus::Volatile,
+            intent: acropolis_common::BlockIntent::none(),
+            slot,
+            number: slot,
+            hash: acropolis_common::BlockHash::new([0; 32]),
+            epoch: 0,
+            epoch_slot: 0,
+            new_epoch: false,
+            tip_slot: None,
+            timestamp: 0,
+            era: acropolis_common::Era::Dijkstra,
+            is_new_era: false,
+        }
+    }
+
+    /// A node on fresh state, loaded from `persistence`.
+    async fn start(
+        persistence: &dyn crate::persistence::Persistence,
+    ) -> (SundaeV4Indexer, Arc<Mutex<SundaeV4HistoricalState>>) {
+        let state = Arc::new(Mutex::new(SundaeV4HistoricalState::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let mut indexer = SundaeV4Indexer::new(
+            state.clone(),
+            event_tx,
+            protocol(),
+            2160,
+            persistence.indexer_dao("sundae_v4"),
+        );
+        indexer.load().await.unwrap();
+        (indexer, state)
+    }
+
+    /// Indexes `tx` in a block at slot 1000 and returns the invalid orders,
+    /// as `(utxo, reason)`, and the valid ones.
+    async fn index(tx: &[u8]) -> (Vec<(String, String)>, Vec<String>) {
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+        let (mut node, state) = start(&*persistence).await;
+        let at = block(1000);
+        node.handle_block(&at).await.unwrap();
+        node.handle_onchain_tx_bytes(&at, tx).await.unwrap();
+        let history = state.lock().await;
+        let latest = history.latest();
+        (
+            latest.invalid_orders.iter().map(|o| (o.input.to_string(), o.reason.clone())).collect(),
+            latest.orders.iter().map(|o| o.input.to_string()).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_order_placed_in_a_sub_transaction_is_tracked_under_its_id() {
+        let (invalid, valid) = index(&fixture()).await;
+        assert!(valid.is_empty());
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        let (utxo, reason) = &invalid[0];
+        assert_eq!(
+            utxo,
+            &format!("{SUB_TX_ID}#0"),
+            "keyed by the sub-transaction, not the parent"
+        );
+        assert!(
+            reason.starts_with(DATUM_DECODED),
+            "the inline datum decodes: {reason}"
+        );
+    }
+
+    /// The persisted output is a Dijkstra-era output of the sub-transaction;
+    /// a restart must decode it and key it the same way.
+    #[tokio::test]
+    async fn a_sub_transaction_order_survives_a_restart() {
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+        let (mut node, _) = start(&*persistence).await;
+        let at = block(1000);
+        node.handle_block(&at).await.unwrap();
+        node.handle_onchain_tx_bytes(&at, &fixture()).await.unwrap();
+
+        let (_, state) = start(&*persistence).await;
+        let history = state.lock().await;
+        let reloaded: Vec<String> =
+            history.latest().invalid_orders.iter().map(|o| o.input.to_string()).collect();
+        assert_eq!(reloaded, vec![format!("{SUB_TX_ID}#0")]);
+    }
+
+    /// The fixture order's inline datum, re-encoded, to place behind a hash.
+    fn order_datum() -> Vec<u8> {
+        let bytes = fixture();
+        let tx = MultiEraTx::decode(&bytes).unwrap();
+        let subs = tx.sub_transactions();
+        let output = subs[0].outputs()[0].clone();
+        let cardano_types::RawDatum::Inline(datum) = cardano_types::convert_txo(&output).datum
+        else {
+            panic!("the fixture order has an inline datum");
+        };
+        minicbor::to_vec(&datum).unwrap()
+    }
+
+    // CBOR major types: the first argument of `head`.
+    const UINT: u8 = 0;
+    const BYTES: u8 = 2;
+    const ARRAY: u8 = 4;
+    const MAP: u8 = 5;
+
+    /// Minimal CBOR writer for the synthetic transactions below: the head of
+    /// an item of type `major`. `n` is the value of a `UINT`, the length of
+    /// `BYTES`, or the number of entries of an `ARRAY` or `MAP`.
+    fn head(out: &mut Vec<u8>, major: u8, n: usize) {
+        let major = major << 5;
+        match n {
+            0..=23 => out.push(major | n as u8),
+            24..=0xff => out.extend([major | 24, n as u8]),
+            0x100..=0xffff => {
+                out.push(major | 25);
+                out.extend((n as u16).to_be_bytes());
+            }
+            _ => {
+                out.push(major | 26);
+                out.extend((n as u32).to_be_bytes());
+            }
+        }
+    }
+    fn bytes(out: &mut Vec<u8>, b: &[u8]) {
+        head(out, BYTES, b.len());
+        out.extend_from_slice(b);
+    }
+    /// `{4: [datum]}` when `datum` is given, otherwise `{}`.
+    fn witnesses(out: &mut Vec<u8>, datum: Option<&[u8]>) {
+        match datum {
+            Some(d) => {
+                head(out, MAP, 1);
+                head(out, UINT, 4);
+                head(out, ARRAY, 1);
+                out.extend_from_slice(d);
+            }
+            None => head(out, MAP, 0),
+        }
+    }
+
+    /// `{103251: {hash(datum): [64-byte chunks]}}` when `datum` is given,
+    /// otherwise null.
+    fn auxiliary_data(out: &mut Vec<u8>, datum: Option<&[u8]>) {
+        let Some(datum) = datum else {
+            out.push(0xf6);
+            return;
+        };
+        head(out, MAP, 1);
+        head(out, UINT, METADATA_DATUM_KEY as usize);
+        head(out, MAP, 1);
+        bytes(out, Hasher::<256>::hash(datum).as_ref());
+        head(out, ARRAY, datum.chunks(64).count());
+        for chunk in datum.chunks(64) {
+            bytes(out, chunk);
+        }
+    }
+
+    /// A script address with no stake part.
+    fn script_address(script_hash: &[u8]) -> Vec<u8> {
+        let mut address = vec![0x70];
+        address.extend_from_slice(script_hash);
+        address
+    }
+
+    /// An order output that carries the hash of `datum`.
+    fn order_output(datum: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        head(&mut out, MAP, 3);
+        head(&mut out, UINT, 0);
+        bytes(
+            &mut out,
+            &script_address(&hex::decode(ORDER_SCRIPT_HASH).unwrap()),
+        );
+        head(&mut out, UINT, 1);
+        head(&mut out, UINT, 2_000_000);
+        head(&mut out, UINT, 2);
+        head(&mut out, ARRAY, 2);
+        head(&mut out, UINT, 0);
+        bytes(&mut out, Hasher::<256>::hash(datum).as_ref());
+        out
+    }
+
+    /// One body of a synthetic transaction.
+    #[derive(Default)]
+    struct Body {
+        /// Encoded outputs.
+        outputs: Vec<Vec<u8>>,
+        /// A datum in the body's witness set.
+        witness_datum: Option<Vec<u8>>,
+        /// A datum the body publishes in its metadata.
+        metadata_datum: Option<Vec<u8>>,
+    }
+
+    /// `0: [], 1: [outputs]`: no inputs.
+    fn inputs_and_outputs(out: &mut Vec<u8>, outputs: &[Vec<u8>]) {
+        head(out, UINT, 0);
+        head(out, ARRAY, 0);
+        head(out, UINT, 1);
+        head(out, ARRAY, outputs.len());
+        for output in outputs {
+            out.extend_from_slice(output);
+        }
+    }
+
+    /// The phase-2 result of a whole transaction.
+    #[derive(Clone, Copy)]
+    enum Phase2 {
+        Valid,
+        Failed,
+    }
+
+    /// A block-form Dijkstra transaction: `parent` with fee 0 and the
+    /// sub-transactions `subs` in body field 23.
+    fn dijkstra_tx(parent: Body, subs: Vec<Body>, phase2: Phase2) -> Vec<u8> {
+        let mut tx = vec![];
+        head(&mut tx, ARRAY, 4);
+        head(&mut tx, MAP, if subs.is_empty() { 3 } else { 4 });
+        inputs_and_outputs(&mut tx, &parent.outputs);
+        head(&mut tx, UINT, 2);
+        head(&mut tx, UINT, 0);
+        if !subs.is_empty() {
+            head(&mut tx, UINT, 23);
+            head(&mut tx, ARRAY, subs.len());
+            for sub in &subs {
+                head(&mut tx, ARRAY, 3);
+                head(&mut tx, MAP, 2);
+                inputs_and_outputs(&mut tx, &sub.outputs);
+                witnesses(&mut tx, sub.witness_datum.as_deref());
+                auxiliary_data(&mut tx, sub.metadata_datum.as_deref());
+            }
+        }
+        witnesses(&mut tx, parent.witness_datum.as_deref());
+        auxiliary_data(&mut tx, parent.metadata_datum.as_deref());
+        tx.push(match phase2 {
+            Phase2::Valid => 0xf5,
+            Phase2::Failed => 0xf4,
+        });
+        tx
+    }
+
+    /// The body whose witness set carries the order datum.
+    enum DatumIn {
+        Sub,
+        Parent,
+    }
+
+    /// A transaction whose one sub-transaction pays an order output that
+    /// carries a datum hash. The datum preimage goes in the witness set of
+    /// `datum_in`.
+    fn sub_tx_with_hashed_order(datum_in: DatumIn, phase2: Phase2) -> Vec<u8> {
+        let datum = order_datum();
+        let parent = Body {
+            witness_datum: matches!(datum_in, DatumIn::Parent).then(|| datum.clone()),
+            ..Default::default()
+        };
+        let sub = Body {
+            outputs: vec![order_output(&datum)],
+            witness_datum: matches!(datum_in, DatumIn::Sub).then(|| datum.clone()),
+            ..Default::default()
+        };
+        dijkstra_tx(parent, vec![sub], phase2)
+    }
+
+    fn sub_tx_id(tx: &[u8]) -> String {
+        hex::encode(MultiEraTx::decode(tx).unwrap().sub_transactions()[0].hash())
+    }
+
+    #[tokio::test]
+    async fn a_datum_hash_resolves_from_the_sub_transactions_own_witnesses() {
+        let tx = sub_tx_with_hashed_order(DatumIn::Sub, Phase2::Valid);
+        let (invalid, _) = index(&tx).await;
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, format!("{}#0", sub_tx_id(&tx)));
+        assert!(invalid[0].1.starts_with(DATUM_DECODED), "{}", invalid[0].1);
+    }
+
+    /// CIP-118 lets the top-level transaction carry supplemental datums for
+    /// the outputs of its sub-transactions.
+    #[tokio::test]
+    async fn a_datum_hash_resolves_from_the_parents_witnesses() {
+        let tx = sub_tx_with_hashed_order(DatumIn::Parent, Phase2::Valid);
+        let (invalid, _) = index(&tx).await;
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, format!("{}#0", sub_tx_id(&tx)));
+        assert!(invalid[0].1.starts_with(DATUM_DECODED), "{}", invalid[0].1);
+    }
+
+    /// A transaction that fails phase-2 validation produces only the
+    /// parent's collateral return; its sub-transactions produce nothing.
+    #[tokio::test]
+    async fn a_failed_transaction_indexes_no_sub_transaction_output() {
+        let (invalid, valid) = index(&sub_tx_with_hashed_order(DatumIn::Sub, Phase2::Failed)).await;
+        assert!(invalid.is_empty(), "{invalid:?}");
+        assert!(valid.is_empty(), "{valid:?}");
+    }
+
+    /// Metadata datums are shared by all bodies of a transaction, as they
+    /// are after a restart: a parent order resolves a datum that its
+    /// sub-transaction publishes.
+    #[tokio::test]
+    async fn a_datum_hash_resolves_from_a_later_bodys_metadata() {
+        let datum = order_datum();
+        let parent = Body {
+            outputs: vec![order_output(&datum)],
+            ..Default::default()
+        };
+        let sub = Body {
+            metadata_datum: Some(datum),
+            ..Default::default()
+        };
+        let tx = dijkstra_tx(parent, vec![sub], Phase2::Valid);
+        let parent_id = hex::encode(MultiEraTx::decode(&tx).unwrap().hash());
+
+        let (invalid, _) = index(&tx).await;
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, format!("{parent_id}#0"));
+        assert!(invalid[0].1.starts_with(DATUM_DECODED), "{}", invalid[0].1);
     }
 }

@@ -368,7 +368,7 @@ impl ChainIndex for SundaeV3Indexer {
             state.datums.add_metadata_datum(new_datum);
         }
 
-        let datums = state.datums.for_tx(&tx);
+        let datums = state.datums.for_tx(&tx, None);
 
         // Find which pools and orders have been updated in this transaction.
         // Do not apply those updates to our new state yet.
