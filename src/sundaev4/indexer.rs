@@ -747,6 +747,469 @@ impl SundaeV4Indexer {
         let cs_hash = &self.protocol.execution.as_ref()?.module_scripts.constant_sum.as_ref()?.hash;
         extract_cs_config_from_tx(tx, cs_hash)
     }
+
+    /// Scans the outputs one transaction body produces: pools, orders,
+    /// settings, wallet and reference UTxOs. Every output is keyed by
+    /// `view.hash()`, and datum hashes resolve from the metadata and witness
+    /// set of `view` itself. Spends are not handled here.
+    fn scan_outputs(
+        &self,
+        view: &MultiEraTx,
+        slot: u64,
+        state: &mut SundaeV4State,
+        module_cache: &mut PoolModuleConfigCache,
+        changes: &mut TxChanges,
+        out: &mut ProducedOutputs,
+    ) -> Result<()> {
+        let this_tx_hash = view.hash();
+        for new_datum in self.extract_metadata_datums(view) {
+            let persisted = PersistedDatum {
+                hash: Hasher::<256>::hash(&new_datum.0).to_vec(),
+                datum: new_datum.0.clone(),
+                created_slot: slot,
+            };
+            debug!(slot, hash = %hex::encode(&persisted.hash), "v4: metadata datum spotted");
+            changes.metadata_datums.push(persisted);
+            state.datums.add_metadata_datum(new_datum);
+        }
+
+        let datums = state.datums.for_tx(view);
+
+        // Try to extract per-module configs from this tx's Create/Operate
+        // redeemers (if any). For scoop txs without a Create redeemer for a
+        // given module, these return None — harmless. We use the result to
+        // populate per-pool config caches.
+        let cs_config_from_tx = self.extract_cs_config_from_tx(view);
+        let cp_config_from_tx = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
+            .and_then(|h| extract_cp_config_from_tx(view, &h));
+        let cl_config_from_tx = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
+            .and_then(|cl| extract_cl_config_from_tx(view, &cl.hash));
+        let fs_config_from_tx =
+            self.protocol.execution.as_ref().and_then(|e| {
+                extract_fee_split_config_from_tx(view, &e.module_scripts.fee_split.hash)
+            });
+        // Stableswap: every config this tx vouches for (Create initial_state,
+        // Operate entry configs, and the post-rate-update form of each).
+        // Which one applies to a given pool output is decided by its datum's
+        // module_state hash below.
+        let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.stableswap.as_ref())
+            .map(|ss| extract_ss_config_candidates(view, &ss.hash))
+            .unwrap_or_default();
+        let swap_order_hash: Vec<u8> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.swap_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
+        let basic_order_hash: Vec<u8> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.basic_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
+        let strategy_order_hash: Vec<u8> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.strategy_order.as_ref())
+            .map(|s| s.hash.as_ref().to_vec())
+            .unwrap_or_default();
+        let cs_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.constant_sum.as_ref())
+            .map(|cs| cs.hash.as_ref().to_vec());
+        let cp_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.constant_product.as_ref())
+            .map(|cp| cp.hash.as_ref().to_vec());
+        let cl_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
+            .map(|cl| cl.hash.as_ref().to_vec());
+        let ss_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .and_then(|e| e.module_scripts.stableswap.as_ref())
+            .map(|ss| ss.hash.as_ref().to_vec());
+        let fs_module_hash_bytes: Option<Vec<u8>> = self
+            .protocol
+            .execution
+            .as_ref()
+            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
+
+        // Scan outputs for vault/order/settings script hashes
+        for (ix, output) in view.outputs().iter().enumerate() {
+            let address = output.address()?;
+            if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                if let Some(pd) = self.parse_pool(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "pool".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+
+                    let pool_id = pd.identifier.clone();
+                    // Resolution priority for the CS/CP branch inside detect_pool_type:
+                    //   1. config-file override (consulted internally)
+                    //   2. this tx's Create redeemer
+                    //   3. previously-resolved persisted config (cache)
+                    //   4. defaults
+                    let resolved_cs =
+                        cs_config_from_tx.as_ref().or_else(|| module_cache.cs.get(&pool_id));
+                    let resolved_cp =
+                        cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
+                    let resolved_cl =
+                        cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
+                    // Stableswap: the datum's module_state hash selects among
+                    // this tx's candidates and the cache. A cached config a
+                    // rate update has superseded is not used.
+                    let resolved_ss = ss_module_hash_bytes.as_ref().and_then(|h| {
+                        resolve_ss_config(
+                            &pd,
+                            h,
+                            &ss_candidates_from_tx,
+                            module_cache.ss.get(&pool_id),
+                        )
+                    });
+                    let pool_type = detect_pool_type(
+                        &pd,
+                        self.protocol.execution.as_ref(),
+                        resolved_cs,
+                        resolved_cp,
+                        resolved_cl,
+                        resolved_ss.as_ref(),
+                    );
+
+                    // Stableswap: persist on first sight AND on change (a
+                    // tag-7 rate update rewrites `rates`; the row is upserted).
+                    if let (Some(cfg), Some(ss_hash)) =
+                        (resolved_ss.as_ref(), ss_module_hash_bytes.as_ref())
+                        && module_cache.ss.get(&pool_id) != Some(cfg)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode StableSwapConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: ss_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.ss.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            rates = ?cfg.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                            "v4: persisted stableswap pool config from redeemer"
+                        );
+                    }
+
+                    // If we just learned this pool's CS config from a Create
+                    // redeemer, persist it and remember it for future blocks.
+                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantSum { .. }) =
+                        (cs_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cs.contains_key(&pool_id)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantSumConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cs_module_hash_bytes
+                                .clone()
+                                .expect("cs_module_hash present when CS pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cs.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CS pool config from Create redeemer"
+                        );
+                    }
+                    // Same for CP: persist on first sighting (Create or Operate).
+                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
+                        (cp_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cp.contains_key(&pool_id)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConstantProductConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cp_module_hash_bytes
+                                .clone()
+                                .expect("cp_module_hash present when CP pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cp.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CP pool config from redeemer"
+                        );
+                    }
+                    // Same for CL: persist the spa/spb/fee from Create.
+                    if let (
+                        Some(cfg),
+                        crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. },
+                    ) = (cl_config_from_tx.as_ref(), &pool_type)
+                        && !module_cache.cl.contains_key(&pool_id)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode ConcentratedLiquidityConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: cl_module_hash_bytes
+                                .clone()
+                                .expect("cl_module_hash present when CL pool detected"),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted CL pool config from Create redeemer"
+                        );
+                    }
+
+                    // Same for fee_split: every pool has fee_split config in
+                    // the mint tx (Create) and in every later scoop (Operate).
+                    // Either form is usable; the first time we see it we
+                    // persist and cache for future scoops.
+                    if let (Some(cfg), Some(fs_hash)) =
+                        (fs_config_from_tx.as_ref(), fs_module_hash_bytes.as_ref())
+                        && !module_cache.fee_split.contains_key(&pool_id)
+                    {
+                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
+                            .context("encode FeeSplitConfig CBOR")?;
+                        changes.module_configs.push(PersistedModuleConfig {
+                            pool_id: pool_id.to_bytes().to_vec(),
+                            module_hash: fs_hash.clone(),
+                            config_cbor: cbor,
+                            created_slot: slot,
+                        });
+                        module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
+                        info!(
+                            pool = %hex::encode(pool_id.to_bytes()),
+                            "v4: persisted fee_split config from redeemer"
+                        );
+                    }
+
+                    let fs_cfg = module_cache.fee_split.get(&pool_id).cloned();
+                    let pool_record = SundaeV4Pool {
+                        input: this_input,
+                        address: address.to_vec(),
+                        value: tx_out.value,
+                        pool_datum: pd,
+                        pool_type,
+                        slot,
+                        fee_split_config: fs_cfg,
+                    };
+                    out.updated_pools.insert(pool_id, Arc::new(pool_record));
+                }
+            } else if self
+                .protocol
+                .order_script_hashes
+                .iter()
+                .any(|hash| payment_hash_equals(&address, hash))
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
+                    |datum| {
+                        crate::sundaev4::decode_order_constraint(
+                            &datum,
+                            &swap_order_hash,
+                            &basic_order_hash,
+                            &strategy_order_hash,
+                        )
+                        .map(|c| (datum, c))
+                    },
+                ) {
+                    Ok((od, constraint)) => {
+                        changes.created_txos.push(PersistedTxo {
+                            txo_id: this_input.clone(),
+                            txo_type: "order".to_string(),
+                            created_slot: slot,
+                            era: output.era().into(),
+                            txo: output.encode(),
+                            address: tx_out.address.to_vec(),
+                            datum: tx_out.hashed_datum(&datums),
+                        });
+
+                        let order = SundaeV4Order {
+                            input: this_input,
+                            address: tx_out.address.to_vec(),
+                            value: tx_out.value,
+                            datum: od,
+                            constraint,
+                            slot,
+                        };
+                        out.new_orders.push(Arc::new(order));
+                    }
+                    Err(reason) => {
+                        warn!(slot, input = %this_input, "v4: invalid order datum: {reason}");
+                        changes.created_txos.push(PersistedTxo {
+                            txo_id: this_input.clone(),
+                            txo_type: "invalid_order".to_string(),
+                            created_slot: slot,
+                            era: output.era().into(),
+                            txo: output.encode(),
+                            address: tx_out.address.to_vec(),
+                            datum: tx_out.hashed_datum(&datums),
+                        });
+                        out.new_invalid_orders.push(InvalidOrder {
+                            input: this_input,
+                            slot,
+                            reason,
+                        });
+                    }
+                }
+            } else if payment_hash_equals(&address, &self.protocol.settings_script_hash) {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                if let Some(sd) = self.parse_settings(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "settings".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+                    out.new_settings = Some(Arc::new(SundaeV4Settings {
+                        input: this_input,
+                        value: tx_out.value,
+                        datum: sd,
+                        slot,
+                    }));
+                } else if let Some(base_fee) = self.parse_fee_settings(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "fee_settings".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+                    out.new_fee_settings =
+                        Some(Arc::new(crate::sundaev4::types::SundaeV4FeeSettings {
+                            input: this_input,
+                            token: self
+                                .protocol
+                                .fee_settings_token
+                                .as_ref()
+                                .and_then(|t| hex::decode(t).ok())
+                                .unwrap_or_default(),
+                            base_fee,
+                            slot,
+                        }));
+                } else if let Some((token_name, oc)) = self.parse_order_config(&tx_out, &datums) {
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "order_config".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: tx_out.hashed_datum(&datums),
+                    });
+                    out.new_order_configs.push((
+                        token_name.clone(),
+                        Arc::new(SundaeV4OrderConfig {
+                            input: this_input,
+                            value: tx_out.value,
+                            token_name,
+                            config: oc,
+                            slot,
+                        }),
+                    ));
+                }
+            }
+
+            // Track wallet UTxOs by payment credential — CIP-1852 wallets use
+            // base addresses (payment + stake) but the scooper might be
+            // configured with an enterprise address. Matching by payment
+            // credential alone accepts any address form (enterprise, base,
+            // pointer) whose payment key we hold.
+            if let Some(scooper_kh) = &self.scooper_keyhash
+                && payment_hash_equals(&address, scooper_kh)
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                let tx_out = cardano_types::convert_txo(output);
+                trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
+                changes.created_txos.push(PersistedTxo {
+                    txo_id: this_input.clone(),
+                    txo_type: "wallet".to_string(),
+                    created_slot: slot,
+                    era: output.era().into(),
+                    txo: output.encode(),
+                    address: tx_out.address.to_vec(),
+                    datum: None,
+                });
+                state.wallet_utxos.insert(this_input, tx_out.value);
+            }
+
+            // Track reference UTxO outputs (for ScriptContext building)
+            {
+                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
+                if self.ref_utxo_inputs.contains(&this_input) {
+                    let tx_out = cardano_types::convert_txo(output);
+                    trace!(slot, utxo = %this_input, "v4: ref UTxO output spotted");
+                    changes.created_txos.push(PersistedTxo {
+                        txo_id: this_input.clone(),
+                        txo_type: "ref".to_string(),
+                        created_slot: slot,
+                        era: output.era().into(),
+                        txo: output.encode(),
+                        address: tx_out.address.to_vec(),
+                        datum: None,
+                    });
+                    state.ref_utxo_outputs.insert(this_input, tx_out);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the output scan of one transaction body found, before it is applied
+/// to the state.
+#[derive(Default)]
+struct ProducedOutputs {
+    updated_pools: BTreeMap<Ident, Arc<SundaeV4Pool>>,
+    new_orders: Vec<Arc<SundaeV4Order>>,
+    new_invalid_orders: Vec<InvalidOrder>,
+    new_settings: Option<Arc<SundaeV4Settings>>,
+    new_fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>>,
+    /// (token_name, OrderConfig) for settings entries the body creates.
+    new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)>,
 }
 
 /// The reference-script UTxOs the indexer must keep so the evaluator's
@@ -1105,14 +1568,6 @@ impl ChainIndex for SundaeV4Indexer {
         trace!("v4: Ingesting tx: {}", hex::encode(this_tx_hash));
         let mut history = self.state.lock().await;
 
-        let mut updated_pools = BTreeMap::new();
-        let mut new_orders = vec![];
-        let mut new_invalid_orders = vec![];
-        let mut new_settings = None;
-        // (token_name, OrderConfigEntry) — newly-discovered OrderConfig
-        // settings entries in this tx.
-        let mut new_fee_settings: Option<Arc<crate::sundaev4::types::SundaeV4FeeSettings>> = None;
-        let mut new_order_configs: Vec<(Vec<u8>, Arc<SundaeV4OrderConfig>)> = vec![];
         let mut changes = TxChanges::new(info.slot, info.number);
         let mut events: Vec<IndexEvent> = vec![];
 
@@ -1120,443 +1575,26 @@ impl ChainIndex for SundaeV4Indexer {
         // this just retrieves the existing mutable reference.
         let state = history.update_slot(slot)?;
 
-        for new_datum in self.extract_metadata_datums(&tx) {
-            let persisted = PersistedDatum {
-                hash: Hasher::<256>::hash(&new_datum.0).to_vec(),
-                datum: new_datum.0.clone(),
-                created_slot: slot,
-            };
-            debug!(slot, hash = %hex::encode(&persisted.hash), "v4: metadata datum spotted");
-            changes.metadata_datums.push(persisted);
-            state.datums.add_metadata_datum(new_datum);
-        }
-
-        let datums = state.datums.for_tx(&tx);
-
-        // Try to extract per-module configs from this tx's Create/Operate
-        // redeemers (if any). For scoop txs without a Create redeemer for a
-        // given module, these return None — harmless. We use the result to
-        // populate per-pool config caches.
-        let cs_config_from_tx = self.extract_cs_config_from_tx(&tx);
-        let cp_config_from_tx = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref().map(|cp| cp.hash))
-            .and_then(|h| extract_cp_config_from_tx(&tx, &h));
-        let cl_config_from_tx = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .and_then(|cl| extract_cl_config_from_tx(&tx, &cl.hash));
-        let fs_config_from_tx =
-            self.protocol.execution.as_ref().and_then(|e| {
-                extract_fee_split_config_from_tx(&tx, &e.module_scripts.fee_split.hash)
-            });
-        // Stableswap: every config this tx vouches for (Create initial_state,
-        // Operate entry configs, and the post-rate-update form of each).
-        // Which one applies to a given pool output is decided by its datum's
-        // module_state hash below.
-        let ss_candidates_from_tx: Vec<crate::sundaev4::types::StableSwapConfig> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.stableswap.as_ref())
-            .map(|ss| extract_ss_config_candidates(&tx, &ss.hash))
-            .unwrap_or_default();
-        let swap_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.swap_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let basic_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.basic_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let strategy_order_hash: Vec<u8> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.strategy_order.as_ref())
-            .map(|s| s.hash.as_ref().to_vec())
-            .unwrap_or_default();
-        let cs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_sum.as_ref())
-            .map(|cs| cs.hash.as_ref().to_vec());
-        let cp_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.constant_product.as_ref())
-            .map(|cp| cp.hash.as_ref().to_vec());
-        let cl_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.concentrated_liquidity.as_ref())
-            .map(|cl| cl.hash.as_ref().to_vec());
-        let ss_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .and_then(|e| e.module_scripts.stableswap.as_ref())
-            .map(|ss| ss.hash.as_ref().to_vec());
-        let fs_module_hash_bytes: Option<Vec<u8>> = self
-            .protocol
-            .execution
-            .as_ref()
-            .map(|e| e.module_scripts.fee_split.hash.as_ref().to_vec());
-
         // Lock the persisted-config cache for the duration of output scanning:
         // pool outputs read from it, and Create writes a new entry.
         let mut module_cache = self.module_configs.lock().await;
-
-        // Scan outputs for vault/order/settings script hashes
-        for (ix, output) in tx.outputs().iter().enumerate() {
-            let address = output.address()?;
-            if payment_hash_equals(&address, &self.protocol.pool_script_hash) {
-                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output);
-                if let Some(pd) = self.parse_pool(&tx_out, &datums) {
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "pool".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: tx_out.hashed_datum(&datums),
-                    });
-
-                    let pool_id = pd.identifier.clone();
-                    // Resolution priority for the CS/CP branch inside detect_pool_type:
-                    //   1. config-file override (consulted internally)
-                    //   2. this tx's Create redeemer
-                    //   3. previously-resolved persisted config (cache)
-                    //   4. defaults
-                    let resolved_cs =
-                        cs_config_from_tx.as_ref().or_else(|| module_cache.cs.get(&pool_id));
-                    let resolved_cp =
-                        cp_config_from_tx.as_ref().or_else(|| module_cache.cp.get(&pool_id));
-                    let resolved_cl =
-                        cl_config_from_tx.as_ref().or_else(|| module_cache.cl.get(&pool_id));
-                    // Stableswap: the datum's module_state hash selects among
-                    // this tx's candidates and the cache. A cached config a
-                    // rate update has superseded is not used.
-                    let resolved_ss = ss_module_hash_bytes.as_ref().and_then(|h| {
-                        resolve_ss_config(
-                            &pd,
-                            h,
-                            &ss_candidates_from_tx,
-                            module_cache.ss.get(&pool_id),
-                        )
-                    });
-                    let pool_type = detect_pool_type(
-                        &pd,
-                        self.protocol.execution.as_ref(),
-                        resolved_cs,
-                        resolved_cp,
-                        resolved_cl,
-                        resolved_ss.as_ref(),
-                    );
-
-                    // Stableswap: persist on first sight AND on change (a
-                    // tag-7 rate update rewrites `rates`; the row is upserted).
-                    if let (Some(cfg), Some(ss_hash)) =
-                        (resolved_ss.as_ref(), ss_module_hash_bytes.as_ref())
-                        && module_cache.ss.get(&pool_id) != Some(cfg)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode StableSwapConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: ss_hash.clone(),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.ss.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            rates = ?cfg.rates.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-                            "v4: persisted stableswap pool config from redeemer"
-                        );
-                    }
-
-                    // If we just learned this pool's CS config from a Create
-                    // redeemer, persist it and remember it for future blocks.
-                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantSum { .. }) =
-                        (cs_config_from_tx.as_ref(), &pool_type)
-                        && !module_cache.cs.contains_key(&pool_id)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode ConstantSumConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: cs_module_hash_bytes
-                                .clone()
-                                .expect("cs_module_hash present when CS pool detected"),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.cs.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            "v4: persisted CS pool config from Create redeemer"
-                        );
-                    }
-                    // Same for CP: persist on first sighting (Create or Operate).
-                    if let (Some(cfg), crate::sundaev4::types::PoolType::ConstantProduct { .. }) =
-                        (cp_config_from_tx.as_ref(), &pool_type)
-                        && !module_cache.cp.contains_key(&pool_id)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode ConstantProductConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: cp_module_hash_bytes
-                                .clone()
-                                .expect("cp_module_hash present when CP pool detected"),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.cp.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            "v4: persisted CP pool config from redeemer"
-                        );
-                    }
-                    // Same for CL: persist the spa/spb/fee from Create.
-                    if let (
-                        Some(cfg),
-                        crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. },
-                    ) = (cl_config_from_tx.as_ref(), &pool_type)
-                        && !module_cache.cl.contains_key(&pool_id)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode ConcentratedLiquidityConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: cl_module_hash_bytes
-                                .clone()
-                                .expect("cl_module_hash present when CL pool detected"),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            "v4: persisted CL pool config from Create redeemer"
-                        );
-                    }
-
-                    // Same for fee_split: every pool has fee_split config in
-                    // the mint tx (Create) and in every later scoop (Operate).
-                    // Either form is usable; the first time we see it we
-                    // persist and cache for future scoops.
-                    if let (Some(cfg), Some(fs_hash)) =
-                        (fs_config_from_tx.as_ref(), fs_module_hash_bytes.as_ref())
-                        && !module_cache.fee_split.contains_key(&pool_id)
-                    {
-                        let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode FeeSplitConfig CBOR")?;
-                        changes.module_configs.push(PersistedModuleConfig {
-                            pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: fs_hash.clone(),
-                            config_cbor: cbor,
-                            created_slot: slot,
-                        });
-                        module_cache.fee_split.insert(pool_id.clone(), cfg.clone());
-                        info!(
-                            pool = %hex::encode(pool_id.to_bytes()),
-                            "v4: persisted fee_split config from redeemer"
-                        );
-                    }
-
-                    let fs_cfg = module_cache.fee_split.get(&pool_id).cloned();
-                    let pool_record = SundaeV4Pool {
-                        input: this_input,
-                        address: address.to_vec(),
-                        value: tx_out.value,
-                        pool_datum: pd,
-                        pool_type,
-                        slot,
-                        fee_split_config: fs_cfg,
-                    };
-                    updated_pools.insert(pool_id, Arc::new(pool_record));
-                }
-            } else if self
-                .protocol
-                .order_script_hashes
-                .iter()
-                .any(|hash| payment_hash_equals(&address, hash))
-            {
-                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output);
-                match tx_out.datum.try_parse::<crate::sundaev4::OrderDatum>(&datums).and_then(
-                    |datum| {
-                        crate::sundaev4::decode_order_constraint(
-                            &datum,
-                            &swap_order_hash,
-                            &basic_order_hash,
-                            &strategy_order_hash,
-                        )
-                        .map(|c| (datum, c))
-                    },
-                ) {
-                    Ok((od, constraint)) => {
-                        changes.created_txos.push(PersistedTxo {
-                            txo_id: this_input.clone(),
-                            txo_type: "order".to_string(),
-                            created_slot: slot,
-                            era: output.era().into(),
-                            txo: output.encode(),
-                            address: tx_out.address.to_vec(),
-                            datum: tx_out.hashed_datum(&datums),
-                        });
-
-                        let order = SundaeV4Order {
-                            input: this_input,
-                            address: tx_out.address.to_vec(),
-                            value: tx_out.value,
-                            datum: od,
-                            constraint,
-                            slot,
-                        };
-                        new_orders.push(Arc::new(order));
-                    }
-                    Err(reason) => {
-                        warn!(slot, input = %this_input, "v4: invalid order datum: {reason}");
-                        changes.created_txos.push(PersistedTxo {
-                            txo_id: this_input.clone(),
-                            txo_type: "invalid_order".to_string(),
-                            created_slot: slot,
-                            era: output.era().into(),
-                            txo: output.encode(),
-                            address: tx_out.address.to_vec(),
-                            datum: tx_out.hashed_datum(&datums),
-                        });
-                        new_invalid_orders.push(InvalidOrder {
-                            input: this_input,
-                            slot,
-                            reason,
-                        });
-                    }
-                }
-            } else if payment_hash_equals(&address, &self.protocol.settings_script_hash) {
-                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output);
-                if let Some(sd) = self.parse_settings(&tx_out, &datums) {
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "settings".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: tx_out.hashed_datum(&datums),
-                    });
-                    new_settings = Some(Arc::new(SundaeV4Settings {
-                        input: this_input,
-                        value: tx_out.value,
-                        datum: sd,
-                        slot,
-                    }));
-                } else if let Some(base_fee) = self.parse_fee_settings(&tx_out, &datums) {
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "fee_settings".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: tx_out.hashed_datum(&datums),
-                    });
-                    new_fee_settings =
-                        Some(Arc::new(crate::sundaev4::types::SundaeV4FeeSettings {
-                            input: this_input,
-                            token: self
-                                .protocol
-                                .fee_settings_token
-                                .as_ref()
-                                .and_then(|t| hex::decode(t).ok())
-                                .unwrap_or_default(),
-                            base_fee,
-                            slot,
-                        }));
-                } else if let Some((token_name, oc)) = self.parse_order_config(&tx_out, &datums) {
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "order_config".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: tx_out.hashed_datum(&datums),
-                    });
-                    new_order_configs.push((
-                        token_name.clone(),
-                        Arc::new(SundaeV4OrderConfig {
-                            input: this_input,
-                            value: tx_out.value,
-                            token_name,
-                            config: oc,
-                            slot,
-                        }),
-                    ));
-                }
-            }
-
-            // Track wallet UTxOs by payment credential — CIP-1852 wallets use
-            // base addresses (payment + stake) but the scooper might be
-            // configured with an enterprise address. Matching by payment
-            // credential alone accepts any address form (enterprise, base,
-            // pointer) whose payment key we hold.
-            if let Some(scooper_kh) = &self.scooper_keyhash
-                && payment_hash_equals(&address, scooper_kh)
-            {
-                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                let tx_out = cardano_types::convert_txo(output);
-                trace!(slot, utxo = %this_input, "v4: wallet UTxO spotted");
-                changes.created_txos.push(PersistedTxo {
-                    txo_id: this_input.clone(),
-                    txo_type: "wallet".to_string(),
-                    created_slot: slot,
-                    era: output.era().into(),
-                    txo: output.encode(),
-                    address: tx_out.address.to_vec(),
-                    datum: None,
-                });
-                state.wallet_utxos.insert(this_input, tx_out.value);
-            }
-
-            // Track reference UTxO outputs (for ScriptContext building)
-            {
-                let this_input = TransactionInput::new(this_tx_hash, ix as u64);
-                if self.ref_utxo_inputs.contains(&this_input) {
-                    let tx_out = cardano_types::convert_txo(output);
-                    trace!(slot, utxo = %this_input, "v4: ref UTxO output spotted");
-                    changes.created_txos.push(PersistedTxo {
-                        txo_id: this_input.clone(),
-                        txo_type: "ref".to_string(),
-                        created_slot: slot,
-                        era: output.era().into(),
-                        txo: output.encode(),
-                        address: tx_out.address.to_vec(),
-                        datum: None,
-                    });
-                    state.ref_utxo_outputs.insert(this_input, tx_out);
-                }
-            }
-        }
+        let mut produced = ProducedOutputs::default();
+        self.scan_outputs(
+            &tx,
+            slot,
+            state,
+            &mut module_cache,
+            &mut changes,
+            &mut produced,
+        )?;
+        let ProducedOutputs {
+            mut updated_pools,
+            mut new_orders,
+            mut new_invalid_orders,
+            new_settings,
+            new_fee_settings,
+            mut new_order_configs,
+        } = produced;
 
         let mut spent_inputs = tx
             .inputs()
