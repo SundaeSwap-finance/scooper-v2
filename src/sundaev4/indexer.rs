@@ -2460,7 +2460,23 @@ pub fn detect_pool_type(
     let ident_hex = hex::encode(pool_datum.identifier.to_bytes());
     let invariant = exec.module_scripts.pool_invariant(pool_datum);
     let matched_kind = invariant.map(|(k, _)| k);
-    if matched_kind.is_none() {
+    // An emergency-disabled pool has no enabled action that names an
+    // invariant module, but its modules are known. Say that it is disabled,
+    // and do not report the treasury and governance hashes as unknown
+    // (preview, 2026-11-27, pool 489dbf42 with tag 100 disabled).
+    let disabled_invariant = matched_kind.is_none() && {
+        let mut all_enabled = pool_datum.clone();
+        for a in all_enabled.actions.iter_mut() {
+            a.enabled = true;
+        }
+        exec.module_scripts.pool_invariant(&all_enabled).is_some()
+    };
+    if disabled_invariant {
+        info!(
+            pool = %ident_hex,
+            "pool's scoop action is disabled; the pool is not scooped until it is enabled again",
+        );
+    } else if matched_kind.is_none() {
         // Log the unknown first-module hashes so the operator can see why
         // detect_pool_type couldn't classify this pool. The scooper does not
         // scoop a pool whose modules it cannot resolve (see
