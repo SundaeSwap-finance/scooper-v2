@@ -148,17 +148,40 @@ Your other pools are not affected. To scoop the new pools:
 
 ### Release 0.8.0: concentrated liquidity
 
-Release 0.8.0 can scoop concentrated-liquidity pools. It needs two new
-`module-scripts` entries on mainnet:
+Release 0.8.0 can scoop concentrated-liquidity pools. SundaeSwap published
+the two scripts on mainnet on 2026-11-27. Change `module-scripts` in your
+config in two places:
 
-| Role | Hash |
-| --- | --- |
-| `banded-concentrated-liquidity` | `5c1ec4813a3d5575d521d03682a36b43b8122a4a99c4f2cdcd742194` |
-| `fee-split`, second entry | `877b40ceda282cf35794c7fb1af72d00280719f8b39515c7c9b1564e` |
+1. Add the concentrated-liquidity entry:
+   ```json
+   "banded-concentrated-liquidity": {
+     "hash": "5c1ec4813a3d5575d521d03682a36b43b8122a4a99c4f2cdcd742194",
+     "ref-utxo": "461468832c5ae18b43d70d630c3d6413e2d8b67000e49f05bd77abfea791af96#0"
+   }
+   ```
+2. Make `fee-split` a list. Keep the entry you have and add the second one:
+   ```json
+   "fee-split": [
+     {
+       "hash": "1351c687e6359b0030086fc7ddd6cd389f55f97faba3f531c5535688",
+       "ref-utxo": "a13a049fe23608b553eaeb61ff85f808315d94e3ff637920e11d86ec6a2dc824#0"
+     },
+     {
+       "hash": "877b40ceda282cf35794c7fb1af72d00280719f8b39515c7c9b1564e",
+       "ref-utxo": "ad70bd0e56c43e7174256f6669d314fb2e411fef9afa57e7a4897304f8299790#0"
+     }
+   ]
+   ```
 
-The two reference UTxOs do not exist until SundaeSwap publishes the scripts.
-The announcement of the publication gives them. Until you add the entries,
-0.8.0 runs with the config you have and scoops the pools it scooped before.
+Then stop the scooper, delete the database file and start it, as in the
+steps above. [`config/mainnet-v4.json`](../config/mainnet-v4.json) of this
+release has both changes.
+
+The existing constant-sum and stableswap pools keep the first `fee-split`
+entry. Concentrated-liquidity pools name the second one.
+
+If you install 0.8.0 and do not change the config, it scoops the pools it
+scooped before, and it does not scoop concentrated-liquidity pools.
 
 `concentrated-liquidity` is accepted as a name for the
 `banded-concentrated-liquidity` role.
