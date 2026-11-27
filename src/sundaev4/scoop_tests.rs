@@ -2140,7 +2140,7 @@ mod tests {
             .iter()
             .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
             .find_map(|(_, data, _)| {
-                match crate::sundaev4::types::BandedCLRedeemer::from_plutus(data.clone()) {
+                match crate::sundaev4::types::BandedCLRedeemer::from_plutus_any_form(data.clone()) {
                     Ok(crate::sundaev4::types::BandedCLRedeemer::Operate { entries }) => {
                         Some(entries)
                     }
@@ -2151,7 +2151,8 @@ mod tests {
             .remove(0);
         assert_eq!(entry.counter, BigInt::from(999_999_813i64));
         assert_eq!(entry.active_band, BigInt::from(0));
-        assert_eq!(entry.config, cfg);
+        // The on-chain form: a decoded config does not know its revision.
+        assert_eq!(entry.config.to_plutus(), cfg.clone().to_plutus());
         let after = &result.predicted_pools[0].2;
         assert_eq!(
             after.pool_datum.assets[0].1,
@@ -4489,6 +4490,40 @@ mod tests {
         );
     }
 
+    /// The same CL scoop tests against the revision-3 CL and oracle
+    /// (sundae-v4 115f19d, the audited build). `with_cl_revision` makes the
+    /// env add `REVISION_3_MODULES`, so each pool names the revision-3
+    /// hashes, the scooper writes the `Operate` config table, and the scoop
+    /// evaluates against the audited scripts.
+    mod cl_revision_3 {
+        use crate::sundaev4::test_harness::{Revision, with_cl_revision};
+
+        macro_rules! on_revision_3 {
+            ($($name:ident),* $(,)?) => {$(
+                #[test]
+                fn $name() {
+                    with_cl_revision(Revision(3), super::$name);
+                }
+            )*};
+        }
+
+        on_revision_3!(
+            bcl_single_order,
+            bcl_oracle_pool_scoops_and_advances_the_slot,
+            bcl_multi_withdrawal_evaluates,
+            bcl_multi_deposit_evaluates,
+            bcl_swap_crossing_a_band_evaluates,
+            bcl_zap_crossing_a_band_evaluates,
+            bcl_zap_single_asset_evaluates,
+            bcl_routed_swap_crossing_bands_evaluates,
+            bcl_cross_pair_movement_evaluates,
+            bcl_movement_between_pools,
+            blended_split_across_two_banded_pools_with_crossings,
+            small_two_hop_route_between_banded_pools,
+            ladder_output_matches_step_planner,
+        );
+    }
+
     // ─── Assertion helpers ────────────────────────────────────────────────────
 
     fn assert_k_nondecreasing(a0: &BigInt, b0: &BigInt, a1: &BigInt, b1: &BigInt) {
@@ -5550,8 +5585,10 @@ mod cl_revision_tests {
         build: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
         hash: &[u8],
     ) -> Vec<BandedOperateEntry> {
-        match BandedCLRedeemer::from_plutus(reward_redeemer_of(build, hash).expect("CL withdrawal"))
-            .expect("CL redeemer decodes")
+        match BandedCLRedeemer::from_plutus_any_form(
+            reward_redeemer_of(build, hash).expect("CL withdrawal"),
+        )
+        .expect("CL redeemer decodes")
         {
             BandedCLRedeemer::Operate { entries } => entries,
             other => panic!("expected Operate, got {other:?}"),
@@ -5689,6 +5726,109 @@ mod cl_revision_tests {
         };
         assert_eq!(lp_growth(&p1), BigInt::from(62));
         assert_eq!(lp_growth(&p2), BigInt::from(106));
+    }
+
+    /// One scoop over three CL revision-3 pools (sundae-v4 115f19d) and one
+    /// revision-2 pool. Two of the revision-3 pools share a ladder, so the
+    /// revision-3 `Operate` holds two configs for three entries. The
+    /// revision-2 redeemer keeps one config per entry. Both withdrawals
+    /// evaluate against their own scripts.
+    #[test]
+    fn revision_3_operate_carries_each_ladder_once() {
+        use crate::sundaev4::types::BandedCLTableRedeemer;
+        let env = TestEnv::preview_all_revisions();
+        let r2 = env.cl_script(Revision(2)).hash;
+        let r3 = env.cl_script(Revision(3)).hash;
+        assert_eq!(
+            hex::encode(r3),
+            "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9"
+        );
+        let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
+        let other_fee = Rational {
+            num: BigInt::from(5),
+            den: BigInt::from(1000),
+        };
+        let shared = bcl_eq8_config_at(fee_3(), Revision(3));
+        let other = bcl_eq8_config_at(other_fee, Revision(3));
+        assert_ne!(shared, other);
+        let pa = make_bcl_pool(&env, 0xC1, reserves.clone(), shared.clone());
+        let pb = make_bcl_pool(&env, 0xC2, reserves.clone(), other.clone());
+        let pc = make_bcl_pool(&env, 0xC3, reserves.clone(), shared.clone());
+        let p2 = make_bcl_pool(
+            &env,
+            0xC4,
+            reserves,
+            bcl_eq8_config_at(fee_3(), Revision(2)),
+        );
+        let batches = vec![
+            swap_batch(&pa, &env, 1),
+            swap_batch(&pb, &env, 2),
+            swap_batch(&pc, &env, 3),
+            swap_batch(&p2, &env, 4),
+        ];
+        let settings = make_settings(&env, &env.scooper_keyhash());
+        let (build, eval) = env
+            .build_and_eval(&batches, &settings, 1000)
+            .expect("a batch over CL revisions 2 and 3 evaluates against both scripts");
+        for h in [r2, r3] {
+            let idx = build
+                .tx_body
+                .withdrawals
+                .as_ref()
+                .unwrap()
+                .iter()
+                .position(|(acct, _)| &acct[1..] == h.as_ref())
+                .expect("each CL hash withdraws");
+            assert!(
+                eval.budgets
+                    .iter()
+                    .any(|(k, _)| k.tag == RedeemerTag::Reward && k.index == idx as u32),
+                "CL {} was evaluated",
+                hex::encode(h)
+            );
+        }
+
+        // The revision-3 redeemer: three entries, two configs. Each entry
+        // names the config of its own pool.
+        let raw = reward_redeemer_of(&build, r3.as_ref()).expect("revision-3 withdrawal");
+        let BandedCLTableRedeemer::Operate { entries, configs } =
+            BandedCLTableRedeemer::from_plutus(raw.clone()).expect("the table form decodes")
+        else {
+            panic!("expected Operate");
+        };
+        assert_eq!((entries.len(), configs.len()), (3, 2));
+        let mut shared_uses = 0;
+        for e in &entries {
+            let config = &configs[e.config_index as usize];
+            let pool = [&pa, &pb, &pc]
+                .into_iter()
+                .find(|p| {
+                    p.input.0.transaction_id.as_ref() == e.pool_oref.transaction_id.as_slice()
+                        && p.input.0.index == e.pool_oref.output_index
+                })
+                .expect("the entry names a pool of the batch");
+            let want = if Arc::ptr_eq(pool, &pb) {
+                &other
+            } else {
+                &shared
+            };
+            // The on-chain form: a decoded config does not know its revision.
+            assert_eq!(config.clone().to_plutus(), want.clone().to_plutus());
+            shared_uses += usize::from(!Arc::ptr_eq(pool, &pb));
+        }
+        assert_eq!(shared_uses, 2);
+        // The one-config-per-entry form does not decode this redeemer, and
+        // the any-form decoder returns each entry with its config.
+        assert!(BandedCLRedeemer::from_plutus(raw).is_err());
+        assert_eq!(cl_entries(&build, r3.as_ref()).len(), 3);
+
+        // The revision-2 redeemer keeps its form.
+        let raw2 = reward_redeemer_of(&build, r2.as_ref()).expect("revision-2 withdrawal");
+        assert!(BandedCLTableRedeemer::from_plutus(raw2.clone()).is_err());
+        match BandedCLRedeemer::from_plutus(raw2).expect("the entry form decodes") {
+            BandedCLRedeemer::Operate { entries } => assert_eq!(entries.len(), 1),
+            other => panic!("expected Operate, got {other:?}"),
+        }
     }
 
     /// One oracle pool on each oracle revision in one scoop: a revision-1

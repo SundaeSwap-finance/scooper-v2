@@ -112,6 +112,9 @@ pub const PREVIEW_FIXTURE: &str = "test/fixtures/preview-launch-candidate-bluepr
 /// The revision-1 CL and oracle, and the e7d9c14 constant_sum, on the same
 /// parameters. Add with `TestEnv::with_modules_file`.
 pub const REVISION_1_MODULES: &str = "test/fixtures/preview-revision-1-modules.json";
+/// The revision-3 CL and oracle (sundae-v4 115f19d, the audited build), on
+/// the same parameters. Add with `TestEnv::with_modules_file`.
+pub const REVISION_3_MODULES: &str = "test/fixtures/preview-revision-3-modules.json";
 
 pub use crate::sundaev4::module_scripts::Revision;
 
@@ -122,7 +125,7 @@ thread_local! {
 /// The CL revision the current test runs on: 2 unless the test runs inside
 /// `with_cl_revision`. `bcl_eq8_config` builds its config in this
 /// revision's form, and `TestEnv::from_blueprint_file(PREVIEW_FIXTURE)`
-/// adds the revision-1 modules when it is 1. Each test runs on its own
+/// adds the modules of revision 1 or 3 when it is that. Each test runs on its own
 /// thread, so the setting does not leak between tests.
 pub fn cl_test_revision() -> Revision {
     CL_TEST_REVISION.with(|c| c.get())
@@ -142,7 +145,8 @@ pub fn with_cl_revision(revision: Revision, f: impl FnOnce()) {
     f()
 }
 
-/// `r1` under CL revision 1, `r2` under revision 2 (`cl_test_revision`).
+/// `r1` under CL revision 1, `r2` under revision 2 or 3 (`cl_test_revision`).
+/// Revision 3 has the arithmetic of revision 2.
 pub fn by_cl_revision<T>(r1: T, r2: T) -> T {
     if cl_test_revision() == Revision(1) {
         r1
@@ -215,14 +219,24 @@ impl TestEnv {
         Self::from_blueprint_file_only(PREVIEW_FIXTURE).with_modules_file(REVISION_1_MODULES)
     }
 
-    /// Load from a blueprint fixture file. Under `with_cl_revision(1)` the
-    /// preview fixture also gets the revision-1 modules.
+    /// The preview launch-candidate fixture with the modules of revisions
+    /// 1 and 3.
+    pub fn preview_all_revisions() -> Self {
+        Self::preview_both_revisions().with_modules_file(REVISION_3_MODULES)
+    }
+
+    /// Load from a blueprint fixture file. Under `with_cl_revision(1)` or
+    /// `with_cl_revision(3)` the preview fixture also gets the modules of
+    /// that revision.
     pub fn from_blueprint_file(path: &str) -> Self {
         let env = Self::from_blueprint_file_only(path);
-        if path == PREVIEW_FIXTURE && cl_test_revision() == Revision(1) {
-            env.with_modules_file(REVISION_1_MODULES)
-        } else {
-            env
+        if path != PREVIEW_FIXTURE {
+            return env;
+        }
+        match cl_test_revision() {
+            Revision(1) => env.with_modules_file(REVISION_1_MODULES),
+            Revision(3) => env.with_modules_file(REVISION_3_MODULES),
+            _ => env,
         }
     }
 

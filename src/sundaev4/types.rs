@@ -740,6 +740,12 @@ pub struct ClRules {
     /// sundae-v4 05106ad (`types/cl.ConcentratedLiquidityConfig`): the
     /// config has a fifth field, `ext`. When false, it has four.
     pub config_has_ext: bool,
+    /// sundae-v4 d09ab60 (`ConcentratedLiquidityRedeemer.Operate`): the
+    /// redeemer is `Operate { entries, configs }`, each ladder is in
+    /// `configs` once, and an entry names its ladder by `config_index`.
+    /// When false, it is `Operate { entries }` and every entry carries its
+    /// own config.
+    pub operate_has_config_table: bool,
 }
 
 impl ClRules {
@@ -750,6 +756,7 @@ impl ClRules {
         fee_budget_is_fee_value: false,
         tagged_steps: false,
         config_has_ext: false,
+        operate_has_config_table: false,
     };
 
     /// sundae-v4 `25d60ae`, the launch candidate: PRs #226 to #234 and the
@@ -761,12 +768,26 @@ impl ClRules {
         fee_budget_is_fee_value: true,
         tagged_steps: true,
         config_has_ext: true,
+        operate_has_config_table: false,
+    };
+
+    /// sundae-v4 `115f19d`, the audited build (PR #238). The arithmetic and
+    /// the config are those of revision 2. The `Operate` redeemer carries a
+    /// config table (d09ab60). The module finds the pool input at the index
+    /// in the pool's own spend redeemer (660f039); the scooper already
+    /// writes that index for the vault, so that rule needs no flag.
+    pub const REVISION_3: ClRules = ClRules {
+        revision: crate::sundaev4::module_scripts::Revision(3),
+        operate_has_config_table: true,
+        ..Self::REVISION_2
     };
 
     /// The rules of a revision. `None` for a revision the scooper does not
     /// implement.
     pub fn of(revision: crate::sundaev4::module_scripts::Revision) -> Option<ClRules> {
-        [Self::REVISION_1, Self::REVISION_2].into_iter().find(|r| r.revision == revision)
+        [Self::REVISION_1, Self::REVISION_2, Self::REVISION_3]
+            .into_iter()
+            .find(|r| r.revision == revision)
     }
 
     /// The first revision whose config has this shape. A config decoded from
@@ -1223,6 +1244,112 @@ pub struct BandedOperateEntry {
     pub active_band: BigInt,
 }
 
+/// `ConcentratedLiquidityRedeemer` from CL revision 3
+/// (`ClRules::operate_has_config_table`, sundae-v4 d09ab60). `Create` and
+/// `Destroy` are those of `BandedCLRedeemer`. `Operate` carries each ladder
+/// once in `configs`; an entry names its ladder by position. The module
+/// hashes the config at that position and compares the hash with the
+/// pool's own `module_state` slot, so a wrong index fails on chain.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum BandedCLTableRedeemer {
+    Create {
+        initial_state: BandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<BandedTableEntry>,
+        configs: Vec<BandedCLConfig>,
+    },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `BandedCLTableRedeemer::Operate`.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct BandedTableEntry {
+    pub pool_oref: OutputRef,
+    pub config_index: u64,
+    pub counter: BigInt,
+    pub active_band: BigInt,
+}
+
+impl BandedCLRedeemer {
+    /// The `Operate` redeemer in the form `rules` reads, for `entries` in
+    /// batch order. With a config table, equal ladders share one table
+    /// position, in order of first use.
+    pub fn operate(rules: &ClRules, entries: Vec<BandedOperateEntry>) -> PlutusData {
+        if !rules.operate_has_config_table {
+            return BandedCLRedeemer::Operate { entries }.to_plutus();
+        }
+        let mut configs: Vec<BandedCLConfig> = vec![];
+        let entries = entries
+            .into_iter()
+            .map(|e| {
+                let config_index = match configs.iter().position(|c| *c == e.config) {
+                    Some(i) => i,
+                    None => {
+                        configs.push(e.config);
+                        configs.len() - 1
+                    }
+                };
+                BandedTableEntry {
+                    pool_oref: e.pool_oref,
+                    config_index: config_index as u64,
+                    counter: e.counter,
+                    active_band: e.active_band,
+                }
+            })
+            .collect();
+        BandedCLTableRedeemer::Operate { entries, configs }.to_plutus()
+    }
+
+    /// Decode either redeemer form. A table `Operate` comes back with each
+    /// entry's config resolved from the table. `Err` when the data is
+    /// neither form, or when an entry's index is past the table.
+    pub fn from_plutus_any_form(data: PlutusData) -> Result<Self, String> {
+        if let Ok(r) = BandedCLRedeemer::from_plutus(data.clone()) {
+            return Ok(r);
+        }
+        match BandedCLTableRedeemer::from_plutus(data).map_err(|e| e.to_string())? {
+            BandedCLTableRedeemer::Create {
+                initial_state,
+                pool_output_index,
+                initial_band,
+            } => Ok(BandedCLRedeemer::Create {
+                initial_state,
+                pool_output_index,
+                initial_band,
+            }),
+            BandedCLTableRedeemer::Destroy { entries } => Ok(BandedCLRedeemer::Destroy { entries }),
+            BandedCLTableRedeemer::Operate { entries, configs } => {
+                let entries = entries
+                    .into_iter()
+                    .map(|e| {
+                        let config =
+                            configs.get(e.config_index as usize).cloned().ok_or_else(|| {
+                                format!(
+                                    "CL entry names config {} of a table of {}",
+                                    e.config_index,
+                                    configs.len()
+                                )
+                            })?;
+                        Ok(BandedOperateEntry {
+                            pool_oref: e.pool_oref,
+                            config,
+                            counter: e.counter,
+                            active_band: e.active_band,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(BandedCLRedeemer::Operate { entries })
+            }
+        }
+    }
+}
+
 /// The pre-V13 ladder: `BandedCLConfig` without the index (spec section
 /// 2.3). Pools created before the index carry this form in their `Create`
 /// redeemer. The index is a pure function of the bands, so
@@ -1315,10 +1442,21 @@ impl OracleRules {
         clock_starts_at_first_swap: true,
     };
 
+    /// sundae-v4 `115f19d`, the audited build (PR #238, 660f039). The slot
+    /// arithmetic is that of revision 2. The module finds the pool input at
+    /// the index in the pool's own spend redeemer; the scooper already
+    /// writes that index for the vault, so no rule field differs.
+    pub const REVISION_3: OracleRules = OracleRules {
+        revision: crate::sundaev4::module_scripts::Revision(3),
+        ..Self::REVISION_2
+    };
+
     /// The rules of a revision. `None` for a revision the scooper does not
     /// implement.
     pub fn of(revision: crate::sundaev4::module_scripts::Revision) -> Option<OracleRules> {
-        [Self::REVISION_1, Self::REVISION_2].into_iter().find(|r| r.revision == revision)
+        [Self::REVISION_1, Self::REVISION_2, Self::REVISION_3]
+            .into_iter()
+            .find(|r| r.revision == revision)
     }
 }
 

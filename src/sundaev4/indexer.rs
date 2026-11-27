@@ -1135,8 +1135,10 @@ pub fn extract_ss_config_candidates(
 ///     `ext = Void` (`banded_math::config_forms`). A governor migration
 ///     from CL revision 1 to revision 2 writes that five-field config's
 ///     hash to the pool's slot and the config itself to no redeemer.
+///  4. It reads the config table of a revision-3 `Operate`
+///     (`BandedCLRedeemer::from_plutus_any_form`).
 ///
-/// All three rules only ADD candidates. The hash pin rejects anything wrong.
+/// All four rules only ADD candidates. The hash pin rejects anything wrong.
 pub fn extract_bcl_config_candidates(
     tx: &MultiEraTx,
     bcl_script_hash: &ScriptHash,
@@ -1154,7 +1156,7 @@ pub fn extract_bcl_config_candidates(
     for redeemer in redeemers {
         let data = redeemer.data().clone();
         let out = &mut found;
-        if let Ok(parsed) = BandedCLRedeemer::from_plutus(data.clone()) {
+        if let Ok(parsed) = BandedCLRedeemer::from_plutus_any_form(data.clone()) {
             match parsed {
                 BandedCLRedeemer::Create { initial_state, .. } => out.push(initial_state),
                 BandedCLRedeemer::Operate { entries } => {

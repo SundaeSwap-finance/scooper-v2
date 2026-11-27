@@ -4570,10 +4570,14 @@ impl PoolModuleEntries {
             }
             .to_plutus(),
             ModuleKind::ConcentratedLiquidity => {
-                crate::sundaev4::types::BandedCLRedeemer::Operate {
-                    entries: collect!(Cl),
-                }
-                .to_plutus()
+                // One module hash has one revision, and each config carries
+                // the rules of its pool's module hash.
+                let entries: Vec<crate::sundaev4::types::BandedOperateEntry> = collect!(Cl);
+                let rules = entries
+                    .first()
+                    .map(|e| e.config.rules)
+                    .unwrap_or(crate::sundaev4::types::ClRules::REVISION_1);
+                crate::sundaev4::types::BandedCLRedeemer::operate(&rules, entries)
             }
             ModuleKind::FeeSplit => FeeSplitRedeemer::Operate {
                 entries: collect!(FeeSplit),

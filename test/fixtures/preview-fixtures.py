@@ -1,10 +1,11 @@
 """Build the scoop-test fixtures from two unparameterized sundae-v4 blueprints.
 
-    python3 -I test/fixtures/preview-fixtures.py <launch-candidate plutus.json> <revision-1 plutus.json>
+    python3 -I test/fixtures/preview-fixtures.py <launch-candidate plutus.json> <revision-1 plutus.json> <audited plutus.json>
 
 Inputs:
   launch candidate: sundae-v4 25d60ae (main + PRs #234, #226-#233), `aiken build`.
   revision 1:       sundae-v4 e7d9c14, `aiken build`.
+  audited:          sundae-v4 115f19d (PR #238), `aiken build`.
 
 Each validator gets the preview parameters through `aiken blueprint apply`:
   pool_policy      b8a18e251b3e5078c04203f1a9af52408064c5d3a4256cfcfe3f67dd
@@ -19,6 +20,8 @@ Outputs, next to this script:
   preview-revision-1-modules.json  the revision-1 CL and oracle, and the
       e7d9c14 constant_sum, titled by config role key, for
       `TestEnv::with_modules_file`.
+  preview-revision-3-modules.json  the audited (revision-3) CL and oracle,
+      in the same form.
 
 The script asserts the applied hashes that preview runs, so a wrong input or
 a wrong parameter fails here and not in a test. settings_mint needs the
@@ -82,7 +85,7 @@ def ref(i):
 
 
 def main():
-    launch_src, r1_src = sys.argv[1], sys.argv[2]
+    launch_src, r1_src, r3_src = sys.argv[1], sys.argv[2], sys.argv[3]
     # (fixture title, validator, revision). The order is the one the
     # October fixture used: `to_v4_module_scripts` matches titles by
     # substring and takes the first hit.
@@ -109,6 +112,10 @@ def main():
         ("oracle", "modules/oracle.oracle_module", 1),
         ("constant-sum", "modules/constant_sum.constant_sum_module", 1),
     ]
+    revision_3 = [
+        ("banded-concentrated-liquidity", "modules/concentrated_liquidity.concentrated_liquidity_module", 3),
+        ("oracle", "modules/oracle.oracle_module", 3),
+    ]
     expect = {
         "pool": "f577d24cfa393efdb85482554acbdd5082f99acba9c17eab916cf87a",
         "poolMint": POOL_POLICY,
@@ -121,11 +128,17 @@ def main():
         "banded-concentrated-liquidity": "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18",
         "oracle": "31e23dfda0b2c2120667234dfa92a66909fd8765e80166de734c6927",
     }
+    expect_r3 = {
+        "banded-concentrated-liquidity": "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9",
+        "oracle": "e0819f6e35de6ce91a2a8a6e1e156ddaee5289b910aa20f71dddd287",
+    }
     sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
     with tempfile.TemporaryDirectory() as work:
         got = apply_all(launch_src, work, [n for _, n, _ in launch])
     with tempfile.TemporaryDirectory() as work:
         got_r1 = apply_all(r1_src, work, ["order.order_validator"] + [n for _, n, _ in revision_1])
+    with tempfile.TemporaryDirectory() as work:
+        got_r3 = apply_all(r3_src, work, ["order.order_validator"] + [n for _, n, _ in revision_3])
 
     def entries(rows, got, expect):
         vals, refs = [], []
@@ -154,8 +167,15 @@ def main():
                    "pool_policy": POOL_POLICY, "settings_policy": SETTINGS_POLICY},
         "validators": vals1, "references": refs1,
     }
+    vals3, refs3 = entries(revision_3, got_r3, expect_r3)
+    r3_bp = {
+        "source": {"sundae-v4": "115f19d", "plutus.json sha256": sha(r3_src),
+                   "pool_policy": POOL_POLICY, "settings_policy": SETTINGS_POLICY},
+        "validators": vals3, "references": refs3,
+    }
     for name, bp in [("preview-launch-candidate-blueprint.json", main_bp),
-                     ("preview-revision-1-modules.json", r1_bp)]:
+                     ("preview-revision-1-modules.json", r1_bp),
+                     ("preview-revision-3-modules.json", r3_bp)]:
         with open(os.path.join(HERE, name), "w") as f:
             json.dump(bp, f, indent=1)
             f.write("\n")
@@ -164,6 +184,8 @@ def main():
         print(f"  {t:30} {got[n][0]}")
     for t, n, _ in revision_1:
         print(f"  r1 {t:27} {got_r1[n][0]}")
+    for t, n, _ in revision_3:
+        print(f"  r3 {t:27} {got_r3[n][0]}")
 
 
 main()

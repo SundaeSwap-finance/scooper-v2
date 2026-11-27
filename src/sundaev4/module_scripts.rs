@@ -124,7 +124,7 @@ impl ModuleKind {
     /// revision from [`Revision::DEFAULT`] to this one is implemented.
     pub fn latest_revision(self) -> Revision {
         match self {
-            ModuleKind::ConcentratedLiquidity | ModuleKind::Oracle => Revision(2),
+            ModuleKind::ConcentratedLiquidity | ModuleKind::Oracle => Revision(3),
             _ => Revision::DEFAULT,
         }
     }
@@ -152,6 +152,8 @@ impl ModuleKind {
 /// | `banded-concentrated-liquidity` | 2 | `25d60ae`, the launch candidate | `ClRules::REVISION_2` |
 /// | `oracle` | 1 | `e7d9c14`, preview `31e23dfd…` and `144f4c99…` | `OracleRules::REVISION_1` |
 /// | `oracle` | 2 | `25d60ae`, the launch candidate | `OracleRules::REVISION_2` |
+/// | `banded-concentrated-liquidity` | 3 | `115f19d`, the audited build | `ClRules::REVISION_3` |
+/// | `oracle` | 3 | `115f19d`, the audited build | `OracleRules::REVISION_3` |
 ///
 /// To add a revision: add a rules constant for it next to the existing
 /// ones, return it from that rules type's `of`, raise
@@ -850,7 +852,7 @@ mod tests {
             )
         };
         for (key, rev) in [
-            ("concentrated-liquidity", 3),
+            ("concentrated-liquidity", 4),
             ("fee-split", 2),
             ("oracle", 0),
         ] {
