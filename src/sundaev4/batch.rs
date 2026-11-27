@@ -1512,6 +1512,33 @@ pub fn resolve_proportional_withdraw(
         ));
     }
     let (lp_burned, dy, target_delta_v) = resolve_withdraw_of_offered(pool, offered)?;
+    // The basic-order constraint measures what the order receives of each
+    // min_received asset and requires at least the minimum
+    // (check_min_received_gross). Refuse here, by name, a fill that pays
+    // less: a CL pool at its ladder edge holds almost none of one asset, and
+    // a withdraw with a minimum of 1 on both assets then pays 0 of it
+    // (preview, 2026-11-27, order 4a15bbbd on pool 1f256c00). The order can
+    // fill later, when the pool holds that asset again.
+    if let Constraint::Withdraw { min_received, .. } = &order.constraint {
+        let zero = BigInt::from(0);
+        for (asset, minimum) in min_received {
+            let paid = pool
+                .pool_datum
+                .assets
+                .iter()
+                .position(|(a, _)| a == asset)
+                .map(|i| &dy[i])
+                .unwrap_or(&zero);
+            if paid < minimum {
+                return Err(format!(
+                    "withdraw pays {} of {}, below the order's minimum {}",
+                    paid,
+                    hex::encode(&asset.token),
+                    minimum
+                ));
+            }
+        }
+    }
     Ok(ResolvedWithdraw {
         order: order.clone(),
         lp_burned,
@@ -2156,6 +2183,49 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("cancel"), "{err}");
+    }
+    /// A withdraw whose payout of one asset is below that asset's minimum is
+    /// refused by name. The pool here holds 1 unit of ADA, as a CL pool at
+    /// its ladder edge does, so a withdraw of 10% of the LP pays 0 ADA.
+    #[test]
+    fn withdraw_that_pays_less_than_a_minimum_is_refused_by_name() {
+        let pool = make_pool(1, 1_000_000);
+        let lp = AssetClass {
+            policy: vec![0xcc; 28],
+            token: vec![0x00, 0x14, 0xdf, 0x10, 0xde, 0xad],
+        };
+        let burn = &pool.pool_datum.total_lp / BigInt::from(10);
+        let order_with = |min_received: Vec<(AssetClass, BigInt)>| {
+            let mut value = Value::default();
+            value.insert(&ada(), BigInt::from(2_000_000i64));
+            value.insert(&lp, burn.clone());
+            let mut order = SundaeV4Order::test_swap_order(
+                TransactionInput::new([8u8; 32].into(), 0),
+                value,
+                Multisig::Signature(vec![0xaa; 28]),
+                Destination::SelfDestination,
+                (lp.clone(), burn.clone()),
+                (ada(), BigInt::from(1)),
+                BigInt::from(1_500_000i64),
+                7,
+            );
+            order.constraint = Constraint::Withdraw {
+                offered: vec![(lp.clone(), burn.clone())],
+                min_received,
+            };
+            Arc::new(order)
+        };
+        let both = order_with(vec![(ada(), BigInt::from(1)), (token_a(), BigInt::from(1))]);
+        let err = match resolve_proportional_withdraw(&pool, &both) {
+            Err(e) => e,
+            Ok(_) => panic!("a payout below a minimum must be refused"),
+        };
+        assert!(err.contains("withdraw pays 0 of"), "{err}");
+        assert!(err.contains("below the order's minimum 1"), "{err}");
+
+        // The same order with a minimum only on the asset the pool can pay.
+        let one = order_with(vec![(token_a(), BigInt::from(1))]);
+        assert!(resolve_proportional_withdraw(&pool, &one).is_ok());
     }
     /// A swap order whose min_received list is empty. Nothing checks the
     /// list when an order is created, so such an order can be on chain. The
