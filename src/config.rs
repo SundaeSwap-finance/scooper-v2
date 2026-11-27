@@ -184,10 +184,11 @@ mod tests {
         use crate::sundaev4::ModuleKind;
         // Preview lists the older hashes of each migrated kind beside the
         // current one, so it has two fee_split hashes. Preprod lists the
-        // older CL and oracle hashes beside the audited ones.
+        // older CL and oracle hashes beside the audited ones, and the
+        // audited fee_split that new CL pools name beside the launch one.
         for (file, modules, fee_splits) in [
             ("config/preview-v4.json", 18, 2),
-            ("config/preprod-v4.json", 11, 1),
+            ("config/preprod-v4.json", 12, 2),
             ("config/mainnet-v4.json", 7, 1),
         ] {
             let config = load_config([file]).expect("config loads");

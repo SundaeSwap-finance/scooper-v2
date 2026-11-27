@@ -399,10 +399,16 @@
       "hash": "726a1160a888c6d08934c4e001eb166e81dda300c2500d8b53fb4130",
       "ref-utxo": "471002b45ecc6bf10ec403b17fe914a9d3c7d3f2221b38606d24eb5c12b31385#0"
      },
-     "fee-split": {
-      "hash": "1735ce824f52913fdae7e03a9005c35b4eb56aaa793c51d1b20e904d",
-      "ref-utxo": "8afe88bcb19cccc5ebdc3666733c796fc6a0b9bfa47f233a2b15877f71686528#0"
-     },
+     "fee-split": [
+      {
+       "hash": "1735ce824f52913fdae7e03a9005c35b4eb56aaa793c51d1b20e904d",
+       "ref-utxo": "8afe88bcb19cccc5ebdc3666733c796fc6a0b9bfa47f233a2b15877f71686528#0"
+      },
+      {
+       "hash": "c6c7c1a56dbe6ab9ff7e258e1416bbc046719933e22b91b846a5887c",
+       "ref-utxo": "bc7930d7f36c092edcc143338c170c2403f4223e674b671ddf97dba70cd1d0ed#0"
+      }
+     ],
      "fairness": {
       "hash": "e2a916c7a20f53970e7270dd27918b5104a3dfe06dcf47ecd0395844",
       "ref-utxo": "40982ac55d21b7911b9fea6f39afb396aba0213501ef7bacb7a95e6cf92f6b23#0"
