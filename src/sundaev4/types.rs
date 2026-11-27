@@ -510,6 +510,10 @@ impl Constraint {
     }
 }
 
+/// Why a swap order with an empty `min_received` list is refused.
+pub const NO_MIN_RECEIVED: &str = "the order's min_received list is empty: the order was built wrong, \
+     it can never be scooped, and its owner must cancel it";
+
 /// Decode an order's constraint into `(OrderDatum, Constraint)`, or an
 /// enriched error string suitable for surfacing to operators / the API.
 ///
@@ -1467,10 +1471,14 @@ impl SundaeV4Order {
 
     /// First entry of the Swap's min_received list. See
     /// [`Constraint::swap_min_received`].
-    pub fn swap_min_received(&self) -> (&AssetClass, &BigInt) {
-        self.constraint
-            .swap_min_received()
-            .expect("SundaeV4Order::swap_min_received called on non-Swap constraint")
+    ///
+    /// `None` for an order that is not a swap, and for a swap whose
+    /// `min_received` list is empty. The list is the order owner's data and
+    /// nothing checks it when the order is created, so an empty list can
+    /// reach the scooper. Such an order can never be scooped; a caller
+    /// refuses it with [`NO_MIN_RECEIVED`].
+    pub fn swap_min_received(&self) -> Option<(&AssetClass, &BigInt)> {
+        self.constraint.swap_min_received()
     }
 
     /// Test-only constructor for a Swap-shaped order. `offer` is `(asset, qty)`

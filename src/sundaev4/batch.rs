@@ -519,6 +519,11 @@ pub fn try_execute_order(
     running_total_lp: &BigInt,
     pool_type: &PoolType,
 ) -> Result<ResolvedSwap, String> {
+    // Before the direction lookup, which reads the same list and would
+    // report a pool mismatch.
+    if order.swap_min_received().is_none() {
+        return Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+    }
     let (input_idx, output_idx) = detect_swap_direction(order, running_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
@@ -543,7 +548,9 @@ pub fn try_execute_order(
     }
 
     // Check min_received constraint
-    let (_, min_qty) = order.swap_min_received();
+    let Some((_, min_qty)) = order.swap_min_received() else {
+        return Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+    };
     if &dy < min_qty {
         return Err(format!(
             "computed dy={dy} below min_received={min_qty} (dx={dx}, reserves=[in={}, out={}])",
@@ -698,6 +705,11 @@ pub fn check_order_executability(
     total_lp: &BigInt,
     pool_type: &PoolType,
 ) -> Result<ResolvedSwap, String> {
+    // Before the direction lookup, which reads the same list and would
+    // report a pool mismatch.
+    if order.swap_min_received().is_none() {
+        return Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+    }
     let (input_idx, output_idx) = detect_swap_direction(order, pool_assets)
         .ok_or_else(|| "no matching pool asset in order value".to_string())?;
 
@@ -713,7 +725,9 @@ pub fn check_order_executability(
 
     // Check min_received
     let output_asset = &pool_assets[output_idx].0;
-    let (ask_asset, min_qty) = order.swap_min_received();
+    let Some((ask_asset, min_qty)) = order.swap_min_received() else {
+        return Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+    };
     if ask_asset != output_asset {
         return Err("pool output asset doesn't match min_received token".to_string());
     }
@@ -1918,5 +1932,82 @@ mod tests {
         let groups = group_orders_by_pool(&orders, &pools);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[&ident].len(), 2);
+    }
+
+    /// A swap order whose min_received list is empty. Nothing checks the
+    /// list when an order is created, so such an order can be on chain. The
+    /// scooper used to read the first entry with `expect`, and one such
+    /// order stopped the preview scooper at every start from 2026-11-21
+    /// (order 84df706e…#9). The accessor now returns `None`, and each path
+    /// refuses the order by name.
+    #[test]
+    fn swap_with_an_empty_min_received_is_refused_by_name() {
+        let pool = make_pool(1_000_000, 1_000_000);
+        let mut value = Value::default();
+        value.insert(&ada(), BigInt::from(6_000_000i64));
+        let mut order = SundaeV4Order::test_swap_order(
+            TransactionInput::new([9u8; 32].into(), 9),
+            value,
+            Multisig::Signature(vec![0xaa; 28]),
+            Destination::SelfDestination,
+            (ada(), BigInt::from(2_000_000i64)),
+            (token_a(), BigInt::from(1)),
+            BigInt::from(1_500_000i64),
+            7,
+        );
+        let Constraint::Swap { min_received, .. } = &mut order.constraint else {
+            panic!("test_swap_order builds a swap");
+        };
+        min_received.clear();
+        assert!(order.swap_min_received().is_none());
+        let order = Arc::new(order);
+        for result in [
+            try_execute_order(
+                &order,
+                &pool.pool_datum.assets,
+                &pool.pool_datum.total_lp,
+                &pool.pool_type,
+            ),
+            check_order_executability(
+                &order,
+                &pool.pool_datum.assets,
+                &pool.pool_datum.total_lp,
+                &pool.pool_type,
+            ),
+        ] {
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("an empty min_received must be refused"),
+            };
+            assert!(err.contains("min_received list is empty"), "{err}");
+            assert!(err.contains("cancel"), "{err}");
+        }
+    }
+
+    /// The datum of preview order 84df706e…#9 decodes to that order: a
+    /// basic-order swap of 2 ADA with no minimum.
+    #[test]
+    fn the_preview_order_with_no_minimum_decodes_to_an_empty_list() {
+        use plutus_parser::AsPlutus;
+        let cbor = hex::decode(
+            include_str!("../../test/fixtures/preview-order-empty-min-received-84df706e-9.hex")
+                .trim(),
+        )
+        .unwrap();
+        let data: pallas_primitives::PlutusData = minicbor::decode(&cbor).unwrap();
+        let datum = crate::sundaev4::OrderDatum::from_plutus(data).unwrap();
+        let basic =
+            hex::decode("4859acf5f46a50f383d16323a3c7eacf502ba732aa8874a7d3b7783e").unwrap();
+        match crate::sundaev4::decode_order_constraint(&datum, &[], &basic, &[]).unwrap() {
+            Constraint::Swap {
+                remaining_offered,
+                min_received,
+                ..
+            } => {
+                assert_eq!(remaining_offered, BigInt::from(2_000_000i64));
+                assert!(min_received.is_empty());
+            }
+            other => panic!("expected a swap, got {other:?}"),
+        }
     }
 }
