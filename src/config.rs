@@ -183,10 +183,11 @@ mod tests {
     fn every_environment_config_parses_its_module_scripts() {
         use crate::sundaev4::ModuleKind;
         // Preview lists the older hashes of each migrated kind beside the
-        // current one, so it has two fee_split hashes.
+        // current one, so it has two fee_split hashes. Preprod lists the
+        // older CL and oracle hashes beside the audited ones.
         for (file, modules, fee_splits) in [
             ("config/preview-v4.json", 18, 2),
-            ("config/preprod-v4.json", 9, 1),
+            ("config/preprod-v4.json", 11, 1),
             ("config/mainnet-v4.json", 7, 1),
         ] {
             let config = load_config([file]).expect("config loads");
