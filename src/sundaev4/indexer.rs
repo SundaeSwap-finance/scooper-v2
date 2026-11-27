@@ -2496,7 +2496,7 @@ mod mainnet_create_tx_tests {
 }
 
 #[cfg(test)]
-mod sub_transaction_tests {
+pub(crate) mod sub_transaction_tests {
     //! Dijkstra sub-transactions (#113). The fixture is Musashi transaction
     //! ca89430c…, copied unchanged from sundae-portfolio
     //! (functions/kinesis-v4-order/testdata), which took it from
@@ -2510,13 +2510,15 @@ mod sub_transaction_tests {
     use super::*;
     use crate::persistence::{PersistenceConfig, connect};
 
-    const SUB_TX_ID: &str = "ede49f69c8e99d253d82b0b06d024be6435168cfeb1b960761370fe1bf5f8377";
+    pub(crate) const SUB_TX_ID: &str =
+        "ede49f69c8e99d253d82b0b06d024be6435168cfeb1b960761370fe1bf5f8377";
     /// The order spend script of the preview cs-launch deployment the
     /// fixture's order was placed against.
-    const ORDER_SCRIPT_HASH: &str = "c323b9545afa6826b4121c048634ec168d78fa6f2349198169ff76f7";
+    pub(crate) const ORDER_SCRIPT_HASH: &str =
+        "c323b9545afa6826b4121c048634ec168d78fa6f2349198169ff76f7";
     const DATUM_DECODED: &str = "constraint decode:";
 
-    fn fixture() -> Vec<u8> {
+    pub(crate) fn fixture() -> Vec<u8> {
         hex::decode(include_str!("../../testdata/musashi-ca89430c.hex").trim()).unwrap()
     }
 
@@ -2741,7 +2743,7 @@ mod sub_transaction_tests {
 
     /// The phase-2 result of a whole transaction.
     #[derive(Clone, Copy)]
-    enum Phase2 {
+    pub(crate) enum Phase2 {
         Valid,
         Failed,
     }
@@ -2776,7 +2778,7 @@ mod sub_transaction_tests {
     }
 
     /// The body whose witness set carries the order datum.
-    enum DatumIn {
+    pub(crate) enum DatumIn {
         Sub,
         Parent,
     }
@@ -2784,7 +2786,7 @@ mod sub_transaction_tests {
     /// A transaction whose one sub-transaction pays an order output that
     /// carries a datum hash. The datum preimage goes in the witness set of
     /// `datum_in`.
-    fn sub_tx_with_hashed_order(datum_in: DatumIn, phase2: Phase2) -> Vec<u8> {
+    pub(crate) fn sub_tx_with_hashed_order(datum_in: DatumIn, phase2: Phase2) -> Vec<u8> {
         let datum = order_datum();
         let parent = Body {
             witness_datum: matches!(datum_in, DatumIn::Parent).then(|| datum.clone()),
@@ -2798,7 +2800,7 @@ mod sub_transaction_tests {
         dijkstra_tx(parent, vec![sub], phase2)
     }
 
-    fn sub_tx_id(tx: &[u8]) -> String {
+    pub(crate) fn sub_tx_id(tx: &[u8]) -> String {
         hex::encode(MultiEraTx::decode(tx).unwrap().sub_transactions()[0].hash())
     }
 
