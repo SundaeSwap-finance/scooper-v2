@@ -1781,7 +1781,15 @@ impl Scooper {
                     // drained the optimal one.
                     let (offer_asset, _) = order.swap_offered();
                     let offer_amount = &order.swap_executable();
-                    let (ask_asset, _) = order.swap_min_received();
+                    let Some((ask_asset, _)) = order.swap_min_received() else {
+                        skip_add_failed += 1;
+                        tracing::info!(
+                            order = %order.input,
+                            "{}",
+                            crate::sundaev4::NO_MIN_RECEIVED
+                        );
+                        continue;
+                    };
                     if offer_asset == ask_asset {
                         continue;
                     }
@@ -3782,7 +3790,7 @@ impl Scooper {
         };
         let (offer_asset, remaining) = order.swap_offered();
         let executable = order.swap_executable();
-        let (ask_asset, min_qty) = order.swap_min_received();
+        let (ask_asset, min_qty) = order.swap_min_received()?;
 
         // Economic floor under the fee redesign (SUNDAE-2587): a partial
         // fill of `dx` lets the scooper deduct at most

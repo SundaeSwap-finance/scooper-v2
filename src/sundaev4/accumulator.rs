@@ -1013,8 +1013,10 @@ impl Accumulator {
                 }
             }
         }
-        if result.is_ok() {
-            let (ask_asset, min_qty) = order.swap_min_received();
+        if result.is_ok() && order.swap_min_received().is_none() {
+            result = Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+        }
+        if let (true, Some((ask_asset, min_qty))) = (result.is_ok(), order.swap_min_received()) {
             let final_asset = self.routes.last().map(|r| r.final_output_asset.clone());
             if final_asset.as_ref() == Some(ask_asset) {
                 let executable = order.swap_executable();
@@ -1360,7 +1362,9 @@ impl Accumulator {
         // pro-rata cross-multiplication:
         //   received · original_offered ≥ min · offered_this_fill
         if enforce_min {
-            let (ask_asset, min_qty) = order.swap_min_received();
+            let Some((ask_asset, min_qty)) = order.swap_min_received() else {
+                return Err(crate::sundaev4::types::NO_MIN_RECEIVED.to_string());
+            };
             if final_output_asset.as_ref() == Some(ask_asset) {
                 let executable = order.swap_executable();
                 let ok = if route.total_input < executable {
