@@ -66,7 +66,9 @@ pub struct TestConstraintCtx {
     pub fairness_order: Vec<u8>,
     pub strategy_order: Vec<u8>,
     pub settings_mint: Vec<u8>,
-    pub fee_constraint: Vec<u8>,
+    /// Absent from fixtures without a `feeConstraint` validator (the
+    /// preview fixture has none); `CFG_SWAP_FEE` needs it.
+    pub fee_constraint: Option<Vec<u8>>,
 }
 pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync::OnceLock::new();
 
@@ -91,6 +93,8 @@ pub struct TestEnv {
     pub scripts: ScriptStore,
     /// Loaded Butane runtime for conversion-leg tests (repo config).
     pub butane: Option<crate::sundaev4::butane::ButaneRuntime>,
+    /// Cardano-Swaps order-book fixture (runtime + orders).
+    pub cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot>,
     pub ref_utxo_outputs:
         BTreeMap<crate::cardano_types::TransactionInput, crate::cardano_types::TransactionOutput>,
     pub language_views: Vec<u8>,
@@ -101,6 +105,10 @@ pub struct TestEnv {
     pub funding: Option<(TransactionInput, Value)>,
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
 }
+
+/// The audited build (sundae-v4 115f19d) on the preview parameters. Built by
+/// `test/fixtures/preview-fixtures.py`.
+pub const PREVIEW_FIXTURE: &str = "test/fixtures/preview-audited-blueprint.json";
 
 impl TestEnv {
     /// Load from a blueprint fixture file.
@@ -132,11 +140,14 @@ impl TestEnv {
         for validator in &blueprint.validators {
             if let Some(code_hex) = &validator.compiled_code {
                 // Find the reference for this validator
-                if let Some(reference) = blueprint.references.iter().find(|r| {
-                    r.key == validator.title
-                        || validator.title.contains(&r.key)
-                        || r.key.contains(&validator.title)
-                }) {
+                // An exact key first: "pool" is a substring of "poolMint".
+                if let Some(reference) =
+                    blueprint.references.iter().find(|r| r.key == validator.title).or_else(|| {
+                        blueprint.references.iter().find(|r| {
+                            validator.title.contains(&r.key) || r.key.contains(&validator.title)
+                        })
+                    })
+                {
                     let tx_hash_bytes = hex::decode(&reference.tx_in.hash).unwrap();
                     let tx_hash: Hash<32> = tx_hash_bytes.as_slice().into();
                     let input =
@@ -175,15 +186,14 @@ impl TestEnv {
             .find(|v| v.title == "settingsMint" || v.title.contains("settings_mint"))
             .map(|v| hex::decode(&v.hash).expect("settingsMint hash hex"));
         let ctx = match (
-            &module_scripts.swap_order,
-            &module_scripts.basic_order,
-            &module_scripts.route_order,
-            &module_scripts.fairness_order,
-            &module_scripts.strategy_order,
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::SwapOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::BasicOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::RouteOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::FairnessOrder),
+            &module_scripts.first_of(crate::sundaev4::ModuleKind::StrategyOrder),
             settings_mint,
-            &module_scripts.fee_constraint,
         ) {
-            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm), Some(fc)) => {
+            (Some(sw), Some(ba), Some(ro), Some(fo), Some(st), Some(sm)) => {
                 Some(TestConstraintCtx {
                     swap_order: sw.hash.as_ref().to_vec(),
                     basic_order: ba.hash.as_ref().to_vec(),
@@ -191,7 +201,9 @@ impl TestEnv {
                     fairness_order: fo.hash.as_ref().to_vec(),
                     strategy_order: st.hash.as_ref().to_vec(),
                     settings_mint: sm,
-                    fee_constraint: fc.hash.as_ref().to_vec(),
+                    fee_constraint: module_scripts
+                        .first_of(crate::sundaev4::ModuleKind::FeeConstraint)
+                        .map(|fc| fc.hash.as_ref().to_vec()),
                 })
             }
             _ => None,
@@ -200,7 +212,7 @@ impl TestEnv {
             BTreeMap::new();
         if let Some(ctx) = &ctx {
             // Mirrors the CLI's mint-order-config presets.
-            let entries: [(&[u8], Vec<Vec<u8>>); 4] = [
+            let mut entries: Vec<(&[u8], Vec<Vec<u8>>)> = vec![
                 (
                     CFG_SWAP,
                     vec![
@@ -221,16 +233,18 @@ impl TestEnv {
                         ctx.fairness_order.clone(),
                     ],
                 ),
-                (
+            ];
+            if let Some(fee_constraint) = &ctx.fee_constraint {
+                entries.push((
                     CFG_SWAP_FEE,
                     vec![
                         ctx.swap_order.clone(),
                         ctx.route_order.clone(),
                         ctx.fairness_order.clone(),
-                        ctx.fee_constraint.clone(),
+                        fee_constraint.clone(),
                     ],
-                ),
-            ];
+                ));
+            }
             for (i, (token, required)) in entries.into_iter().enumerate() {
                 let token = token.to_vec();
                 let mut value = Value::default();
@@ -278,10 +292,11 @@ impl TestEnv {
                 slot_length: 1000,
             },
             pool_configs: std::collections::BTreeMap::new(),
-            max_tx_ex_mem: 14_000_000,
+            max_tx_ex_mem: 16_500_000,
             max_tx_ex_steps: 10_000_000_000,
             max_tx_size: 16_384,
             budget_padding: crate::sundaev4::types::default_budget_padding(),
+            evaluate_url: crate::sundaev4::types::default_evaluate_url(),
             blacklisted_pools: Default::default(),
             rate_guards: Vec::new(),
             pool_allowlists: Default::default(),
@@ -290,6 +305,7 @@ impl TestEnv {
             strategy_peers: Vec::new(),
             conversions: Vec::new(),
             butane: None,
+            cardano_swaps: None,
             plutus_v2_cost_model: None,
             partial_fill_margin: None,
             partial_fill_fee_estimate: 2_500_000,
@@ -313,6 +329,7 @@ impl TestEnv {
         funding_value.insert(&ada(), BigInt::from(50_000_000i64));
 
         TestEnv {
+            cardano_swaps: None,
             exec,
             scripts,
             butane: None,
@@ -341,11 +358,71 @@ impl TestEnv {
             routes: Vec::new(),
             global_seq: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
         };
         self.build_and_eval_plan(&plan, settings, slot)
     }
 
     /// Build + eval from a full ScoopPlan (with routes + global_seq).
+    /// Load the Cardano-Swaps fixture: the mainnet runtime constants and
+    /// the orders from the replay fixtures, with the swap script admitted
+    /// to the eval store and its reference UTxO to `ref_utxo_outputs`.
+    pub fn enable_cardano_swaps(
+        &mut self,
+    ) -> &crate::sundaev4::cardano_swaps::CardanoSwapsSnapshot {
+        use crate::sundaev4::cardano_swaps::{self as cs, replay_tests as rt};
+        let config = cs::CardanoSwapsConfig {
+            enabled: true,
+            swap_script_hash: rt::SWAP_HASH.into(),
+            swap_ref_utxo: "e7ab2e2e12b5ae51110758e3b668b31cfa215187d24c388bb5e736b6338d2a07#0"
+                .into(),
+            beacon_policy: rt::BEACON_POLICY.into(),
+            // The live orders sit right on their own min-UTxO floor, so the
+            // fixture keeps exactly what the chain kept.
+            min_keep_lovelace: 2_780_000,
+            foreign_fills: Some(cs::ForeignFillConfig {
+                enabled: true,
+                min_revenue_lovelace: 0,
+                fee_estimate_lovelace: 0,
+                min_pool_lovelace: 0,
+            }),
+        };
+        let runtime = cs::CardanoSwapsRuntime::load(&config).expect("fixture config loads");
+        let utxos = rt::utxo_set();
+        let mut state = cs::CardanoSwapsState::default();
+        for (k, out) in &utxos {
+            if out.address.to_vec().get(1..29) != Some(&runtime.swap_hash[..]) {
+                continue;
+            }
+            // Only the orders the real fills consumed, not their
+            // continuations (which the fixtures also contain).
+            if let Some(o) = cs::SwapOrder::from_output(k.clone(), out)
+                && o.datum.prev_input.is_none()
+            {
+                state.orders.insert(k.clone(), o);
+            }
+        }
+        for r in runtime.static_ref_utxos() {
+            let out = utxos.get(&r).expect("swap script ref UTxO in the fixtures");
+            let Some(crate::cardano_types::ScriptRef::PlutusV3(script)) = &out.script_ref else {
+                panic!("the swap ref UTxO carries no V3 script");
+            };
+            self.scripts
+                .insert_with_version(script.as_ref(), 3)
+                .expect("cardano-swaps script inserts");
+            self.ref_utxo_outputs.insert(r, out.clone());
+        }
+        self.exec.slot_config = rt::mainnet_slots();
+        let (_, legs) = runtime.edges(&state, 0);
+        self.cardano_swaps = Some(cs::CardanoSwapsSnapshot {
+            runtime,
+            state,
+            legs,
+            slot_config: rt::mainnet_slots(),
+        });
+        self.cardano_swaps.as_ref().unwrap()
+    }
+
     /// Use this when testing routed orders via the accumulator.
     /// Load the Butane runtime from the committed preview config and
     /// admit its scripts to the eval store. Returns false (test should
@@ -421,6 +498,7 @@ impl TestEnv {
             Some(&fee_settings_node()),
             self.funding.as_ref().map(|(i, v)| (i.clone(), v)),
             self.butane.as_ref(),
+            self.cardano_swaps.as_ref().map(|s| s.context()).as_ref(),
         )?;
 
         let eval = evaluate_scoop_tx(
@@ -580,16 +658,28 @@ impl TestEnv {
             (
                 self.exec
                     .module_scripts
-                    .constant_product
-                    .as_ref()
+                    .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                     .expect("harness blueprint includes constantProduct")
                     .hash
                     .to_vec(),
                 cp_hash,
             ),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -600,13 +690,22 @@ impl TestEnv {
         vec![
             self.exec
                 .module_scripts
-                .constant_product
-                .as_ref()
+                .first_of(crate::sundaev4::ModuleKind::ConstantProduct)
                 .expect("harness blueprint includes constantProduct")
                 .hash
                 .to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -617,8 +716,7 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
 
         let cs_config = ConstantSumConfig {
@@ -649,9 +747,22 @@ impl TestEnv {
 
         vec![
             (cs_script.hash.to_vec(), cs_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
         ]
@@ -662,13 +773,22 @@ impl TestEnv {
         let cs_script = self
             .exec
             .module_scripts
-            .constant_sum
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::ConstantSum)
             .expect("blueprint must include constantSum validator for CS tests");
         vec![
             cs_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -679,8 +799,7 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         let ss_hash = crate::sundaev4::ss_math::config_hash(config);
 
@@ -696,11 +815,116 @@ impl TestEnv {
 
         vec![
             (ss_script.hash.to_vec(), ss_hash),
-            (self.exec.module_scripts.fee_split.hash.to_vec(), fs_hash),
             (
-                self.exec.module_scripts.fairness.hash.to_vec(),
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
                 fairness_hash,
             ),
+        ]
+    }
+
+    /// `module_state` entries for a banded concentrated-liquidity pool: the
+    /// ladder's hash under the banded module credential, plus fee_split and
+    /// fairness as for every pool.
+    pub fn bcl_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let script = self.cl_script();
+        let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
+        let fs_config = FeeSplitConfig {
+            protocol_share: Rational {
+                num: BigInt::from(self.exec.protocol_share.0),
+                den: BigInt::from(self.exec.protocol_share.1),
+            },
+        };
+        let fs_cbor = minicbor::to_vec(fs_config.to_plutus()).unwrap();
+        let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
+        vec![
+            (script.hash.to_vec(), bcl_hash),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                fs_hash,
+            ),
+            (
+                self.exec
+                    .module_scripts
+                    .first_of(crate::sundaev4::ModuleKind::Fairness)
+                    .unwrap()
+                    .hash
+                    .to_vec(),
+                vec![0x80],
+            ),
+        ]
+    }
+
+    /// The action entry modules list for banded pools:
+    /// `[bcl_hash, fs_hash, fairness_hash]`.
+    /// Module list and module_state for a banded pool that also carries the
+    /// oracle module: the ladder hash, fee_split, fairness, and the oracle's
+    /// fresh slot `0x80`.
+    pub fn bcl_oracle_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let oracle = self.oracle_script();
+        let mut ms = self.bcl_module_state(config);
+        ms.push((oracle.hash.to_vec(), vec![0x80]));
+        ms
+    }
+
+    /// The CL pool's action modules plus the oracle.
+    pub fn bcl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
+        let oracle = self.oracle_script();
+        let mut m = self.bcl_action_modules();
+        m.push(oracle.hash.to_vec());
+        m
+    }
+
+    /// The fixture's CL script.
+    pub fn cl_script(&self) -> &ScriptRefInfo {
+        self.exec
+            .module_scripts
+            .first_of(crate::sundaev4::ModuleKind::ConcentratedLiquidity)
+            .expect("the fixture has a CL script")
+    }
+
+    /// The fixture's oracle script.
+    pub fn oracle_script(&self) -> &ScriptRefInfo {
+        self.exec
+            .module_scripts
+            .first_of(crate::sundaev4::ModuleKind::Oracle)
+            .expect("the fixture has an oracle script")
+    }
+
+    pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
+        let script = self.cl_script();
+        vec![
+            script.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 
@@ -710,13 +934,22 @@ impl TestEnv {
         let ss_script = self
             .exec
             .module_scripts
-            .stableswap
-            .as_ref()
+            .first_of(crate::sundaev4::ModuleKind::Stableswap)
             .expect("blueprint must include the stableswap validator for SS tests");
         vec![
             ss_script.hash.to_vec(),
-            self.exec.module_scripts.fee_split.hash.to_vec(),
-            self.exec.module_scripts.fairness.hash.to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::FeeSplit)
+                .unwrap()
+                .hash
+                .to_vec(),
+            self.exec
+                .module_scripts
+                .first_of(crate::sundaev4::ModuleKind::Fairness)
+                .unwrap()
+                .hash
+                .to_vec(),
         ]
     }
 }
@@ -848,95 +1081,6 @@ pub fn make_pool(
             fee: Rational {
                 num: BigInt::from(env.exec.fee.0),
                 den: BigInt::from(env.exec.fee.1),
-            },
-        },
-        slot: 100,
-        fee_split_config: None,
-    })
-}
-
-/// A concentrated-liquidity pool. Only the router/accumulator fields matter
-/// (pool_type, assets, total_lp) — module_state is left CP-shaped since the
-/// property tests exercise routing + accumulation, not on-chain eval.
-#[allow(clippy::too_many_arguments)]
-pub fn make_cl_pool(
-    env: &TestEnv,
-    ident_byte: u8,
-    tok_a: AssetClass,
-    tok_a_reserve: i64,
-    tok_b: AssetClass,
-    tok_b_reserve: i64,
-    total_lp: i64,
-    spa_num: i64,
-    spa_den: i64,
-    spb_num: i64,
-    spb_den: i64,
-    fee_num: i64,
-    fee_den: i64,
-) -> Arc<SundaeV4Pool> {
-    let ident_bytes = vec![ident_byte; 28];
-    let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
-    nft_name.extend_from_slice(&ident_bytes);
-    let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
-    lp_name.extend_from_slice(&ident_bytes);
-    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
-    let nft_asset = AssetClass {
-        policy: pool_mint_policy.clone(),
-        token: nft_name,
-    };
-    let lp_asset = AssetClass {
-        policy: pool_mint_policy,
-        token: lp_name,
-    };
-
-    let mut value = Value::default();
-    value.insert(&ada(), BigInt::from(50_000_000i64));
-    if tok_a_reserve > 0 {
-        value.insert(&tok_a, BigInt::from(tok_a_reserve));
-    }
-    if tok_b_reserve > 0 {
-        value.insert(&tok_b, BigInt::from(tok_b_reserve));
-    }
-    value.insert(&nft_asset, BigInt::from(1i64));
-    value.insert(&lp_asset, BigInt::from(total_lp));
-
-    let mut tx_hash = [0u8; 32];
-    tx_hash[0] = ident_byte;
-
-    Arc::new(SundaeV4Pool {
-        input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
-        address: pool_script_address(env, None),
-        value,
-        pool_datum: PoolDatum {
-            assets: vec![
-                (tok_a, BigInt::from(tok_a_reserve)),
-                (tok_b, BigInt::from(tok_b_reserve)),
-            ],
-            total_lp: BigInt::from(total_lp),
-            circulating_lp: BigInt::from(total_lp),
-            preminted_lp: BigInt::from(0i64),
-            identifier: Ident::new(&ident_bytes),
-            actions: vec![ActionEntry {
-                tag: BigInt::from(100),
-                enabled: true,
-                modules: env.action_modules(),
-            }],
-            module_state: env.module_state(),
-            min_surplus: BigInt::from(0),
-            extension: crate::sundaev4::types::plutus_void(),
-        },
-        pool_type: PoolType::ConcentratedLiquidity {
-            sqrt_price_a: Rational {
-                num: BigInt::from(spa_num),
-                den: BigInt::from(spa_den),
-            },
-            sqrt_price_b: Rational {
-                num: BigInt::from(spb_num),
-                den: BigInt::from(spb_den),
-            },
-            fee: Rational {
-                num: BigInt::from(fee_num),
-                den: BigInt::from(fee_den),
             },
         },
         slot: 100,
@@ -1115,6 +1259,132 @@ pub fn make_ss_pool(
     })
 }
 
+/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/cl_check_unit.ak`:
+/// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee,
+/// in the five-field form the module reads.
+pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
+    bcl_eq8_config_four_fields(fee).with_void_ext().expect("four fields")
+}
+
+/// The same ladder in the pre-audit four-field form. Only config recovery
+/// from chain history reads this form.
+pub fn bcl_eq8_config_four_fields(fee: Rational) -> BandedCLConfig {
+    let r = |n: i64, d: i64| Rational {
+        num: BigInt::from(n),
+        den: BigInt::from(d),
+    };
+    crate::sundaev4::banded_math::with_index(
+        (0..8)
+            .map(|i| BandSpec {
+                start: r(1_000_000 + 10_000 * i, 1_000_000),
+                weight: BigInt::from(1),
+                curve: BigInt::from(0),
+                fee_buy: fee.clone(),
+                fee_sell: fee.clone(),
+            })
+            .collect(),
+        r(1_080_000, 1_000_000),
+        BigInt::from(8),
+    )
+}
+
+/// Create a banded concentrated-liquidity pool with the proper module
+/// pipeline (banded + FS + fairness). `total_lp` is the ladder counter the
+/// reserves witness (spec V12), found with `find_witness`; the reserves
+/// must therefore sit on a point of the ladder.
+pub fn make_bcl_pool(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: BandedCLConfig,
+) -> Arc<SundaeV4Pool> {
+    make_bcl_pool_with_oracle(env, ident_byte, assets, config, false)
+}
+
+/// `make_bcl_pool`, optionally listing the oracle module in the trade
+/// action with a fresh accumulator slot.
+pub fn make_bcl_pool_with_oracle(
+    env: &TestEnv,
+    ident_byte: u8,
+    assets: Vec<(AssetClass, i64)>,
+    config: BandedCLConfig,
+    with_oracle: bool,
+) -> Arc<SundaeV4Pool> {
+    assert_eq!(assets.len(), 2, "banded pools hold exactly two assets");
+    let ident_bytes = vec![ident_byte; 28];
+
+    let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
+    nft_name.extend_from_slice(&ident_bytes);
+    let mut lp_name = vec![0x00, 0x14, 0xdf, 0x10];
+    lp_name.extend_from_slice(&ident_bytes);
+
+    let pool_mint_policy = env.exec.module_scripts.pool_mint.hash.to_vec();
+    let nft_asset = AssetClass {
+        policy: pool_mint_policy.clone(),
+        token: nft_name,
+    };
+    let lp_asset = AssetClass {
+        policy: pool_mint_policy,
+        token: lp_name,
+    };
+
+    let w = crate::sundaev4::banded_math::find_witness(
+        &config,
+        &BigInt::from(assets[0].1),
+        &BigInt::from(assets[1].1),
+    )
+    .expect("the test reserves sit on the ladder");
+    let total_lp = w.x;
+    let circulating_lp = BigInt::from(0);
+    let preminted_lp = total_lp.clone();
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(50_000_000i64));
+    for (asset, reserve) in &assets {
+        value.insert(asset, BigInt::from(*reserve));
+    }
+    value.insert(&nft_asset, BigInt::from(1i64));
+    value.insert(&lp_asset, preminted_lp.clone());
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = ident_byte;
+
+    let datum_assets: Vec<(AssetClass, BigInt)> =
+        assets.iter().map(|(a, r)| (a.clone(), BigInt::from(*r))).collect();
+
+    Arc::new(SundaeV4Pool {
+        input: crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        address: pool_script_address(env, None),
+        value,
+        pool_datum: PoolDatum {
+            assets: datum_assets,
+            total_lp,
+            circulating_lp,
+            preminted_lp,
+            identifier: Ident::new(&ident_bytes),
+            actions: vec![ActionEntry {
+                tag: BigInt::from(100),
+                enabled: true,
+                modules: if with_oracle {
+                    env.bcl_oracle_action_modules()
+                } else {
+                    env.bcl_action_modules()
+                },
+            }],
+            module_state: if with_oracle {
+                env.bcl_oracle_module_state(&config)
+            } else {
+                env.bcl_module_state(&config)
+            },
+            min_surplus: BigInt::from(0),
+            extension: crate::sundaev4::types::plutus_void(),
+        },
+        pool_type: PoolType::BandedConcentratedLiquidity { config },
+        slot: 100,
+        fee_split_config: None,
+    })
+}
+
 /// Create an order that offers `offer_tok` and wants `want_tok` in return.
 ///
 /// For a token-to-token pool with assets (A, B):
@@ -1271,7 +1541,7 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
             ctx.swap_order.clone(),
             ctx.route_order.clone(),
             ctx.fairness_order.clone(),
-            ctx.fee_constraint.clone(),
+            ctx.fee_constraint.clone().expect("CFG_SWAP_FEE needs a fixture with a feeConstraint"),
         ],
         _ => panic!("unknown cfg token"),
     };
@@ -1281,7 +1551,7 @@ pub fn with_real_constraints(mut order: SundaeV4Order, cfg_token: &[u8]) -> Sund
         .map(|h| {
             let data = if *h == ctx.route_order {
                 empty_list.clone()
-            } else if *h == ctx.fairness_order || *h == ctx.fee_constraint {
+            } else if *h == ctx.fairness_order || ctx.fee_constraint.as_ref() == Some(h) {
                 void.clone()
             } else {
                 payload.clone()
@@ -1440,6 +1710,81 @@ pub fn make_basic_withdraw_order(
     order.constraint = crate::sundaev4::types::Constraint::Withdraw {
         offered: offered_bi,
         min_received: min_bi,
+    };
+    Arc::new(order)
+}
+
+/// A basic-module order with arbitrary offered and min_received lists:
+/// several LP tokens on either side, plain assets, any mix. `ctor` is the
+/// basic constraint's dispatch tag (0 deposit, 1 withdraw, 2 swap); the
+/// chain ignores it. The order value carries every offered asset.
+pub fn make_basic_lp_order(
+    offered: Vec<(AssetClass, i64)>,
+    min_received: Vec<(AssetClass, i64)>,
+    ctor: u64,
+    slot: u64,
+) -> Arc<SundaeV4Order> {
+    use plutus_parser::AsPlutus;
+
+    let mut value = Value::default();
+    value.insert(&ada(), BigInt::from(5_000_000i64));
+    for (a, q) in &offered {
+        let cur = value.get(a);
+        value.insert(a, &cur + &BigInt::from(*q));
+    }
+
+    let mut tx_hash = [0u8; 32];
+    tx_hash[0] = 0xD4;
+    tx_hash[1] = ctor as u8;
+    tx_hash[2..10].copy_from_slice(&slot.to_be_bytes());
+
+    let (seed_offer, seed_amt) = offered[0].clone();
+    let (seed_want, seed_min) = min_received[0].clone();
+    let order = SundaeV4Order::test_swap_order(
+        crate::cardano_types::TransactionInput::new(tx_hash.into(), 0),
+        value,
+        Multisig::Signature(vec![0xAA; 28]),
+        Destination::Fixed(
+            crate::sundaev3::PlutusAddress {
+                payment_credential: crate::sundaev3::Credential::VerificationKey([0xAA; 28].into()),
+                stake_credential: None,
+            },
+            None,
+        ),
+        (seed_offer, BigInt::from(seed_amt)),
+        (seed_want, BigInt::from(seed_min)),
+        BigInt::from(1_500_000i64),
+        slot,
+    );
+
+    let offered_bi: Vec<(AssetClass, BigInt)> =
+        offered.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
+    let min_bi: Vec<(AssetClass, BigInt)> =
+        min_received.into_iter().map(|(a, q)| (a, BigInt::from(q))).collect();
+    let payload = PlutusData::Constr(pallas_primitives::Constr {
+        tag: 121 + ctor,
+        any_constructor: None,
+        fields: pallas_primitives::MaybeIndefArray::Def(vec![
+            offered_bi.clone().to_plutus(),
+            min_bi.clone().to_plutus(),
+        ]),
+    });
+    let mut order = with_real_constraints_payload(order, CFG_BASIC, Some(payload));
+    order.constraint = match ctor {
+        0 => crate::sundaev4::types::Constraint::Deposit {
+            offered: offered_bi,
+            min_received: min_bi,
+        },
+        1 => crate::sundaev4::types::Constraint::Withdraw {
+            offered: offered_bi,
+            min_received: min_bi,
+        },
+        _ => crate::sundaev4::types::Constraint::Swap {
+            offered: offered_bi[0].0.clone(),
+            original_offered: offered_bi[0].1.clone(),
+            remaining_offered: offered_bi[0].1.clone(),
+            min_received: min_bi,
+        },
     };
     Arc::new(order)
 }

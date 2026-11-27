@@ -17,6 +17,7 @@ use crate::cardano_types;
 use crate::sundaev4::types::SlotConfig;
 
 /// Resolved transaction output data for building TxInInfo.
+#[derive(Clone)]
 pub struct ResolvedTxOut {
     pub address: Vec<u8>,
     pub value: cardano_types::Value,
@@ -25,6 +26,7 @@ pub struct ResolvedTxOut {
 }
 
 /// Datum attached to a TxOut (for ScriptContext purposes).
+#[derive(Clone)]
 pub enum DatumOption {
     None,
     DatumHash(Hash<32>),

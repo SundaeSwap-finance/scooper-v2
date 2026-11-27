@@ -219,26 +219,13 @@ async fn run() -> Result<()> {
     // Captured before `protocol` moves into manager_loop.
     let mempool_spawn = protocol.v4.as_ref().and_then(|v4| {
         v4.mempool.clone().map(|cfg| {
-            let module_hash = |s: &Option<crate::sundaev4::ScriptRefInfo>| {
-                s.as_ref().map(|m| m.hash.as_ref().to_vec()).unwrap_or_default()
-            };
             let watch = mempool::ProtocolWatch {
                 pool_script_hash: v4.pool_script_hash,
                 order_script_hashes: v4.order_script_hashes.clone(),
-                swap_order_hash: v4
+                constraint_hashes: v4
                     .execution
                     .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.swap_order))
-                    .unwrap_or_default(),
-                basic_order_hash: v4
-                    .execution
-                    .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.basic_order))
-                    .unwrap_or_default(),
-                strategy_order_hash: v4
-                    .execution
-                    .as_ref()
-                    .map(|e| module_hash(&e.module_scripts.strategy_order))
+                    .map(|e| crate::sundaev4::ConstraintHashes::from_scripts(&e.module_scripts))
                     .unwrap_or_default(),
             };
             // Chained execution needs both the execute flag and an execution
@@ -477,6 +464,11 @@ async fn manager_loop(
         // because a protocol can legitimately have 0 pools while still having
         // indexed blocks, settings, orders, etc.
         let mut bootstrap_point: Option<acropolis_common::Point> = None;
+        // True when this start bootstrapped v4. That bootstrap already tried
+        // to recover every pool's module configs; running the recovery again
+        // would repeat the same history walks for each pool it could not
+        // recover.
+        let mut v4_bootstrapped = false;
         if let Some(ref bootstrap_config) = protocol.bootstrap {
             let v3_needs_bootstrap = match &v3_state {
                 Some(s) => s.lock().await.latest().pools.is_empty(),
@@ -506,6 +498,7 @@ async fn manager_loop(
                 .await
                 {
                     Ok(result) => {
+                        v4_bootstrapped = v4_needs_bootstrap;
                         if !result.tip_hash.is_empty() {
                             let point_str = format!("{}.{}", result.tip_slot, result.tip_hash);
                             match point_str.parse() {
@@ -554,9 +547,12 @@ async fn manager_loop(
         // config and scooped it with guessed defaults that fail eval. Recover
         // whatever is missing on every start, then re-classify the pools that
         // were loaded with the wrong defaults.
-        if let (Some(bootstrap_config), Some(v4_proto), Some(v4_state)) =
-            (&protocol.bootstrap, protocol.v4.as_ref(), &v4_state)
-        {
+        if let (false, Some(bootstrap_config), Some(v4_proto), Some(v4_state)) = (
+            v4_bootstrapped,
+            &protocol.bootstrap,
+            protocol.v4.as_ref(),
+            &v4_state,
+        ) {
             match bootstrap::recover_missing_module_configs(
                 bootstrap_config,
                 v4_proto,

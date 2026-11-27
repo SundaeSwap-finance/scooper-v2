@@ -34,6 +34,12 @@ impl fmt::Display for BigInt {
     }
 }
 
+impl From<num_bigint::BigInt> for BigInt {
+    fn from(i: num_bigint::BigInt) -> Self {
+        BigInt(i)
+    }
+}
+
 impl From<i32> for BigInt {
     fn from(i: i32) -> Self {
         Self(num_bigint::BigInt::from(i))

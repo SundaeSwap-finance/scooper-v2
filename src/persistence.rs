@@ -148,7 +148,7 @@ pub struct SpentPersistedTxo {
 /// CBOR-encoded module config keyed by `(pool_id, module_hash)`.
 ///
 /// Each pool's `module_state` stores `(module_credential, blake2b_256(config))`
-/// for every module that contributes to scoop validation (CS, fee_split, CL,
+/// for every module that contributes to scoop validation (CS, fee_split, banded,
 /// …). We persist the on-chain config recovered from the module's `Create`
 /// withdrawal so we can re-send it in `Operate` redeemers across restarts.
 #[derive(Debug, Clone, PartialEq, Eq)]

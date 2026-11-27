@@ -1,5 +1,5 @@
 use crate::bigint::BigInt;
-use num_traits::{One, Signed, Zero};
+use num_traits::{Signed, Zero};
 use tracing::warn;
 
 /// Integer square root via Newton's method (floor).
@@ -11,8 +11,12 @@ pub(crate) fn isqrt(n: &BigInt) -> BigInt {
     if *n < two {
         return n.clone();
     }
-    let mut x = n.clone();
-    let mut y = (&x + &BigInt::one()) / &two;
+    // Start just above √n: n < 2^bits, so 2^(bits/2 + 1) > √n. Newton's method
+    // descends to ⌊√n⌋ from any start above it. (Ported from scooper-v2 PR #93:
+    // starting at n spent ~150 big-integer divisions per call.)
+    let bits = n.clone().unwrap().bits();
+    let mut x = num_traits::pow(two.clone(), (bits / 2 + 1) as usize);
+    let mut y = (&x + n / &x) / &two;
     while y < x {
         x = y.clone();
         y = (&x + n / &x) / &two;
@@ -88,7 +92,7 @@ pub fn cs_swap_result(
 
 /// Largest constant-sum input `dx` whose output `dy` does not exceed the pool's
 /// output reserve, so a fill can never drain the pool negative. Mirrors
-/// [`cl_max_dx_for_reserve`]. Returns `None` if the fee makes the swap
+/// the banded band cap. Returns `None` if the fee makes the swap
 /// ill-defined (`fee_den <= fee_num`) or the input price is non-positive.
 ///
 /// `dy = (dx·p_in − floor(dx·p_in·fee_num/fee_den)) / p_out ≤ reserve_out`
@@ -132,246 +136,6 @@ pub fn cs_max_dx_for_reserve(
         return Some(BigInt::from(0));
     }
     Some(dx_max)
-}
-
-/// Concentrated-liquidity swap. The virtual-reserve formulas in the validator
-/// aren't symmetric in (A,B): VA always uses spb, VB always uses spa, and the
-/// denominators differ between A→B and B→A. Caller passes (a, b, lp) in pool-
-/// positional order plus `is_a_input` to pick the direction.
-///
-/// VA = a·spb_num + L·spb_den, VB = b·spa_den + L·spa_num
-///   A→B: dy = floor(VB · dVA_eff / ((VA + dVA_eff) · spa_den))   with dVA_eff = dx_eff·spb_num
-///   B→A: dy = floor(VA · dVB_eff / ((VB + dVB_eff) · spb_num))   with dVB_eff = dx_eff·spa_num
-#[allow(clippy::too_many_arguments)]
-pub fn cl_swap_result(
-    a: &BigInt,
-    b: &BigInt,
-    lp: &BigInt,
-    dx: &BigInt,
-    is_a_input: bool,
-    spa_num: &BigInt,
-    spa_den: &BigInt,
-    spb_num: &BigInt,
-    spb_den: &BigInt,
-    fee_num: &BigInt,
-    fee_den: &BigInt,
-) -> BigInt {
-    let fee = dx * fee_num / fee_den;
-    let dx_eff = dx - &fee;
-    let va0 = &(a * spb_num) + &(lp * spb_den);
-    let vb0 = &(b * spa_den) + &(lp * spa_num);
-    if is_a_input {
-        let dva_eff = &dx_eff * spb_num;
-        let denom = &(&va0 + &dva_eff) * spa_den;
-        if denom.is_zero() {
-            warn!("cl_swap_result: zero denominator (A→B)");
-            return BigInt::from(0);
-        }
-        &vb0 * &dva_eff / &denom
-    } else {
-        let dvb_eff = &dx_eff * spa_num;
-        let denom = &(&vb0 + &dvb_eff) * spb_num;
-        if denom.is_zero() {
-            warn!("cl_swap_result: zero denominator (B→A)");
-            return BigInt::from(0);
-        }
-        &va0 * &dvb_eff / &denom
-    }
-}
-
-/// Maximum *raw* (pre-fee) dx that a CL pool can absorb without driving its
-/// actual `reserve_out` below zero. Used by the router to cap allocations for
-/// already-depleted pools — without this, CL virtual reserves can let the
-/// formula produce dy > actual b, which fails value conservation at submit.
-///
-/// Returns `None` if the pool can't absorb any positive dx (e.g. reserve_out
-/// already zero, or the pool is at its price boundary).
-#[allow(clippy::too_many_arguments)]
-pub fn cl_max_dx_for_reserve(
-    a: &BigInt,
-    b: &BigInt,
-    lp: &BigInt,
-    is_a_input: bool,
-    spa_num: &BigInt,
-    spa_den: &BigInt,
-    spb_num: &BigInt,
-    spb_den: &BigInt,
-    fee_num: &BigInt,
-    fee_den: &BigInt,
-) -> Option<BigInt> {
-    let va0 = &(a * spb_num) + &(lp * spb_den);
-    let vb0 = &(b * spa_den) + &(lp * spa_num);
-    let fee_mult = fee_den - fee_num;
-    if !fee_mult.is_positive() {
-        return None;
-    }
-    if is_a_input {
-        // dy = vb0·dva_eff / ((va0+dva_eff)·spa_den);  set dy = b:
-        //   dva_eff_max = b·spa_den·va0 / (vb0 - b·spa_den) = b·spa_den·va0 / (L·spa_num)
-        if !b.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        let denom = lp * spa_num;
-        if !denom.is_positive() {
-            return None;
-        }
-        let dva_eff_max = (b * spa_den * &va0) / &denom;
-        if !dva_eff_max.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        let dx_eff_max = &dva_eff_max / spb_num;
-        if !dx_eff_max.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        Some(&dx_eff_max * fee_den / &fee_mult)
-    } else {
-        if !a.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        let denom = lp * spb_den;
-        if !denom.is_positive() {
-            return None;
-        }
-        let dvb_eff_max = (a * spb_num * &vb0) / &denom;
-        if !dvb_eff_max.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        let dx_eff_max = &dvb_eff_max / spa_num;
-        if !dx_eff_max.is_positive() {
-            return Some(BigInt::from(0));
-        }
-        Some(&dx_eff_max * fee_den / &fee_mult)
-    }
-}
-
-/// Concentrated-liquidity fee budget via the quadratic formula.
-///
-/// `|C| = spb_num·spa_den − spb_den·spa_num`,
-/// `B   = a1·spb_num·spa_num + b1·spb_den·spa_den`,
-/// `A   = a1·b1·spb_num·spa_den`,
-/// `fee_budget = floor((B + √(B² + 4·A·|C|)) / (2·|C|)) − lp_after`.
-///
-/// Returns 0 when `|C| ≤ 0` (degenerate range, treated as no fee).
-pub fn cl_fee_budget(
-    a1: &BigInt,
-    b1: &BigInt,
-    lp_after: &BigInt,
-    spa_num: &BigInt,
-    spa_den: &BigInt,
-    spb_num: &BigInt,
-    spb_den: &BigInt,
-) -> BigInt {
-    let abs_c = &(spb_num * spa_den) - &(spb_den * spa_num);
-    if !abs_c.is_positive() {
-        return BigInt::from(0);
-    }
-    let big_b = &(&(a1 * spb_num) * spa_num) + &(&(b1 * spb_den) * spa_den);
-    let big_a = &(&(a1 * b1) * spb_num) * spa_den;
-    let disc = &(&big_b * &big_b) + &(&(&BigInt::from(4) * &big_a) * &abs_c);
-    let root = isqrt(&disc);
-    &(&big_b + &root) / &(&BigInt::from(2) * &abs_c) - lp_after
-}
-
-/// The largest raw dx a CL pool can absorb while keeping the swap
-/// **value-preserving** — i.e. `cl_fee_budget(after) >= 0`. A swap that drives
-/// the fee budget negative makes the pool lose value, which the pool contract's
-/// `check_lp_accounting` (`circulating_lp <= total_lp`) rejects. That happens
-/// today for B-input swaps on any pool whose range floor sits above price 1.0,
-/// because of a `spa_num`/`spa_den` scaling slip in the deployed B-input swap
-/// (filed for audit — the fix is `cl_check.ak:103` `spa_num -> spa_den`). Until
-/// that ships, this caps each CL pool at its value-preserving input so the
-/// router never proposes a leg the validator would reject.
-///
-/// Binary-searches `[0, dx_reserve_cap]`. Returns `dx_reserve_cap` unchanged
-/// when the whole range stays value-preserving (the common in-range case), so
-/// healthy pools are unaffected; returns ~0 for a pool swapped in its
-/// value-losing direction, effectively excluding it from that direction.
-#[allow(clippy::too_many_arguments)]
-pub fn cl_max_dx_value_preserving(
-    a: &BigInt,
-    b: &BigInt,
-    lp: &BigInt,
-    dx_reserve_cap: &BigInt,
-    is_a_input: bool,
-    spa_num: &BigInt,
-    spa_den: &BigInt,
-    spb_num: &BigInt,
-    spb_den: &BigInt,
-    fee_num: &BigInt,
-    fee_den: &BigInt,
-) -> BigInt {
-    let fee_budget_after = |dx: &BigInt| -> BigInt {
-        if !dx.is_positive() {
-            return BigInt::from(0);
-        }
-        let dy = cl_swap_result(
-            a, b, lp, dx, is_a_input, spa_num, spa_den, spb_num, spb_den, fee_num, fee_den,
-        );
-        // Reserves after the swap: the input side grows by dx (fee stays in the
-        // pool), the output side shrinks by dy.
-        let (a1, b1) = if is_a_input {
-            (a + dx, b - &dy)
-        } else {
-            (a - &dy, b + dx)
-        };
-        cl_fee_budget(&a1, &b1, lp, spa_num, spa_den, spb_num, spb_den)
-    };
-
-    if !dx_reserve_cap.is_positive() {
-        return BigInt::from(0);
-    }
-    // A pool that loses value on the SMALLEST possible swap is in deficit at
-    // rest: its declared total_lp already exceeds the liquidity its reserves
-    // support, so every dx below the deficit's break-even loses value and the
-    // admissible set is a suffix, not a prefix. A single max-dx cap cannot
-    // express that, so exclude the pool from this direction outright — which is
-    // what we want anyway for a pool whose books don't balance. Without this
-    // the scan below starts at cap/64 and never sees the deficit, handing back
-    // the full reserve cap and letting the router drop a small allocation
-    // straight into the value-losing zone (found by
-    // `underfunded_cl_pool_is_excluded_from_routing`). One extra evaluation;
-    // an on-curve pool answers `+` here and pays nothing further.
-    if fee_budget_after(&BigInt::from(1)).is_negative() {
-        return BigInt::from(0);
-    }
-
-    // Coarse-scan for the FIRST dx that loses value, then binary-refine within
-    // the last value-preserving interval. `fee_budget` is monotonic in dx for an
-    // on-curve pool (all-positive or all-negative), so the scan just confirms the
-    // endpoint; but a malformed off-curve pool can be non-monotonic (value-losing
-    // for a mid-range dx while its endpoints look fine), and a plain "check the
-    // endpoint" fast-path would wrongly hand back the full reserve. Scanning from
-    // 0 upward returns the largest cap whose ENTIRE prefix preserves value.
-    const STEPS: u64 = 64;
-    let steps = BigInt::from(STEPS);
-    let mut last_ok = BigInt::from(0);
-    let mut first_bad: Option<BigInt> = None;
-    for i in 1..=STEPS {
-        let dx = dx_reserve_cap * &BigInt::from(i) / &steps;
-        if fee_budget_after(&dx).is_negative() {
-            first_bad = Some(dx);
-            break;
-        }
-        last_ok = dx;
-    }
-    let mut hi = match first_bad {
-        None => return dx_reserve_cap.clone(), // whole range preserves value
-        Some(bad) => bad,
-    };
-    let mut lo = last_ok;
-    let one = BigInt::from(1);
-    for _ in 0..128 {
-        if &hi - &lo <= one {
-            break;
-        }
-        let mid = &(&lo + &hi) / &BigInt::from(2);
-        if fee_budget_after(&mid).is_negative() {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    lo
 }
 
 /// The CS fee-carve dock for one swap step (cs_check.check_swap, ADR-0013):
@@ -488,25 +252,33 @@ pub fn compute_fee_budget(
                 }
             }
         }
-        super::types::PoolType::ConcentratedLiquidity {
-            sqrt_price_a,
-            sqrt_price_b,
-            ..
-        } => {
-            // The CL fee budget is a pure function of the after-state and
-            // the pool's sqrt-price bounds; the before-state determines
-            // lp_before for callers that want the *delta* over a sequence
-            // of swaps, but here we compute it as `formula − lp_after`
-            // which already encodes both the achievable and tight bounds.
-            cl_fee_budget(
-                &assets_after[0].1,
-                &assets_after[1].1,
-                lp_before,
-                &sqrt_price_a.num,
-                &sqrt_price_a.den,
-                &sqrt_price_b.num,
-                &sqrt_price_b.den,
-            )
+        super::types::PoolType::BandedConcentratedLiquidity { config } => {
+            // cl_check.fee_value_pair: `bp - lp_before =
+            // floor(lp_before * fee_value / pool_value)` with `bp = lp_after
+            // + fee_budget`, at the before witness's band price (sundae-v4
+            // SV4-001b). This prices the change as ONE transcript step. A
+            // non-swap step must declare 0.
+            if assets_before.len() != 2 || assets_after.len() != 2 {
+                warn!("banded fee_budget: pool does not hold two assets");
+                return BigInt::from(0);
+            }
+            let (a0, b0) = (&assets_before[0].1, &assets_before[1].1);
+            let (a1, b1) = (&assets_after[0].1, &assets_after[1].1);
+            let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
+            if !is_swap {
+                return BigInt::from(0);
+            }
+            let Some(before) = super::banded_math::find_witness(config, a0, b0) else {
+                warn!("banded fee_budget: no ladder witness for the step's before reserves");
+                return BigInt::from(0);
+            };
+            match super::banded_math::swap_fee_budget(config, a0, b0, a1, b1, &before, lp_before) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    warn!("banded fee_budget: {e}");
+                    BigInt::from(0)
+                }
+            }
         }
     }
 }
@@ -521,75 +293,49 @@ pub fn compute_protocol_lp(fee_budget: &BigInt, ps_num: u64, ps_den: u64) -> Big
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_traits::{Signed, Zero};
+    use num_traits::{One, Signed, Zero};
     use proptest::prelude::*;
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(4000))]
-
-        /// INVARIANT: `cl_max_dx_for_reserve` must be a correct cap — every dx at
-        /// or below it yields dy that does NOT exceed the output reserve. The
-        /// router's `pool_can_absorb` trusts this to gate allocations; if it's
-        /// wrong, the router green-lights a leg that drains the pool below zero
-        /// (exactly the live quarantine we hit: dy=383k against a 350k reserve).
+        /// INVARIANT: `isqrt(n)` is the floor square root, `r² <= n < (r+1)²`, up to
+        /// 512-bit inputs (the router calls it on ~300-bit products). Inputs mix
+        /// random n with n right around a perfect square, where the answer steps up
+        /// and an off-by-one would show: random n almost never land there.
         #[test]
-        fn cl_max_dx_never_over_drains(
-            a in 1i64..2_000_000_000_000i64,
-            b in 1i64..2_000_000_000_000i64,
-            lp in 1i64..2_000_000_000_000i64,
-            spa_num in 1i64..100_000i64,
-            spa_den in 1i64..100_000i64,
-            spb_num in 1i64..100_000i64,
-            spb_den in 1i64..100_000i64,
-            fee_num in 0i64..500i64,
-            fee_den in 1_000i64..10_000i64,
-            is_a_input in any::<bool>(),
-            dx_permille in 0u64..=1000u64,
-        ) {
-            prop_assume!(fee_num < fee_den);
-            // Order the two sqrt-price ratios so spa < spb (CL config invariant)
-            // instead of rejecting — keeps the case yield high.
-            let (spa_num, spa_den, spb_num, spb_den) =
-                if spa_num * spb_den < spb_num * spa_den {
-                    (spa_num, spa_den, spb_num, spb_den)
-                } else {
-                    (spb_num, spb_den, spa_num, spa_den)
-                };
-            prop_assume!(spa_num * spb_den < spb_num * spa_den); // skip exact-equal
-
-            let a = BigInt::from(a);
-            let b = BigInt::from(b);
-            let lp = BigInt::from(lp);
-            let spa_num = BigInt::from(spa_num);
-            let spa_den = BigInt::from(spa_den);
-            let spb_num = BigInt::from(spb_num);
-            let spb_den = BigInt::from(spb_den);
-            let fee_num = BigInt::from(fee_num);
-            let fee_den = BigInt::from(fee_den);
-
-            let max_dx = cl_max_dx_for_reserve(
-                &a, &b, &lp, is_a_input,
-                &spa_num, &spa_den, &spb_num, &spb_den, &fee_num, &fee_den,
-            );
-            if let Some(max_dx) = max_dx
-                && max_dx.is_positive() {
-                    // Sample dx across [0, max_dx].
-                    let dx = &max_dx * BigInt::from(dx_permille) / BigInt::from(1000u64);
-                    if dx.is_positive() {
-                        let dy = cl_swap_result(
-                            &a, &b, &lp, &dx, is_a_input,
-                            &spa_num, &spa_den, &spb_num, &spb_den, &fee_num, &fee_den,
-                        );
-                        let reserve_out = if is_a_input { &b } else { &a };
-                        prop_assert!(
-                            &dy <= reserve_out,
-                            "CL over-drain within cap: dy={} > reserve_out={} \
-                             (dx={}, max_dx={}, is_a_input={})",
-                            dy, reserve_out, dx, max_dx, is_a_input
-                        );
-                    }
-                }
+        fn isqrt_is_floor_sqrt(n in prop_oneof![any_big(), near_square()]) {
+            let r = isqrt(&n);
+            let r1 = &r + &BigInt::from(1);
+            prop_assert!(&r * &r <= n, "isqrt({}) = {}: r² > n", n, r);
+            prop_assert!(&r1 * &r1 > n, "isqrt({}) = {}: (r+1)² <= n", n, r);
         }
+    }
+
+    /// Any n from 0 to 512 bits.
+    fn any_big() -> impl Strategy<Value = BigInt> {
+        proptest::collection::vec(any::<u64>(), 0..9).prop_map(|limbs| from_limbs(&limbs))
+    }
+
+    /// n around a perfect square k² (k ≥ 1, up to 256 bits): k²-1, k², k²+1, or
+    /// k²+2k = (k+1)²-1, the last n whose root is still k.
+    fn near_square() -> impl Strategy<Value = BigInt> {
+        (proptest::collection::vec(any::<u64>(), 0..5), 0u8..4).prop_map(|(limbs, which)| {
+            let k = from_limbs(&limbs) + BigInt::from(1);
+            let square = &k * &k;
+            match which {
+                0 => &square - &BigInt::from(1),
+                1 => square,
+                2 => &square + &BigInt::from(1),
+                _ => &square + &(&k * &BigInt::from(2)),
+            }
+        })
+    }
+
+    /// Big integer from 64-bit limbs, most significant first.
+    fn from_limbs(limbs: &[u64]) -> BigInt {
+        let base = BigInt::from(1i128 << 64);
+        limbs.iter().fold(BigInt::zero(), |acc, limb| {
+            &(&acc * &base) + &BigInt::from(*limb)
+        })
     }
 
     #[test]
@@ -984,5 +730,44 @@ mod tests {
             },
         );
         assert_eq!(fb, BigInt::from(15));
+    }
+
+    /// The banded arm books the fee's LP worth (sundae-v4 SV4-001b,
+    /// `cl_check_unit.ak`): 624 B in on the eq8 ladder, 615 A out, total_lp
+    /// 1e9, fee 2 B. The module pins 213. The counter ratio
+    /// `floor(1e9 * 1_000_000_062 / 999_999_813) - 1e9` gave 249, and a
+    /// scoop that declared it was rejected.
+    #[test]
+    fn banded_fee_budget_is_the_fee_value() {
+        let cfg = crate::sundaev4::test_harness::bcl_eq8_config(crate::sundaev4::types::Rational {
+            num: BigInt::from(3),
+            den: BigInt::from(1000),
+        });
+        let pool_type =
+            crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { config: cfg };
+        let ca = crate::cardano_types::AssetClass::from_pair((vec![0xaa; 28], b"A".to_vec()));
+        let cb = crate::cardano_types::AssetClass::from_pair((vec![0xbb; 28], b"B".to_vec()));
+        let before = vec![
+            (ca.clone(), BigInt::from(8_637_368)),
+            (cb.clone(), BigInt::from(624_999)),
+        ];
+        let after = vec![
+            (ca.clone(), BigInt::from(8_636_753)),
+            (cb.clone(), BigInt::from(625_623)),
+        ];
+        let lp = BigInt::from(1_000_000_000i64);
+        assert_eq!(
+            compute_fee_budget(&pool_type, &before, &after, &lp),
+            BigInt::from(213)
+        );
+        // A non-swap step declares 0.
+        let doubled = vec![
+            (ca, BigInt::from(17_273_506)),
+            (cb, BigInt::from(1_251_246)),
+        ];
+        assert_eq!(
+            compute_fee_budget(&pool_type, &after, &doubled, &lp),
+            BigInt::from(0)
+        );
     }
 }

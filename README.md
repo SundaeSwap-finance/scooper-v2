@@ -29,10 +29,13 @@ A v4 execution config needs these additional settings
 | Config key | Needs |
 | --- | --- |
 | `protocol.v4.execution.butane.deployment-file` | A named Butane deployment file |
+| `protocol.v4.execution.cardano-swaps` | Hashes + the swap script's ref UTxO, to fill Cardano-Swaps orders ([docs/cardano-swaps.md](./docs/cardano-swaps.md)) |
 | `protocol.v4.mempool.socket-path` | A node's IPC socket (to read the mempool) |
 | `protocol.v4.execution.scooper-secret-key-file` | The key file (prefer this over the inline key) |
 | `server.tls_cert` / `tls_key` | Cert and key, if TLS is enabled |
 | `server.public_address` | `-p 9998:9998` |
+
+`protocol.v4.execution.module-scripts` maps a role to one `{hash, ref-utxo}` object, or to a list of them when more than one version of a module is live (for example two `fee-split` hashes, one for the constant-sum pools and one for the concentrated-liquidity pools). `pool`, `order`, `pool-mint` and `settings` take one object only. A hash can appear once in the whole map. The scooper reads the module hashes a pool or order names and looks each one up by hash; a pool that names a hash the map does not list is not scooped. `concentrated-liquidity` is an alias of `banded-concentrated-liquidity`.
 
 Pool families: constant product, constant sum, concentrated liquidity, and stableswap. Stableswap pools need `module-scripts.stableswap` and carry a config that changes on chain; see [docs/stableswap.md](./docs/stableswap.md) for how they are recognised, priced, and what to do when the module is deployed.
 

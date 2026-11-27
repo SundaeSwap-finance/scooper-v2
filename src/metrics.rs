@@ -48,8 +48,8 @@ impl BatchFailureReason {
 pub enum PoolFamily {
     ConstantProduct,
     ConstantSum,
-    ConcentratedLiquidity,
     StableSwap,
+    BandedConcentratedLiquidity,
 }
 
 impl PoolFamily {
@@ -57,8 +57,8 @@ impl PoolFamily {
         match self {
             Self::ConstantProduct => "cp",
             Self::ConstantSum => "cs",
-            Self::ConcentratedLiquidity => "cl",
             Self::StableSwap => "ss",
+            Self::BandedConcentratedLiquidity => "bcl",
         }
     }
 }
@@ -146,8 +146,8 @@ pub struct Metrics {
     /// increments multiple families.
     scooped_cp: AtomicU64,
     scooped_cs: AtomicU64,
-    scooped_cl: AtomicU64,
     scooped_ss: AtomicU64,
+    scooped_bcl: AtomicU64,
     /// Submit latency histogram in seconds. Buckets are tuned for
     /// Blockfrost: most submits land in 100ms-2s, tail past 5s is a
     /// sign of upstream trouble.
@@ -161,7 +161,49 @@ pub struct Metrics {
     pub mempool_pool_spends: AtomicU64,
     pub mempool_confirmed: AtomicU64,
     pub mempool_evicted: AtomicU64,
+    /// Times we lost a scoop race and rebuilt on the winner's mempool tx
+    /// immediately, rather than waiting a block.
+    pub race_rebuilds: AtomicU64,
+    /// Execution budget of the most recent built scoop, and the peak seen,
+    /// in ABSOLUTE units.
+    ///
+    /// The only figures we had for this were a manual one-off measurement
+    /// (docs/design/banded-cl-budgets.md), which carries its own warning
+    /// that it predates the gap-provenance rule. Every design question
+    /// about ladder length and pools-per-scoop bottoms out in "how close to
+    /// the ceiling are we", so it should be observed continuously rather
+    /// than re-derived by hand.
+    ///
+    /// Absolute, not a percentage of the limit. The first version divided
+    /// by hardcoded Conway maxima taken from that same budget doc — and
+    /// the memory figure there (16,500,000) is not preview's actual limit
+    /// (17,500,000), so it reported 99.6% where the truth was 93.9%. A
+    /// wrong denominator is worse than an explicit one: export the
+    /// numerator and let the consumer divide by the protocol parameter it
+    /// can actually read.
+    pub scoop_mem_last: AtomicU64,
+    pub scoop_steps_last: AtomicU64,
+    pub scoop_size_last: AtomicU64,
+    pub scoop_mem_peak: AtomicU64,
+    pub scoop_steps_peak: AtomicU64,
+    pub scoop_size_peak: AtomicU64,
+    /// The shape that produced the peak, as pools*1000 + steps.
+    pub scoop_peak_shape: AtomicU64,
     pub mempool_lead_time: Histogram,
+    /// Time spent solving a banded pool's witness. See the boundaries.
+    /// This times the searches that RAN; `witness_memo_hits` counts the
+    /// calls that never had to search, so the two together give the real
+    /// cost per call.
+    pub witness_latency: Histogram,
+    /// `find_witness` calls answered from the memo without a search.
+    pub witness_memo_hits: AtomicU64,
+    /// Wall time of one `find_blended_route` call.
+    pub route_latency: Histogram,
+    /// `evaluate_path` probes per route call: the multiplier that turns a
+    /// cheap split into an expensive order.
+    pub route_evals: Histogram,
+    pub route_paths: Histogram,
+    pub route_calls: AtomicU64,
     /// 1 while the mempool monitor holds a live node connection.
     pub mempool_connected: AtomicU64,
     /// Unix seconds of the last mempool snapshot processed. Age > ~1 min
@@ -198,6 +240,24 @@ const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
 /// a tx. Preview/mainnet blocks average 20s, so the interesting range is
 /// 1-60s with a tail for txs that waited out several blocks.
 const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0];
+
+/// Witness-search latency for one banded pool, seconds.
+///
+/// `find_witness` walks every band with an 800-counter scan per band and
+/// cost 92-159ms cold on the ladders the traffic simulator provisions. The
+/// router calls it once per pool per graph build and twice per step
+/// evaluation, which took the scooper from scooping every block to 90
+/// seconds per order dispatch. Nothing measured it: the cost was found by
+/// hand-benchmarking after the scooper had already stalled.
+///
+/// Buckets span microseconds to a tenth of a second because the seeded
+/// path is ~0.4ms and the cold path is ~160ms — four orders of magnitude,
+/// and the whole point is seeing which one we are on.
+const ROUTE_LATENCY_BOUNDARIES: &[f64] = &[
+    0.001, 0.005, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+];
+const ROUTE_EVALS_BOUNDARIES: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0];
+const WITNESS_LATENCY_BOUNDARIES: &[f64] = &[0.0002, 0.0005, 0.001, 0.005, 0.02, 0.05, 0.1, 0.25];
 
 /// Point-in-time operator health, refreshed by the scooper each batch cycle.
 /// Everything an operator needs to answer "why is nothing happening":
@@ -255,8 +315,8 @@ impl Metrics {
             failed_eval_error: AtomicU64::new(0),
             scooped_cp: AtomicU64::new(0),
             scooped_cs: AtomicU64::new(0),
-            scooped_cl: AtomicU64::new(0),
             scooped_ss: AtomicU64::new(0),
+            scooped_bcl: AtomicU64::new(0),
             submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
             mempool_txs_seen: AtomicU64::new(0),
             mempool_order_creates: AtomicU64::new(0),
@@ -264,7 +324,21 @@ impl Metrics {
             mempool_pool_spends: AtomicU64::new(0),
             mempool_confirmed: AtomicU64::new(0),
             mempool_evicted: AtomicU64::new(0),
+            race_rebuilds: AtomicU64::new(0),
+            scoop_mem_last: AtomicU64::new(0),
+            scoop_steps_last: AtomicU64::new(0),
+            scoop_size_last: AtomicU64::new(0),
+            scoop_mem_peak: AtomicU64::new(0),
+            scoop_steps_peak: AtomicU64::new(0),
+            scoop_size_peak: AtomicU64::new(0),
+            scoop_peak_shape: AtomicU64::new(0),
             mempool_lead_time: Histogram::new(MEMPOOL_LEAD_BOUNDARIES),
+            witness_latency: Histogram::new(WITNESS_LATENCY_BOUNDARIES),
+            witness_memo_hits: AtomicU64::new(0),
+            route_latency: Histogram::new(ROUTE_LATENCY_BOUNDARIES),
+            route_evals: Histogram::new(ROUTE_EVALS_BOUNDARIES),
+            route_paths: Histogram::new(ROUTE_EVALS_BOUNDARIES),
+            route_calls: AtomicU64::new(0),
             mempool_connected: AtomicU64::new(0),
             mempool_last_snapshot_unix: AtomicU64::new(0),
             node_rejects: AtomicU64::new(0),
@@ -279,6 +353,41 @@ impl Metrics {
 
     /// Record a batch failure for the given reason. Replaces direct access
     /// to the now-private per-reason atomics.
+    /// A lost race whose winner was already in our mempool, so we chained
+    /// onto it instead of backing off for a block.
+    /// Record a built scoop's execution budget against the Conway
+    /// per-transaction limits. `pools` and `steps` describe the shape, so a
+    /// peak can be attributed rather than just observed.
+    pub fn note_scoop_budget(
+        &self,
+        mem: u64,
+        steps: u64,
+        size_bytes: u64,
+        pools: u64,
+        transcript_steps: u64,
+    ) {
+        self.scoop_mem_last.store(mem, Ordering::Relaxed);
+        self.scoop_steps_last.store(steps, Ordering::Relaxed);
+        self.scoop_size_last.store(size_bytes, Ordering::Relaxed);
+        // Peak is tracked on MEMORY, which the budget doc identifies as the
+        // binding limit (about 2.2M per additional pool) and which the
+        // first live measurement confirms: 93.9% of memory against 63.9%
+        // of steps and 59.1% of size, on the same transaction.
+        if mem > self.scoop_mem_peak.load(Ordering::Relaxed) {
+            self.scoop_mem_peak.store(mem, Ordering::Relaxed);
+            self.scoop_steps_peak.store(steps, Ordering::Relaxed);
+            self.scoop_size_peak.store(size_bytes, Ordering::Relaxed);
+            self.scoop_peak_shape.store(
+                pools.saturating_mul(1000) + transcript_steps,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub fn note_race_rebuild(&self) {
+        self.race_rebuilds.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_batch_failure(&self, reason: BatchFailureReason) {
         let counter = match reason {
             BatchFailureReason::RaceLost => &self.failed_race_lost,
@@ -296,8 +405,8 @@ impl Metrics {
         let counter = match family {
             PoolFamily::ConstantProduct => &self.scooped_cp,
             PoolFamily::ConstantSum => &self.scooped_cs,
-            PoolFamily::ConcentratedLiquidity => &self.scooped_cl,
             PoolFamily::StableSwap => &self.scooped_ss,
+            PoolFamily::BandedConcentratedLiquidity => &self.scooped_bcl,
         };
         counter.fetch_add(n, Ordering::Relaxed);
     }
@@ -715,12 +824,12 @@ pub async fn render_metrics(
             metrics.scooped_cs.load(Ordering::Relaxed),
         ),
         (
-            PoolFamily::ConcentratedLiquidity.label(),
-            metrics.scooped_cl.load(Ordering::Relaxed),
-        ),
-        (
             PoolFamily::StableSwap.label(),
             metrics.scooped_ss.load(Ordering::Relaxed),
+        ),
+        (
+            PoolFamily::BandedConcentratedLiquidity.label(),
+            metrics.scooped_bcl.load(Ordering::Relaxed),
         ),
     ] {
         let _ = writeln!(
@@ -853,12 +962,143 @@ pub async fn render_metrics(
         "Mempool-seen txs later confirmed in a block",
         metrics.mempool_confirmed.load(Ordering::Relaxed),
     );
+    for (name, help, v) in [
+        (
+            "scooper_scoop_mem",
+            "Execution memory of the last built scoop, in memory units",
+            &metrics.scoop_mem_last,
+        ),
+        (
+            "scooper_scoop_steps",
+            "Execution steps of the last built scoop, in steps",
+            &metrics.scoop_steps_last,
+        ),
+        (
+            "scooper_scoop_size_bytes",
+            "Size of the last built scoop, in bytes",
+            &metrics.scoop_size_last,
+        ),
+        (
+            "scooper_scoop_mem_peak",
+            "Highest scoop execution memory seen, in memory units",
+            &metrics.scoop_mem_peak,
+        ),
+        (
+            "scooper_scoop_steps_peak",
+            "Execution steps of the highest-memory scoop, in steps",
+            &metrics.scoop_steps_peak,
+        ),
+        (
+            "scooper_scoop_size_peak_bytes",
+            "Size of the highest-memory scoop, in bytes",
+            &metrics.scoop_size_peak,
+        ),
+        (
+            "scooper_scoop_peak_shape",
+            "Shape of the highest-memory scoop, as pools*1000 + transcript steps",
+            &metrics.scoop_peak_shape,
+        ),
+    ] {
+        write_gauge(&mut out, name, help, v.load(Ordering::Relaxed));
+    }
+    write_counter(
+        &mut out,
+        "scooper_race_rebuilds_total",
+        "Lost scoop races where the winner was in our mempool and we rebuilt on it immediately",
+        metrics.race_rebuilds.load(Ordering::Relaxed),
+    );
     write_counter(
         &mut out,
         "scooper_mempool_evicted_total",
         "Mempool-seen txs that vanished without confirming",
         metrics.mempool_evicted.load(Ordering::Relaxed),
     );
+    metrics.witness_latency.write(
+        &mut out,
+        "scooper_banded_witness_seconds",
+        "Time to solve a banded pool's witness, over the searches that ran",
+    );
+    write_counter(
+        &mut out,
+        "scooper_banded_witness_memo_hits_total",
+        "find_witness calls answered from the memo, with no search",
+        metrics.witness_memo_hits.load(Ordering::Relaxed),
+    );
+    metrics.route_latency.write(
+        &mut out,
+        "scooper_route_seconds",
+        "Wall time of one find_blended_route call",
+    );
+    metrics.route_evals.write(
+        &mut out,
+        "scooper_route_evaluate_path_per_call",
+        "evaluate_path probes made by one find_blended_route call",
+    );
+    metrics.route_paths.write(
+        &mut out,
+        "scooper_route_paths_per_call",
+        "paths find_paths enumerated for one find_blended_route call; each is fully evaluated to rank it",
+    );
+    write_counter(
+        &mut out,
+        "scooper_route_calls_total",
+        "find_blended_route calls",
+        metrics.route_calls.load(Ordering::Relaxed),
+    );
+    {
+        // Where routing spends its time: process-wide counters kept by the
+        // router itself, read here as totals.
+        let p = &crate::sundaev4::router::ROUTER_PROFILE;
+        for (name, help, v) in [
+            (
+                "scooper_router_split_calls_total",
+                "optimize_split calls",
+                p.split_calls.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_split_rounds_total",
+                "λ-bisection rounds inside optimize_split",
+                p.split_rounds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_pool_outputs_total",
+                "pool_output calls",
+                p.pool_outputs.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_split_millis_total",
+                "milliseconds inside optimize_split",
+                p.split_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_ladder_builds_total",
+                "banded ladders built (ladder cache misses)",
+                p.ladder_builds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_ladder_build_millis_total",
+                "milliseconds spent building ladders",
+                p.ladder_build_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_fill_curve_builds_total",
+                "banded fill curves built",
+                p.fill_curve_builds.load(Ordering::Relaxed),
+            ),
+            (
+                "scooper_router_fill_curve_millis_total",
+                "milliseconds spent building fill curves",
+                p.fill_curve_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "scooper_router_fill_curve_empty_total",
+                "fill curves that came back empty (state off the ladder; every λ-round then re-solves max_dx_in_band)",
+                p.fill_curve_empty.load(Ordering::Relaxed),
+            ),
+        ] {
+            write_counter(&mut out, name, help, v);
+        }
+    }
     metrics.mempool_lead_time.write(
         &mut out,
         "scooper_mempool_lead_time_seconds",

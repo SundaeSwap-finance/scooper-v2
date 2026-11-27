@@ -12,6 +12,19 @@ use pallas_primitives::{ExUnits, Hash, PlutusData};
 use tracing::warn;
 
 use crate::cardano_types;
+
+/// The protocol version the UPLC decoder gates builtins against.
+///
+/// The decoder refuses a builtin the given (plutus version, protocol
+/// version) pair does not admit, so this has to match the chain we build
+/// for or a valid script is rejected locally. Protocol 11 is what admits
+/// the Value builtins -- `lookup_value` (`LookupCoin`), `un_value_data`
+/// (`UnValueData`) and the rest of batch 6 -- and `drop_list`, all of
+/// which the vault and the modules use today. Preview's own V3 cost model
+/// in `config/preview-v4.json` carries 350 entries, which is the batch-6
+/// model, so the chain admits them and so do we.
+const PROTOCOL_VERSION: amaru_kernel::cardano::protocol_version::ProtocolVersion =
+    amaru_kernel::cardano::protocol_version::PROTOCOL_VERSION_11;
 use crate::sundaev4::script_context::{
     self, Credential, DatumOption, OutputReference, ResolvedTxOut, ScriptPurpose,
 };
@@ -69,6 +82,20 @@ impl ScriptStore {
             .with_context(|| format!("CBOR unwrap failed for script {}", hex::encode(hash)))?;
         self.scripts.insert(hash, (flat_bytes, version));
         Ok(hash)
+    }
+
+    /// Serve the script stored under `existing` also under `alias`. Tests
+    /// use it to stand up a second version of a module (a second hash of one
+    /// kind) without a second compiled script.
+    #[cfg(test)]
+    pub fn alias(&mut self, existing: &Hash<28>, alias: Hash<28>) -> Result<()> {
+        let script = self
+            .scripts
+            .get(existing)
+            .cloned()
+            .with_context(|| format!("no script {} to alias", hex::encode(existing)))?;
+        self.scripts.insert(alias, script);
+        Ok(())
     }
 
     /// Build a ScriptStore from a Blueprint's compiled code.
@@ -151,12 +178,6 @@ pub struct FailedScriptContext {
 /// For each redeemer, builds the appropriate ScriptContext, looks up the script,
 /// applies CIP-0069 convention (single argument for V3), and evaluates.
 #[allow(clippy::too_many_arguments)]
-/// The protocol version the chain we build for runs: the decoder gates
-/// builtins and the cost model's semantics on it.
-const PROTOCOL_VERSION: amaru_kernel::cardano::protocol_version::ProtocolVersion =
-    amaru_kernel::cardano::protocol_version::PROTOCOL_VERSION_11;
-
-#[allow(clippy::too_many_arguments)]
 pub fn evaluate_scoop_tx(
     tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
     redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
@@ -195,7 +216,11 @@ pub fn evaluate_scoop_tx(
         // Evaluate in a fresh arena (16MB stack not needed for single-threaded)
         let arena = Arena::new();
 
-        // Decode FLAT script
+        // Decode FLAT script.
+        //
+        // The decoder gates builtins on (plutus version, protocol version).
+        // `PROTOCOL_VERSION` is what the chain we build for admits; see its
+        // definition for why it is 11.
         let plutus_version = if version == 2 {
             PlutusVersion::V2
         } else {
@@ -214,7 +239,7 @@ pub fn evaluate_scoop_tx(
         // (datum,) redeemer, context as separate arguments.
         let budget = ExBudget {
             cpu: 10_000_000_000,
-            mem: 14_000_000,
+            mem: 16_500_000,
         };
         let (context_cbor, result) = if version == 3 {
             let context_cbor = script_context::build_script_context(
@@ -294,8 +319,16 @@ pub fn evaluate_scoop_tx(
                 for log in &result.info.logs {
                     warn!(script = %hex::encode(script_hash), "trace: {log}");
                 }
+                // The traces name the failing check when the validator kept
+                // them (Indigo's orderbook does); carry them in the error so
+                // tests and operators see the reason, not just the fact.
+                let traces = if result.info.logs.is_empty() {
+                    String::new()
+                } else {
+                    format!("; traces: {:?}", result.info.logs)
+                };
                 let err_msg = format!(
-                    "script {} ({:?}[{}]) evaluation failed: {e:?}",
+                    "script {} ({:?}[{}]) evaluation failed: {e:?}{traces}",
                     hex::encode(script_hash),
                     key.tag,
                     key.index,
@@ -317,6 +350,48 @@ pub fn evaluate_scoop_tx(
     }
 
     Ok(EvalResult { budgets })
+}
+
+/// Write the V3 ScriptContext this evaluator builds for every redeemer of a
+/// tx to `/tmp/ctx-<tx>-<purpose><index>.cbor`, for diffing against the
+/// context the node builds for the same tx. Returns the paths written.
+#[allow(clippy::too_many_arguments)]
+pub fn dump_script_contexts(
+    tx_body: &conway::PseudoTransactionBody<TransactionOutput>,
+    redeemers: &[(RedeemersKey, PlutusData, ExUnits)],
+    resolved_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    resolved_ref_inputs: &BTreeMap<cardano_types::TransactionInput, ResolvedTxOut>,
+    tx_hash: Hash<32>,
+    slot_config: &crate::sundaev4::types::SlotConfig,
+) -> Vec<String> {
+    let redeemer_pairs: Vec<(RedeemersKey, PlutusData)> =
+        redeemers.iter().map(|(k, d, _)| (k.clone(), d.clone())).collect();
+    let mut paths = Vec::new();
+    for (key, redeemer_data, _) in redeemers {
+        let Ok((_, purpose)) = resolve_script_and_purpose(key, tx_body, resolved_inputs) else {
+            continue;
+        };
+        let cbor = script_context::build_script_context(
+            tx_body,
+            &redeemer_pairs,
+            resolved_inputs,
+            resolved_ref_inputs,
+            tx_hash,
+            &purpose,
+            redeemer_data,
+            slot_config,
+        );
+        let path = format!(
+            "/tmp/ctx-{}-{:?}{}.cbor",
+            hex::encode(tx_hash),
+            key.tag,
+            key.index
+        );
+        if std::fs::write(&path, &cbor).is_ok() {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Determine which script hash to evaluate and build the ScriptPurpose.
@@ -419,6 +494,7 @@ mod debug_eval {
     #[test]
     #[ignore]
     fn eval_dumped_context() {
+        use super::PROTOCOL_VERSION;
         use amaru_kernel::cardano::plutus_version::PlutusVersion;
         use uplc_turbo::arena::Arena;
         use uplc_turbo::binder::DeBruijn;
@@ -439,14 +515,14 @@ mod debug_eval {
             &arena,
             &flat,
             PlutusVersion::V3,
-            super::PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
         )
         .unwrap();
         let context_pd = UplcPlutusData::from_cbor(&arena, &ctx).unwrap();
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {
             cpu: 10_000_000_000,
-            mem: 14_000_000,
+            mem: 16_500_000,
         };
         let cost_model: Vec<i64> = serde_json::from_str(
             &std::fs::read_to_string(std::env::var("COST_MODEL_FILE").unwrap()).unwrap(),
@@ -454,7 +530,7 @@ mod debug_eval {
         .unwrap();
         let result = applied.eval(
             &arena,
-            CostModel::new(PlutusVersion::V3, super::PROTOCOL_VERSION, &cost_model),
+            CostModel::new(PlutusVersion::V3, PROTOCOL_VERSION, &cost_model),
             budget,
         );
         println!("logs ({}):", result.info.logs.len());
@@ -507,7 +583,7 @@ mod builtin_profile_probe {
         let applied = program.apply(&arena, Term::data(&arena, context_pd));
         let budget = ExBudget {
             cpu: 10_000_000_000,
-            mem: 14_000_000,
+            mem: 16_500_000,
         };
         let result = applied.eval(
             &arena,

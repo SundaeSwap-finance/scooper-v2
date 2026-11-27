@@ -440,6 +440,7 @@ impl Constraint {
     /// `basic_order_hash`, then decoding that inner Data with the matching
     /// class's field shapes (the two modules encode different layouts for
     /// tag 2).
+    #[cfg(test)]
     pub fn from_order_datum(
         datum: &OrderDatum,
         swap_order_hash: &[u8],
@@ -460,18 +461,20 @@ impl Constraint {
     /// so it must be selected by hash, never by ctor tag.
     pub fn from_order_datum_with_strategy(
         datum: &OrderDatum,
-        swap_order_hash: &[u8],
-        basic_order_hash: &[u8],
-        strategy_order_hash: &[u8],
+        hashes: &ConstraintHashes,
     ) -> anyhow::Result<Self> {
-        if !strategy_order_hash.is_empty()
-            && let Some(data) = datum.find_constraint_by_hash(strategy_order_hash)
-        {
+        if let Some(data) = hashes.find(datum, &hashes.strategy) {
             let constraints = StrategyConstraints::from_plutus(data.clone())
                 .map_err(|e| anyhow::anyhow!("decode StrategyConstraints: {e}"))?;
             return Ok(Constraint::Strategy { constraints });
         }
-        Self::from_order_datum(datum, swap_order_hash, basic_order_hash)
+        if let Some(data) = hashes.find(datum, &hashes.swap) {
+            return Self::from_plutus_constraint(data);
+        }
+        if let Some(data) = hashes.find(datum, &hashes.basic) {
+            return Self::from_basic_plutus_constraint(data);
+        }
+        anyhow::bail!("order has neither swap_order nor basic_order constraint")
     }
 
     /// The strategy constraints, for a strategy order.
@@ -525,22 +528,13 @@ pub const NO_MIN_RECEIVED: &str = "the order's min_received list is empty: the o
 /// reason rather than dropping it silently.
 pub fn decode_order_constraint(
     datum: &OrderDatum,
-    swap_order_hash: &[u8],
-    basic_order_hash: &[u8],
-    strategy_order_hash: &[u8],
+    hashes: &ConstraintHashes,
 ) -> Result<Constraint, String> {
-    Constraint::from_order_datum_with_strategy(
-        datum,
-        swap_order_hash,
-        basic_order_hash,
-        strategy_order_hash,
-    )
-    .map_err(|e| {
-        let supported: [&[u8]; 3] = [swap_order_hash, basic_order_hash, strategy_order_hash];
+    Constraint::from_order_datum_with_strategy(datum, hashes).map_err(|e| {
         let unsupported: Vec<String> = datum
             .constraints
             .iter()
-            .filter(|(h, _)| !supported.contains(&h.as_slice()))
+            .filter(|(h, _)| !hashes.is_executable(h))
             .map(|(h, _)| hex::encode(h))
             .collect();
         if unsupported.is_empty() {
@@ -552,6 +546,36 @@ pub fn decode_order_constraint(
             )
         }
     })
+}
+
+/// The constraint-module hashes whose order data the scooper can decode:
+/// every configured `swap_order`, `basic_order` and `strategy_order` hash.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConstraintHashes {
+    pub swap: Vec<Vec<u8>>,
+    pub basic: Vec<Vec<u8>>,
+    pub strategy: Vec<Vec<u8>>,
+}
+
+impl ConstraintHashes {
+    pub fn from_scripts(scripts: &ModuleScripts) -> Self {
+        ConstraintHashes {
+            swap: scripts.modules.hashes_of_kind(ModuleKind::SwapOrder),
+            basic: scripts.modules.hashes_of_kind(ModuleKind::BasicOrder),
+            strategy: scripts.modules.hashes_of_kind(ModuleKind::StrategyOrder),
+        }
+    }
+
+    /// The data of the first datum constraint whose hash is in `set`.
+    fn find<'a>(&self, datum: &'a OrderDatum, set: &[Vec<u8>]) -> Option<&'a PlutusData> {
+        datum.constraints.iter().find(|(h, _)| set.contains(h)).map(|(_, d)| d)
+    }
+
+    fn is_executable(&self, hash: &[u8]) -> bool {
+        [&self.swap, &self.basic, &self.strategy]
+            .iter()
+            .any(|set| set.iter().any(|h| h.as_slice() == hash))
+    }
 }
 
 /// An order can be spent either to Scoop (execute) it, or to cancel it
@@ -633,16 +657,6 @@ pub enum PoolType {
         bounty_k: Rational,
         balance_fee: Rational,
     },
-    /// Single-range concentrated liquidity. `sqrt_price_a` and `sqrt_price_b`
-    /// bound the pool's price range (`a < b`). The validator works on
-    /// virtual reserves `VA = a·spb_num + L·spb_den`, `VB = b·spa_den + L·spa_num`
-    /// and the CP invariant `VA·VB = L²·spb_num·spa_den`. Cross-range
-    /// execution is done by the router splitting across multiple CL pools.
-    ConcentratedLiquidity {
-        sqrt_price_a: Rational,
-        sqrt_price_b: Rational,
-        fee: Rational,
-    },
     /// Curve-style stableswap (`validators/modules/stableswap.ak`). The whole
     /// config preimage rides along: the Operate redeemer re-sends it, the
     /// output datum's `module_state` slot is its hash, and `rates` may change
@@ -650,6 +664,16 @@ pub enum PoolType {
     /// always price against the config it holds for the pool's current UTxO.
     StableSwap {
         config: StableSwapConfig,
+    },
+    /// Banded concentrated liquidity
+    /// (`validators/modules/banded_concentrated_liquidity.ak`): a ladder of
+    /// price bands, each a CL arc or a constant-sum bin, sharing one
+    /// liquidity counter that IS the pool's `total_lp`. Like stableswap the
+    /// whole config preimage rides along: every Operate entry re-sends it and
+    /// the datum's `module_state` slot is its hash. Unlike stableswap it never
+    /// changes after Create.
+    BandedConcentratedLiquidity {
+        config: BandedCLConfig,
     },
 }
 
@@ -680,6 +704,114 @@ pub struct ConstantProductConfig {
     pub fee: Rational,
 }
 
+/// One band of a ladder (`types/banded_cl.BandSpec`). `start` is the band's
+/// LOWER sqrt-price edge; its upper edge is the next band's `start`, or the
+/// config's `closing` for the last band. `curve` is 0 for a CL arc and 1 for
+/// a constant-sum bin. `fee_buy` applies when the trade buys asset A (pays
+/// B), `fee_sell` when it sells A.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BandSpec {
+    pub start: Rational,
+    pub weight: BigInt,
+    pub curve: BigInt,
+    pub fee_buy: Rational,
+    pub fee_sell: Rational,
+}
+
+/// `ConcentratedLiquidityConfig` (`types/cl.ak`, sundae-v4 115f19d).
+/// Stored in the pool datum's `module_state` as
+/// `blake2b_256(serialise_data(config))`; the preimage travels once per
+/// transaction in the `Operate` redeemer's config table. `weight_total` is
+/// exactly the sum of the band weights (the module checks equality).
+///
+/// `ext` is `Some` for the five-field config the module reads. `None` is
+/// the four-field config of the pre-audit preview modules. The scooper
+/// decodes that form only to recover a ladder from chain history
+/// (`banded_math::config_forms`); it never scoops a pool that stores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BandedCLConfig {
+    pub bands: Vec<BandSpec>,
+    /// The ladder index (sundae-v4 spec section 2.3): one entry per band,
+    /// each the pair of cumulative saturation coefficients for the bands
+    /// ABOVE and BELOW it, in fixed point at `2^64` and rounded up. `Create`
+    /// pins it against `bands` (V13) and a spend reads one entry instead of
+    /// walking the ladder, so the prefix sums round up ONCE rather than once
+    /// per band. Build it with `banded_math::build_index`; never write one by
+    /// hand.
+    pub index: Vec<(BigInt, BigInt)>,
+    pub closing: Rational,
+    pub weight_total: BigInt,
+    /// The reserved fifth field (`cl_check.ext_is_void`). `Void` for every
+    /// pool `Create` admits.
+    #[serde(skip)]
+    pub ext: Option<PlutusData>,
+}
+
+impl BandedCLConfig {
+    /// `Void`: `Constr 0 []`.
+    pub fn void_data() -> PlutusData {
+        plutus_parser::create_constr(0, vec![])
+    }
+
+    /// The same ladder with `ext = Void` appended. This is the config that
+    /// the preview governor migration wrote for a four-field pool
+    /// (sundae-v4 `testnet_governor_launch_candidate`, `with_void_ext`).
+    /// `None` when the config already has `ext`.
+    pub fn with_void_ext(&self) -> Option<Self> {
+        if self.ext.is_some() {
+            return None;
+        }
+        Some(Self {
+            ext: Some(Self::void_data()),
+            ..self.clone()
+        })
+    }
+}
+
+impl AsPlutus for BandedCLConfig {
+    fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
+        let (variant, fields) = plutus_parser::parse_constr(data)?;
+        if variant != 0 {
+            return Err(plutus_parser::DecodeError::unexpected_variant(variant));
+        }
+        let n = fields.len();
+        let mut it = fields.into_iter();
+        let mut next = || it.next().expect("length checked");
+        if n != 4 && n != 5 {
+            return Err(plutus_parser::DecodeError::wrong_variant_field_count(
+                0, 4, n,
+            ));
+        }
+        let bands = Vec::<BandSpec>::from_plutus(next()).map_err(|e| e.with_field_name("bands"))?;
+        let index =
+            Vec::<(BigInt, BigInt)>::from_plutus(next()).map_err(|e| e.with_field_name("index"))?;
+        let closing = Rational::from_plutus(next()).map_err(|e| e.with_field_name("closing"))?;
+        let weight_total =
+            BigInt::from_plutus(next()).map_err(|e| e.with_field_name("weight_total"))?;
+        let ext = if n == 5 { Some(next()) } else { None };
+        Ok(Self {
+            bands,
+            index,
+            closing,
+            weight_total,
+            ext,
+        })
+    }
+
+    fn to_plutus(self) -> PlutusData {
+        let mut fields = vec![
+            self.bands.to_plutus(),
+            self.index.to_plutus(),
+            self.closing.to_plutus(),
+            self.weight_total.to_plutus(),
+        ];
+        if let Some(ext) = self.ext {
+            fields.push(ext);
+        }
+        plutus_parser::create_constr(0, fields)
+    }
+}
+
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConstantSumConfig {
     pub prices: Vec<BigInt>,
@@ -694,13 +826,6 @@ pub struct ConstantSumConfig {
     /// OP-PORTION V (claim restored), so the claim is bounded by cap_b plus
     /// the no-overshoot guard — cap_a (claim <= v_increase) is gone.
     pub balance_fee: Rational,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ConcentratedLiquidityConfig {
-    pub sqrt_price_a: Rational,
-    pub sqrt_price_b: Rational,
-    pub fee: Rational,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -946,26 +1071,6 @@ pub enum ConstantSumRedeemer {
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub enum ConcentratedLiquidityRedeemer {
-    Create {
-        initial_state: ConcentratedLiquidityConfig,
-    },
-    Operate {
-        entries: Vec<CLOperateEntry>,
-    },
-    /// SUN-103/ADR-0006 teardown; parsed only.
-    Destroy {
-        entries: Vec<PlutusData>,
-    },
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct CLOperateEntry {
-    pub pool_oref: OutputRef,
-    pub config: ConcentratedLiquidityConfig,
-}
-
-#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
 pub struct CSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: ConstantSumConfig,
@@ -1001,6 +1106,456 @@ pub struct SSOperateEntry {
     pub pool_oref: OutputRef,
     pub config: StableSwapConfig,
     pub sum_invariant: BigInt,
+}
+
+// `Create` carries the whole ladder; see the note on `StableSwapRedeemer`.
+//
+// `Operate` here is the pre-audit form, one config per entry. The scooper
+// reads it from chain history and uses it as the decoded form of both
+// redeemers (`from_plutus_any_form`); it writes `BandedCLTableRedeemer`
+// (`BandedCLRedeemer::operate`).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum BandedCLRedeemer {
+    /// `initial_state` stays field 0 (pool_mint hashes it for module_state).
+    /// `initial_band` is the band holding the launch price; the counter is
+    /// the pool's `total_lp` and has no field.
+    Create {
+        initial_state: BandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<BandedOperateEntry>,
+    },
+    /// SUN-103/ADR-0006 teardown; parsed only.
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `BandedCLRedeemer::Operate`. `config` is the ladder
+/// as stored in the pool INPUT's `module_state`; `counter` / `active_band`
+/// are the witness pair for the pool input's reserves, which the walk's
+/// first step re-derives and checks (`banded_cl_check.band_proof`).
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct BandedOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: BandedCLConfig,
+    pub counter: BigInt,
+    pub active_band: BigInt,
+}
+
+/// `ConcentratedLiquidityRedeemer` (sundae-v4 115f19d), the form the
+/// scooper writes. `Create` and `Destroy` are those of `BandedCLRedeemer`.
+/// `Operate` carries each ladder once in `configs` (d09ab60); an entry
+/// names its ladder by position. The module
+/// hashes the config at that position and compares the hash with the
+/// pool's own `module_state` slot, so a wrong index fails on chain.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum BandedCLTableRedeemer {
+    Create {
+        initial_state: BandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<BandedTableEntry>,
+        configs: Vec<BandedCLConfig>,
+    },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// One pool's entry in `BandedCLTableRedeemer::Operate`.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct BandedTableEntry {
+    pub pool_oref: OutputRef,
+    pub config_index: u64,
+    pub counter: BigInt,
+    pub active_band: BigInt,
+}
+
+impl BandedCLRedeemer {
+    /// The `Operate` redeemer for `entries` in batch order, in the form the
+    /// module reads (`BandedCLTableRedeemer`). Equal ladders share one
+    /// table position, in order of first use.
+    pub fn operate(entries: Vec<BandedOperateEntry>) -> PlutusData {
+        let mut configs: Vec<BandedCLConfig> = vec![];
+        let entries = entries
+            .into_iter()
+            .map(|e| {
+                let config_index = match configs.iter().position(|c| *c == e.config) {
+                    Some(i) => i,
+                    None => {
+                        configs.push(e.config);
+                        configs.len() - 1
+                    }
+                };
+                BandedTableEntry {
+                    pool_oref: e.pool_oref,
+                    config_index: config_index as u64,
+                    counter: e.counter,
+                    active_band: e.active_band,
+                }
+            })
+            .collect();
+        BandedCLTableRedeemer::Operate { entries, configs }.to_plutus()
+    }
+
+    /// Decode either redeemer form: the table form the module reads, or
+    /// the form with one config per entry that the pre-audit preview
+    /// modules read. A table `Operate` comes back with each entry's config
+    /// resolved from the table. `Err` when the data is
+    /// neither form, or when an entry's index is past the table.
+    pub fn from_plutus_any_form(data: PlutusData) -> Result<Self, String> {
+        if let Ok(r) = BandedCLRedeemer::from_plutus(data.clone()) {
+            return Ok(r);
+        }
+        match BandedCLTableRedeemer::from_plutus(data).map_err(|e| e.to_string())? {
+            BandedCLTableRedeemer::Create {
+                initial_state,
+                pool_output_index,
+                initial_band,
+            } => Ok(BandedCLRedeemer::Create {
+                initial_state,
+                pool_output_index,
+                initial_band,
+            }),
+            BandedCLTableRedeemer::Destroy { entries } => Ok(BandedCLRedeemer::Destroy { entries }),
+            BandedCLTableRedeemer::Operate { entries, configs } => {
+                let entries = entries
+                    .into_iter()
+                    .map(|e| {
+                        let config =
+                            configs.get(e.config_index as usize).cloned().ok_or_else(|| {
+                                format!(
+                                    "CL entry names config {} of a table of {}",
+                                    e.config_index,
+                                    configs.len()
+                                )
+                            })?;
+                        Ok(BandedOperateEntry {
+                            pool_oref: e.pool_oref,
+                            config,
+                            counter: e.counter,
+                            active_band: e.active_band,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(BandedCLRedeemer::Operate { entries })
+            }
+        }
+    }
+}
+
+/// The pre-V13 ladder: `BandedCLConfig` without the index (spec section
+/// 2.3). Pools created before the index carry this form in their `Create`
+/// redeemer. The index is a pure function of the bands, so
+/// `banded_math::with_index` rebuilds the current config from this one; the
+/// indexer uses that to recover the config of a pool an index-swap governor
+/// migrated. Parsed only; the scooper never writes this form.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct LegacyBandedCLConfig {
+    pub bands: Vec<BandSpec>,
+    pub closing: Rational,
+    pub weight_total: BigInt,
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct LegacyBandedOperateEntry {
+    pub pool_oref: OutputRef,
+    pub config: LegacyBandedCLConfig,
+    pub counter: BigInt,
+    pub active_band: BigInt,
+}
+
+/// `BandedCLRedeemer` in its pre-V13 form. See `LegacyBandedCLConfig`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum LegacyBandedCLRedeemer {
+    Create {
+        initial_state: LegacyBandedCLConfig,
+        pool_output_index: u64,
+        initial_band: u64,
+    },
+    Operate {
+        entries: Vec<LegacyBandedOperateEntry>,
+    },
+    Destroy {
+        entries: Vec<PlutusData>,
+    },
+}
+
+/// `modules/oracle.ak`'s redeemer. `Create` pins the fresh slot (`0x80`);
+/// `Operate` carries one entry per oracle pool in the scoop; the module
+/// recomputes the slot from the transcript and the validity lower bound.
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub enum OracleRedeemer {
+    Create,
+    Operate { entries: Vec<OracleEntry> },
+    Destroy { entries: Vec<PlutusData> },
+}
+
+#[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
+pub struct OracleEntry {
+    pub pool_oref: OutputRef,
+}
+
+/// The oracle module's 128-byte accumulator slot (`lib/modules/oracle_check.ak`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleSlot {
+    pub creation_time: BigInt,
+    pub last_time: BigInt,
+    pub last_price: BigInt,
+    pub volume_a: BigInt,
+    pub volume_b: BigInt,
+    pub twap_num: BigInt,
+}
+
+impl OracleSlot {
+    pub const FRESH: &'static [u8] = &[0x80];
+    pub const BYTES: usize = 128;
+    /// `price_scale` in the module: B per A, scaled by 1e18.
+    pub fn price_scale() -> BigInt {
+        let mut s = BigInt::from(1);
+        for _ in 0..18 {
+            s = &s * &BigInt::from(10);
+        }
+        s
+    }
+
+    fn put(out: &mut Vec<u8>, v: &BigInt, width: usize) -> Result<(), String> {
+        let (sign, bytes) = v.clone().unwrap().to_bytes_be();
+        if sign == num_bigint::Sign::Minus {
+            return Err("oracle slot field is negative".into());
+        }
+        if bytes.len() > width {
+            return Err(format!("oracle slot field does not fit {width} bytes"));
+        }
+        out.extend(std::iter::repeat_n(0u8, width - bytes.len()));
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(Self::BYTES);
+        Self::put(&mut out, &self.creation_time, 8)?;
+        Self::put(&mut out, &self.last_time, 8)?;
+        Self::put(&mut out, &self.last_price, 16)?;
+        Self::put(&mut out, &self.volume_a, 32)?;
+        Self::put(&mut out, &self.volume_b, 32)?;
+        Self::put(&mut out, &self.twap_num, 32)?;
+        Ok(out)
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, String> {
+        if b.len() != Self::BYTES {
+            return Err(format!(
+                "oracle slot is {} bytes, expected {}",
+                b.len(),
+                Self::BYTES
+            ));
+        }
+        let be = |r: std::ops::Range<usize>| {
+            BigInt::from(num_bigint::BigInt::from_bytes_be(
+                num_bigint::Sign::Plus,
+                &b[r],
+            ))
+        };
+        Ok(Self {
+            creation_time: be(0..8),
+            last_time: be(8..16),
+            last_price: be(16..32),
+            volume_a: be(32..64),
+            volume_b: be(64..96),
+            twap_num: be(96..128),
+        })
+    }
+
+    /// `acc_modulus` in the module: the accumulators count modulo 2^256.
+    pub fn acc_modulus() -> BigInt {
+        let mut m = BigInt::from(1);
+        for _ in 0..256 {
+            m = &m * &BigInt::from(2);
+        }
+        m
+    }
+
+    /// `price_max` in the module: the largest value of the 16-byte price.
+    pub fn price_max() -> BigInt {
+        let mut m = BigInt::from(1);
+        for _ in 0..128 {
+            m = &m * &BigInt::from(2);
+        }
+        &m - &BigInt::from(1)
+    }
+
+    /// `oracle_check.spend_price`: a spend's volume-weighted price, scaled,
+    /// and saturated at `price_max` so that it always fits its 16 bytes.
+    pub fn spend_price(volume_a: &BigInt, volume_b: &BigInt) -> BigInt {
+        let p = &(volume_b * &Self::price_scale()) / volume_a;
+        let max = Self::price_max();
+        if p > max { max } else { p }
+    }
+
+    /// `oracle_check.unstarted`: every field zero.
+    pub fn unstarted() -> Self {
+        Self {
+            creation_time: BigInt::from(0),
+            last_time: BigInt::from(0),
+            last_price: BigInt::from(0),
+            volume_a: BigInt::from(0),
+            volume_b: BigInt::from(0),
+            twap_num: BigInt::from(0),
+        }
+    }
+
+    /// `oracle_check.is_unstarted`: no price has existed yet.
+    pub fn is_unstarted(&self) -> bool {
+        self.creation_time == BigInt::from(0)
+    }
+
+    /// The bytes a spend writes to the slot (`oracle_check.encode_slot`):
+    /// the `0x80` sentinel while no price has existed, the 128-byte state
+    /// after.
+    pub fn encode_slot(&self) -> Result<Vec<u8>, String> {
+        if self.is_unstarted() {
+            Ok(Self::FRESH.to_vec())
+        } else {
+            self.encode()
+        }
+    }
+
+    /// An accumulator: it counts modulo 2^256 (sundae-v4 SV4-008).
+    fn acc(v: BigInt) -> BigInt {
+        &v % &Self::acc_modulus()
+    }
+
+    /// `oracle_check.initialise`. A spend with no swap has no price and
+    /// returns the unstarted state, which `encode_slot` writes as the
+    /// sentinel. The volumes are stored modulo 2^256; the price reads them
+    /// unreduced.
+    pub fn initialise(now: &BigInt, volume_a: &BigInt, volume_b: &BigInt) -> Self {
+        use num_traits::Signed;
+        if !volume_a.is_positive() {
+            return Self::unstarted();
+        }
+        Self {
+            creation_time: now.clone(),
+            last_time: now.clone(),
+            last_price: Self::spend_price(volume_a, volume_b),
+            volume_a: Self::acc(volume_a.clone()),
+            volume_b: Self::acc(volume_b.clone()),
+            twap_num: BigInt::from(0),
+        }
+    }
+
+    /// `oracle_check.advance`; `now` must not precede `last_time`. An
+    /// unstarted state starts the clock (`initialise`). The accumulators
+    /// count modulo 2^256.
+    pub fn advance(
+        &self,
+        now: &BigInt,
+        volume_a: &BigInt,
+        volume_b: &BigInt,
+    ) -> Result<Self, String> {
+        use num_traits::Signed;
+        if self.is_unstarted() {
+            return Ok(Self::initialise(now, volume_a, volume_b));
+        }
+        let dt = now - &self.last_time;
+        if dt.is_negative() {
+            return Err(format!(
+                "oracle: validity start {now} precedes the slot's last_time {}",
+                self.last_time
+            ));
+        }
+        let last_price = if volume_a.is_positive() {
+            Self::spend_price(volume_a, volume_b)
+        } else {
+            self.last_price.clone()
+        };
+        Ok(Self {
+            creation_time: self.creation_time.clone(),
+            last_time: now.clone(),
+            last_price,
+            volume_a: Self::acc(&self.volume_a + volume_a),
+            volume_b: Self::acc(&self.volume_b + volume_b),
+            twap_num: Self::acc(&self.twap_num + &(&dt * &self.last_price)),
+        })
+    }
+
+    /// A spend's two volumes (`oracle_check.spend_volumes`): the walk over
+    /// the transcript from the input reserves. A swap step adds |da| and
+    /// |db|; a non-swap step adds nothing. `lp_in` and `lp_out` are the
+    /// total_lp of the pool input and output datums. Each transcript state
+    /// is `(a, b, total_lp)`.
+    ///
+    /// A swap step whose own total_lp `c` lies outside `[lo, hi]`, the min
+    /// and max of `lp_in` and `lp_out`, counts at the nearer end: `da * hi
+    /// / c` and `db * hi / c` when `c > hi`, `da * lo / c` and `db * lo / c`
+    /// when `c < lo`, each floored (sundae-v4 SV4-008, SV4-009). `Err` for a
+    /// swap step below `lo` at `c <= 0`, which the module rejects.
+    pub fn spend_volumes(
+        reserves_before: (&BigInt, &BigInt),
+        lp_in: &BigInt,
+        lp_out: &BigInt,
+        transcript_states: impl Iterator<Item = (BigInt, BigInt, BigInt)>,
+    ) -> Result<(BigInt, BigInt), String> {
+        use num_traits::Signed;
+        let (lo, hi) = if lp_in < lp_out {
+            (lp_in, lp_out)
+        } else {
+            (lp_out, lp_in)
+        };
+        let (mut a0, mut b0) = (reserves_before.0.clone(), reserves_before.1.clone());
+        let mut va = BigInt::from(0);
+        let mut vb = BigInt::from(0);
+        for (a1, b1, lp1) in transcript_states {
+            let is_swap = (a1 > a0 && b1 < b0) || (a1 < a0 && b1 > b0);
+            if is_swap {
+                let da = if a1 > a0 { &a1 - &a0 } else { &a0 - &a1 };
+                let db = if b1 > b0 { &b1 - &b0 } else { &b0 - &b1 };
+                if &lp1 > hi {
+                    va = &va + &(&(&da * hi) / &lp1);
+                    vb = &vb + &(&(&db * hi) / &lp1);
+                } else if &lp1 < lo {
+                    if !lp1.is_positive() {
+                        return Err(format!("oracle: a swap step has total_lp {lp1}"));
+                    }
+                    va = &va + &(&(&da * lo) / &lp1);
+                    vb = &vb + &(&(&db * lo) / &lp1);
+                } else {
+                    va = &va + &da;
+                    vb = &vb + &db;
+                }
+            }
+            a0 = a1;
+            b0 = b1;
+        }
+        Ok((va, vb))
+    }
+
+    /// The slot after a scoop: `spend_volumes` over the transcript, then
+    /// initialise or advance. Write it with [`OracleSlot::encode_slot`].
+    pub fn after_scoop(
+        in_slot: &[u8],
+        now: &BigInt,
+        reserves_before: (&BigInt, &BigInt),
+        lp_in: &BigInt,
+        lp_out: &BigInt,
+        transcript_states: impl Iterator<Item = (BigInt, BigInt, BigInt)>,
+    ) -> Result<Self, String> {
+        let (va, vb) = Self::spend_volumes(reserves_before, lp_in, lp_out, transcript_states)?;
+        if in_slot == Self::FRESH {
+            Ok(Self::initialise(now, &va, &vb))
+        } else {
+            Self::decode(in_slot)?.advance(now, &va, &vb)
+        }
+    }
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1108,18 +1663,7 @@ impl SlotConfig {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum PoolConfig {
-    ConstantSum {
-        prices: Vec<i64>,
-        fee: (u64, u64),
-    },
-    /// Operator-provided override for CL pools whose Create-redeemer
-    /// config wasn't recoverable from chain history. Stored as a sqrt-
-    /// price range `[a, b]` with `a < b`, fee as `(num, den)`.
-    ConcentratedLiquidity {
-        sqrt_price_a: (i64, i64),
-        sqrt_price_b: (i64, i64),
-        fee: (u64, u64),
-    },
+    ConstantSum { prices: Vec<i64>, fee: (u64, u64) },
 }
 
 /// The network id the scooper writes into every address it builds.
@@ -1193,7 +1737,7 @@ pub struct ScooperExecution {
     /// Keyed by pool ident (hex string).
     #[serde(default)]
     pub pool_configs: std::collections::BTreeMap<String, PoolConfig>,
-    /// Maximum transaction execution memory units. Default: 14_000_000.
+    /// Maximum transaction execution memory units. Default: 16_500_000.
     #[serde(default = "default_max_tx_ex_mem")]
     pub max_tx_ex_mem: u64,
     /// Maximum transaction execution CPU steps. Default: 10_000_000_000.
@@ -1202,11 +1746,21 @@ pub struct ScooperExecution {
     /// Maximum transaction size in bytes. Default: 16_384.
     #[serde(default = "default_max_tx_size")]
     pub max_tx_size: usize,
+    /// An ogmios endpoint that can MEASURE a tx (`evaluateTransaction`),
+    /// used only to diagnose a rejected scoop: the node's per-redeemer
+    /// numbers next to ours. Default: the scooper box's own ogmios.
+    #[serde(default = "default_evaluate_url")]
+    pub evaluate_url: String,
     /// Budget padding as (numerator, denominator). Padded = raw * num / den.
     /// Default: (1, 1), no padding. The declared budget is what our
     /// evaluator measures, and the evaluator matches the node to the unit
     /// (amaru-uplc main; the previous revision priced divideInteger short).
-    /// Every padded unit is fee the protocol pays for nothing.
+    /// A rejection at submit then means our ScriptContext or costing
+    /// differs from the node's, and the submit-failure diagnostics
+    /// (declared / local / node per redeemer, context dumps) say where. A
+    /// pad hid those differences until one happened to exceed it — preprod
+    /// 2026-10-07, fairness +8.2% — and every padded unit is fee the
+    /// protocol pays for nothing.
     #[serde(default = "default_budget_padding")]
     pub budget_padding: (u64, u64),
     /// Pool idents (hex) to exclude from scooping; see
@@ -1249,6 +1803,10 @@ pub struct ScooperExecution {
     /// router conversion edges). Absent/broken config degrades to disabled.
     #[serde(default)]
     pub butane: Option<crate::sundaev4::butane::ButaneConfig>,
+    /// Cardano-Swaps one-way order fills as router edges
+    /// (`execution.cardano-swaps`). Absent/broken config = disabled.
+    #[serde(default)]
+    pub cardano_swaps: Option<crate::sundaev4::cardano_swaps::CardanoSwapsConfig>,
     /// Enable partial fills with this profitability margin (num, den): a
     /// partial fill must cover at least margin × the scooper's per-order fee
     /// share in pro-rata allowance. None (default) = partial fills disabled.
@@ -1267,13 +1825,16 @@ fn default_partial_fill_fee_estimate() -> u64 {
 }
 
 fn default_max_tx_ex_mem() -> u64 {
-    14_000_000
+    16_500_000
 }
 fn default_max_tx_ex_steps() -> u64 {
     10_000_000_000
 }
 fn default_max_tx_size() -> usize {
     16_384
+}
+pub(crate) fn default_evaluate_url() -> String {
+    "http://localhost:1337".to_string()
 }
 pub(crate) fn default_budget_padding() -> (u64, u64) {
     (1, 1)
@@ -1348,73 +1909,7 @@ pub fn normalize_secret_key_hex(input: &str) -> anyhow::Result<String> {
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ModuleScripts {
-    /// Optional: only required when scooping constant-product pools (the
-    /// audit-final cs-launch deployment does not publish CP).
-    #[serde(default)]
-    pub constant_product: Option<ScriptRefInfo>,
-    pub fee_split: ScriptRefInfo,
-    pub fairness: ScriptRefInfo,
-    pub pool: ScriptRefInfo,
-    pub order: ScriptRefInfo,
-    pub pool_mint: ScriptRefInfo,
-    pub settings: ScriptRefInfo,
-    /// Optional: only required when scooping constant-sum pools.
-    #[serde(default)]
-    pub constant_sum: Option<ScriptRefInfo>,
-    /// Optional: only required when scooping concentrated-liquidity pools.
-    #[serde(default)]
-    pub concentrated_liquidity: Option<ScriptRefInfo>,
-    /// Optional: only required when scooping stableswap pools. Without it
-    /// the scooper cannot classify a stableswap pool and skips it (see
-    /// `detect_pool_type`).
-    #[serde(default)]
-    pub stableswap: Option<ScriptRefInfo>,
-    /// Per-class constraint validators (modular order constraints, PR #11).
-    /// Every order's OrderConfig lists which constraint hashes it requires;
-    /// the order_validator's withdraw handler requires each listed constraint
-    /// to also withdraw. Slots are `Option` so a deployment that doesn't use
-    /// e.g. strategy orders can omit that module.
-    #[serde(default)]
-    pub swap_order: Option<ScriptRefInfo>,
-    /// `basic_order_constraint` covers Deposit/Withdraw/Claim shapes.
-    #[serde(default)]
-    pub basic_order: Option<ScriptRefInfo>,
-    /// `route_order_constraint` carries the per-order route table (pool
-    /// whitelist + per-step pool_input / transcript_step indices).
-    #[serde(default)]
-    pub route_order: Option<ScriptRefInfo>,
-    /// `fairness_order_constraint` pins the authorized scooper for the tx
-    /// via the global settings entry's authorized_scoopers list.
-    #[serde(default)]
-    pub fairness_order: Option<ScriptRefInfo>,
-    /// `strategy_order_constraint` accepts a `List<SignedStrategyExecution>`
-    /// redeemer signed off-chain. The scooper doesn't yet construct these —
-    /// optional until strategy execution ingestion is designed.
-    #[serde(default)]
-    pub strategy_order: Option<ScriptRefInfo>,
-    /// `fee_constraint` — the once-per-scoop service-fee aggregator
-    /// (docs/fee-system.md). Optional: absent = fee-bearing OrderConfigs
-    /// can't be scooped.
-    #[serde(default)]
-    pub fee_constraint: Option<ScriptRefInfo>,
-}
-
-#[serde_with::serde_as]
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ScriptRefInfo {
-    pub hash: ScriptHash,
-    #[serde_as(as = "serde_with::DisplayFromStr")]
-    pub ref_utxo: crate::cardano_types::TransactionInput,
-    /// Hex-encoded CBOR-wrapped script (double-wrapped: CBOR bytestring containing FLAT-encoded UPLC)
-    /// Hex-encoded script CBOR, populated from blueprint. Retained for serde round-trip.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub script_cbor: Option<String>,
-}
+pub use super::module_scripts::{ModuleKind, ModuleRegistry, ModuleScripts, ScriptRefInfo};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Indexed state wrapper types
@@ -2211,5 +2706,365 @@ mod tests {
         } else {
             panic!("expected Constr");
         }
+    }
+}
+
+#[cfg(test)]
+mod datum_round_trip {
+    //! Byte-compare a chain datum with its trip through the scooper's
+    //! parsed types. The evaluator hands scripts the RE-ENCODED datum for
+    //! the settings and order-config reference inputs, so any difference
+    //! here is a difference between the node's ScriptContext and ours.
+    use super::*;
+    use plutus_parser::AsPlutus;
+
+    fn trip<T: AsPlutus + std::fmt::Debug>(name: &str, hex_path: &str) {
+        let hex_str = std::fs::read_to_string(hex_path).unwrap();
+        let bytes = hex::decode(hex_str.trim()).unwrap();
+        let pd: pallas_primitives::PlutusData = minicbor::decode(&bytes).unwrap();
+        let parsed = T::from_plutus(pd.clone()).unwrap();
+        let back = minicbor::to_vec(parsed.to_plutus()).unwrap();
+        println!(
+            "{name}: chain {} bytes, re-encoded {} bytes, equal={}",
+            bytes.len(),
+            back.len(),
+            bytes == back
+        );
+        if bytes != back {
+            println!("  chain: {}", hex::encode(&bytes));
+            println!("  ours : {}", hex::encode(&back));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs datum hex files; set DATUM_DIR"]
+    fn chain_datums_survive_the_round_trip() {
+        let dir = std::env::var("DATUM_DIR").unwrap();
+        trip::<SettingsDatum>("settings", &format!("{dir}/datum-settings.hex"));
+        trip::<PoolDatum>("pool", &format!("{dir}/datum-pool.hex"));
+        trip::<OrderDatum>("order", &format!("{dir}/datum-order.hex"));
+        trip::<OrderConfig>("orderconfig", &format!("{dir}/datum-orderconfig.hex"));
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    //! The oracle slot the scooper writes must equal the slot the module
+    //! computes (sundae-v4 PR #230, `lib/modules/oracle_check.ak`). The
+    //! vectors are from `lib/tests/unit/oracle_scale.ak` and
+    //! `lib/tests/unit/oracle_total.ak` on branch pi/sv4-008-oracle-total.
+    use super::OracleSlot;
+    use crate::bigint::BigInt;
+
+    fn b(v: i64) -> BigInt {
+        BigInt::from(v)
+    }
+
+    fn pow2(n: u32) -> BigInt {
+        let mut m = b(1);
+        for _ in 0..n {
+            m = &m * &b(2);
+        }
+        m
+    }
+
+    /// `spend_volumes` on transcript states `(a, b, total_lp)`.
+    fn vols(
+        a0: &BigInt,
+        b0: &BigInt,
+        lp_in: &BigInt,
+        lp_out: &BigInt,
+        states: &[(BigInt, BigInt, BigInt)],
+    ) -> (BigInt, BigInt) {
+        OracleSlot::spend_volumes((a0, b0), lp_in, lp_out, states.iter().cloned()).unwrap()
+    }
+
+    /// The SV4-002 runbook pool of `oracle_scale.ak`: 800,000 A, 1,200,000
+    /// B, total_lp 2,000,000.
+    fn runbook(states: &[(i64, i64, i64)], lp_out: i64) -> (BigInt, BigInt) {
+        let st: Vec<_> = states.iter().map(|&(a, bb, l)| (b(a), b(bb), b(l))).collect();
+        vols(&b(800_000), &b(1_200_000), &b(2_000_000), &b(lp_out), &st)
+    }
+
+    // ── Honest transcripts: counted unchanged ──────────────────────────
+
+    #[test]
+    fn counts_an_honest_swap() {
+        assert_eq!(
+            runbook(&[(880_000, 1_120_200, 2_000_040)], 2_000_040),
+            (b(80_000), b(79_800))
+        );
+    }
+
+    #[test]
+    fn counts_a_swap_before_a_deposit() {
+        let t = [
+            (880_000, 1_120_200, 2_000_040),
+            (968_000, 1_232_220, 2_200_044),
+        ];
+        assert_eq!(runbook(&t, 2_200_044), (b(80_000), b(79_800)));
+    }
+
+    #[test]
+    fn counts_a_swap_after_a_deposit() {
+        let t = [
+            (880_000, 1_320_000, 2_200_000),
+            (968_000, 1_232_220, 2_200_044),
+        ];
+        assert_eq!(runbook(&t, 2_200_044), (b(88_000), b(87_780)));
+    }
+
+    #[test]
+    fn counts_a_swap_after_a_withdrawal() {
+        let t = [
+            (720_000, 1_080_000, 1_800_000),
+            (792_000, 1_008_180, 1_800_036),
+        ];
+        assert_eq!(runbook(&t, 1_800_036), (b(72_000), b(71_820)));
+    }
+
+    // ── Unbacked liquidity steps: counted at the real size (SV4-008/009) ─
+
+    /// Withdraw to 1/40, swap 2,000 A at that scale, deposit back. The step
+    /// at total_lp 50,001 is below lo = 2,000,000, so it scales by
+    /// 2,000,000 / 50,001 (floored per volume).
+    #[test]
+    fn counts_a_shrunk_swap_at_the_real_size() {
+        let t = [
+            (20_000, 30_000, 50_000),
+            (22_000, 28_005, 50_001),
+            (880_000, 1_120_200, 2_000_040),
+        ];
+        assert_eq!(runbook(&t, 2_000_040), (b(79_998), b(79_798)));
+    }
+
+    /// An unbacked x1000 deposit, a round trip of 500,000,000 A, and the
+    /// withdrawal back. Unscaled it counted 998,750,000 A.
+    #[test]
+    fn counts_an_inflated_round_trip_at_the_real_size() {
+        let t = [
+            (800_000_000, 1_200_000_000, 2_000_000_000),
+            (1_300_000_000, 701_250_000, 2_000_250_000),
+            (801_250_000, 1_200_000_000, 2_000_250_000),
+            (801_250, 1_200_000, 2_000_250),
+        ];
+        assert_eq!(runbook(&t, 2_000_250), (b(998_750), b(997_500)));
+    }
+
+    /// The inflation at any factor `k`: a zero-fee round trip of 100,000 A
+    /// at x`k` counts as the same round trip at x1.
+    #[test]
+    fn inflation_at_any_factor_counts_at_the_real_size() {
+        for k in [b(2), b(1000), pow2(200)] {
+            let st = vec![
+                (&b(800_000) * &k, &b(1_200_000) * &k, &b(2_000_000) * &k),
+                (&b(900_000) * &k, &b(1_100_000) * &k, &b(2_000_000) * &k),
+                (&b(800_000) * &k, &b(1_200_000) * &k, &b(2_000_000) * &k),
+                (b(800_000), b(1_200_000), b(2_000_000)),
+            ];
+            let got = vols(
+                &b(800_000),
+                &b(1_200_000),
+                &b(2_000_000),
+                &b(2_000_000),
+                &st,
+            );
+            assert_eq!(got, (b(200_000), b(200_000)), "k={k}");
+        }
+    }
+
+    /// The shrink at any factor `k`: a pool `k` times the base pool shrinks
+    /// to the base pool, swaps 1,000 A, and grows back. The swap counts as
+    /// 1,000 * `k`.
+    #[test]
+    fn shrink_at_any_factor_counts_at_the_real_size() {
+        for k in [b(2), b(7), b(1_000_000)] {
+            let st = vec![
+                (b(800_000), b(1_200_000), b(2_000_000)),
+                (b(801_000), b(1_199_000), b(2_000_000)),
+                (&b(801_000) * &k, &b(1_199_000) * &k, &b(2_000_000) * &k),
+            ];
+            let lp = &b(2_000_000) * &k;
+            let got = vols(&(&b(800_000) * &k), &(&b(1_200_000) * &k), &lp, &lp, &st);
+            assert_eq!(got, (&b(1000) * &k, &b(1000) * &k), "k={k}");
+        }
+    }
+
+    /// The known undercount: a deposit, the swap, a withdrawal. The swap ran
+    /// above both ends and counts at the end size.
+    #[test]
+    fn undercounts_a_swap_between_a_deposit_and_a_withdrawal() {
+        let t = [
+            (880_000, 1_320_000, 2_200_000),
+            (968_000, 1_232_220, 2_200_044),
+            (880_000, 1_120_200, 2_000_040),
+        ];
+        assert_eq!(runbook(&t, 2_000_040), (b(80_000), b(79_800)));
+    }
+
+    /// `lp_lo` and `lp_hi` are the min and max of the two ends, whichever
+    /// end is larger.
+    #[test]
+    fn the_bounds_do_not_depend_on_which_end_is_larger() {
+        // lp_in 4,000,000 > lp_out 2,000,000; the swap at 8,000,000 scales
+        // down to hi = 4,000,000.
+        let st = vec![(b(1_000_100), b(999_900), b(8_000_000))];
+        assert_eq!(
+            vols(
+                &b(1_000_000),
+                &b(1_000_000),
+                &b(4_000_000),
+                &b(2_000_000),
+                &st
+            ),
+            (b(50), b(50))
+        );
+        assert_eq!(
+            vols(
+                &b(1_000_000),
+                &b(1_000_000),
+                &b(2_000_000),
+                &b(4_000_000),
+                &st
+            ),
+            (b(50), b(50))
+        );
+    }
+
+    /// A swap step below `lp_lo` with total_lp 0 makes the module fail
+    /// (`expect lp1 > 0`). The scooper refuses it instead of dividing.
+    #[test]
+    fn a_swap_step_at_zero_total_lp_is_refused() {
+        let st = vec![(b(1_000_100), b(999_900), b(0))];
+        assert!(
+            OracleSlot::spend_volumes(
+                (&b(1_000_000), &b(1_000_000)),
+                &b(10),
+                &b(10),
+                st.into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    // ── Wrap and saturate ──────────────────────────────────────────────
+
+    fn state(
+        volume_a: BigInt,
+        volume_b: BigInt,
+        twap_num: BigInt,
+        last_price: BigInt,
+    ) -> OracleSlot {
+        OracleSlot {
+            creation_time: b(1_000),
+            last_time: b(2_000),
+            last_price,
+            volume_a,
+            volume_b,
+            twap_num,
+        }
+    }
+
+    /// `oracle_volume_wraps_past_two_to_the_256`.
+    #[test]
+    fn volume_wraps_past_two_to_the_256() {
+        let prev = state(&pow2(256) - &b(1), b(10), b(0), b(450_000_000_000_000_000));
+        let next = prev.advance(&b(3_000), &b(300), &b(135)).unwrap();
+        assert_eq!(next.volume_a, b(299));
+        assert_eq!(next.volume_b, b(145));
+        assert_eq!(OracleSlot::decode(&next.encode().unwrap()).unwrap(), next);
+    }
+
+    /// `twap_num` counts modulo 2^256 too.
+    #[test]
+    fn twap_num_wraps_past_two_to_the_256() {
+        let prev = state(b(1), b(1), &pow2(256) - &b(1), b(2));
+        let next = prev.advance(&b(2_001), &b(0), &b(0)).unwrap();
+        assert_eq!(next.twap_num, b(1));
+        assert!(next.encode().is_ok());
+    }
+
+    /// `oracle_price_saturates`: one A for 10^21 B is 10^39 scaled.
+    #[test]
+    fn price_saturates() {
+        let first = OracleSlot::initialise(
+            &b(5_000),
+            &b(1),
+            &(&b(1_000_000_000) * &b(1_000_000_000_000)),
+        );
+        assert_eq!(first.last_price, &pow2(128) - &b(1));
+        assert_eq!(OracleSlot::decode(&first.encode().unwrap()).unwrap(), first);
+        let prev = state(b(1), b(1), b(0), b(1));
+        let next = prev
+            .advance(
+                &b(3_000),
+                &b(1),
+                &(&b(1_000_000_000) * &b(1_000_000_000_000)),
+            )
+            .unwrap();
+        assert_eq!(next.last_price, &pow2(128) - &b(1));
+    }
+
+    /// The first priced spend stores its volumes modulo 2^256. The price
+    /// uses the unreduced volumes.
+    #[test]
+    fn initialise_reduces_its_volumes() {
+        let va = &pow2(256) + &b(5);
+        let vb = &pow2(256) + &b(7);
+        let first = OracleSlot::initialise(&b(5_000), &va, &vb);
+        assert_eq!(first.volume_a, b(5));
+        assert_eq!(first.volume_b, b(7));
+        assert_eq!(first.last_price, OracleSlot::spend_price(&va, &vb));
+        assert!(first.encode().is_ok());
+    }
+
+    // ── The sentinel (oracle_check.encode_slot) ────────────────────────
+
+    /// A spend with no swap on a fresh slot has no price. The module writes
+    /// the `0x80` sentinel back, so the clock starts with the first swap.
+    #[test]
+    fn a_swapless_first_spend_writes_the_sentinel() {
+        let deposit = vec![(b(2_000), b(2_000), b(2_000_000))];
+        let next = OracleSlot::after_scoop(
+            OracleSlot::FRESH,
+            &b(5_000),
+            (&b(1_000), &b(1_000)),
+            &b(1_000_000),
+            &b(2_000_000),
+            deposit.into_iter(),
+        )
+        .unwrap();
+        assert!(next.is_unstarted());
+        assert_eq!(next.encode_slot().unwrap(), OracleSlot::FRESH.to_vec());
+    }
+
+    /// `advance` on an unstarted state is `initialise`: no interval is owed
+    /// to a price that did not exist.
+    #[test]
+    fn advance_from_unstarted_is_initialise() {
+        let next = OracleSlot::unstarted().advance(&b(5_000), &b(100), &b(120)).unwrap();
+        assert_eq!(next, OracleSlot::initialise(&b(5_000), &b(100), &b(120)));
+        assert_eq!(next.creation_time, b(5_000));
+        assert_eq!(next.twap_num, b(0));
+    }
+
+    /// A priced first spend writes the 128-byte state.
+    #[test]
+    fn a_priced_first_spend_writes_the_state() {
+        let swap = vec![(b(1_100), b(880), b(1_000_000))];
+        let next = OracleSlot::after_scoop(
+            OracleSlot::FRESH,
+            &b(5_000),
+            (&b(1_000), &b(1_000)),
+            &b(1_000_000),
+            &b(1_000_000),
+            swap.into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            (next.volume_a.clone(), next.volume_b.clone()),
+            (b(100), b(120))
+        );
+        assert_eq!(next.encode_slot().unwrap().len(), OracleSlot::BYTES);
     }
 }

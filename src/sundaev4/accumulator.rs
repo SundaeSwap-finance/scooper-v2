@@ -22,7 +22,7 @@ use crate::sundaev4::types::SundaeV4Pool;
 /// Per-pool running state within a multi-pool tx being built incrementally.
 ///
 /// The accumulator mirrors the tx-builder's streaming walk so that
-/// CL swap math (which depends on `total_lp` via virtual reserves) gives the
+/// LP-dependent swap math (the banded ladder reads `total_lp` as its counter) gives the
 /// *same* dy at accumulation time as at tx-build time. Without this, the
 /// router would route against the accumulator's projection and the tx-builder
 /// would compute different dys, leading to value-conservation failures.
@@ -108,6 +108,7 @@ pub struct Accumulator {
     pub pools: BTreeMap<Ident, PoolAccum>,
     routes: Vec<RouteInfo>,
     conversions: Vec<batch::PlannedConversion>,
+    moves: Vec<batch::ResolvedMove>,
     /// Order ops were added across all pools, stored as `(pool_ident, op_idx_in_pool)`.
     /// Resolved to `(batch_idx, op_idx)` in `into_plan` once batches are materialised.
     global_seq_raw: Vec<(Ident, usize)>,
@@ -166,12 +167,66 @@ impl PoolAccum {
     }
 }
 
+/// Apply a banded swap of `dx` to a running pool state as in-band steps,
+/// accruing each step's fee budget and protocol LP exactly as the tx walk
+/// does, so a deposit pinned after the swap sees the walk's `total_lp`.
+/// Returns the total output.
+#[allow(clippy::too_many_arguments)]
+pub fn accrue_banded_swap(
+    cfg: &crate::sundaev4::types::BandedCLConfig,
+    assets: &mut [(AssetClass, BigInt)],
+    total_lp: &mut BigInt,
+    ps: &(BigInt, BigInt),
+    cum_gross_fb: &mut BigInt,
+    cum_protocol_lp: &mut BigInt,
+    input_idx: usize,
+    dx: &BigInt,
+) -> Result<BigInt, String> {
+    use crate::sundaev4::banded_math;
+    use num_traits::Signed;
+    if assets.len() != 2 || input_idx > 1 {
+        return Err("banded swap needs a two-asset pool".into());
+    }
+    let is_a_input = input_idx == 0;
+    let steps = banded_math::swap_steps(cfg, &assets[0].1, &assets[1].1, is_a_input, dx)?;
+    let mut total_dy = BigInt::from(0);
+    for st in &steps {
+        let (a0, b0) = (assets[0].1.clone(), assets[1].1.clone());
+        let (a1, b1) = if is_a_input {
+            (&a0 + &st.dx, &b0 - &st.dy)
+        } else {
+            (&a0 - &st.dy, &b0 + &st.dx)
+        };
+        // The same number `tx_builder::walk_banded_swap` declares: the fee's
+        // LP worth (sundae-v4 SV4-001b).
+        let fb = banded_math::swap_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, total_lp)?;
+        if fb.is_negative() {
+            return Err(format!("banded step books a negative fee budget ({fb})"));
+        }
+        if is_a_input {
+            assets[0].1 = &assets[0].1 + &st.dx;
+            assets[1].1 = &assets[1].1 - &st.dy;
+        } else {
+            assets[1].1 = &assets[1].1 + &st.dx;
+            assets[0].1 = &assets[0].1 - &st.dy;
+        }
+        *cum_gross_fb = &*cum_gross_fb + &fb;
+        let new_cum_protocol_lp = &*cum_gross_fb * &ps.0 / &ps.1;
+        let op_protocol_lp = &new_cum_protocol_lp - &*cum_protocol_lp;
+        *cum_protocol_lp = new_cum_protocol_lp;
+        *total_lp = &*total_lp + &op_protocol_lp;
+        total_dy = &total_dy + &st.dy;
+    }
+    Ok(total_dy)
+}
+
 impl Accumulator {
     pub fn new(protocol_share: (u64, u64)) -> Self {
         Self {
             pools: BTreeMap::new(),
             routes: Vec::new(),
             conversions: Vec::new(),
+            moves: Vec::new(),
             global_seq_raw: Vec::new(),
             protocol_share,
         }
@@ -183,7 +238,7 @@ impl Accumulator {
         pool_ident: &Ident,
         effective_pool: &Arc<SundaeV4Pool>,
     ) -> PoolAccum {
-        // CS pools capture protocol revenue like CP/CL post-SUN-101 (cs_check
+        // CS pools capture protocol revenue like CP post-SUN-101 (cs_check
         // no longer forbids LP growth on swap entries). Must stay in lockstep
         // with tx_builder's per_pool_ps or predicted pool state diverges from
         // the built tx.
@@ -276,7 +331,7 @@ impl Accumulator {
 
         // Per-entry protocol_lp bump (cumulative-target trick — see tx_builder).
         // Keeps running_total_lp in sync with what tx_builder will see, so any
-        // CL dys computed against the post-bump LP match between accumulator
+        // LP-dependent dys computed against the post-bump LP match between accumulator
         // and tx_builder. CS pools have ps=(0, _) by current design so this is
         // a no-op for them.
         let fb = swap_math::compute_fee_budget(
@@ -383,29 +438,57 @@ impl Accumulator {
 
         // Swap step.
         let mut after_swap = assets.clone();
-        for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
-            *amt = &*amt + &swap_deltas[i];
-            if amt.is_negative() {
+        let mut lp_at_deposit = lp_before.clone();
+        let mut cum_gross_fb = cum_gross_fb_before.clone();
+        let mut new_cum_protocol_lp = cum_protocol_lp_before.clone();
+        if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { config } =
+            &effective_pool.pool_type
+        {
+            let Some(in_idx) = swap_deltas.iter().position(|d| d.is_positive()) else {
+                return Err("zap swap pays nothing in".into());
+            };
+            let dy = accrue_banded_swap(
+                config,
+                &mut after_swap,
+                &mut lp_at_deposit,
+                &ps,
+                &mut cum_gross_fb,
+                &mut new_cum_protocol_lp,
+                in_idx,
+                &swap_deltas[in_idx],
+            )
+            .map_err(|e| format!("zap swap on pool {pool_ident}: {e}"))?;
+            if -&dy != swap_deltas[1 - in_idx] {
                 return Err(format!(
-                    "zap swap would drive pool {pool_ident} asset {i} negative"
+                    "zap swap plan pays {dy} but the basket split expected {}",
+                    -&swap_deltas[1 - in_idx]
                 ));
             }
+        } else {
+            for (i, (_, amt)) in after_swap.iter_mut().enumerate() {
+                *amt = &*amt + &swap_deltas[i];
+                if amt.is_negative() {
+                    return Err(format!(
+                        "zap swap would drive pool {pool_ident} asset {i} negative"
+                    ));
+                }
+            }
+            let fb = swap_math::compute_fee_budget(
+                &effective_pool.pool_type,
+                &assets,
+                &after_swap,
+                &lp_before,
+            );
+            if fb.is_negative() {
+                return Err(format!(
+                    "zap swap would make pool {pool_ident} lose value (fee_budget={fb})"
+                ));
+            }
+            cum_gross_fb = &cum_gross_fb_before + &fb;
+            new_cum_protocol_lp = &cum_gross_fb * &ps.0 / &ps.1;
+            let op_protocol_lp = &new_cum_protocol_lp - &cum_protocol_lp_before;
+            lp_at_deposit = &lp_before + &op_protocol_lp;
         }
-        let fb = swap_math::compute_fee_budget(
-            &effective_pool.pool_type,
-            &assets,
-            &after_swap,
-            &lp_before,
-        );
-        if fb.is_negative() {
-            return Err(format!(
-                "zap swap would make pool {pool_ident} lose value (fee_budget={fb})"
-            ));
-        }
-        let cum_gross_fb = &cum_gross_fb_before + &fb;
-        let new_cum_protocol_lp = &cum_gross_fb * &ps.0 / &ps.1;
-        let op_protocol_lp = &new_cum_protocol_lp - &cum_protocol_lp_before;
-        let lp_at_deposit = &lp_before + &op_protocol_lp;
 
         // Deposit step, against the post-swap reserves and the basket the swap
         // left the order holding.
@@ -510,6 +593,363 @@ impl Accumulator {
     ///
     /// Fee budget computed here is router-projected; tx_builder recomputes
     /// fresh per-pool fee budgets during its streaming walk.
+    #[cfg(test)]
+    /// Add a movement: one burn leg and one mint leg.
+    pub fn try_add_move(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        from_ident: &Ident,
+        from_pool: &Arc<SundaeV4Pool>,
+        to_ident: &Ident,
+        to_pool: &Arc<SundaeV4Pool>,
+    ) -> Result<(), String> {
+        if from_ident == to_ident {
+            return Err("movement must name two different pools".into());
+        }
+        let (burns, mints) = batch::lp_legs(
+            order,
+            &BTreeMap::from([
+                (from_ident.clone(), from_pool.clone()),
+                (to_ident.clone(), to_pool.clone()),
+            ]),
+        );
+        let pools = BTreeMap::from([
+            (from_ident.clone(), from_pool.clone()),
+            (to_ident.clone(), to_pool.clone()),
+        ]);
+        self.try_add_liquidity_op(
+            order,
+            &burns.into_iter().map(|(p, q)| (p, q, from_pool.clone())).collect::<Vec<_>>(),
+            &mints.into_iter().map(|(p, q)| (p, q, to_pool.clone())).collect::<Vec<_>>(),
+            &[],
+            &[],
+            &pools,
+            crate::sundaev4::router::RoutingLimits::unlimited(),
+        )
+    }
+
+    /// Add a multi-leg liquidity operation. `burns` are `(pool, lp to burn,
+    /// pool state)`; `mints` are `(pool, LP floor, pool state)`. The deposit
+    /// basket is the burn payouts plus `plain_offered`; each asset of it is
+    /// split equally among the mint targets whose pool holds that asset,
+    /// the last target taking the rounding remainder. Each leg is a
+    /// proportional step (fee_budget 0 on every curve). `plain_floors` are
+    /// checked against what is left for the user. The caller works on a
+    /// cloned accumulator and drops it on `Err`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_add_liquidity_op(
+        &mut self,
+        order: &Arc<crate::sundaev4::types::SundaeV4Order>,
+        burns: &[(Ident, BigInt, Arc<SundaeV4Pool>)],
+        mints: &[(Ident, BigInt, Arc<SundaeV4Pool>)],
+        plain_offered: &[(AssetClass, BigInt)],
+        plain_floors: &[(AssetClass, BigInt)],
+        pools: &BTreeMap<Ident, Arc<SundaeV4Pool>>,
+        limits: crate::sundaev4::router::RoutingLimits,
+    ) -> Result<(), String> {
+        use num_traits::Signed;
+
+        if burns.is_empty() && mints.is_empty() {
+            return Err("liquidity op has no LP legs".into());
+        }
+        {
+            let mut seen: Vec<&Ident> = Vec::new();
+            for (p, _, _) in burns.iter().chain(mints.iter()) {
+                if seen.contains(&p) {
+                    return Err(format!("liquidity op names pool {p} twice"));
+                }
+                seen.push(p);
+            }
+        }
+
+        // Basket: plain offered assets plus every withdraw payout.
+        let mut basket: BTreeMap<AssetClass, BigInt> = BTreeMap::new();
+        for (a, q) in plain_offered {
+            *basket.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+        }
+
+        let mut burn_legs: Vec<batch::BurnLeg> = Vec::new();
+        for (ident, lp_offered, pool) in burns {
+            let fresh = self.fresh_pool_accum(ident, pool);
+            let accum = self.pools.entry(ident.clone()).or_insert(fresh);
+            accum.check_canonical_append(&order.input)?;
+            let mut transient = (**pool).clone();
+            transient.pool_datum.assets = accum.running_assets.clone();
+            transient.pool_datum.total_lp = accum.running_total_lp.clone();
+            // resolve_withdraw_of_offered matches the LP by label and
+            // pool ident only; the policy is not consulted.
+            let lp_asset = AssetClass {
+                policy: Vec::new(),
+                token: {
+                    let mut t = vec![0x00, 0x14, 0xdf, 0x10];
+                    t.extend_from_slice(ident.to_bytes());
+                    t
+                },
+            };
+            let offered_list = [(lp_asset, lp_offered.clone())];
+            let (lp_burned, dy, wd_target) =
+                batch::resolve_withdraw_of_offered(&transient, &offered_list)?;
+            let next_preminted = accum.lp_return_after(&lp_burned)?;
+            for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+                *amt = &*amt - &dy[i];
+            }
+            accum.running_total_lp = &accum.running_total_lp - &lp_burned;
+            accum.running_circ_lp = &accum.running_circ_lp - &lp_burned;
+            accum.running_preminted = next_preminted;
+            let withdrawn: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .zip(dy.iter())
+                .map(|((a, _), q)| (a.clone(), q.clone()))
+                .collect();
+            for (a, q) in &withdrawn {
+                *basket.entry(a.clone()).or_insert_with(|| BigInt::from(0)) += q;
+            }
+            let w_idx = accum.withdraws.len();
+            accum.withdraws.push(batch::ResolvedWithdraw {
+                order: order.clone(),
+                lp_burned: lp_burned.clone(),
+                dy,
+                target_delta_v: wd_target,
+            });
+            let op_idx = accum.ops_order.len();
+            accum.ops_order.push(BatchOp::Withdraw(w_idx));
+            self.global_seq_raw.push((ident.clone(), op_idx));
+            burn_legs.push(batch::BurnLeg {
+                pool: ident.clone(),
+                batch: usize::MAX,
+                lp_burned,
+                withdrawn,
+            });
+        }
+
+        // Cross-pair: route every basket asset no target holds into the
+        // assets the targets hold but the basket lacks. A/B -> A/C becomes
+        // withdraw(A,B), swap B->C, deposit(A,C). Several deficits share a
+        // surplus equally; several surpluses each route in full.
+        let mut swap_legs: Vec<batch::SwapLeg> = Vec::new();
+        if !mints.is_empty() {
+            let needed: std::collections::BTreeSet<AssetClass> = mints
+                .iter()
+                .flat_map(|(_, _, p)| p.pool_datum.assets.iter().map(|(a, _)| a.clone()))
+                .collect();
+            let surplus: Vec<AssetClass> = basket
+                .iter()
+                .filter(|(a, q)| q.is_positive() && !needed.contains(*a))
+                .map(|(a, _)| a.clone())
+                .collect();
+            let deficit: Vec<AssetClass> = needed
+                .iter()
+                .filter(|a| !basket.get(*a).is_some_and(|q| q.is_positive()))
+                .cloned()
+                .collect();
+            if !deficit.is_empty() {
+                if limits.max_pools == 0 || limits.max_steps == 0 {
+                    return Err(format!(
+                        "liquidity op needs a swap between its legs but the order's budget buys \
+                         no pool beyond the {} legs (raise max_per_execution)",
+                        burns.len() + mints.len()
+                    ));
+                }
+                for from in surplus {
+                    let total = basket.get(&from).cloned().unwrap_or_else(|| BigInt::from(0));
+                    let n = BigInt::from(deficit.len() as i64);
+                    let mut spent = BigInt::from(0);
+                    for (di, to) in deficit.iter().enumerate() {
+                        let dx = if di + 1 == deficit.len() {
+                            &total - &spent
+                        } else {
+                            &total / &n
+                        };
+                        if !dx.is_positive() {
+                            continue;
+                        }
+                        let Some(blend) = crate::sundaev4::router::find_blended_route(
+                            pools,
+                            &[],
+                            &from,
+                            to,
+                            &dx,
+                            limits,
+                        ) else {
+                            // Diagnose: which single hops resolve on their own?
+                            let probe = |a: &AssetClass, b: &AssetClass| -> String {
+                                let mut found = Vec::new();
+                                for (ident, p) in pools {
+                                    let has = |x: &AssetClass| {
+                                        p.pool_datum.assets.iter().any(|(q, _)| q == x)
+                                    };
+                                    if has(a) && has(b) {
+                                        let one: BTreeMap<_, _> =
+                                            [(ident.clone(), p.clone())].into_iter().collect();
+                                        let ok = crate::sundaev4::router::find_blended_route(
+                                            &one,
+                                            &[],
+                                            a,
+                                            b,
+                                            &dx,
+                                            crate::sundaev4::router::RoutingLimits::unlimited(),
+                                        )
+                                        .is_some();
+                                        found.push(format!(
+                                            "{ident}:{}",
+                                            if ok { "ok" } else { "no" }
+                                        ));
+                                    }
+                                }
+                                found.join(",")
+                            };
+                            let via: Vec<String> = needed
+                                .iter()
+                                .filter(|x| *x != to)
+                                .map(|mid| {
+                                    format!(
+                                        "{}->{}: [{}] then [{}]",
+                                        hex::encode(&from.token),
+                                        hex::encode(&mid.token),
+                                        probe(&from, mid),
+                                        probe(mid, to)
+                                    )
+                                })
+                                .collect();
+                            return Err(format!(
+                                "liquidity op: no route for {dx} {}->{} across {} pools (max_pools {}, max_steps {}); direct [{}]; via {:?}",
+                                hex::encode(&from.token),
+                                hex::encode(&to.token),
+                                pools.len(),
+                                limits.max_pools,
+                                limits.max_steps,
+                                probe(&from, to),
+                                via
+                            ));
+                        };
+                        let first_route = self.routes.len();
+                        let mut dy = BigInt::from(0);
+                        for branch in &blend.branches {
+                            dy =
+                                &dy + &self.add_route_branch(order, branch, pools, false, false)?;
+                        }
+                        if !dy.is_positive() {
+                            return Err("liquidity op: swap leg pays nothing".into());
+                        }
+                        spent = &spent + &dx;
+                        *basket.entry(to.clone()).or_insert_with(|| BigInt::from(0)) += &dy;
+                        swap_legs.push(batch::SwapLeg {
+                            from: from.clone(),
+                            dx,
+                            to: to.clone(),
+                            dy,
+                            route_idxs: (first_route..self.routes.len()).collect(),
+                        });
+                    }
+                    if let Some(b) = basket.get_mut(&from) {
+                        *b = &*b - &spent;
+                    }
+                }
+            }
+        }
+
+        // Equal split of each basket asset among the targets holding it.
+        let mut users_of: BTreeMap<AssetClass, usize> = BTreeMap::new();
+        for (_, _, pool) in mints {
+            for (a, _) in &pool.pool_datum.assets {
+                if basket.contains_key(a) {
+                    *users_of.entry(a.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut remaining_users = users_of.clone();
+        let mut mint_legs: Vec<batch::MintLeg> = Vec::new();
+        for (ident, min_lp, pool) in mints {
+            let fresh = self.fresh_pool_accum(ident, pool);
+            let accum = self.pools.entry(ident.clone()).or_insert(fresh);
+            accum.check_canonical_append(&order.input)?;
+            let share: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .map(|(a, _)| {
+                    let avail = basket.get(a).cloned().unwrap_or_else(|| BigInt::from(0));
+                    let n = remaining_users.get(a).cloned().unwrap_or(1).max(1);
+                    (a.clone(), &avail / &BigInt::from(n as i64))
+                })
+                .collect();
+            for (a, _) in &share {
+                if let Some(n) = remaining_users.get_mut(a) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            let offered_per_pool = batch::align_offered_to_pool(&share, &accum.running_assets);
+            let (dx, lp_minted, dep_target) = batch::resolve_deposit_basket(
+                &pool.pool_type,
+                &accum.running_assets,
+                &accum.running_total_lp,
+                &offered_per_pool,
+            )
+            .map_err(|e| format!("deposit leg into pool {ident}: {e}"))?;
+            if !lp_minted.is_positive() {
+                return Err(format!("deposit leg into pool {ident} produces zero LP"));
+            }
+            if &lp_minted < min_lp {
+                return Err(format!(
+                    "deposit leg into pool {ident} mints {lp_minted} LP, below the order's minimum {min_lp}"
+                ));
+            }
+            let (next_preminted, next_minted) = accum.lp_issue_after(&lp_minted)?;
+            for (i, (_, amt)) in accum.running_assets.iter_mut().enumerate() {
+                *amt = &*amt + &dx[i];
+            }
+            accum.running_total_lp = &accum.running_total_lp + &lp_minted;
+            accum.running_circ_lp = &accum.running_circ_lp + &lp_minted;
+            accum.running_preminted = next_preminted;
+            accum.running_minted = next_minted;
+            let deposited: Vec<(AssetClass, BigInt)> = accum
+                .running_assets
+                .iter()
+                .zip(dx.iter())
+                .map(|((a, _), q)| (a.clone(), q.clone()))
+                .collect();
+            for (a, q) in &deposited {
+                if let Some(b) = basket.get_mut(a) {
+                    *b = &*b - q;
+                }
+            }
+            let dep_idx = accum.deposits.len();
+            accum.deposits.push(batch::ResolvedDeposit {
+                order: order.clone(),
+                dx,
+                lp_minted: lp_minted.clone(),
+                surplus: Vec::new(),
+                target_delta_v: dep_target,
+            });
+            let op_idx = accum.ops_order.len();
+            accum.ops_order.push(BatchOp::Deposit(dep_idx));
+            self.global_seq_raw.push((ident.clone(), op_idx));
+            mint_legs.push(batch::MintLeg {
+                pool: ident.clone(),
+                batch: usize::MAX,
+                deposited,
+                lp_minted,
+            });
+        }
+
+        for (a, floor) in plain_floors {
+            let left = basket.get(a).cloned().unwrap_or_else(|| BigInt::from(0));
+            if &left < floor {
+                return Err(format!(
+                    "liquidity op leaves {left} of an asset for the user, below the order's floor {floor}"
+                ));
+            }
+        }
+
+        self.moves.push(batch::ResolvedMove {
+            order: order.clone(),
+            burns: burn_legs,
+            swaps: swap_legs,
+            mints: mint_legs,
+        });
+        Ok(())
+    }
+
     pub fn try_add_routed_order(
         &mut self,
         order: &Arc<crate::sundaev4::types::SundaeV4Order>,
@@ -784,66 +1224,91 @@ impl Accumulator {
                     proportional
                 };
 
-                let dy = batch::compute_swap_result(
-                    &effective_pool.pool_type,
-                    &accum.running_assets,
-                    &accum.running_total_lp,
-                    input_idx,
-                    output_idx,
-                    &dx,
-                );
-                if !dy.is_positive() {
-                    return Err(format!("zero output from pool {}", pool_ident));
-                }
+                let dy = if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity {
+                    config,
+                } = &effective_pool.pool_type
+                {
+                    // Several in-band steps, each accruing its own fee
+                    // budget, exactly as the tx walk emits them.
+                    let ps = accum.ps.clone();
+                    let dy = accrue_banded_swap(
+                        config,
+                        &mut accum.running_assets,
+                        &mut accum.running_total_lp,
+                        &ps,
+                        &mut accum.cum_gross_fb,
+                        &mut accum.cum_protocol_lp,
+                        input_idx,
+                        &dx,
+                    )
+                    .map_err(|e| format!("pool {pool_ident}: {e}"))?;
+                    if !dy.is_positive() {
+                        return Err(format!("zero output from pool {}", pool_ident));
+                    }
+                    dy
+                } else {
+                    let dy = batch::compute_swap_result(
+                        &effective_pool.pool_type,
+                        &accum.running_assets,
+                        &accum.running_total_lp,
+                        input_idx,
+                        output_idx,
+                        &dx,
+                    );
+                    if !dy.is_positive() {
+                        return Err(format!("zero output from pool {}", pool_ident));
+                    }
 
-                // Never emit a leg that drains a pool below zero. The pool
-                // contract rejects it (check_reserves_covered: `amount >= 0`),
-                // so building + evaluating it is wasted work ending in a
-                // quarantine loop. Reject the order up front instead — an
-                // over-allocated leg (the router put more input into this pool
-                // than its output reserve can cover) fails fast here.
-                if dy > accum.running_assets[output_idx].1 {
-                    return Err(format!(
-                        "leg would over-drain pool {pool_ident} output reserve \
-                         (dy={dy} > running reserve={})",
-                        accum.running_assets[output_idx].1
-                    ));
-                }
+                    // Never emit a leg that drains a pool below zero. The pool
+                    // contract rejects it (check_reserves_covered: `amount >= 0`),
+                    // so building + evaluating it is wasted work ending in a
+                    // quarantine loop. Reject the order up front instead — an
+                    // over-allocated leg (the router put more input into this pool
+                    // than its output reserve can cover) fails fast here.
+                    if dy > accum.running_assets[output_idx].1 {
+                        return Err(format!(
+                            "leg would over-drain pool {pool_ident} output reserve \
+                             (dy={dy} > running reserve={})",
+                            accum.running_assets[output_idx].1
+                        ));
+                    }
 
-                // Capture reserves before update for fee budget computation
-                let prev_assets = accum.running_assets.clone();
+                    // Capture reserves before update for fee budget computation
+                    let prev_assets = accum.running_assets.clone();
 
-                // Update running reserves
-                accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
-                accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
+                    // Update running reserves
+                    accum.running_assets[input_idx].1 = &accum.running_assets[input_idx].1 + &dx;
+                    accum.running_assets[output_idx].1 = &accum.running_assets[output_idx].1 - &dy;
 
-                // Per-entry protocol_lp bump (mirrors tx_builder) so CL dy
-                // computed for subsequent ops in this pool matches tx-time.
-                let fb = swap_math::compute_fee_budget(
-                    &effective_pool.pool_type,
-                    &prev_assets,
-                    &accum.running_assets,
-                    &accum.running_total_lp,
-                );
-                // A swap must never drive the pool's fee budget negative — that
-                // means the leg lost the pool value, and the pool contract's
-                // check_lp_accounting (circulating_lp <= total_lp) rejects it,
-                // quarantining the order. The router's value-preservation cap
-                // (cl_max_dx_value_preserving) should already prevent this; this
-                // is the fail-fast backstop so a mispriced leg can never build an
-                // invalid tx. (Currently trips for B-input swaps on range-above-
-                // 1.0 CL pools — the spa_num/spa_den slip filed for audit.)
-                if fb.is_negative() {
-                    return Err(format!(
-                        "leg would make pool {pool_ident} lose value \
-                         (fee_budget={fb} < 0); swap outside its value-preserving range"
-                    ));
-                }
-                accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
-                let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
-                let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
-                accum.cum_protocol_lp = new_cum_protocol_lp;
-                accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
+                    // Per-entry protocol_lp bump (mirrors tx_builder) so LP-dependent dy
+                    // computed for subsequent ops in this pool matches tx-time.
+                    let fb = swap_math::compute_fee_budget(
+                        &effective_pool.pool_type,
+                        &prev_assets,
+                        &accum.running_assets,
+                        &accum.running_total_lp,
+                    );
+                    // A swap must never drive the pool's fee budget negative — that
+                    // means the leg lost the pool value, and the pool contract's
+                    // check_lp_accounting (circulating_lp <= total_lp) rejects it,
+                    // quarantining the order. The router's value-preservation cap
+                    // (the per-curve absorb caps) should already prevent this; this
+                    // is the fail-fast backstop so a mispriced leg can never build an
+                    // invalid tx. (Currently trips for B-input swaps on range-above-
+                    // 1.0 pools.)
+                    if fb.is_negative() {
+                        return Err(format!(
+                            "leg would make pool {pool_ident} lose value \
+                             (fee_budget={fb} < 0); swap outside its value-preserving range"
+                        ));
+                    }
+                    accum.cum_gross_fb = &accum.cum_gross_fb + &fb;
+                    let new_cum_protocol_lp = &accum.cum_gross_fb * &accum.ps.0 / &accum.ps.1;
+                    let op_protocol_lp = &new_cum_protocol_lp - &accum.cum_protocol_lp;
+                    accum.cum_protocol_lp = new_cum_protocol_lp;
+                    accum.running_total_lp = &accum.running_total_lp + &op_protocol_lp;
+                    dy
+                };
 
                 this_hop_output = &this_hop_output + &dy;
 
@@ -974,11 +1439,15 @@ impl Accumulator {
     }
 
     /// Total number of orders across all pools (swaps + deposits + withdraws).
+    /// Orders in the batch: pool ops plus orders owned by a conversion
+    /// leg (routes with no pool split at all, e.g. a pure external fill).
     pub fn order_count(&self) -> usize {
-        self.pools
+        let pool_ops: usize = self
+            .pools
             .values()
             .map(|a| a.swaps.len() + a.deposits.len() + a.withdraws.len() + a.zaps.len())
-            .sum()
+            .sum();
+        pool_ops + self.conversions.iter().filter(|c| c.primary).count()
     }
 
     /// Collect all order inputs across all accumulated pools.
@@ -997,7 +1466,7 @@ impl Accumulator {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.is_empty() || self.order_count() == 0
+        self.order_count() == 0
     }
 
     /// Convert accumulated state into a `ScoopPlan` for the tx builder.
@@ -1042,6 +1511,7 @@ impl Accumulator {
                 withdraws: accum.withdraws,
                 zaps: accum.zaps,
                 claims: Vec::new(),
+                foreign: Vec::new(),
                 ops_order: accum.ops_order,
                 final_assets: accum.running_assets,
                 final_total_lp,
@@ -1062,11 +1532,26 @@ impl Accumulator {
             })
             .collect();
 
+        let moves = self
+            .moves
+            .into_iter()
+            .map(|mut m| {
+                for leg in &mut m.burns {
+                    leg.batch = ident_to_batch_idx[&leg.pool];
+                }
+                for leg in &mut m.mints {
+                    leg.batch = ident_to_batch_idx[&leg.pool];
+                }
+                m
+            })
+            .collect();
+
         ScoopPlan {
             batches,
             routes: self.routes,
             global_seq,
             conversions,
+            moves,
         }
     }
 

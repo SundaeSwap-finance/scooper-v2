@@ -1613,17 +1613,25 @@ impl AdminServer {
         // A stableswap pool's config is per pool (and its rates move on
         // chain), so its preimage comes from the pool record, not the
         // startup map.
-        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> =
-            if let crate::sundaev4::PoolType::StableSwap { config } = &pool.pool_type {
-                use plutus_parser::AsPlutus;
-                let cbor = minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default();
-                Some((
+        // The same holds for a banded ladder, whose config is per pool.
+        let ss_preimage: Option<(Vec<u8>, Vec<u8>)> = {
+            use plutus_parser::AsPlutus;
+            let cbor = match &pool.pool_type {
+                crate::sundaev4::PoolType::StableSwap { config } => {
+                    Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
+                }
+                crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } => {
+                    Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
+                }
+                _ => None,
+            };
+            cbor.map(|cbor| {
+                (
                     pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec(),
                     cbor,
-                ))
-            } else {
-                None
-            };
+                )
+            })
+        };
         if let Some(obj) = pool_json.get_mut("pool_datum").and_then(|d| d.get_mut("module_state")) {
             let mut enriched = serde_json::Map::new();
             for (module_hash, state_bytes) in &pool.pool_datum.module_state {
@@ -1643,6 +1651,47 @@ impl AdminServer {
                 enriched.insert(hex::encode(module_hash), serde_json::Value::Object(entry));
             }
             *obj = serde_json::Value::Object(enriched);
+        }
+        // Banded pools: the ladder witness (counter X, active band k) is
+        // derived from the reserves, never stored, so compute it here for
+        // the dashboard along with the active band's price edges and the
+        // input each direction can still absorb.
+        if let crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type
+            && pool.pool_datum.assets.len() == 2
+        {
+            use crate::sundaev4::banded_math as bm;
+            let (a, b) = (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1);
+            let band_state = match bm::find_witness(config, a, b) {
+                Some(w) => {
+                    let view = bm::band_view(config, a, b, &w).ok();
+                    let (ra, rb, lo, hi) = view
+                        .as_ref()
+                        .map(|v| {
+                            (
+                                v.ra.to_string(),
+                                v.rb.to_string(),
+                                format!("{}/{}", v.lo.num, v.lo.den),
+                                format!("{}/{}", v.hi.num, v.hi.den),
+                            )
+                        })
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "counter": w.x.to_string(),
+                        "active_band": w.k,
+                        "bands": config.bands.len(),
+                        "residual_a": ra,
+                        "residual_b": rb,
+                        "sqrt_price_lo": lo,
+                        "sqrt_price_hi": hi,
+                        "capacity_a_in": bm::ladder_capacity_from(config, a, b, true, Some(&w)).to_string(),
+                        "capacity_b_in": bm::ladder_capacity_from(config, a, b, false, Some(&w)).to_string(),
+                    })
+                }
+                None => serde_json::json!({ "error": "no ladder witness for the reserves" }),
+            };
+            if let Some(obj) = pool_json.as_object_mut() {
+                obj.insert("band_state".into(), band_state);
+            }
         }
         pool_json
     }
@@ -1806,8 +1855,8 @@ impl AdminServer {
             let kind = match &pool.pool_type {
                 PoolType::ConstantProduct { .. } => "cp",
                 PoolType::ConstantSum { .. } => "cs",
-                PoolType::ConcentratedLiquidity { .. } => "cl",
                 PoolType::StableSwap { .. } => "ss",
+                PoolType::BandedConcentratedLiquidity { .. } => "bcl",
             };
             *by_type.entry(kind).or_default() += 1;
             if self.v4_pool_allowlists.is_restricted(ident) {
@@ -2096,6 +2145,10 @@ fn format_sse_event(event: &IndexEvent) -> (&'static str, String) {
             "v4_mempool_tx_dropped",
             serde_json::json!({ "tx_hash": hex::encode(tx_hash) }).to_string(),
         ),
+        IndexEvent::CardanoSwapsOrderbookChanged { tx_id } => (
+            "cardano_swaps_orderbook_changed",
+            serde_json::json!({ "tx_id": tx_id }).to_string(),
+        ),
         IndexEvent::V3PoolCreated { id, .. } => (
             "v3_pool_created",
             serde_json::json!({ "id": id.to_string() }).to_string(),
@@ -2224,7 +2277,7 @@ mod protocol_stats_tests {
 
     #[tokio::test]
     async fn aggregates_pools_orders_and_equity() {
-        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
         // 1000 A / 2000 B, with a quarter of the LP held by the protocol.
         let pool = make_pool(&env, 0xA1, token_a(), 1_000_000, token_b(), 2_000_000);
         let mut pool = (*pool).clone();
@@ -2284,7 +2337,7 @@ mod protocol_stats_tests {
 
     #[tokio::test]
     async fn unindexed_order_config_is_counted_not_priced() {
-        let env = TestEnv::from_blueprint_file("test/fixtures/devnet-blueprint.json");
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
         let pool = make_pool(&env, 0xA2, token_a(), 1_000_000, token_b(), 2_000_000);
         let mut state = crate::sundaev4::SundaeV4State::default();
         state.pools.insert(pool.pool_datum.identifier.clone(), pool);
