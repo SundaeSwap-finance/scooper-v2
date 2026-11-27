@@ -148,11 +148,10 @@ fn ss_swap_op_data(
 /// A state with no witness cannot be the after state of a valid step, so
 /// the tx is refused rather than built.
 /// The banded entry's operation_data for a known after-witness: `[X, k]`
-/// plus the attribution. From revision 2 (`ClRules::tagged_steps`) the list
-/// is exactly three items, so a step that serves no order writes `Void` in
-/// the third.
+/// plus the attribution. The list is exactly three items
+/// (`cl_check.decode_entry`), so a step that serves no order writes `Void`
+/// in the third.
 fn banded_op_data_for(
-    rules: &crate::sundaev4::types::ClRules,
     w: &crate::sundaev4::banded_math::Witness,
     attribution: Option<pallas_primitives::PlutusData>,
 ) -> pallas_primitives::PlutusData {
@@ -162,23 +161,15 @@ fn banded_op_data_for(
     ];
     match attribution {
         Some(a) => items.push(a),
-        None if rules.tagged_steps => {
-            items.push(crate::sundaev4::types::BandedCLConfig::void_data())
-        }
-        None => {}
+        None => items.push(crate::sundaev4::types::BandedCLConfig::void_data()),
     }
     pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items))
 }
 
-/// The `operation_tag` of a CL entry. From revision 2 the module requires 3
-/// on a swap step and 6 or 4 on a non-swap step (`cl_check.step_tag_ok`).
-/// Revision 1 reads no tag, and the scooper writes the sentinel 100 there.
-fn cl_operation_tag(rules: &crate::sundaev4::types::ClRules, tag: u64) -> BigInt {
-    if rules.tagged_steps {
-        BigInt::from(tag)
-    } else {
-        BigInt::from(100)
-    }
+/// The `operation_tag` of a CL entry. The module requires 3 on a swap step
+/// and 6 or 4 on a non-swap step (`cl_check.step_tag_ok`).
+fn cl_operation_tag(tag: u64) -> BigInt {
+    BigInt::from(tag)
 }
 
 /// Per-pool running state the streaming walk threads through every op.
@@ -233,25 +224,21 @@ fn walk_banded_swap(
         } else {
             (&a0 - &step.dy, &b0 + &step.dx)
         };
-        // From revision 2, the fee's LP worth at the before witness
-        // (sundae-v4 SV4-001b); the module pins `lp_after + fee_budget -
-        // lp_before` to it exactly. In revision 1, the counter ratio.
-        let gross_fb = banded_math::step_fee_budget(
+        // The fee's LP worth at the before witness (sundae-v4 SV4-001b);
+        // the module pins `lp_after + fee_budget - lp_before` to it
+        // exactly.
+        let gross_fb = banded_math::swap_fee_budget(
             config,
             &a0,
             &b0,
             &a1,
             &b1,
             &step.before,
-            &step.after,
             st.running_total_lp,
         )
         .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
         if gross_fb.is_negative() {
-            if config.rules.fee_budget_is_fee_value {
-                bail!("banded step books a negative fee budget ({gross_fb})");
-            }
-            bail!("banded step lowers the ladder counter (fee_budget={gross_fb})");
+            bail!("banded step books a negative fee budget ({gross_fb})");
         }
         if is_a_input {
             st.running_assets[0].1 = &st.running_assets[0].1 + &step.dx;
@@ -292,11 +279,7 @@ fn walk_banded_swap(
             },
             fee_budget: submitted_fee_budget,
             operation_tag: swap_tag.clone(),
-            operation_data: banded_op_data_for(
-                &config.rules,
-                &step.after,
-                Some(attribution.clone()),
-            ),
+            operation_data: banded_op_data_for(&step.after, Some(attribution.clone())),
         });
     }
     let (gross_fb, after) = last.expect("swap_steps returns at least one step");
@@ -319,7 +302,7 @@ fn banded_op_data(
                 after[1].1
             )
         })?;
-    Ok(banded_op_data_for(&config.rules, &w, attribution))
+    Ok(banded_op_data_for(&w, attribution))
 }
 
 /// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
@@ -791,8 +774,8 @@ pub fn build_multi_pool_scoop_tx(
         .collect();
 
     // Per-pool operation_tag for swap entries. CS dispatches on tag==3
-    // (`tag_swap` in cs_check.ak); CP infers from asset deltas, and so does
-    // CL revision 1. CL from revision 2 requires the tag to agree.
+    // (`tag_swap` in cs_check.ak); CP infers from asset deltas. CL
+    // requires the tag to agree (`cl_check.step_tag_ok`).
     let per_pool_swap_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -800,15 +783,15 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_SWAP)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { config } => {
-                cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_SWAP)
+            PoolType::BandedConcentratedLiquidity { .. } => {
+                cl_operation_tag(crate::sundaev4::types::TAG_SWAP)
             }
         })
         .collect();
 
     // Per-pool operation_tag for deposit entries. CS dispatches on tag==6
-    // (`tag_deposit` in cs_check.ak); CP infers from asset deltas, and so
-    // does CL revision 1.
+    // (`tag_deposit` in cs_check.ak); CP infers from asset deltas. CL
+    // requires tag 6.
     let per_pool_deposit_tag: Vec<BigInt> = batches
         .iter()
         .map(|b| match &b.pool.pool_type {
@@ -816,8 +799,8 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { config } => {
-                cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_DEPOSIT)
+            PoolType::BandedConcentratedLiquidity { .. } => {
+                cl_operation_tag(crate::sundaev4::types::TAG_DEPOSIT)
             }
         })
         .collect();
@@ -1299,9 +1282,9 @@ pub fn build_multi_pool_scoop_tx(
                 *running_circ_lp = &*running_circ_lp - &w.lp_burned;
                 *running_preminted = &*running_preminted + &w.lp_burned;
                 // CS pools dispatch per-tag (cs_check.ak: tag_swap=3,
-                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP and CL
-                // revision 1 infer from asset deltas, so any sentinel tag
-                // works. CL from revision 2 requires tag 4 or 6.
+                // tag_withdraw=4, tag_claim=5, tag_deposit=6). CP infers
+                // from asset deltas, so any sentinel tag works. CL requires
+                // tag 4 or 6.
                 tracing::debug!(
                     order = %w.order.input,
                     lp_burned = %w.lp_burned,
@@ -1311,8 +1294,8 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
-                    PoolType::BandedConcentratedLiquidity { config } => {
-                        cl_operation_tag(&config.rules, crate::sundaev4::types::TAG_WITHDRAW)
+                    PoolType::BandedConcentratedLiquidity { .. } => {
+                        cl_operation_tag(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
                         BigInt::from(crate::sundaev4::types::TAG_WITHDRAW)
@@ -1410,9 +1393,7 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             };
             op_data_override = Some(match &banded_after {
-                Some(w) => {
-                    banded_op_data_for(&config.rules, w, served_order.map(order_ref_to_plutus))
-                }
+                Some(w) => banded_op_data_for(w, served_order.map(order_ref_to_plutus)),
                 None => banded_op_data(
                     config,
                     running_assets,
@@ -1538,22 +1519,9 @@ pub fn build_multi_pool_scoop_tx(
                     e.state_after.total_lp.clone(),
                 )
             });
-            // The rules of the oracle hash this pool names.
-            let rules = exec
-                .module_scripts
-                .revision_of(oracle_hash.as_ref())
-                .and_then(crate::sundaev4::types::OracleRules::of)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "pool {}: oracle module {} has no implemented revision",
-                        pool.pool_datum.identifier,
-                        hex::encode(oracle_hash)
-                    )
-                })?;
             // The module reads total_lp from the pool input datum and from
             // the pool output datum, which carries `final_total_lp`.
-            let next = crate::sundaev4::types::OracleSlot::after_scoop_with(
-                &rules,
+            let next = crate::sundaev4::types::OracleSlot::after_scoop(
                 &slot.1,
                 &now_ms,
                 (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1),
@@ -1571,7 +1539,7 @@ pub fn build_multi_pool_scoop_tx(
                 "oracle slot after scoop",
             );
             slot.1 = next
-                .encode_for(&rules)
+                .encode_slot()
                 .map_err(|e| anyhow::anyhow!("pool {}: {e}", pool.pool_datum.identifier))?;
         }
         let updated_datum = PoolDatum {
@@ -1995,18 +1963,13 @@ pub fn build_multi_pool_scoop_tx(
                     .iter()
                     .find(|(cred, _)| cred.as_slice() == bcl_cred)
                     .map(|(_, h)| h.clone());
-                // The rules the config carries must be the rules of the hash
-                // the pool names, or the arithmetic above mirrored the wrong
-                // module.
-                let revision = exec.module_scripts.revision_of(bcl_cred);
-                if revision != Some(config.rules.revision) {
+                // The module hashes five fields. A four-field config is the
+                // pre-audit form, and no implemented module reads it.
+                if config.ext.is_none() {
                     bail!(
-                        "pool {}: banded config carries CL revision {} but the pool's module {} \
-                         is revision {}",
+                        "pool {}: the CL config has four fields; module {} reads five",
                         batch.pool.pool_datum.identifier,
-                        config.rules.revision,
                         hex::encode(bcl_cred),
-                        revision.map(|r| r.to_string()).unwrap_or_else(|| "unknown".into()),
                     );
                 }
                 let expected = crate::sundaev4::banded_math::config_hash(config);
@@ -4570,14 +4533,7 @@ impl PoolModuleEntries {
             }
             .to_plutus(),
             ModuleKind::ConcentratedLiquidity => {
-                // One module hash has one revision, and each config carries
-                // the rules of its pool's module hash.
-                let entries: Vec<crate::sundaev4::types::BandedOperateEntry> = collect!(Cl);
-                let rules = entries
-                    .first()
-                    .map(|e| e.config.rules)
-                    .unwrap_or(crate::sundaev4::types::ClRules::REVISION_1);
-                crate::sundaev4::types::BandedCLRedeemer::operate(&rules, entries)
+                crate::sundaev4::types::BandedCLRedeemer::operate(collect!(Cl))
             }
             ModuleKind::FeeSplit => FeeSplitRedeemer::Operate {
                 entries: collect!(FeeSplit),

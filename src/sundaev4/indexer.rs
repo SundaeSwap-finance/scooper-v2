@@ -1132,10 +1132,11 @@ pub fn extract_ss_config_candidates(
 ///     redeemer, so the derived form is the only way to recover the config
 ///     of a migrated pool from chain history.
 ///  3. After each four-field candidate it adds the same ladder with
-///     `ext = Void` (`banded_math::config_forms`). A governor migration
-///     from CL revision 1 to revision 2 writes that five-field config's
-///     hash to the pool's slot and the config itself to no redeemer.
-///  4. It reads the config table of a revision-3 `Operate`
+///     `ext = Void` (`banded_math::config_forms`). The preview governor
+///     migration of 2026-11-14 wrote that five-field config's hash to the
+///     pool's slot and the config itself to no redeemer.
+///  4. It reads both `Operate` forms: the config table the module reads,
+///     and the one-config-per-entry form of the pre-audit preview modules
 ///     (`BandedCLRedeemer::from_plutus_any_form`).
 ///
 /// All four rules only ADD candidates. The hash pin rejects anything wrong.
@@ -1192,8 +1193,8 @@ pub fn extract_bcl_config_candidates(
 /// then refuses the pool.
 ///
 /// The cached config's `ext = Void` form is how a pool that a governor has
-/// just migrated to CL revision 2 is recovered while indexing: the
-/// migration transaction holds no CL redeemer.
+/// just migrated from the four-field config is recovered while indexing:
+/// the migration transaction holds no CL redeemer.
 pub fn resolve_bcl_config(
     pool_datum: &PoolDatum,
     bcl_module_hash: &[u8],
@@ -2579,15 +2580,16 @@ pub fn detect_pool_type(
     }
 
     if matched_kind == Some(ModuleKind::ConcentratedLiquidity) {
-        // The config takes the rules of the CL hash the pool names. A config
-        // whose shape that revision does not read cannot be the pool's.
-        let revision = invariant.and_then(|(_, h)| exec.module_scripts.revision_of(h.as_ref()));
-        let rules = revision.and_then(crate::sundaev4::types::ClRules::of);
-        if let (Some(cfg), Some(rules)) = (bcl_config, rules) {
-            match cfg.clone().with_rules(rules) {
-                Ok(config) => return PoolType::BandedConcentratedLiquidity { config },
-                Err(e) => warn!(pool = %ident_hex, "banded pool's config is refused: {e}"),
+        // The module hashes five fields. A four-field config is the
+        // pre-audit form: no implemented module reads it, so it cannot be
+        // the config of a pool the scooper can scoop.
+        if let Some(cfg) = bcl_config {
+            if cfg.ext.is_some() {
+                return PoolType::BandedConcentratedLiquidity {
+                    config: cfg.clone(),
+                };
             }
+            warn!(pool = %ident_hex, "banded pool's config has four fields; it is refused");
         }
         // No preimage that hashes to the datum's module_state slot, and no
         // operator override: the ladder is hash-pinned and the module reads
@@ -2609,7 +2611,6 @@ pub fn detect_pool_type(
                 },
                 weight_total: BigInt::from(0),
                 ext: None,
-                rules: rules.unwrap_or(crate::sundaev4::types::ClRules::REVISION_1),
             },
         };
     }

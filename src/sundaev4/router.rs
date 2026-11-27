@@ -355,8 +355,7 @@ fn banded_marginal(
     }
     let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
     let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
-    let dx_eff = raw_allocated
-        - &crate::sundaev4::banded_math::band_fee_rounded(raw_allocated, fee, band.fee_rounds_up);
+    let dx_eff = raw_allocated - &crate::sundaev4::banded_math::band_fee(raw_allocated, fee);
     if is_a_input {
         let va = &va0 + &(&dx_eff * spb_num);
         let denom = &fee_den * spa_den * &va * &va;
@@ -3507,7 +3506,6 @@ mod depth_fallback {
             closing: sqrt_price(((BANDS_PER_SIDE as f64 + 0.5) * h).exp().sqrt()),
             weight_total,
             ext: None,
-            rules: crate::sundaev4::types::ClRules::REVISION_1,
         };
         config.index = build_index(&config);
         check_shape(&config).expect("the ladder passes the module's shape checks");

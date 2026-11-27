@@ -3079,7 +3079,7 @@ mod recover_missing_configs_tests {
     use crate::sundaev4::{ConstantSumConfig, PoolConfig, PoolType, Rational, SundaeV4Pool};
     use std::collections::BTreeMap;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-audited-blueprint.json";
 
     fn cs_pool(env: &TestEnv) -> std::sync::Arc<SundaeV4Pool> {
         make_cs_pool(
@@ -3256,7 +3256,8 @@ mod migrated_pool_bootstrap_tests {
     use super::*;
     use crate::bigint::BigInt;
     use crate::sundaev4::test_harness::{
-        Revision, TestEnv, bcl_eq8_config_at, make_bcl_pool, make_cs_pool, token_a, token_b,
+        TestEnv, bcl_eq8_config, bcl_eq8_config_four_fields, make_bcl_pool, make_cs_pool, token_a,
+        token_b,
     };
     use crate::sundaev4::{
         BandedCLRedeemer, CSOperateEntry, ConstantSumConfig, ConstantSumRedeemer, FeeSplitConfig,
@@ -3277,38 +3278,41 @@ mod migrated_pool_bootstrap_tests {
         }
     }
 
-    /// The preview launch-candidate fixture (current CS and CL revision 2),
-    /// the revision-1 modules (old CS 95e2c69a, old CL 33485bba), and a
-    /// second, old fee_split hash.
+    /// The same for the constant_sum and CL modules a migrated pool was
+    /// created on.
+    const OLD_CS: [u8; 28] = [0xC5; 28];
+    const OLD_CL: [u8; 28] = [0xC1; 28];
+
+    /// The audited preview fixture, and an old hash with no code for each
+    /// of constant_sum, CL and fee_split.
     fn env() -> TestEnv {
-        let mut env = TestEnv::preview_both_revisions();
-        env.exec
-            .module_scripts
-            .modules
-            .insert(
-                ModuleKind::FeeSplit,
-                ScriptRefInfo {
-                    hash: ScriptHash::new(OLD_FS),
-                    ref_utxo: crate::cardano_types::TransactionInput::new([0xF5; 32].into(), 0),
-                    script_cbor: None,
-                },
-            )
-            .unwrap();
+        let mut env = TestEnv::from_blueprint_file(crate::sundaev4::test_harness::PREVIEW_FIXTURE);
+        for (kind, hash) in [
+            (ModuleKind::FeeSplit, OLD_FS),
+            (ModuleKind::ConstantSum, OLD_CS),
+            (ModuleKind::ConcentratedLiquidity, OLD_CL),
+        ] {
+            env.exec
+                .module_scripts
+                .modules
+                .insert(
+                    kind,
+                    ScriptRefInfo {
+                        hash: ScriptHash::new(hash),
+                        ref_utxo: crate::cardano_types::TransactionInput::new(
+                            [hash[0]; 32].into(),
+                            0,
+                        ),
+                        script_cbor: None,
+                    },
+                )
+                .unwrap();
+        }
         env
     }
 
-    fn hash_of(env: &TestEnv, kind: ModuleKind, revision: Revision) -> ScriptHash {
-        env.exec.module_scripts.first_of_revision(kind, revision).expect("registered").hash
-    }
-
-    fn old_cs(env: &TestEnv) -> ScriptHash {
-        let current = env.exec.module_scripts.first_of(ModuleKind::ConstantSum).unwrap().hash;
-        env.exec
-            .module_scripts
-            .of_kind(ModuleKind::ConstantSum)
-            .map(|s| s.hash)
-            .find(|h| *h != current)
-            .expect("the revision-1 modules add a second constant_sum")
+    fn old_cs(_env: &TestEnv) -> ScriptHash {
+        ScriptHash::new(OLD_CS)
     }
 
     fn current_fs(env: &TestEnv) -> ScriptHash {
@@ -3721,8 +3725,8 @@ mod migrated_pool_bootstrap_tests {
 
     /// The acceptance test. Bootstrap with an empty DB against five pools:
     ///  1. CS on the new CS and fee_split hashes, Creates under the old ones;
-    ///  2. CL revision 1 migrated to revision 2 (slot = the `ext = Void`
-    ///     form), Create under the revision-1 hash with four fields;
+    ///  2. CL migrated by the preview governor (slot = the `ext = Void`
+    ///     form), Create under an old CL hash with four fields;
     ///  3. a CS pool on the new hash whose config is in no redeemer;
     ///  4. a CS pool whose mint-tx request fails (a Blockfrost error);
     ///  5. a CS pool that no governor touched.
@@ -3749,16 +3753,16 @@ mod migrated_pool_bootstrap_tests {
             vec![withdrawal_tx(22, vec![])],
         );
 
-        let four = bcl_eq8_config_at(ratio(3, 1000), Revision(1));
-        let five = bcl_eq8_config_at(ratio(3, 1000), Revision(2));
+        let four = bcl_eq8_config_four_fields(ratio(3, 1000));
+        let five = bcl_eq8_config(ratio(3, 1000));
         let p2 = make_bcl_pool(
             &env,
             0xC2,
             vec![(token_a(), 1_000_000), (token_b(), 1_000_000)],
             five.clone(),
         );
-        let r1 = hash_of(&env, ModuleKind::ConcentratedLiquidity, Revision(1));
-        let r2 = hash_of(&env, ModuleKind::ConcentratedLiquidity, Revision(2));
+        let r1 = ScriptHash::new(OLD_CL);
+        let r2 = env.cl_script().hash;
         assert_eq!(p2.pool_datum.actions[0].modules[0], r2.as_ref().to_vec());
         let cl_create = BandedCLRedeemer::Create {
             initial_state: four.clone(),
@@ -3825,7 +3829,7 @@ mod migrated_pool_bootstrap_tests {
                 && crate::sundaev4::module_configs_match_datum(pool, &env.exec).is_ok()
         };
         assert!(scoopable(&p1), "migrated CS pool");
-        assert!(scoopable(&p2), "CL pool migrated to revision 2");
+        assert!(scoopable(&p2), "CL pool migrated to the five-field config");
         assert!(!scoopable(&p3), "a CS pool with no config is not scooped");
         assert!(
             !scoopable(&p4),
@@ -3835,7 +3839,6 @@ mod migrated_pool_bootstrap_tests {
 
         match &pools[&p2.pool_datum.identifier].pool_type {
             PoolType::BandedConcentratedLiquidity { config } => {
-                assert_eq!(config.rules.revision, Revision(2));
                 assert_eq!(
                     crate::sundaev4::banded_math::config_hash(config),
                     crate::sundaev4::banded_math::config_hash(&five)

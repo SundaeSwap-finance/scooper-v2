@@ -93,7 +93,6 @@ fn ladder(shape: &MarketShape) -> BandedCLConfig {
         closing: sqrt_price(((last as f64 + 0.5) * h).exp().sqrt()),
         weight_total,
         ext: None,
-        rules: crate::sundaev4::ClRules::REVISION_1,
     };
     cfg.index = build_index(&cfg);
     check_shape(&cfg).expect("the synthetic ladder passes the module's shape checks");

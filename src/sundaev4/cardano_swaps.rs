@@ -1320,7 +1320,6 @@ mod foreign_fill_tests {
                 },
                 weight_total: BigInt::from(0),
                 ext: None,
-                rules: crate::sundaev4::types::ClRules::REVISION_1,
             },
         };
         assert!(

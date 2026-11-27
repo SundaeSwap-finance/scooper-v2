@@ -11,9 +11,9 @@
 //!
 //! A kind says what a module is (its config type and its place in a
 //! transaction). It does not say which rules the module applies: two hashes
-//! of one kind can check different arithmetic. Each registered hash
-//! therefore also carries a [`Revision`] of its kind, and the scooper
-//! chooses rules from `(kind, revision)`. See [`Revision`] for the table.
+//! of one kind can check different arithmetic. A config entry can therefore
+//! name a [`Revision`] of its kind, and the scooper refuses a revision it
+//! does not implement. See [`Revision`].
 //!
 //! Config form, under `protocol.v4.execution.module-scripts`: each key is a
 //! role. A role key maps to one `{hash, ref-utxo, revision?}` object, or to
@@ -123,10 +123,7 @@ impl ModuleKind {
     /// The newest revision of this kind that the scooper implements. Every
     /// revision from [`Revision::DEFAULT`] to this one is implemented.
     pub fn latest_revision(self) -> Revision {
-        match self {
-            ModuleKind::ConcentratedLiquidity | ModuleKind::Oracle => Revision(3),
-            _ => Revision::DEFAULT,
-        }
+        Revision::DEFAULT
     }
 
     /// True when the scooper implements `revision` of this kind.
@@ -143,27 +140,16 @@ impl ModuleKind {
 /// whose module checks different arithmetic, a different redeemer shape or
 /// a different config shape needs a new revision.
 ///
-/// The implemented revisions, by kind:
+/// Every kind has one implemented revision today. For the CL and oracle
+/// modules it is sundae-v4 `115f19d`, the audited build. The modules that
+/// ran on preview before the audit are not implemented: a pool that still
+/// names one of them is refused.
 ///
-/// | kind | revision | sundae-v4 source | rules |
-/// | --- | --- | --- | --- |
-/// | every kind | 1 | the first module of the kind | the rules the scooper had before revisions existed |
-/// | `banded-concentrated-liquidity` | 1 | `e7d9c14`, preview `33485bba…` | `ClRules::REVISION_1` |
-/// | `banded-concentrated-liquidity` | 2 | `25d60ae`, the launch candidate | `ClRules::REVISION_2` |
-/// | `oracle` | 1 | `e7d9c14`, preview `31e23dfd…` and `144f4c99…` | `OracleRules::REVISION_1` |
-/// | `oracle` | 2 | `25d60ae`, the launch candidate | `OracleRules::REVISION_2` |
-/// | `banded-concentrated-liquidity` | 3 | `115f19d`, the audited build | `ClRules::REVISION_3` |
-/// | `oracle` | 3 | `115f19d`, the audited build | `OracleRules::REVISION_3` |
+/// To add a revision: raise [`ModuleKind::latest_revision`] for the kind,
+/// carry the revision's rules next to the pool's config, and branch on a
+/// rule (not on the revision number) where the behaviour differs.
 ///
-/// To add a revision: add a rules constant for it next to the existing
-/// ones, return it from that rules type's `of`, raise
-/// [`ModuleKind::latest_revision`] for the kind, and branch on the rule
-/// field (not on the revision number) where the behaviour differs.
-///
-/// A config entry with no `revision` is revision 1. Revision 1 is the
-/// behaviour every scooper release before revisions applied to the CL and
-/// oracle hashes that the files in `config/` name, so an existing config
-/// keeps its meaning.
+/// A config entry with no `revision` is revision 1.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -205,8 +191,6 @@ pub struct ScriptRefInfo {
 #[derive(Clone, Debug)]
 pub struct ModuleEntry {
     pub kind: ModuleKind,
-    /// The rules this hash applies, within its kind.
-    pub revision: Revision,
     pub script: ScriptRefInfo,
 }
 
@@ -264,14 +248,7 @@ impl ModuleRegistry {
         }
         #[cfg(test)]
         self.order.push(script.hash);
-        self.entries.insert(
-            script.hash,
-            ModuleEntry {
-                kind,
-                revision,
-                script,
-            },
-        );
+        self.entries.insert(script.hash, ModuleEntry { kind, script });
         Ok(())
     }
 
@@ -283,11 +260,6 @@ impl ModuleRegistry {
     /// The kind of a registered hash.
     pub fn kind_of(&self, hash: &[u8]) -> Option<ModuleKind> {
         self.get(hash).map(|e| e.kind)
-    }
-
-    /// The revision of a registered hash.
-    pub fn revision_of(&self, hash: &[u8]) -> Option<Revision> {
-        self.get(hash).map(|e| e.revision)
     }
 
     /// Every script of one kind, in hash order.
@@ -451,11 +423,6 @@ impl ModuleScripts {
         self.modules.kind_of(hash)
     }
 
-    /// The revision of a registered module hash.
-    pub fn revision_of(&self, hash: &[u8]) -> Option<Revision> {
-        self.modules.revision_of(hash)
-    }
-
     /// Every registered hash of `kind` in hash order, with `first` moved to
     /// the front when it is one of them. Config recovery reads the
     /// redeemers of every hash of a kind: a governor can move a pool to a
@@ -491,21 +458,6 @@ impl ModuleScripts {
             .iter()
             .filter_map(|h| self.modules.entries.get(h))
             .find(|e| e.kind == kind)
-            .map(|e| &e.script)
-    }
-
-    /// The first script (insertion order) of `kind` at `revision`.
-    #[cfg(test)]
-    pub fn first_of_revision(
-        &self,
-        kind: ModuleKind,
-        revision: Revision,
-    ) -> Option<&ScriptRefInfo> {
-        self.modules
-            .order
-            .iter()
-            .filter_map(|h| self.modules.entries.get(h))
-            .find(|e| e.kind == kind && e.revision == revision)
             .map(|e| &e.script)
     }
 
@@ -800,21 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_without_a_revision_is_revision_1() {
-        let ms = parse(&base(&format!(
-            r#", "fee-split": {}, "concentrated-liquidity": {}, "oracle": {}"#,
-            entry(6),
-            entry(9),
-            entry(12)
-        )))
-        .unwrap();
-        for h in [6u8, 9, 12, 5] {
-            assert_eq!(ms.revision_of(&[h; 28]), Some(Revision(1)), "hash {h}");
-        }
-    }
-
-    #[test]
-    fn a_revision_key_sets_the_revision() {
+    fn a_revision_key_of_1_is_accepted() {
         let with_rev = |n: u8, rev: u16| {
             format!(
                 r#"{{"hash": "{}", "ref-utxo": "{}#{n}", "revision": {rev}}}"#,
@@ -823,22 +761,18 @@ mod tests {
             )
         };
         let ms = parse(&base(&format!(
-            r#", "fee-split": {}, "banded-concentrated-liquidity": [{}, {}], "oracle": [{}, {}]"#,
+            r#", "fee-split": {}, "banded-concentrated-liquidity": [{}, {}], "oracle": {}"#,
             entry(6),
             entry(9),
-            with_rev(10, 2),
+            with_rev(10, 1),
             with_rev(12, 1),
-            with_rev(13, 2)
         )))
         .unwrap();
-        assert_eq!(ms.revision_of(&[9; 28]), Some(Revision(1)));
-        assert_eq!(ms.revision_of(&[10; 28]), Some(Revision(2)));
-        assert_eq!(ms.revision_of(&[12; 28]), Some(Revision(1)));
-        assert_eq!(ms.revision_of(&[13; 28]), Some(Revision(2)));
         assert_eq!(
             ms.kind_of(&[10; 28]),
             Some(ModuleKind::ConcentratedLiquidity)
         );
+        assert_eq!(ms.kind_of(&[12; 28]), Some(ModuleKind::Oracle));
         assert_eq!(ms.get(&[10; 28]).unwrap().ref_utxo.0.index, 10);
     }
 
@@ -852,7 +786,7 @@ mod tests {
             )
         };
         for (key, rev) in [
-            ("concentrated-liquidity", 4),
+            ("concentrated-liquidity", 2),
             ("fee-split", 2),
             ("oracle", 0),
         ] {

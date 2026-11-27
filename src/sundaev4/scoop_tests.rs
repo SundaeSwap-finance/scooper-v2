@@ -16,7 +16,7 @@ mod tests {
     use num_traits::Signed;
     use plutus_parser::AsPlutus;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-audited-blueprint.json";
 
     #[test]
     fn test_fixture_loads() {
@@ -533,7 +533,7 @@ mod tests {
     /// predicted UTxO must include it, or the next chained scoop fails with
     /// ValueNotConservedUTxO.
     #[test]
-    #[ignore = "needs a fixture with a feeConstraint validator; preview-launch-candidate-blueprint.json has none"]
+    #[ignore = "needs a fixture with a feeConstraint validator; preview-audited-blueprint.json has none"]
     fn fee_surplus_is_in_the_predicted_designated_pool() {
         use num_traits::ToPrimitive;
         use pallas_primitives::conway::{TransactionOutput, Value as ConwayValue};
@@ -1886,7 +1886,7 @@ mod tests {
             cfg,
             true,
         );
-        let oracle_hash = env.oracle_script(cl_test_revision()).hash.to_vec();
+        let oracle_hash = env.oracle_script().hash.to_vec();
         let slot_of = |p: &crate::sundaev4::SundaeV4Pool| -> Vec<u8> {
             p.pool_datum.module_state.iter().find(|(h, _)| *h == oracle_hash).unwrap().1.clone()
         };
@@ -1919,9 +1919,9 @@ mod tests {
         let after1 = result.predicted_pools[0].2.clone();
         let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
         assert_eq!(s1.volume_b, BigInt::from(624));
-        // From CL revision 2 the band fee rounds up to 2 (sundae-v4
-        // SV4-006), so 624 B pays 615 A. Revision 1 floors it to 1: 616 A.
-        let out = by_cl_revision(616, 615);
+        // The band fee rounds up to 2 (sundae-v4 SV4-006), so 624 B pays
+        // 615 A.
+        let out = 615;
         assert_eq!(s1.volume_a, BigInt::from(out));
         assert_eq!(s1.creation_time, s1.last_time);
         assert_eq!(s1.twap_num, BigInt::from(0));
@@ -2092,9 +2092,8 @@ mod tests {
         )
         .expect("banded batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 1);
-        // Revision 1 (branch banded-cl): the fee floors to 1, 616 out, the
-        // counter moves to 999_999_938 and the budget is 125.
-        assert_eq!(batch.swaps[0].dy, BigInt::from(by_cl_revision(616, 615)));
+        // The fee rounds up to 2, so 624 B pays 615 A.
+        assert_eq!(batch.swaps[0].dy, BigInt::from(615));
 
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
@@ -2128,7 +2127,7 @@ mod tests {
             .expect("banded entry carries a list");
         assert_eq!(
             BigInt::from_plutus(pair[0].clone()).unwrap(),
-            BigInt::from(by_cl_revision(999_999_938i64, 1_000_000_062i64))
+            BigInt::from(1_000_000_062i64)
         );
         assert_eq!(
             BigInt::from_plutus(pair[1].clone()).unwrap(),
@@ -2151,15 +2150,11 @@ mod tests {
             .remove(0);
         assert_eq!(entry.counter, BigInt::from(999_999_813i64));
         assert_eq!(entry.active_band, BigInt::from(0));
-        // The on-chain form: a decoded config does not know its revision.
-        assert_eq!(entry.config.to_plutus(), cfg.clone().to_plutus());
+        assert_eq!(entry.config, cfg);
         let after = &result.predicted_pools[0].2;
-        assert_eq!(
-            after.pool_datum.assets[0].1,
-            BigInt::from(by_cl_revision(8_636_752i64, 8_636_753i64))
-        );
+        assert_eq!(after.pool_datum.assets[0].1, BigInt::from(8_636_753i64));
         assert_eq!(after.pool_datum.assets[1].1, BigInt::from(625_623i64));
-        // fee_budget 213 (125 in revision 1) at the default protocol share grows total_lp, not
+        // fee_budget 213 at the default protocol share grows total_lp, not
         // circulating_lp.
         assert!(after.pool_datum.total_lp > pool.pool_datum.total_lp);
         assert_eq!(
@@ -4453,77 +4448,6 @@ mod tests {
         );
     }
 
-    /// The CL scoop tests above, unchanged, against the revision-1 CL and
-    /// oracle (sundae-v4 e7d9c14, preview `33485bba…` and `31e23dfd…`).
-    /// `with_cl_revision` makes `bcl_eq8_config` return the four-field
-    /// config and makes the env add `REVISION_1_MODULES`, so each pool names
-    /// the revision-1 hashes and evaluates against their scripts. The two
-    /// tests with revision-specific numbers read them through
-    /// `by_cl_revision`; their revision-1 numbers are the ones on branch
-    /// banded-cl.
-    mod cl_revision_1 {
-        use crate::sundaev4::test_harness::{Revision, with_cl_revision};
-
-        macro_rules! on_revision_1 {
-            ($($name:ident),* $(,)?) => {$(
-                #[test]
-                fn $name() {
-                    with_cl_revision(Revision(1), super::$name);
-                }
-            )*};
-        }
-
-        on_revision_1!(
-            bcl_single_order,
-            bcl_oracle_pool_scoops_and_advances_the_slot,
-            bcl_multi_withdrawal_evaluates,
-            bcl_multi_deposit_evaluates,
-            bcl_swap_crossing_a_band_evaluates,
-            bcl_zap_crossing_a_band_evaluates,
-            bcl_zap_single_asset_evaluates,
-            bcl_routed_swap_crossing_bands_evaluates,
-            bcl_cross_pair_movement_evaluates,
-            bcl_movement_between_pools,
-            blended_split_across_two_banded_pools_with_crossings,
-            small_two_hop_route_between_banded_pools,
-            ladder_output_matches_step_planner,
-        );
-    }
-
-    /// The same CL scoop tests against the revision-3 CL and oracle
-    /// (sundae-v4 115f19d, the audited build). `with_cl_revision` makes the
-    /// env add `REVISION_3_MODULES`, so each pool names the revision-3
-    /// hashes, the scooper writes the `Operate` config table, and the scoop
-    /// evaluates against the audited scripts.
-    mod cl_revision_3 {
-        use crate::sundaev4::test_harness::{Revision, with_cl_revision};
-
-        macro_rules! on_revision_3 {
-            ($($name:ident),* $(,)?) => {$(
-                #[test]
-                fn $name() {
-                    with_cl_revision(Revision(3), super::$name);
-                }
-            )*};
-        }
-
-        on_revision_3!(
-            bcl_single_order,
-            bcl_oracle_pool_scoops_and_advances_the_slot,
-            bcl_multi_withdrawal_evaluates,
-            bcl_multi_deposit_evaluates,
-            bcl_swap_crossing_a_band_evaluates,
-            bcl_zap_crossing_a_band_evaluates,
-            bcl_zap_single_asset_evaluates,
-            bcl_routed_swap_crossing_bands_evaluates,
-            bcl_cross_pair_movement_evaluates,
-            bcl_movement_between_pools,
-            blended_split_across_two_banded_pools_with_crossings,
-            small_two_hop_route_between_banded_pools,
-            ladder_output_matches_step_planner,
-        );
-    }
-
     // ─── Assertion helpers ────────────────────────────────────────────────────
 
     fn assert_k_nondecreasing(a0: &BigInt, b0: &BigInt, a1: &BigInt, b1: &BigInt) {
@@ -4646,7 +4570,7 @@ mod prop_tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-audited-blueprint.json";
 
     /// Generate random orders for a token-to-token pool.
     ///
@@ -5054,7 +4978,7 @@ mod blend_cost {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-audited-blueprint.json";
     const TOKENS: usize = 13;
 
     fn tok(i: usize) -> crate::cardano_types::AssetClass {
@@ -5187,7 +5111,7 @@ mod module_hash_tests {
     use plutus_parser::AsPlutus;
     use std::sync::Arc;
 
-    const BLUEPRINT_PATH: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
+    const BLUEPRINT_PATH: &str = "test/fixtures/preview-audited-blueprint.json";
 
     /// Register a second script of `kind` at `alias`, served by the same
     /// compiled code as the first script of that kind. Returns the alias's
@@ -5544,15 +5468,14 @@ mod module_hash_tests {
     }
 }
 
-// ─── CL and oracle revisions side by side ────────────────────────────────
+// ─── The CL module's redeemer and config forms ───────────────────────────
 
 #[cfg(test)]
-mod cl_revision_tests {
-    //! Two revisions of the CL and oracle modules are live on preview at
-    //! once. Every test here builds a real transaction and evaluates it
-    //! against both compiled scripts (`TestEnv::preview_both_revisions`).
+mod cl_module_tests {
+    //! The `Operate` config table, and the recovery of a ladder from the
+    //! pre-audit forms in preview's chain history. Every scoop here builds
+    //! a real transaction and evaluates it against the audited scripts.
     use crate::bigint::BigInt;
-    use crate::sundaev4::ModuleKind;
     use crate::sundaev4::batch::{BatchLimits, assemble_batch};
     use crate::sundaev4::test_harness::*;
     use crate::sundaev4::types::*;
@@ -5595,29 +5518,6 @@ mod cl_revision_tests {
         }
     }
 
-    /// The transcript of the pool whose input is `pool`.
-    fn transcript_of(
-        build: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
-        pool: &SundaeV4Pool,
-    ) -> Vec<TranscriptEntry> {
-        let inputs: Vec<_> = build.tx_body.inputs.iter().cloned().collect();
-        let idx = inputs
-            .iter()
-            .position(|i| {
-                i.transaction_id == pool.input.0.transaction_id && i.index == pool.input.0.index
-            })
-            .expect("pool input is spent");
-        build
-            .redeemers
-            .iter()
-            .find(|(k, _, _)| k.tag == RedeemerTag::Spend && k.index == idx as u32)
-            .and_then(|(_, d, _)| match PoolRedeemer::from_plutus(d.clone()) {
-                Ok(PoolRedeemer::Action { transcript, .. }) => Some(transcript),
-                _ => None,
-            })
-            .expect("pool Action redeemer")
-    }
-
     fn swap_batch(
         pool: &Arc<SundaeV4Pool>,
         env: &TestEnv,
@@ -5633,114 +5533,15 @@ mod cl_revision_tests {
         .expect("CL batch assembles")
     }
 
-    /// One scoop, two CL pools: one on revision 1 (`33485bba…`), one on
-    /// revision 2 (`e025f976…`). Each pool's entries follow its own rules,
-    /// and each CL withdrawal evaluates against its own script.
+    /// One scoop over three CL pools. Two of them share a ladder, so the
+    /// `Operate` holds two configs for three entries, and the CL withdrawal
+    /// evaluates against the audited script.
     #[test]
-    fn one_batch_scoops_a_revision_1_and_a_revision_2_cl_pool() {
-        let env = TestEnv::preview_both_revisions();
-        let r1 = env.cl_script(Revision(1)).hash;
-        let r2 = env.cl_script(Revision(2)).hash;
+    fn operate_carries_each_ladder_once() {
+        let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
+        let cl = env.cl_script().hash;
         assert_eq!(
-            hex::encode(r1),
-            "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18"
-        );
-        assert_eq!(
-            hex::encode(r2),
-            "e025f97689e2550fe68426650322878451112984729843250c25576e"
-        );
-        let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
-        let p1 = make_bcl_pool(
-            &env,
-            0xA1,
-            reserves.clone(),
-            bcl_eq8_config_at(fee_3(), Revision(1)),
-        );
-        let p2 = make_bcl_pool(
-            &env,
-            0xA2,
-            reserves,
-            bcl_eq8_config_at(fee_3(), Revision(2)),
-        );
-        let b1 = swap_batch(&p1, &env, 1);
-        let b2 = swap_batch(&p2, &env, 2);
-        // Revision 1 floors the band fee to 1, revision 2 rounds it up to 2.
-        assert_eq!(b1.swaps[0].dy, BigInt::from(616));
-        assert_eq!(b2.swaps[0].dy, BigInt::from(615));
-
-        let settings = make_settings(&env, &env.scooper_keyhash());
-        let (build, eval) = env
-            .build_and_eval(&[b1, b2], &settings, 1000)
-            .expect("a batch over both CL revisions evaluates against both scripts");
-        for h in [r1, r2] {
-            let idx = build
-                .tx_body
-                .withdrawals
-                .as_ref()
-                .unwrap()
-                .iter()
-                .position(|(acct, _)| &acct[1..] == h.as_ref())
-                .expect("each CL hash withdraws");
-            assert!(
-                eval.budgets
-                    .iter()
-                    .any(|(k, _)| k.tag == RedeemerTag::Reward && k.index == idx as u32),
-                "CL {} was evaluated",
-                hex::encode(h)
-            );
-        }
-
-        // Each CL redeemer carries the entry of its own pool only, in its
-        // own config shape.
-        let e1 = cl_entries(&build, r1.as_ref());
-        let e2 = cl_entries(&build, r2.as_ref());
-        assert_eq!((e1.len(), e2.len()), (1, 1));
-        assert_eq!(e1[0].config.ext, None);
-        assert_eq!(e2[0].config.ext, Some(BandedCLConfig::void_data()));
-        let fields = |c: &BandedCLConfig| match c.clone().to_plutus() {
-            PlutusData::Constr(c) => c.fields.len(),
-            _ => 0,
-        };
-        assert_eq!((fields(&e1[0].config), fields(&e2[0].config)), (4, 5));
-
-        // Revision 1 reads no tag (the scooper writes 100); revision 2
-        // requires 3 on a swap. Both write [X, k, order ref].
-        let t1 = transcript_of(&build, &p1);
-        let t2 = transcript_of(&build, &p2);
-        assert_eq!(t1[0].operation_tag, BigInt::from(100));
-        assert_eq!(t2[0].operation_tag, BigInt::from(TAG_SWAP));
-        for t in [&t1, &t2] {
-            let items = Vec::<PlutusData>::from_plutus(t[0].operation_data.clone()).unwrap();
-            assert_eq!(items.len(), 3);
-        }
-        // Revision 1 books the counter ratio (125), revision 2 the fee's
-        // value (213). The protocol takes half of each.
-        let lp_growth = |p: &SundaeV4Pool| {
-            let after = &build
-                .predicted_pools
-                .iter()
-                .find(|(i, _, _)| *i == p.pool_datum.identifier)
-                .unwrap()
-                .2;
-            &after.pool_datum.total_lp - &p.pool_datum.total_lp
-        };
-        assert_eq!(lp_growth(&p1), BigInt::from(62));
-        assert_eq!(lp_growth(&p2), BigInt::from(106));
-    }
-
-    /// One scoop over three CL revision-3 pools (sundae-v4 115f19d) and one
-    /// revision-2 pool. Two of the revision-3 pools share a ladder, so the
-    /// revision-3 `Operate` holds two configs for three entries. The
-    /// revision-2 redeemer keeps one config per entry. Both withdrawals
-    /// evaluate against their own scripts.
-    #[test]
-    fn revision_3_operate_carries_each_ladder_once() {
-        use crate::sundaev4::types::BandedCLTableRedeemer;
-        let env = TestEnv::preview_all_revisions();
-        let r2 = env.cl_script(Revision(2)).hash;
-        let r3 = env.cl_script(Revision(3)).hash;
-        assert_eq!(
-            hex::encode(r3),
+            hex::encode(cl),
             "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9"
         );
         let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
@@ -5748,49 +5549,37 @@ mod cl_revision_tests {
             num: BigInt::from(5),
             den: BigInt::from(1000),
         };
-        let shared = bcl_eq8_config_at(fee_3(), Revision(3));
-        let other = bcl_eq8_config_at(other_fee, Revision(3));
+        let shared = bcl_eq8_config(fee_3());
+        let other = bcl_eq8_config(other_fee);
         assert_ne!(shared, other);
         let pa = make_bcl_pool(&env, 0xC1, reserves.clone(), shared.clone());
         let pb = make_bcl_pool(&env, 0xC2, reserves.clone(), other.clone());
-        let pc = make_bcl_pool(&env, 0xC3, reserves.clone(), shared.clone());
-        let p2 = make_bcl_pool(
-            &env,
-            0xC4,
-            reserves,
-            bcl_eq8_config_at(fee_3(), Revision(2)),
-        );
+        let pc = make_bcl_pool(&env, 0xC3, reserves, shared.clone());
         let batches = vec![
             swap_batch(&pa, &env, 1),
             swap_batch(&pb, &env, 2),
             swap_batch(&pc, &env, 3),
-            swap_batch(&p2, &env, 4),
         ];
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (build, eval) = env
             .build_and_eval(&batches, &settings, 1000)
-            .expect("a batch over CL revisions 2 and 3 evaluates against both scripts");
-        for h in [r2, r3] {
-            let idx = build
-                .tx_body
-                .withdrawals
-                .as_ref()
-                .unwrap()
-                .iter()
-                .position(|(acct, _)| &acct[1..] == h.as_ref())
-                .expect("each CL hash withdraws");
-            assert!(
-                eval.budgets
-                    .iter()
-                    .any(|(k, _)| k.tag == RedeemerTag::Reward && k.index == idx as u32),
-                "CL {} was evaluated",
-                hex::encode(h)
-            );
-        }
+            .expect("a batch over three CL pools evaluates");
+        let idx = build
+            .tx_body
+            .withdrawals
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|(acct, _)| &acct[1..] == cl.as_ref())
+            .expect("the CL hash withdraws");
+        assert!(
+            eval.budgets.iter().any(|(k, _)| k.tag == RedeemerTag::Reward && k.index == idx as u32),
+            "the CL module was evaluated"
+        );
 
-        // The revision-3 redeemer: three entries, two configs. Each entry
-        // names the config of its own pool.
-        let raw = reward_redeemer_of(&build, r3.as_ref()).expect("revision-3 withdrawal");
+        // Three entries, two configs. Each entry names the config of its
+        // own pool.
+        let raw = reward_redeemer_of(&build, cl.as_ref()).expect("CL withdrawal");
         let BandedCLTableRedeemer::Operate { entries, configs } =
             BandedCLTableRedeemer::from_plutus(raw.clone()).expect("the table form decodes")
         else {
@@ -5799,7 +5588,6 @@ mod cl_revision_tests {
         assert_eq!((entries.len(), configs.len()), (3, 2));
         let mut shared_uses = 0;
         for e in &entries {
-            let config = &configs[e.config_index as usize];
             let pool = [&pa, &pb, &pc]
                 .into_iter()
                 .find(|p| {
@@ -5812,246 +5600,33 @@ mod cl_revision_tests {
             } else {
                 &shared
             };
-            // The on-chain form: a decoded config does not know its revision.
-            assert_eq!(config.clone().to_plutus(), want.clone().to_plutus());
+            assert_eq!(&configs[e.config_index as usize], want);
             shared_uses += usize::from(!Arc::ptr_eq(pool, &pb));
         }
         assert_eq!(shared_uses, 2);
-        // The one-config-per-entry form does not decode this redeemer, and
-        // the any-form decoder returns each entry with its config.
+        // The pre-audit form, one config per entry, does not decode this
+        // redeemer. The any-form decoder returns each entry with its config.
         assert!(BandedCLRedeemer::from_plutus(raw).is_err());
-        assert_eq!(cl_entries(&build, r3.as_ref()).len(), 3);
-
-        // The revision-2 redeemer keeps its form.
-        let raw2 = reward_redeemer_of(&build, r2.as_ref()).expect("revision-2 withdrawal");
-        assert!(BandedCLTableRedeemer::from_plutus(raw2.clone()).is_err());
-        match BandedCLRedeemer::from_plutus(raw2).expect("the entry form decodes") {
-            BandedCLRedeemer::Operate { entries } => assert_eq!(entries.len(), 1),
-            other => panic!("expected Operate, got {other:?}"),
-        }
+        assert_eq!(cl_entries(&build, cl.as_ref()).len(), 3);
     }
 
-    /// One oracle pool on each oracle revision in one scoop: a revision-1
-    /// CL pool listing oracle `31e23dfd…` and a revision-2 CL pool listing
-    /// oracle `a5c8dd38…`. Both slots initialise and both modules accept.
+    /// Preview pool 622cee5f... was created on the first preview CL module
+    /// with a four-field config (Create tx c601f694...). The governor
+    /// migration of 2026-11-14 wrote the hash of that config with
+    /// `ext = Void` to the pool's slot. No redeemer holds the five-field
+    /// config; the indexer derives it from the four-field Create, and the
+    /// pool then scoops on the audited module.
     #[test]
-    fn one_batch_scoops_an_oracle_pool_on_each_revision() {
-        let env = TestEnv::preview_both_revisions();
-        let o1 = env.oracle_script(Revision(1)).hash.to_vec();
-        let o2 = env.oracle_script(Revision(2)).hash.to_vec();
-        assert_eq!(
-            hex::encode(&o1),
-            "31e23dfda0b2c2120667234dfa92a66909fd8765e80166de734c6927"
-        );
-        assert_eq!(
-            hex::encode(&o2),
-            "a5c8dd38f6545c82f45fe4096ec9fa068d4efb06f6ac5f145f045dfa"
-        );
-        let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
-        let p1 = make_bcl_pool_with_oracle(
-            &env,
-            0xB1,
-            reserves.clone(),
-            bcl_eq8_config_at(fee_3(), Revision(1)),
-            true,
-        );
-        let p2 = make_bcl_pool_with_oracle(
-            &env,
-            0xB2,
-            reserves,
-            bcl_eq8_config_at(fee_3(), Revision(2)),
-            true,
-        );
-        let settings = make_settings(&env, &env.scooper_keyhash());
-        let (build, _eval) = env
-            .build_and_eval(
-                &[swap_batch(&p1, &env, 1), swap_batch(&p2, &env, 2)],
-                &settings,
-                1000,
-            )
-            .expect("both oracle revisions evaluate in one scoop");
-        assert!(reward_redeemer_of(&build, &o1).is_some());
-        assert!(reward_redeemer_of(&build, &o2).is_some());
-        let slot = |p: &SundaeV4Pool, h: &[u8]| {
-            let after = &build
-                .predicted_pools
-                .iter()
-                .find(|(i, _, _)| *i == p.pool_datum.identifier)
-                .unwrap()
-                .2;
-            OracleSlot::decode(
-                &after.pool_datum.module_state.iter().find(|(k, _)| k == h).unwrap().1,
-            )
-            .unwrap()
-        };
-        assert_eq!(slot(&p1, &o1).volume_a, BigInt::from(616));
-        assert_eq!(slot(&p2, &o2).volume_a, BigInt::from(615));
-    }
-
-    /// A first spend with no swap: revision 1 starts the clock at price 0,
-    /// revision 2 (fdca501) writes the sentinel back. Each module accepts
-    /// its own form. The spend is a deposit, so the transcript holds no
-    /// swap step.
-    #[test]
-    fn a_swapless_first_spend_writes_each_revisions_slot() {
-        let env = TestEnv::preview_both_revisions();
-        let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
-        let mut pools = vec![];
-        for (id, rev) in [(0xD1u8, Revision(1)), (0xD2u8, Revision(2))] {
-            pools.push((
-                make_bcl_pool_with_oracle(
-                    &env,
-                    id,
-                    reserves.clone(),
-                    bcl_eq8_config_at(fee_3(), rev),
-                    true,
-                ),
-                rev,
-            ));
-        }
-        let mut accum = crate::sundaev4::accumulator::Accumulator::new(env.exec.protocol_share);
-        for (i, (p, _)) in pools.iter().enumerate() {
-            let lp = crate::cardano_types::AssetClass {
-                policy: env.exec.module_scripts.pool_mint.hash.to_vec(),
-                token: {
-                    let mut t = vec![0x00, 0x14, 0xdf, 0x10];
-                    t.extend_from_slice(p.pool_datum.identifier.to_bytes());
-                    t
-                },
-            };
-            let order = make_basic_deposit_order(
-                vec![(token_a(), 200_000), (token_b(), 14_500)],
-                lp,
-                1,
-                i as u64 + 1,
-            );
-            accum
-                .try_add_deposit(&order, &p.pool_datum.identifier.clone(), p)
-                .expect("deposit resolves");
-        }
-        let plan = accum.into_plan();
-        let settings = make_settings(&env, &env.scooper_keyhash());
-        let (build, _eval) = env
-            .build_and_eval_plan(&plan, &settings, 1000)
-            .expect("a swapless first spend evaluates on both oracle revisions");
-        for (p, rev) in &pools {
-            let h = env.oracle_script(*rev).hash.to_vec();
-            let after = &build
-                .predicted_pools
-                .iter()
-                .find(|(i, _, _)| *i == p.pool_datum.identifier)
-                .unwrap()
-                .2;
-            let raw = &after.pool_datum.module_state.iter().find(|(k, _)| *k == h).unwrap().1;
-            if *rev == Revision(1) {
-                let s = OracleSlot::decode(raw).expect("revision 1 writes the 128-byte state");
-                assert_eq!(s.last_price, BigInt::from(0));
-                assert!(s.creation_time > BigInt::from(0));
-            } else {
-                assert_eq!(raw, &vec![0x80], "revision 2 keeps the sentinel");
-            }
-        }
-    }
-
-    /// Two constant-sum pools in one scoop, one on the launch-candidate CS
-    /// (`fae0f70d…`) and one on the e7d9c14 CS (`95e2c69a…`). The config
-    /// type is the same, so both are revision 1 of one kind. Each CS hash
-    /// gets its own withdrawal and evaluates.
-    #[test]
-    fn one_batch_scoops_cs_pools_on_both_cs_hashes() {
-        let env = TestEnv::preview_both_revisions();
-        let cs: Vec<_> =
-            env.exec.module_scripts.of_kind(ModuleKind::ConstantSum).map(|s| s.hash).collect();
-        assert_eq!(cs.len(), 2);
-        let launch = env.exec.module_scripts.first_of(ModuleKind::ConstantSum).unwrap().hash;
-        let old = *cs.iter().find(|h| **h != launch).unwrap();
-        assert_eq!(
-            hex::encode(launch),
-            "fae0f70df45477c998fca14475d4a9e5edcf8bae2fe7b24ce4bc6abe"
-        );
-        assert_eq!(
-            hex::encode(old),
-            "95e2c69a2e5811cb1b658152e9aeaa22b9cc33b080a7e9c31d1ea3b1"
-        );
-        let prices = vec![BigInt::from(1_000_000), BigInt::from(1_000_000)];
-        let fee = fee_3();
-        let p1 = make_cs_pool(
-            &env,
-            0xE1,
-            vec![(token_a(), 1_000_000_000), (token_b(), 1_000_000_000)],
-            prices.clone(),
-            fee.clone(),
-        );
-        let tok_c = token(0x05, 0x06);
-        let tok_d = token(0x07, 0x08);
-        let p2 = make_cs_pool(
-            &env,
-            0xE2,
-            vec![
-                (tok_c.clone(), 1_000_000_000),
-                (tok_d.clone(), 1_000_000_000),
-            ],
-            prices,
-            fee,
-        );
-        let mut p2v = (*p2).clone();
-        for a in &mut p2v.pool_datum.actions {
-            for m in &mut a.modules {
-                if m.as_slice() == launch.as_ref() {
-                    *m = old.as_ref().to_vec();
-                }
-            }
-        }
-        for (k, _) in &mut p2v.pool_datum.module_state {
-            if k.as_slice() == launch.as_ref() {
-                *k = old.as_ref().to_vec();
-            }
-        }
-        let p2 = Arc::new(p2v);
-        let b1 = assemble_batch(
-            &p1,
-            &[make_order(token_a(), 10_000_000, token_b(), 1, 1)],
-            env.exec.fee,
-            env.exec.protocol_share,
-            &BatchLimits::default(),
-        )
-        .unwrap();
-        let b2 = assemble_batch(
-            &p2,
-            &[make_order(tok_c, 10_000_000, tok_d, 1, 2)],
-            env.exec.fee,
-            env.exec.protocol_share,
-            &BatchLimits::default(),
-        )
-        .unwrap();
-        let settings = make_settings(&env, &env.scooper_keyhash());
-        let (build, eval) = env
-            .build_and_eval(&[b1, b2], &settings, 1000)
-            .expect("a batch over both CS hashes evaluates");
-        assert!(!eval.budgets.is_empty());
-        assert!(reward_redeemer_of(&build, launch.as_ref()).is_some());
-        assert!(reward_redeemer_of(&build, old.as_ref()).is_some());
-    }
-
-    /// A preview CL pool before and after the governor migration
-    /// (`testnet_governor_launch_candidate`). The ladder comes from the
-    /// pool's real Create transaction `c601f694…`. Before: revision 1, the
-    /// four-field slot `361006908c…`. After: revision 2, the slot is the
-    /// hash of that config with `ext = Void`. No redeemer holds the
-    /// five-field config; the indexer derives it, and the scoop on each
-    /// side evaluates against its own CL script.
-    #[test]
-    fn a_migrated_preview_pool_is_recovered_and_scoops_on_revision_2() {
+    fn a_migrated_preview_pool_is_recovered_and_scoops() {
         use crate::sundaev4::banded_math::config_hash;
-        let env = TestEnv::preview_both_revisions();
-        let r1 = env.cl_script(Revision(1)).hash;
-        let r2 = env.cl_script(Revision(2)).hash;
+        let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
+        let cl = env.cl_script().hash;
         let cbor = hex::decode(
             include_str!("../../test/fixtures/preview-banded-create-c601f694.hex").trim(),
         )
         .unwrap();
         let tx = pallas_traverse::MultiEraTx::decode(&cbor).unwrap();
-        let candidates = crate::sundaev4::extract_bcl_config_candidates(&tx, &r1);
+        let candidates = crate::sundaev4::extract_bcl_config_candidates(&tx, &cl);
         let four = candidates
             .iter()
             .find(|c| {
@@ -6067,14 +5642,12 @@ mod cl_revision_tests {
         );
         // The preview reserves of pool 622cee5f... (steelswap_quote_dump).
         let reserves = vec![(token_a(), 5_953_003), (token_b(), 6_249_988)];
-        let before = make_bcl_pool(&env, 0xF1, reserves.clone(), four.clone());
-        let after = make_bcl_pool(&env, 0xF2, reserves, five.clone());
+        let pool = make_bcl_pool(&env, 0xF2, reserves, five.clone());
         assert!(
-            after
-                .pool_datum
+            pool.pool_datum
                 .module_state
                 .iter()
-                .any(|(k, v)| k.as_slice() == r2.as_ref() && *v == config_hash(&five))
+                .any(|(k, v)| k.as_slice() == cl.as_ref() && *v == config_hash(&five))
         );
 
         // Recovery, both paths: from the Create tx's candidates
@@ -6082,56 +5655,25 @@ mod cl_revision_tests {
         // where the migration tx holds no CL redeemer).
         for (cands, cached) in [(&candidates[..], None), (&[][..], Some(&four))] {
             let got =
-                crate::sundaev4::resolve_bcl_config(&after.pool_datum, r2.as_ref(), cands, cached)
+                crate::sundaev4::resolve_bcl_config(&pool.pool_datum, cl.as_ref(), cands, cached)
                     .expect("the migrated config resolves");
             assert_eq!(config_hash(&got), config_hash(&five));
             match crate::sundaev4::detect_pool_type(
-                &after.pool_datum,
+                &pool.pool_datum,
                 Some(&env.exec),
                 None,
                 None,
                 None,
                 Some(&got),
             ) {
-                PoolType::BandedConcentratedLiquidity { config } => {
-                    assert_eq!(config.rules, ClRules::REVISION_2);
-                    assert_eq!(config, five);
-                }
+                PoolType::BandedConcentratedLiquidity { config } => assert_eq!(config, five),
                 other => panic!("expected CL, got {other:?}"),
             }
         }
-        // The pool still on revision 1 keeps the four-field config and the
-        // revision-1 rules.
-        let got =
-            crate::sundaev4::resolve_bcl_config(&before.pool_datum, r1.as_ref(), &candidates, None)
-                .unwrap();
-        match crate::sundaev4::detect_pool_type(
-            &before.pool_datum,
-            Some(&env.exec),
-            None,
-            None,
-            None,
-            Some(&got),
-        ) {
-            PoolType::BandedConcentratedLiquidity { config } => {
-                assert_eq!(config.rules, ClRules::REVISION_1)
-            }
-            other => panic!("expected CL, got {other:?}"),
-        }
 
-        // Both sides scoop in one transaction.
-        let orders = |slot| vec![make_order(token_a(), 1_000, token_b(), 1, slot)];
-        let b1 = assemble_batch(
-            &before,
-            &orders(1),
-            env.exec.fee,
-            env.exec.protocol_share,
-            &BatchLimits::default(),
-        )
-        .unwrap();
-        let b2 = assemble_batch(
-            &after,
-            &orders(2),
+        let batch = assemble_batch(
+            &pool,
+            &[make_order(token_a(), 1_000, token_b(), 1, 1)],
             env.exec.fee,
             env.exec.protocol_share,
             &BatchLimits::default(),
@@ -6139,27 +5681,19 @@ mod cl_revision_tests {
         .unwrap();
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (build, _eval) = env
-            .build_and_eval(&[b1, b2], &settings, 1000)
-            .expect("the preview ladder scoops on both CL revisions");
-        assert_eq!(cl_entries(&build, r1.as_ref())[0].config, four);
-        assert_eq!(cl_entries(&build, r2.as_ref())[0].config, five);
+            .build_and_eval(&[batch], &settings, 1000)
+            .expect("the preview ladder scoops on the audited CL module");
+        assert_eq!(cl_entries(&build, cl.as_ref())[0].config, five);
     }
 
-    /// A pool whose datum names the revision-2 CL hash with a four-field
-    /// config slot cannot be the pool's: the indexer refuses the config,
-    /// and the builder refuses a config whose revision is not the hash's.
+    /// A four-field config is the pre-audit form. The indexer refuses it
+    /// for a pool, and the builder refuses to scoop with it.
     #[test]
-    fn a_config_of_the_wrong_revision_is_refused() {
-        let env = TestEnv::preview_both_revisions();
-        let r2 = env.cl_script(Revision(2)).hash;
+    fn a_four_field_config_is_refused() {
+        let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
         let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
-        let pool = make_bcl_pool(
-            &env,
-            0xC9,
-            reserves,
-            bcl_eq8_config_at(fee_3(), Revision(2)),
-        );
-        let four = bcl_eq8_config_at(fee_3(), Revision(1));
+        let pool = make_bcl_pool(&env, 0xC9, reserves, bcl_eq8_config(fee_3()));
+        let four = bcl_eq8_config_four_fields(fee_3());
         match crate::sundaev4::detect_pool_type(
             &pool.pool_datum,
             Some(&env.exec),
@@ -6176,17 +5710,15 @@ mod cl_revision_tests {
             }
             other => panic!("expected CL, got {other:?}"),
         }
-        // The builder: a revision-1 config on the revision-2 hash.
         let mut p = (*pool).clone();
         p.pool_type = PoolType::BandedConcentratedLiquidity { config: four };
         let p = Arc::new(p);
         let batch = swap_batch(&p, &env, 1);
         let settings = make_settings(&env, &env.scooper_keyhash());
         let err = match env.build_and_eval(&[batch], &settings, 1000) {
-            Ok(_) => panic!("a revision-1 config on the revision-2 hash must not build"),
+            Ok(_) => panic!("a four-field config must not build"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("revision"), "{err}");
-        let _ = r2;
+        assert!(err.contains("four fields"), "{err}");
     }
 }

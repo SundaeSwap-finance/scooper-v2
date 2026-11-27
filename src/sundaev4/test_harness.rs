@@ -67,7 +67,7 @@ pub struct TestConstraintCtx {
     pub strategy_order: Vec<u8>,
     pub settings_mint: Vec<u8>,
     /// Absent from fixtures without a `feeConstraint` validator (the
-    /// preview launch-candidate fixture has none); `CFG_SWAP_FEE` needs it.
+    /// preview fixture has none); `CFG_SWAP_FEE` needs it.
     pub fee_constraint: Option<Vec<u8>>,
 }
 pub static TEST_CTX: std::sync::OnceLock<Option<TestConstraintCtx>> = std::sync::OnceLock::new();
@@ -106,141 +106,13 @@ pub struct TestEnv {
     pub order_configs: BTreeMap<Vec<u8>, Arc<crate::sundaev4::SundaeV4OrderConfig>>,
 }
 
-/// The launch-candidate deployment on preview parameters (sundae-v4
-/// 25d60ae). Built by `test/fixtures/preview-fixtures.py`.
-pub const PREVIEW_FIXTURE: &str = "test/fixtures/preview-launch-candidate-blueprint.json";
-/// The revision-1 CL and oracle, and the e7d9c14 constant_sum, on the same
-/// parameters. Add with `TestEnv::with_modules_file`.
-pub const REVISION_1_MODULES: &str = "test/fixtures/preview-revision-1-modules.json";
-/// The revision-3 CL and oracle (sundae-v4 115f19d, the audited build), on
-/// the same parameters. Add with `TestEnv::with_modules_file`.
-pub const REVISION_3_MODULES: &str = "test/fixtures/preview-revision-3-modules.json";
-
-pub use crate::sundaev4::module_scripts::Revision;
-
-thread_local! {
-    static CL_TEST_REVISION: std::cell::Cell<Revision> = const { std::cell::Cell::new(Revision(2)) };
-}
-
-/// The CL revision the current test runs on: 2 unless the test runs inside
-/// `with_cl_revision`. `bcl_eq8_config` builds its config in this
-/// revision's form, and `TestEnv::from_blueprint_file(PREVIEW_FIXTURE)`
-/// adds the modules of revision 1 or 3 when it is that. Each test runs on its own
-/// thread, so the setting does not leak between tests.
-pub fn cl_test_revision() -> Revision {
-    CL_TEST_REVISION.with(|c| c.get())
-}
-
-/// Run `f` with the CL test revision set to `revision`. This runs an
-/// existing CL test, unchanged, against another revision's script.
-pub fn with_cl_revision(revision: Revision, f: impl FnOnce()) {
-    let prev = CL_TEST_REVISION.with(|c| c.replace(revision));
-    struct Restore(Revision);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CL_TEST_REVISION.with(|c| c.set(self.0));
-        }
-    }
-    let _restore = Restore(prev);
-    f()
-}
-
-/// `r1` under CL revision 1, `r2` under revision 2 or 3 (`cl_test_revision`).
-/// Revision 3 has the arithmetic of revision 2.
-pub fn by_cl_revision<T>(r1: T, r2: T) -> T {
-    if cl_test_revision() == Revision(1) {
-        r1
-    } else {
-        r2
-    }
-}
+/// The audited build (sundae-v4 115f19d) on the preview parameters. Built by
+/// `test/fixtures/preview-fixtures.py`.
+pub const PREVIEW_FIXTURE: &str = "test/fixtures/preview-audited-blueprint.json";
 
 impl TestEnv {
-    /// Register more module scripts: each validator's title is a config role
-    /// key (`banded-concentrated-liquidity`, `oracle`, ...) and its
-    /// `revision` the module revision. The scripts join the evaluator's
-    /// store and the reference UTxOs. `first_of` still returns the main
-    /// fixture's script of each kind.
-    pub fn with_modules_file(mut self, path: &str) -> Self {
-        let data = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("failed to read module fixture {path}: {e}"));
-        let bp: Blueprint = serde_json::from_str(&data)
-            .unwrap_or_else(|e| panic!("failed to parse module fixture {path}: {e}"));
-        for v in &bp.validators {
-            let kind = crate::sundaev4::ModuleKind::from_config_key(&v.title)
-                .unwrap_or_else(|| panic!("{path}: '{}' is not a role key", v.title));
-            let code = hex::decode(v.compiled_code.as_ref().expect("module fixture has code"))
-                .expect("compiled code hex");
-            let hash = self.scripts.insert_with_version(&code, 3).expect("script decodes");
-            assert_eq!(hex::encode(hash), v.hash, "{path}: {} hash", v.title);
-            let r = bp
-                .references
-                .iter()
-                .find(|r| r.key == v.title)
-                .unwrap_or_else(|| panic!("{path}: no reference for {}", v.title));
-            let tx_hash: Hash<32> = hex::decode(&r.tx_in.hash).unwrap().as_slice().into();
-            let input = crate::cardano_types::TransactionInput::new(tx_hash, r.tx_in.index);
-            self.ref_utxo_outputs.insert(
-                input.clone(),
-                crate::cardano_types::TransactionOutput {
-                    address: pallas_addresses::Address::Shelley(
-                        pallas_addresses::ShelleyAddress::new(
-                            pallas_addresses::Network::Testnet,
-                            pallas_addresses::ShelleyPaymentPart::Key([0u8; 28].into()),
-                            pallas_addresses::ShelleyDelegationPart::Null,
-                        ),
-                    ),
-                    value: Value::default(),
-                    datum: crate::cardano_types::RawDatum::None,
-                    script_ref: Some(crate::cardano_types::ScriptRef::PlutusV3(
-                        pallas_primitives::PlutusScript::<3>(pallas_primitives::Bytes::from(code)),
-                    )),
-                },
-            );
-            self.exec
-                .module_scripts
-                .modules
-                .insert_revision(
-                    kind,
-                    v.revision.unwrap_or(Revision::DEFAULT),
-                    ScriptRefInfo {
-                        hash,
-                        ref_utxo: input,
-                        script_cbor: v.compiled_code.clone(),
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{path}: {e}"));
-        }
-        self
-    }
-
-    /// The preview launch-candidate fixture with the revision-1 modules.
-    pub fn preview_both_revisions() -> Self {
-        Self::from_blueprint_file_only(PREVIEW_FIXTURE).with_modules_file(REVISION_1_MODULES)
-    }
-
-    /// The preview launch-candidate fixture with the modules of revisions
-    /// 1 and 3.
-    pub fn preview_all_revisions() -> Self {
-        Self::preview_both_revisions().with_modules_file(REVISION_3_MODULES)
-    }
-
-    /// Load from a blueprint fixture file. Under `with_cl_revision(1)` or
-    /// `with_cl_revision(3)` the preview fixture also gets the modules of
-    /// that revision.
+    /// Load from a blueprint fixture file.
     pub fn from_blueprint_file(path: &str) -> Self {
-        let env = Self::from_blueprint_file_only(path);
-        if path != PREVIEW_FIXTURE {
-            return env;
-        }
-        match cl_test_revision() {
-            Revision(1) => env.with_modules_file(REVISION_1_MODULES),
-            Revision(3) => env.with_modules_file(REVISION_3_MODULES),
-            _ => env,
-        }
-    }
-
-    fn from_blueprint_file_only(path: &str) -> Self {
         // Surface evaluator traces in test output (RUST_LOG to widen).
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -968,7 +840,7 @@ impl TestEnv {
     /// ladder's hash under the banded module credential, plus fee_split and
     /// fairness as for every pool.
     pub fn bcl_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let script = self.cl_script(config.rules.revision);
+        let script = self.cl_script();
         let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
         let fs_config = FeeSplitConfig {
             protocol_share: Rational {
@@ -1007,40 +879,38 @@ impl TestEnv {
     /// oracle module: the ladder hash, fee_split, fairness, and the oracle's
     /// fresh slot `0x80`.
     pub fn bcl_oracle_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let oracle = self.oracle_script(config.rules.revision);
+        let oracle = self.oracle_script();
         let mut ms = self.bcl_module_state(config);
         ms.push((oracle.hash.to_vec(), vec![0x80]));
         ms
     }
 
-    /// The CL pool's action modules plus the oracle at the same revision:
-    /// a revision-1 CL pool lists the revision-1 oracle.
-    pub fn bcl_oracle_action_modules(&self, revision: Revision) -> Vec<Vec<u8>> {
-        let oracle = self.oracle_script(revision);
-        let mut m = self.bcl_action_modules(revision);
+    /// The CL pool's action modules plus the oracle.
+    pub fn bcl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
+        let oracle = self.oracle_script();
+        let mut m = self.bcl_action_modules();
         m.push(oracle.hash.to_vec());
         m
     }
 
-    /// The CL script at `revision`. Revision 1 needs
-    /// `with_modules_file(REVISION_1_MODULES)`.
-    pub fn cl_script(&self, revision: Revision) -> &ScriptRefInfo {
+    /// The fixture's CL script.
+    pub fn cl_script(&self) -> &ScriptRefInfo {
         self.exec
             .module_scripts
-            .first_of_revision(crate::sundaev4::ModuleKind::ConcentratedLiquidity, revision)
-            .unwrap_or_else(|| panic!("the test env has no CL script at revision {revision}"))
+            .first_of(crate::sundaev4::ModuleKind::ConcentratedLiquidity)
+            .expect("the fixture has a CL script")
     }
 
-    /// The oracle script at `revision`.
-    pub fn oracle_script(&self, revision: Revision) -> &ScriptRefInfo {
+    /// The fixture's oracle script.
+    pub fn oracle_script(&self) -> &ScriptRefInfo {
         self.exec
             .module_scripts
-            .first_of_revision(crate::sundaev4::ModuleKind::Oracle, revision)
-            .unwrap_or_else(|| panic!("the test env has no oracle script at revision {revision}"))
+            .first_of(crate::sundaev4::ModuleKind::Oracle)
+            .expect("the fixture has an oracle script")
     }
 
-    pub fn bcl_action_modules(&self, revision: Revision) -> Vec<Vec<u8>> {
-        let script = self.cl_script(revision);
+    pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
+        let script = self.cl_script();
         vec![
             script.hash.to_vec(),
             self.exec
@@ -1389,28 +1259,16 @@ pub fn make_ss_pool(
     })
 }
 
-/// `bcl_eq8_config_at` the current test's CL revision
-/// (`cl_test_revision`, 2 by default).
-pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
-    bcl_eq8_config_at(fee, cl_test_revision())
-}
-
-/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/banded_cl_check.ak`:
+/// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/cl_check_unit.ak`:
 /// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee,
-/// in the config form CL `revision` reads.
-pub fn bcl_eq8_config_at(fee: Rational, revision: Revision) -> BandedCLConfig {
-    let cfg = bcl_eq8_config_r1(fee);
-    if revision == Revision(1) {
-        cfg
-    } else {
-        cfg.with_void_ext()
-            .expect("four fields")
-            .with_rules(ClRules::of(revision).expect("implemented revision"))
-            .expect("five-field form")
-    }
+/// in the five-field form the module reads.
+pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
+    bcl_eq8_config_four_fields(fee).with_void_ext().expect("four fields")
 }
 
-fn bcl_eq8_config_r1(fee: Rational) -> BandedCLConfig {
+/// The same ladder in the pre-audit four-field form. Only config recovery
+/// from chain history reads this form.
+pub fn bcl_eq8_config_four_fields(fee: Rational) -> BandedCLConfig {
     let r = |n: i64, d: i64| Rational {
         num: BigInt::from(n),
         den: BigInt::from(d),
@@ -1508,9 +1366,9 @@ pub fn make_bcl_pool_with_oracle(
                 tag: BigInt::from(100),
                 enabled: true,
                 modules: if with_oracle {
-                    env.bcl_oracle_action_modules(config.rules.revision)
+                    env.bcl_oracle_action_modules()
                 } else {
-                    env.bcl_action_modules(config.rules.revision)
+                    env.bcl_action_modules()
                 },
             }],
             module_state: if with_oracle {

@@ -198,16 +198,10 @@ pub fn accrue_banded_swap(
             (&a0 - &st.dy, &b0 + &st.dx)
         };
         // The same number `tx_builder::walk_banded_swap` declares: the fee's
-        // LP worth from revision 2 (sundae-v4 SV4-001b), the counter ratio
-        // in revision 1.
-        let fb =
-            banded_math::step_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, &st.after, total_lp)?;
+        // LP worth (sundae-v4 SV4-001b).
+        let fb = banded_math::swap_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, total_lp)?;
         if fb.is_negative() {
-            return Err(if cfg.rules.fee_budget_is_fee_value {
-                format!("banded step books a negative fee budget ({fb})")
-            } else {
-                format!("banded step lowers the ladder counter (fee_budget={fb})")
-            });
+            return Err(format!("banded step books a negative fee budget ({fb})"));
         }
         if is_a_input {
             assets[0].1 = &assets[0].1 + &st.dx;

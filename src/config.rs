@@ -206,12 +206,10 @@ mod tests {
         }
     }
 
-    /// Preview's config names only the revision-1 CL and oracle, with no
-    /// revision key, so both mean revision 1: the rules preview runs today.
+    /// Preview's config names one CL hash and one oracle hash.
     #[test]
-    fn preview_cl_and_oracle_are_revision_1() {
+    fn preview_names_one_cl_and_one_oracle() {
         use crate::sundaev4::ModuleKind;
-        use crate::sundaev4::module_scripts::Revision;
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string("config/preview-v4.json").unwrap())
                 .unwrap();
@@ -221,7 +219,6 @@ mod tests {
         for kind in [ModuleKind::ConcentratedLiquidity, ModuleKind::Oracle] {
             let hashes = ms.modules.hashes_of_kind(kind);
             assert_eq!(hashes.len(), 1, "{kind}");
-            assert_eq!(ms.revision_of(&hashes[0]), Some(Revision(1)), "{kind}");
         }
     }
 
@@ -245,7 +242,7 @@ mod tests {
                 "concentrated-liquidity": {
                     "hash": "c1".repeat(28),
                     "ref-utxo": format!("{}#0", "c1".repeat(32)),
-                    "revision": 2
+                    "revision": 1
                 }
             } } } }
         });
@@ -268,11 +265,6 @@ mod tests {
             ms.of_kind(ModuleKind::ConstantSum).count(),
             1,
             "base keys are kept"
-        );
-        assert_eq!(
-            ms.revision_of(&[0xc1; 28]),
-            Some(crate::sundaev4::module_scripts::Revision(2)),
-            "a revision key survives config-rs"
         );
     }
 

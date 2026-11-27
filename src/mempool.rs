@@ -1180,8 +1180,7 @@ mod tests {
         use crate::sundaev4::test_harness::*;
         use std::collections::BTreeMap as Map;
 
-        let env =
-            TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
         let pool = make_pool(&env, 0xC1, token_a(), 200_000_000, token_b(), 200_000_000);
         let mut pool_map = Map::new();
         pool_map.insert(pool.pool_datum.identifier.clone(), pool.clone());
@@ -1242,8 +1241,7 @@ mod tests {
         use crate::sundaev4::batch::{BatchLimits, assemble_batch};
         use crate::sundaev4::test_harness::*;
 
-        let env =
-            TestEnv::from_blueprint_file("test/fixtures/preview-launch-candidate-blueprint.json");
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
         let pool = make_pool(
             &env,
             0xAA,
