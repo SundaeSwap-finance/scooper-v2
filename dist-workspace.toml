@@ -13,3 +13,11 @@ create-release = false
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# The runner for each target that must not use dist's default. GitHub no
+# longer accepts the macos-14 arm64 image that dist 0.32 picks for
+# aarch64-apple-darwin ("The configuration 'macos-14-arm64-us-default' is not
+# supported", 2026-11-27), so the v0.8.0 release built four targets and
+# published nothing.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
