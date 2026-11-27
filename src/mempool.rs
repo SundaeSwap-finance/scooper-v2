@@ -67,7 +67,8 @@ pub struct ProtocolWatch {
 }
 
 /// What a mempool tx does to the protocol, as far as we can tell without
-/// executing it. `order_spends`/`pool_spends` resolve inputs against the
+/// executing it. Counts cover the parent body and its sub-transactions.
+/// `order_spends`/`pool_spends` resolve inputs against the
 /// indexer's current UTxO view, so a tx spending an order we've never seen
 /// (e.g. created and consumed within the same mempool window) undercounts —
 /// fine for observation, and phase 2's provisional store closes that gap.
@@ -90,8 +91,28 @@ impl TxClass {
     }
 }
 
+/// Visit every body of `tx` whose regular inputs and outputs take effect:
+/// the parent (with `parent = None`) followed by each sub-transaction (with
+/// `parent = Some(tx)`). A phase-2-failed transaction (`!tx.is_valid()`)
+/// spends only collateral inputs and produces only the parent's collateral
+/// return, so it yields no bodies.
+fn for_each_effective_body<'b>(
+    tx: &MultiEraTx<'b>,
+    mut f: impl FnMut(&MultiEraTx<'b>, Option<&MultiEraTx<'b>>),
+) {
+    if !tx.is_valid() {
+        return;
+    }
+    f(tx, None);
+    for sub in &tx.sub_transactions() {
+        f(sub, Some(tx));
+    }
+}
+
 /// Classify a transaction against the protocol's addresses and the current
-/// known order/pool UTxO sets (each `(tx_hash, index)`).
+/// known order/pool UTxO sets (each `(tx_hash, index)`). Counts the outputs
+/// and inputs of the parent body and of every sub-transaction (empty when
+/// `tx` failed phase-2 validation).
 pub fn classify_tx(
     tx: &MultiEraTx,
     watch: &ProtocolWatch,
@@ -99,27 +120,31 @@ pub fn classify_tx(
     known_pool_inputs: &BTreeSet<(Vec<u8>, u64)>,
 ) -> TxClass {
     let mut class = TxClass::default();
-    for output in tx.outputs() {
-        let Ok(address) = output.address() else {
-            continue;
-        };
-        let pallas_addresses::Address::Shelley(shelley) = address else {
-            continue;
-        };
-        let payment = shelley.payment().as_hash();
-        if watch.order_script_hashes.iter().any(|h| h == payment) {
-            class.order_creates += 1;
+    for_each_effective_body(tx, |body, _| {
+        for output in body.outputs() {
+            let Ok(address) = output.address() else {
+                continue;
+            };
+            let pallas_addresses::Address::Shelley(shelley) = address else {
+                continue;
+            };
+            let payment = shelley.payment().as_hash();
+            if watch.order_script_hashes.iter().any(|h| h == payment) {
+                class.order_creates += 1;
+            }
         }
-    }
-    for input in tx.inputs() {
-        let key = (input.hash().to_vec(), input.index());
-        if known_order_inputs.contains(&key) {
-            class.order_spends += 1;
+
+        for input in body.inputs() {
+            let key = (input.hash().to_vec(), input.index());
+            if known_order_inputs.contains(&key) {
+                class.order_spends += 1;
+            }
+            if known_pool_inputs.contains(&key) {
+                class.pool_spends += 1;
+            }
         }
-        if known_pool_inputs.contains(&key) {
-            class.pool_spends += 1;
-        }
-    }
+    });
+
     class
 }
 
@@ -250,7 +275,9 @@ impl ProvisionalState {
         };
         effects.gone = gone;
         for input in &effects.created_orders {
-            if let Some(p) = orders.get_mut(input) {
+            if let Some(p) = orders.get_mut(input)
+                && p.source_tx.as_slice() == tx_hash
+            {
                 p.gone = gone;
             }
         }
@@ -270,7 +297,11 @@ impl ProvisionalState {
             return Vec::new();
         };
         for input in &effects.created_orders {
-            self.orders.remove(input);
+            // Only remove if WE are still the owning parent (a replacement
+            // parent carrying the same sub-transaction may have superseded us).
+            if self.orders.get(input).map(|p| p.source_tx.as_slice()) == Some(tx_hash) {
+                self.orders.remove(input);
+            }
         }
         for input in &effects.spent_orders {
             // Only clear the mark if WE set it (a later tx may have re-spent).
@@ -349,9 +380,15 @@ impl ProvisionalState {
 /// Parse the order-address outputs of a mempool tx into dispatchable orders.
 /// Returns only outputs whose datum decodes into a known constraint shape —
 /// anything else is logged and skipped (same tolerance as the indexer).
-/// Datum resolution covers inline datums and the tx's own witness set;
-/// metadata-posted datums are not resolvable here, and such orders simply
-/// wait for block confirmation (the indexer handles them).
+/// Datum resolution covers inline datums and witness-set datums, by the
+/// indexer's rule ([`crate::datum_lookup::DatumLookup::for_tx`]): a body's
+/// own witnesses, plus the parent's for a sub-transaction (CIP-118 lets the
+/// top-level transaction carry supplemental datums for its sub-transactions'
+/// outputs). Metadata-posted datums are not resolvable here, and such orders
+/// simply wait for block confirmation (the indexer handles them).
+///
+/// Covers the parent body and its sub-transactions; each order is keyed by
+/// the id of the body that produced it.
 pub fn provisional_orders_from_tx(
     tx: &MultiEraTx,
     watch: &ProtocolWatch,
@@ -360,18 +397,30 @@ pub fn provisional_orders_from_tx(
     crate::cardano_types::TransactionInput,
     Arc<crate::sundaev4::SundaeV4Order>,
 )> {
+    let mut out = Vec::new();
+    for_each_effective_body(tx, |body, parent| {
+        out.extend(provisional_orders_from_body(body, parent, watch, slot));
+    });
+    out
+}
+
+/// [`provisional_orders_from_tx`] for one body: its outputs, keyed by its
+/// id. `parent` is the top-level transaction when `tx` is a sub-transaction.
+fn provisional_orders_from_body<'b>(
+    tx: &MultiEraTx<'b>,
+    parent: Option<&MultiEraTx<'b>>,
+    watch: &ProtocolWatch,
+    slot: u64,
+) -> Vec<(
+    crate::cardano_types::TransactionInput,
+    Arc<crate::sundaev4::SundaeV4Order>,
+)> {
     use plutus_parser::AsPlutus;
     let tx_hash = tx.hash();
-    let witness_datums: BTreeMap<pallas_primitives::DatumHash, pallas_primitives::PlutusData> = tx
-        .plutus_data()
-        .iter()
-        .map(|d| {
-            (
-                pallas_crypto::hash::Hasher::<256>::hash(d.raw_cbor()),
-                d.clone().unwrap(),
-            )
-        })
-        .collect();
+    // Metadata-posted datums defer to block confirmation, so the store is
+    // empty and only the witness datums of `tx` (and `parent`) resolve.
+    let datum_store = crate::datum_lookup::DatumLookup::default();
+    let datums = datum_store.for_tx(tx, parent);
     let mut out = Vec::new();
     for (idx, output) in tx.outputs().iter().enumerate() {
         let Ok(address) = output.address() else {
@@ -386,7 +435,7 @@ pub fn provisional_orders_from_tx(
         let converted = crate::cardano_types::convert_txo(output);
         let datum_pd = match &converted.datum {
             crate::cardano_types::RawDatum::Inline(d) => d.clone(),
-            crate::cardano_types::RawDatum::Hash(h) => match witness_datums.get(h) {
+            crate::cardano_types::RawDatum::Hash(h) => match datums.lookup_datum(*h) {
                 Some(d) => d.clone(),
                 None => {
                     debug!(tx = %hex::encode(tx_hash), idx, "mempool order datum by hash, not in witness set; deferring to confirmation");
@@ -436,6 +485,11 @@ pub fn provisional_orders_from_tx(
 /// (a scoop can't change a pool's module) and record which UTxO the
 /// foreign tx spent. Pools we don't already know are skipped — a pool
 /// *creation* in the mempool waits for its block.
+///
+/// Covers the parent body and its sub-transactions; each prediction is keyed
+/// by the id of the body that produced it. Under CIP-118 value conservation is
+/// per-body, so the body recreating a pool must itself spend the known pool
+/// input.
 pub fn pool_predictions_from_tx(
     tx: &MultiEraTx,
     watch: &ProtocolWatch,
@@ -453,60 +507,63 @@ pub fn pool_predictions_from_tx(
     crate::cardano_types::TransactionInput,
 )> {
     use plutus_parser::AsPlutus;
-    let tx_hash = tx.hash();
-    let spent: BTreeSet<(Vec<u8>, u64)> =
-        tx.inputs().iter().map(|i| (i.hash().to_vec(), i.index())).collect();
     let mut out = Vec::new();
-    for (idx, output) in tx.outputs().iter().enumerate() {
-        let Ok(address) = output.address() else {
-            continue;
-        };
-        let pallas_addresses::Address::Shelley(shelley) = address else {
-            continue;
-        };
-        if shelley.payment().as_hash() != &watch.pool_script_hash {
-            continue;
-        }
-        let converted = crate::cardano_types::convert_txo(output);
-        let datum_pd = match &converted.datum {
-            crate::cardano_types::RawDatum::Inline(d) => d.clone(),
-            _ => continue,
-        };
-        let pool_datum: crate::sundaev4::PoolDatum = match AsPlutus::from_plutus(datum_pd) {
-            Ok(d) => d,
-            Err(e) => {
-                debug!(tx = %hex::encode(tx_hash), idx, error = %e, "mempool pool output datum did not parse");
+    for_each_effective_body(tx, |body, _| {
+        let tx_hash = body.hash();
+        let spent: BTreeSet<(Vec<u8>, u64)> =
+            body.inputs().iter().map(|i| (i.hash().to_vec(), i.index())).collect();
+        for (idx, output) in body.outputs().iter().enumerate() {
+            let Ok(address) = output.address() else {
+                continue;
+            };
+            let pallas_addresses::Address::Shelley(shelley) = address else {
+                continue;
+            };
+            if shelley.payment().as_hash() != &watch.pool_script_hash {
                 continue;
             }
-        };
-        let ident = pool_datum.identifier.clone();
-        let Some((old_input, old_pool)) = pool_context.get(&ident) else {
-            debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output for unknown pool; deferring to confirmation");
-            continue;
-        };
-        // Sanity: the tx must actually spend the pool UTxO we know about —
-        // otherwise this is a chain we can't see the base of.
-        if !spent.contains(&(
-            old_input.0.transaction_id.as_ref().to_vec(),
-            old_input.0.index,
-        )) {
-            debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output doesn't spend the known pool input; skipping");
-            continue;
+            let converted = crate::cardano_types::convert_txo(output);
+            let datum_pd = match &converted.datum {
+                crate::cardano_types::RawDatum::Inline(d) => d.clone(),
+                _ => continue,
+            };
+            let pool_datum: crate::sundaev4::PoolDatum = match AsPlutus::from_plutus(datum_pd) {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!(tx = %hex::encode(tx_hash), idx, error = %e, "mempool pool output datum did not parse");
+                    continue;
+                }
+            };
+            let ident = pool_datum.identifier.clone();
+            let Some((old_input, old_pool)) = pool_context.get(&ident) else {
+                debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output for unknown pool; deferring to confirmation");
+                continue;
+            };
+            // Sanity: the body must actually spend the pool UTxO we know about —
+            // otherwise this is a chain we can't see the base of (or an
+            // unauthenticated output in another body).
+            if !spent.contains(&(
+                old_input.0.transaction_id.as_ref().to_vec(),
+                old_input.0.index,
+            )) {
+                debug!(tx = %hex::encode(tx_hash), pool = %ident, "mempool pool output doesn't spend the known pool input; skipping");
+                continue;
+            }
+            out.push((
+                ident,
+                Arc::new(crate::sundaev4::SundaeV4Pool {
+                    input: crate::cardano_types::TransactionInput::new(tx_hash, idx as u64),
+                    address: converted.address.to_vec(),
+                    value: converted.value,
+                    pool_datum,
+                    pool_type: old_pool.pool_type.clone(),
+                    slot,
+                    fee_split_config: old_pool.fee_split_config.clone(),
+                }),
+                old_input.clone(),
+            ));
         }
-        out.push((
-            ident,
-            Arc::new(crate::sundaev4::SundaeV4Pool {
-                input: crate::cardano_types::TransactionInput::new(tx_hash, idx as u64),
-                address: converted.address.to_vec(),
-                value: converted.value,
-                pool_datum,
-                pool_type: old_pool.pool_type.clone(),
-                slot,
-                fee_split_config: old_pool.fee_split_config.clone(),
-            }),
-            old_input.clone(),
-        ));
-    }
+    });
     out
 }
 
@@ -571,9 +628,67 @@ struct SeenTx {
     /// in a block yet. Removal + no confirmation within the eviction window
     /// counts as evicted.
     gone_at: Option<Instant>,
+    /// Hashes of the tx's sub-transactions. The indexer reports an output
+    /// under the id of the body that produced it, so confirming a
+    /// sub-transaction's order arrives with the sub-transaction's hash.
+    sub_txs: Vec<Vec<u8>>,
 }
 
-type SeenMap = BTreeMap<Vec<u8>, SeenTx>;
+/// Mempool-seen txs, keyed by top-level tx hash, plus an alias from each
+/// sub-transaction hash to its parent's, so a confirmation reported under
+/// any body's hash finds the entry.
+#[derive(Default)]
+struct SeenMap {
+    txs: BTreeMap<Vec<u8>, SeenTx>,
+    /// Sub-transaction hash → parent hash.
+    parents: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl SeenMap {
+    fn insert(&mut self, hash: Vec<u8>, entry: SeenTx) {
+        for sub in &entry.sub_txs {
+            self.parents.insert(sub.clone(), hash.clone());
+        }
+        self.txs.insert(hash, entry);
+    }
+
+    fn get_mut(&mut self, hash: &[u8]) -> Option<&mut SeenTx> {
+        self.txs.get_mut(hash)
+    }
+
+    /// The top-level tx a body hash belongs to: the parent for a known
+    /// sub-transaction, `hash` itself otherwise. A parent and its
+    /// sub-transactions land together or not at all, so confirming any body
+    /// confirms the parent.
+    fn top_level(&self, hash: Vec<u8>) -> Vec<u8> {
+        self.parents.get(&hash).cloned().unwrap_or(hash)
+    }
+
+    fn unlink_aliases(parents: &mut BTreeMap<Vec<u8>, Vec<u8>>, hash: &[u8], sub_txs: &[Vec<u8>]) {
+        for sub in sub_txs {
+            if parents.get(sub).map(Vec::as_slice) == Some(hash) {
+                parents.remove(sub);
+            }
+        }
+    }
+
+    fn remove(&mut self, hash: &[u8]) -> Option<SeenTx> {
+        let entry = self.txs.remove(hash)?;
+        Self::unlink_aliases(&mut self.parents, hash, &entry.sub_txs);
+        Some(entry)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&[u8], &SeenTx) -> bool) {
+        let parents = &mut self.parents;
+        self.txs.retain(|hash, entry| {
+            let kept = keep(hash, entry);
+            if !kept {
+                Self::unlink_aliases(parents, hash, &entry.sub_txs);
+            }
+            kept
+        });
+    }
+}
 
 /// How long after a tx vanishes from the mempool we keep waiting for its
 /// block confirmation before counting it as evicted. Preview blocks average
@@ -593,7 +708,7 @@ pub async fn run_mempool_monitor(
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) {
-    let seen: Arc<std::sync::Mutex<SeenMap>> = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let seen: Arc<std::sync::Mutex<SeenMap>> = Arc::new(std::sync::Mutex::new(SeenMap::default()));
 
     let correlate = correlate_confirmations(
         events,
@@ -651,6 +766,23 @@ async fn monitor_loop(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Known order inputs spent by `tx` or any of its effective sub-transactions.
+fn spent_order_inputs(
+    tx: &MultiEraTx,
+    known_order_inputs: &BTreeSet<(Vec<u8>, u64)>,
+) -> Vec<crate::cardano_types::TransactionInput> {
+    let mut spent = Vec::new();
+    for_each_effective_body(tx, |body, _| {
+        spent.extend(
+            body.inputs()
+                .iter()
+                .filter(|i| known_order_inputs.contains(&(i.hash().to_vec(), i.index())))
+                .map(|i| crate::cardano_types::TransactionInput::new(*i.hash(), i.index())),
+        );
+    });
+    spent
 }
 
 /// Decode a mempool transaction in the era the node reports for it
@@ -773,12 +905,8 @@ async fn watch_mempool(
                 } else {
                     Vec::new()
                 };
-                let spent: Vec<crate::cardano_types::TransactionInput> = if class.order_spends > 0 {
-                    tx.inputs()
-                        .iter()
-                        .filter(|i| known_order_inputs.contains(&(i.hash().to_vec(), i.index())))
-                        .map(|i| crate::cardano_types::TransactionInput::new(*i.hash(), i.index()))
-                        .collect()
+                let spent = if class.order_spends > 0 {
+                    spent_order_inputs(&tx, &known_order_inputs)
                 } else {
                     Vec::new()
                 };
@@ -828,12 +956,14 @@ async fn watch_mempool(
                 }
                 p.lock().unwrap().note_tx(hash.clone(), created, spent, pool_predictions);
             }
+            let sub_txs = tx.sub_transactions().iter().map(|sub| sub.hash().to_vec()).collect();
             seen.lock().unwrap().insert(
                 hash,
                 SeenTx {
                     seen_at: Instant::now(),
                     class,
                     gone_at: None,
+                    sub_txs,
                 },
             );
         }
@@ -863,6 +993,32 @@ async fn watch_mempool(
     }
 }
 
+/// The top-level txs an indexer event batch confirms. Each event names the
+/// body that produced or spent something; sub-transaction hashes map to
+/// their parent through `seen`. A set, so a parent confirmed by several of
+/// its bodies is retired once.
+fn confirmed_top_level_txs(batch: &[IndexEvent], seen: &SeenMap) -> BTreeSet<Vec<u8>> {
+    let mut confirmed = BTreeSet::new();
+    for event in batch {
+        let hash = match event {
+            IndexEvent::V4OrderCreated { order } => order.input.0.transaction_id.as_ref().to_vec(),
+            IndexEvent::V4PoolCreated { pool, .. } | IndexEvent::V4PoolUpdated { pool, .. } => {
+                pool.input.0.transaction_id.as_ref().to_vec()
+            }
+            IndexEvent::V4OrderScooped { tx_id, .. }
+            | IndexEvent::V4OrderCancelled { tx_id, .. } => {
+                let Ok(hash) = hex::decode(tx_id) else {
+                    continue;
+                };
+                hash
+            }
+            _ => continue,
+        };
+        confirmed.insert(seen.top_level(hash));
+    }
+    confirmed
+}
+
 /// Match indexer events (block-confirmed order creations, pool updates,
 /// scoops, cancellations) against mempool-seen txs to measure lead time, and
 /// sweep out entries that vanished without confirming (evictions).
@@ -885,27 +1041,8 @@ async fn correlate_confirmations(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
-                let mut confirmed: Vec<Vec<u8>> = Vec::new();
-                for event in &batch {
-                    match event {
-                        IndexEvent::V4OrderCreated { order } => {
-                            confirmed.push(order.input.0.transaction_id.as_ref().to_vec());
-                        }
-                        IndexEvent::V4PoolCreated { pool, .. }
-                        | IndexEvent::V4PoolUpdated { pool, .. } => {
-                            confirmed.push(pool.input.0.transaction_id.as_ref().to_vec());
-                        }
-                        IndexEvent::V4OrderScooped { tx_id, .. }
-                        | IndexEvent::V4OrderCancelled { tx_id, .. } => {
-                            if let Ok(hash) = hex::decode(tx_id) {
-                                confirmed.push(hash);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
                 let mut seen_map = seen.lock().unwrap();
-                for hash in confirmed {
+                for hash in confirmed_top_level_txs(&batch, &seen_map) {
                     // Confirmed: the indexer now carries this tx's orders, so
                     // the provisional copies retire silently (dedupe).
                     if let Some(p) = &provisional {
@@ -943,7 +1080,7 @@ async fn correlate_confirmations(
                                 tx = %hex::encode(hash),
                                 "mempool: tx vanished without block confirmation (evicted or replaced)",
                             );
-                            dropped.push(hash.clone());
+                            dropped.push(hash.to_vec());
                             false
                         } else {
                             true
@@ -980,6 +1117,7 @@ async fn correlate_confirmations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sundaev4::sub_transaction_tests;
 
     #[test]
     fn provisional_store_lifecycle() {
@@ -1347,5 +1485,194 @@ mod tests {
         };
         let class = classify_tx(&tx, &other_watch, &BTreeSet::new(), &BTreeSet::new());
         assert!(!class.relevant());
+    }
+
+    /// The fixture's order validator and the basic-order constraint module
+    /// its order datum carries (a one-asset basic swap).
+    fn musashi_watch() -> ProtocolWatch {
+        ProtocolWatch {
+            pool_script_hash: pallas_primitives::Hash::new([0xEE; 28]),
+            order_script_hashes: vec![sub_transaction_tests::ORDER_SCRIPT_HASH.parse().unwrap()],
+            swap_order_hash: Vec::new(),
+            basic_order_hash: hex::decode(
+                "35f429541437c1aba0c170012f6e75eddf36e8c30b326f334961b347",
+            )
+            .unwrap(),
+            strategy_order_hash: Vec::new(),
+        }
+    }
+
+    /// Production mempool path: N2C `LocalTxMonitor` delivers 3-element
+    /// Dijkstra mempool transactions (no trailing `is_valid` bool), which
+    /// `decode_mempool_tx` decodes using the node's hard-fork era index.
+    #[test]
+    fn sub_transaction_effects_are_classified_and_keyed_by_their_own_id() {
+        let mut mempool_raw = sub_transaction_tests::fixture();
+        assert_eq!(mempool_raw[0], 0x84, "fixture is 4-element block form");
+        assert_eq!(
+            mempool_raw.pop(),
+            Some(0xf5),
+            "fixture ends with is_valid = true"
+        );
+        mempool_raw[0] = 0x83;
+        let dijkstra_era = (u16::from(Era::Dijkstra) - 1) as u8;
+        let tx = decode_mempool_tx(dijkstra_era, &mempool_raw).expect("mempool Dijkstra decodes");
+
+        let subs = tx.sub_transactions();
+        let sub_inputs = subs[0].inputs();
+        let sub_input = &sub_inputs[0];
+        let order_inputs: BTreeSet<(Vec<u8>, u64)> =
+            [(sub_input.hash().to_vec(), sub_input.index())].into();
+        let watch = musashi_watch();
+
+        let class = classify_tx(&tx, &watch, &order_inputs, &BTreeSet::new());
+        assert_eq!(class.order_creates, 1, "the sub-transaction's order output");
+        assert_eq!(class.order_spends, 1, "the sub-transaction's input");
+
+        let spent = spent_order_inputs(&tx, &order_inputs);
+        assert_eq!(
+            spent,
+            vec![crate::cardano_types::TransactionInput::new(
+                *sub_input.hash(),
+                sub_input.index()
+            )]
+        );
+
+        let parsed = provisional_orders_from_tx(&tx, &watch, 42);
+        assert_eq!(parsed.len(), 1);
+        let (input, order) = &parsed[0];
+        assert_eq!(
+            input.to_string(),
+            format!("{}#0", sub_transaction_tests::SUB_TX_ID)
+        );
+        assert_eq!(&order.input, input);
+        assert!(matches!(
+            order.constraint,
+            crate::sundaev4::Constraint::Swap { .. }
+        ));
+    }
+
+    /// CIP-118: the parent may carry the witness datum for an output of its
+    /// sub-transaction. Same rule as the indexer
+    /// (`a_datum_hash_resolves_from_the_parents_witnesses`).
+    #[test]
+    fn a_sub_transaction_order_resolves_its_datum_from_the_parents_witnesses() {
+        for datum_in in [
+            sub_transaction_tests::DatumIn::Sub,
+            sub_transaction_tests::DatumIn::Parent,
+        ] {
+            let bytes = sub_transaction_tests::sub_tx_with_hashed_order(
+                datum_in,
+                sub_transaction_tests::Phase2::Valid,
+            );
+            let tx = MultiEraTx::decode(&bytes).unwrap();
+            let parsed = provisional_orders_from_tx(&tx, &musashi_watch(), 42);
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(
+                parsed[0].0.to_string(),
+                format!("{}#0", sub_transaction_tests::sub_tx_id(&bytes))
+            );
+        }
+    }
+
+    fn seen_tx(sub_txs: Vec<Vec<u8>>) -> SeenTx {
+        SeenTx {
+            seen_at: Instant::now(),
+            class: TxClass::default(),
+            gone_at: None,
+            sub_txs,
+        }
+    }
+
+    /// The indexer reports a sub-transaction's order under the
+    /// sub-transaction's id; the mempool entry is the parent's. Confirming
+    /// the order must retire the parent (once, even across multiple bodies)
+    /// and drop its aliases on both confirmation and eviction sweep.
+    #[test]
+    fn confirming_a_sub_transaction_order_confirms_its_parent() {
+        let bytes = sub_transaction_tests::fixture();
+        let tx = MultiEraTx::decode(&bytes).unwrap();
+        let parent = tx.hash().to_vec();
+        let sub = tx.sub_transactions()[0].hash().to_vec();
+        let created = provisional_orders_from_tx(&tx, &musashi_watch(), 42);
+        let order = created[0].1.clone();
+        assert_eq!(order.input.0.transaction_id.to_vec(), sub);
+
+        let mut provisional = ProvisionalState::default();
+        provisional.note_tx(parent.clone(), created, Vec::new(), Vec::new());
+        let mut seen = SeenMap::default();
+        seen.insert(parent.clone(), seen_tx(vec![sub.clone()]));
+
+        // Both a sub-tx event and a parent event deduplicate to one parent retirement.
+        let parent_order = Arc::new(crate::sundaev4::SundaeV4Order {
+            input: crate::cardano_types::TransactionInput::new(tx.hash(), 0),
+            address: order.address.clone(),
+            value: order.value.clone(),
+            datum: order.datum.clone(),
+            constraint: order.constraint.clone(),
+            slot: order.slot,
+        });
+        let batch = [
+            IndexEvent::V4OrderCreated { order },
+            IndexEvent::V4OrderCreated {
+                order: parent_order,
+            },
+        ];
+        let confirmed = confirmed_top_level_txs(&batch, &seen);
+        assert_eq!(confirmed, [parent.clone()].into());
+
+        for hash in confirmed {
+            assert_eq!(provisional.remove_tx(&hash).len(), 1);
+            assert!(seen.remove(&hash).is_some());
+        }
+        assert_eq!(provisional.counts(), (0, 0));
+        assert_eq!(seen.top_level(sub.clone()), sub);
+
+        // The sweep's `retain` path drops aliases too.
+        seen.insert(parent.clone(), seen_tx(vec![sub.clone()]));
+        assert_eq!(seen.top_level(sub), parent);
+        seen.retain(|_, _| false);
+        assert!(seen.parents.is_empty());
+    }
+
+    /// CIP-118 sponsor replacement: a sub-transaction wrapped in `parent_1`
+    /// is re-wrapped in `parent_2`. Suspending or sweeping the stale `parent_1`
+    /// must not clobber `parent_2`'s live order or confirmation alias.
+    #[test]
+    fn retiring_a_replaced_parent_keeps_the_new_parents_order_and_alias() {
+        let bytes = sub_transaction_tests::fixture();
+        let tx = MultiEraTx::decode(&bytes).unwrap();
+        let sub = tx.sub_transactions()[0].hash().to_vec();
+        let created = provisional_orders_from_tx(&tx, &musashi_watch(), 42);
+        let order = created[0].1.clone();
+        let (parent_1, parent_2) = (vec![0xc1; 32], vec![0xc2; 32]);
+
+        let mut seen = SeenMap::default();
+        let mut provisional = ProvisionalState::default();
+        seen.insert(parent_1.clone(), seen_tx(vec![sub.clone()]));
+        provisional.note_tx(parent_1.clone(), created.clone(), Vec::new(), Vec::new());
+
+        seen.insert(parent_2.clone(), seen_tx(vec![sub.clone()]));
+        provisional.note_tx(parent_2.clone(), created, Vec::new(), Vec::new());
+
+        // `parent_1` leaves the mempool and is later swept as evicted.
+        provisional.set_gone(&parent_1, true);
+        seen.retain(|hash, _| hash != parent_1.as_slice());
+        provisional.remove_tx(&parent_1);
+
+        // `parent_2`'s order and confirmation alias survive intact.
+        assert_eq!(provisional.dispatchable_orders().len(), 1);
+        assert_eq!(provisional.dispatchable_orders()[0].1, parent_2);
+        assert_eq!(seen.top_level(sub), parent_2);
+
+        // Confirming the sub-transaction now retires `parent_2`.
+        let confirmed = confirmed_top_level_txs(&[IndexEvent::V4OrderCreated { order }], &seen);
+        assert_eq!(confirmed, [parent_2.clone()].into());
+        for hash in confirmed {
+            provisional.remove_tx(&hash);
+            assert!(seen.remove(&hash).is_some());
+        }
+        assert_eq!(provisional.counts(), (0, 0));
+        assert!(seen.parents.is_empty());
     }
 }
