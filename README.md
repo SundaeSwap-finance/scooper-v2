@@ -4,15 +4,23 @@ This repo contains the binary which runs v2 the Sundae Labs scooper, powering v4
 
 ## Running
 
-preview:
+**New operator? Start with the [operator guide](./docs/operators.md).** It
+goes from a new key to a scooper that fills orders, and covers upgrades and
+recovery. This README is the reference for every setting.
 
 ```sh
-scooper-v2 --config config/preview.json
+scooper-v2 --config config/mainnet-v4.json
 ```
-mainnet:
-```sh
-scooper-v2 --config config/mainnet.json
-```
+
+| Config | Network and protocol |
+| --- | --- |
+| [`config/mainnet-v4.json`](./config/mainnet-v4.json) | mainnet, v4 |
+| [`config/preprod-v4.json`](./config/preprod-v4.json) | preprod, v4 |
+| [`config/preview-v4.json`](./config/preview-v4.json) | preview, v4 |
+| `config/mainnet.json`, `config/preview.json` | v3 only |
+
+Each v4 config is an example to copy and change: the paths, the node address
+and the key in it are those of the SundaeSwap hosts.
 
 You can find prebuilt binaries in the releases of this project.
 
@@ -239,15 +247,4 @@ The scooper refuses to start if a guard does not resolve. A block logs when it s
 
 ### Docker
 
-Images are published to `ghcr.io/sundaeswap-finance/scooper-v2`, tagged with the version.
-
-To use the image, you must mount your configuration at `/app/config.json` and a writable data volume at `/app/data` (and point `persistence.sqlite.filename` into that dir). For example, to use our standard mainnet config:
-
-```sh
-docker run --rm \
-  -p 9999:9999 \
-  -v "$PWD/config/mainnet.json:/app/config.json:ro" \
-  -v scooper-data:/app/data \
-  -e SCOOPER_V2_PERSISTENCE__SQLITE__FILENAME=/app/data/scooper-v2.db \
-  ghcr.io/sundaeswap-finance/scooper-v2:v0.6.0
-```
+Images are published to `ghcr.io/sundaeswap-finance/scooper-v2`, tagged with the version. The [operator guide](./docs/operators.md#docker) has the run command.
