@@ -182,16 +182,22 @@ mod tests {
     #[test]
     fn every_environment_config_parses_its_module_scripts() {
         use crate::sundaev4::ModuleKind;
-        for (file, modules) in [
-            ("config/preview-v4.json", 9),
-            ("config/preprod-v4.json", 9),
-            ("config/mainnet-v4.json", 7),
+        // Preview lists the older hashes of each migrated kind beside the
+        // current one, so it has two fee_split hashes.
+        for (file, modules, fee_splits) in [
+            ("config/preview-v4.json", 18, 2),
+            ("config/preprod-v4.json", 9, 1),
+            ("config/mainnet-v4.json", 7, 1),
         ] {
             let config = load_config([file]).expect("config loads");
             let exec = config.protocol.v4.and_then(|v4| v4.execution).expect("v4 execution");
             let ms = &exec.module_scripts;
             assert_eq!(ms.modules.len(), modules, "{file}");
-            assert_eq!(ms.of_kind(ModuleKind::FeeSplit).count(), 1, "{file}");
+            assert_eq!(
+                ms.of_kind(ModuleKind::FeeSplit).count(),
+                fee_splits,
+                "{file}"
+            );
         }
         // The devnet files are not full scooper configs; parse their
         // module-scripts section alone. devnet.json names the CL module
@@ -206,9 +212,11 @@ mod tests {
         }
     }
 
-    /// Preview's config names one CL hash and one oracle hash.
+    /// Preview's config names the audited CL and oracle modules (sundae-v4
+    /// 115f19d). The older hashes of each kind stay listed: config recovery
+    /// reads the redeemers of every hash of a kind.
     #[test]
-    fn preview_names_one_cl_and_one_oracle() {
+    fn preview_names_the_audited_cl_and_oracle() {
         use crate::sundaev4::ModuleKind;
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string("config/preview-v4.json").unwrap())
@@ -216,9 +224,18 @@ mod tests {
         let ms: crate::sundaev4::ModuleScripts =
             serde_json::from_value(raw["protocol"]["v4"]["execution"]["module-scripts"].clone())
                 .unwrap();
-        for kind in [ModuleKind::ConcentratedLiquidity, ModuleKind::Oracle] {
-            let hashes = ms.modules.hashes_of_kind(kind);
-            assert_eq!(hashes.len(), 1, "{kind}");
+        for (kind, audited) in [
+            (
+                ModuleKind::ConcentratedLiquidity,
+                "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9",
+            ),
+            (
+                ModuleKind::Oracle,
+                "e0819f6e35de6ce91a2a8a6e1e156ddaee5289b910aa20f71dddd287",
+            ),
+        ] {
+            let hash = hex::decode(audited).unwrap();
+            assert_eq!(ms.kind_of(&hash), Some(kind), "{kind}");
         }
     }
 
