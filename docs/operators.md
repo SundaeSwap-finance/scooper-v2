@@ -129,6 +129,9 @@ not scoop a pool that names a hash that is not in that map, and it logs:
 pool's enabled actions reference unknown module hash(es); the pool is not scooped
 ```
 
+The dashboard shows such a pool with the badge `? unknown module`. Hold the
+pointer on the badge to see the module hash.
+
 Your other pools are not affected. To scoop the new pools:
 
 1. Take the new `module-scripts` entries from the announcement, or from

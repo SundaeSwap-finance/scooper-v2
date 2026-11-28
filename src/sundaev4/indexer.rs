@@ -2460,34 +2460,25 @@ pub fn detect_pool_type(
     // invariant module, but its modules are known. Say that it is disabled,
     // and do not report the treasury and governance hashes as unknown
     // (preview, 2026-11-27, pool 489dbf42 with tag 100 disabled).
-    let disabled_invariant = matched_kind.is_none() && {
-        let mut all_enabled = pool_datum.clone();
-        for a in all_enabled.actions.iter_mut() {
-            a.enabled = true;
-        }
-        exec.module_scripts.pool_invariant(&all_enabled).is_some()
-    };
-    if disabled_invariant {
+    let unknown_modules = exec.module_scripts.unknown_invariant_modules(pool_datum);
+    if matched_kind.is_none() && unknown_modules.is_none() {
         info!(
             pool = %ident_hex,
             "pool's scoop action is disabled; the pool is not scooped until it is enabled again",
         );
-    } else if matched_kind.is_none() {
+    } else if let Some(unknowns) = &unknown_modules {
         // Log the unknown first-module hashes so the operator can see why
         // detect_pool_type couldn't classify this pool. The scooper does not
         // scoop a pool whose modules it cannot resolve (see
-        // `ModuleScripts::pool_modules`).
-        let unknowns: Vec<String> = pool_datum
-            .actions
-            .iter()
-            .filter(|a| a.enabled)
-            .filter_map(|a| a.modules.first().map(hex::encode))
-            .collect();
+        // `ModuleScripts::pool_modules`). The `ConstantProduct` below is a
+        // placeholder; the status endpoints report the pool as an unknown
+        // module (`ModuleScripts::unknown_invariant_modules`).
+        let unknowns: Vec<String> = unknowns.iter().map(hex::encode).collect();
         warn!(
             pool = %ident_hex,
             modules = ?unknowns,
             "pool's enabled actions reference unknown module hash(es); \
-             the pool is not scooped (classified as ConstantProduct for display only)",
+             the pool is not scooped (the status endpoints show it as an unknown module)",
         );
     } else if let Err(e) = exec.module_scripts.pool_modules(pool_datum) {
         warn!(pool = %ident_hex, "pool's scoop action is not supported, the pool is not scooped: {e}");
