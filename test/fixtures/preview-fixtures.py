@@ -95,7 +95,7 @@ def main():
         ("fairnessOrder", "constraints/fairness_order.fairness_order_constraint"),
         ("strategyOrder", "constraints/strategy_order.strategy_order_constraint"),
         ("stableswap", "modules/stableswap.stableswap_module"),
-        ("bandedConcentratedLiquidity", "modules/concentrated_liquidity.concentrated_liquidity_module"),
+        ("concentratedLiquidity", "modules/concentrated_liquidity.concentrated_liquidity_module"),
         ("oracle", "modules/oracle.oracle_module"),
     ]
     expect = {
@@ -103,7 +103,7 @@ def main():
         "poolMint": POOL_POLICY,
         "order": "8a7ecdafb3605ddf761751b391c20482b7ef42ca01575d135d484c2b",
         "settings": "43f2ee25b54dcd8150df9e9908ae890638844cd3a748ef05d8a09d09",
-        "bandedConcentratedLiquidity": "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9",
+        "concentratedLiquidity": "1ecfe94638a3c110140b2f2d71bb69077c7ebc832ca5e78dc69185f9",
         "oracle": "e0819f6e35de6ce91a2a8a6e1e156ddaee5289b910aa20f71dddd287",
     }
     with tempfile.TemporaryDirectory() as work:

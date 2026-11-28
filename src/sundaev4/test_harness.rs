@@ -836,12 +836,12 @@ impl TestEnv {
         ]
     }
 
-    /// `module_state` entries for a banded concentrated-liquidity pool: the
-    /// ladder's hash under the banded module credential, plus fee_split and
+    /// `module_state` entries for a concentrated-liquidity pool: the
+    /// ladder's hash under the CL module credential, plus fee_split and
     /// fairness as for every pool.
-    pub fn bcl_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn cl_module_state(&self, config: &CLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
         let script = self.cl_script();
-        let bcl_hash = crate::sundaev4::banded_math::config_hash(config);
+        let cl_hash = crate::sundaev4::cl_math::config_hash(config);
         let fs_config = FeeSplitConfig {
             protocol_share: Rational {
                 num: BigInt::from(self.exec.protocol_share.0),
@@ -851,7 +851,7 @@ impl TestEnv {
         let fs_cbor = minicbor::to_vec(fs_config.to_plutus()).unwrap();
         let fs_hash = Hasher::<256>::hash(&fs_cbor).to_vec();
         vec![
-            (script.hash.to_vec(), bcl_hash),
+            (script.hash.to_vec(), cl_hash),
             (
                 self.exec
                     .module_scripts
@@ -873,22 +873,22 @@ impl TestEnv {
         ]
     }
 
-    /// The action entry modules list for banded pools:
-    /// `[bcl_hash, fs_hash, fairness_hash]`.
-    /// Module list and module_state for a banded pool that also carries the
+    /// The action entry modules list for CL pools:
+    /// `[cl_hash, fs_hash, fairness_hash]`.
+    /// Module list and module_state for a CL pool that also carries the
     /// oracle module: the ladder hash, fee_split, fairness, and the oracle's
     /// fresh slot `0x80`.
-    pub fn bcl_oracle_module_state(&self, config: &BandedCLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn cl_oracle_module_state(&self, config: &CLConfig) -> Vec<(Vec<u8>, Vec<u8>)> {
         let oracle = self.oracle_script();
-        let mut ms = self.bcl_module_state(config);
+        let mut ms = self.cl_module_state(config);
         ms.push((oracle.hash.to_vec(), vec![0x80]));
         ms
     }
 
     /// The CL pool's action modules plus the oracle.
-    pub fn bcl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
+    pub fn cl_oracle_action_modules(&self) -> Vec<Vec<u8>> {
         let oracle = self.oracle_script();
-        let mut m = self.bcl_action_modules();
+        let mut m = self.cl_action_modules();
         m.push(oracle.hash.to_vec());
         m
     }
@@ -909,7 +909,7 @@ impl TestEnv {
             .expect("the fixture has an oracle script")
     }
 
-    pub fn bcl_action_modules(&self) -> Vec<Vec<u8>> {
+    pub fn cl_action_modules(&self) -> Vec<Vec<u8>> {
         let script = self.cl_script();
         vec![
             script.hash.to_vec(),
@@ -1262,18 +1262,18 @@ pub fn make_ss_pool(
 /// The eight equal-weight arcs of sundae-v4's `lib/tests/unit/cl_check_unit.ak`:
 /// sqrt-price 1.00 .. 1.08 in steps of 0.01, all CL arcs at the given fee,
 /// in the five-field form the module reads.
-pub fn bcl_eq8_config(fee: Rational) -> BandedCLConfig {
-    bcl_eq8_config_four_fields(fee).with_void_ext().expect("four fields")
+pub fn cl_eq8_config(fee: Rational) -> CLConfig {
+    cl_eq8_config_four_fields(fee).with_void_ext().expect("four fields")
 }
 
 /// The same ladder in the pre-audit four-field form. Only config recovery
 /// from chain history reads this form.
-pub fn bcl_eq8_config_four_fields(fee: Rational) -> BandedCLConfig {
+pub fn cl_eq8_config_four_fields(fee: Rational) -> CLConfig {
     let r = |n: i64, d: i64| Rational {
         num: BigInt::from(n),
         den: BigInt::from(d),
     };
-    crate::sundaev4::banded_math::with_index(
+    crate::sundaev4::cl_math::with_index(
         (0..8)
             .map(|i| BandSpec {
                 start: r(1_000_000 + 10_000 * i, 1_000_000),
@@ -1288,29 +1288,29 @@ pub fn bcl_eq8_config_four_fields(fee: Rational) -> BandedCLConfig {
     )
 }
 
-/// Create a banded concentrated-liquidity pool with the proper module
-/// pipeline (banded + FS + fairness). `total_lp` is the ladder counter the
+/// Create a concentrated-liquidity pool with the proper module
+/// pipeline (CL + FS + fairness). `total_lp` is the ladder counter the
 /// reserves witness (spec V12), found with `find_witness`; the reserves
 /// must therefore sit on a point of the ladder.
-pub fn make_bcl_pool(
+pub fn make_cl_pool(
     env: &TestEnv,
     ident_byte: u8,
     assets: Vec<(AssetClass, i64)>,
-    config: BandedCLConfig,
+    config: CLConfig,
 ) -> Arc<SundaeV4Pool> {
-    make_bcl_pool_with_oracle(env, ident_byte, assets, config, false)
+    make_cl_pool_with_oracle(env, ident_byte, assets, config, false)
 }
 
-/// `make_bcl_pool`, optionally listing the oracle module in the trade
+/// `make_cl_pool`, optionally listing the oracle module in the trade
 /// action with a fresh accumulator slot.
-pub fn make_bcl_pool_with_oracle(
+pub fn make_cl_pool_with_oracle(
     env: &TestEnv,
     ident_byte: u8,
     assets: Vec<(AssetClass, i64)>,
-    config: BandedCLConfig,
+    config: CLConfig,
     with_oracle: bool,
 ) -> Arc<SundaeV4Pool> {
-    assert_eq!(assets.len(), 2, "banded pools hold exactly two assets");
+    assert_eq!(assets.len(), 2, "CL pools hold exactly two assets");
     let ident_bytes = vec![ident_byte; 28];
 
     let mut nft_name = vec![0x00, 0x0d, 0xe1, 0x40];
@@ -1328,7 +1328,7 @@ pub fn make_bcl_pool_with_oracle(
         token: lp_name,
     };
 
-    let w = crate::sundaev4::banded_math::find_witness(
+    let w = crate::sundaev4::cl_math::find_witness(
         &config,
         &BigInt::from(assets[0].1),
         &BigInt::from(assets[1].1),
@@ -1366,20 +1366,20 @@ pub fn make_bcl_pool_with_oracle(
                 tag: BigInt::from(100),
                 enabled: true,
                 modules: if with_oracle {
-                    env.bcl_oracle_action_modules()
+                    env.cl_oracle_action_modules()
                 } else {
-                    env.bcl_action_modules()
+                    env.cl_action_modules()
                 },
             }],
             module_state: if with_oracle {
-                env.bcl_oracle_module_state(&config)
+                env.cl_oracle_module_state(&config)
             } else {
-                env.bcl_module_state(&config)
+                env.cl_module_state(&config)
             },
             min_surplus: BigInt::from(0),
             extension: crate::sundaev4::types::plutus_void(),
         },
-        pool_type: PoolType::BandedConcentratedLiquidity { config },
+        pool_type: PoolType::ConcentratedLiquidity { config },
         slot: 100,
         fee_split_config: None,
     })

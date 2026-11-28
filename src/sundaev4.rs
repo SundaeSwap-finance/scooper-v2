@@ -1,10 +1,10 @@
 pub mod access;
 pub mod accumulator;
-pub mod banded_math;
 pub mod batch;
 pub mod butane;
 pub mod cardano_swaps;
 pub mod chain_tracker;
+pub mod cl_math;
 pub mod claims;
 pub mod conversions;
 pub mod evaluator;

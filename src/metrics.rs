@@ -49,7 +49,7 @@ pub enum PoolFamily {
     ConstantProduct,
     ConstantSum,
     StableSwap,
-    BandedConcentratedLiquidity,
+    ConcentratedLiquidity,
 }
 
 impl PoolFamily {
@@ -58,7 +58,7 @@ impl PoolFamily {
             Self::ConstantProduct => "cp",
             Self::ConstantSum => "cs",
             Self::StableSwap => "ss",
-            Self::BandedConcentratedLiquidity => "bcl",
+            Self::ConcentratedLiquidity => "cl",
         }
     }
 }
@@ -147,7 +147,7 @@ pub struct Metrics {
     scooped_cp: AtomicU64,
     scooped_cs: AtomicU64,
     scooped_ss: AtomicU64,
-    scooped_bcl: AtomicU64,
+    scooped_cl: AtomicU64,
     /// Submit latency histogram in seconds. Buckets are tuned for
     /// Blockfrost: most submits land in 100ms-2s, tail past 5s is a
     /// sign of upstream trouble.
@@ -190,7 +190,7 @@ pub struct Metrics {
     /// The shape that produced the peak, as pools*1000 + steps.
     pub scoop_peak_shape: AtomicU64,
     pub mempool_lead_time: Histogram,
-    /// Time spent solving a banded pool's witness. See the boundaries.
+    /// Time spent solving a CL pool's witness. See the boundaries.
     /// This times the searches that RAN; `witness_memo_hits` counts the
     /// calls that never had to search, so the two together give the real
     /// cost per call.
@@ -241,7 +241,7 @@ const SUBMIT_LATENCY_BOUNDARIES: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
 /// 1-60s with a tail for txs that waited out several blocks.
 const MEMPOOL_LEAD_BOUNDARIES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0];
 
-/// Witness-search latency for one banded pool, seconds.
+/// Witness-search latency for one CL pool, seconds.
 ///
 /// `find_witness` walks every band with an 800-counter scan per band and
 /// cost 92-159ms cold on the ladders the traffic simulator provisions. The
@@ -316,7 +316,7 @@ impl Metrics {
             scooped_cp: AtomicU64::new(0),
             scooped_cs: AtomicU64::new(0),
             scooped_ss: AtomicU64::new(0),
-            scooped_bcl: AtomicU64::new(0),
+            scooped_cl: AtomicU64::new(0),
             submit_latency: Histogram::new(SUBMIT_LATENCY_BOUNDARIES),
             mempool_txs_seen: AtomicU64::new(0),
             mempool_order_creates: AtomicU64::new(0),
@@ -406,7 +406,7 @@ impl Metrics {
             PoolFamily::ConstantProduct => &self.scooped_cp,
             PoolFamily::ConstantSum => &self.scooped_cs,
             PoolFamily::StableSwap => &self.scooped_ss,
-            PoolFamily::BandedConcentratedLiquidity => &self.scooped_bcl,
+            PoolFamily::ConcentratedLiquidity => &self.scooped_cl,
         };
         counter.fetch_add(n, Ordering::Relaxed);
     }
@@ -828,8 +828,8 @@ pub async fn render_metrics(
             metrics.scooped_ss.load(Ordering::Relaxed),
         ),
         (
-            PoolFamily::BandedConcentratedLiquidity.label(),
-            metrics.scooped_bcl.load(Ordering::Relaxed),
+            PoolFamily::ConcentratedLiquidity.label(),
+            metrics.scooped_cl.load(Ordering::Relaxed),
         ),
     ] {
         let _ = writeln!(
@@ -1015,12 +1015,12 @@ pub async fn render_metrics(
     );
     metrics.witness_latency.write(
         &mut out,
-        "scooper_banded_witness_seconds",
-        "Time to solve a banded pool's witness, over the searches that ran",
+        "scooper_cl_witness_seconds",
+        "Time to solve a CL pool's witness, over the searches that ran",
     );
     write_counter(
         &mut out,
-        "scooper_banded_witness_memo_hits_total",
+        "scooper_cl_witness_memo_hits_total",
         "find_witness calls answered from the memo, with no search",
         metrics.witness_memo_hits.load(Ordering::Relaxed),
     );
@@ -1072,7 +1072,7 @@ pub async fn render_metrics(
             ),
             (
                 "scooper_router_ladder_builds_total",
-                "banded ladders built (ladder cache misses)",
+                "CL ladders built (ladder cache misses)",
                 p.ladder_builds.load(Ordering::Relaxed),
             ),
             (
@@ -1082,7 +1082,7 @@ pub async fn render_metrics(
             ),
             (
                 "scooper_router_fill_curve_builds_total",
-                "banded fill curves built",
+                "CL fill curves built",
                 p.fill_curve_builds.load(Ordering::Relaxed),
             ),
             (
@@ -1123,4 +1123,29 @@ pub async fn render_metrics(
     );
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names of the CL series on `/metrics`. Releases to 0.8.0 wrote
+    /// `pool_type="bcl"`, `scooper_banded_witness_seconds` and
+    /// `scooper_banded_witness_memo_hits_total`. A query that matches an
+    /// old name must change with the release, so this test pins the names.
+    #[tokio::test]
+    async fn the_cl_series_have_the_cl_names() {
+        let metrics = Metrics::new();
+        metrics.record_pool_family_orders(PoolFamily::ConcentratedLiquidity, 3);
+        let paused = std::sync::atomic::AtomicBool::new(false);
+        let body = render_metrics(&None, &None, &paused, &metrics).await;
+        for series in [
+            "scooper_orders_scooped_by_pool_type_total{pool_type=\"cl\"} 3",
+            "scooper_cl_witness_seconds",
+            "scooper_cl_witness_memo_hits_total",
+        ] {
+            assert!(body.contains(series), "{series} is not in:\n{body}");
+        }
+        assert!(!body.contains("bcl") && !body.contains("banded"), "{body}");
+    }
 }

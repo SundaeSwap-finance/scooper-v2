@@ -468,7 +468,7 @@
               "ref-utxo": "11e68d9dd219d4a9c72ac979f08a9e46088d73750fd6f3ccbbba1b934567d719#0"
             }
           ],
-          "banded-concentrated-liquidity": [
+          "concentrated-liquidity": [
             {
               "hash": "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18",
               "ref-utxo": "797d5fe621ad87df854a29c21a4d0cf039872cdbd5025efc16ec6cadfdd1e983#0"

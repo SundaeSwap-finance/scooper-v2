@@ -1,10 +1,10 @@
-//! Banded concentrated liquidity: the scooper's half of
-//! `lib/modules/banded_cl_check.ak` (sundae-v4).
+//! Concentrated liquidity: the scooper's half of
+//! `lib/modules/cl_check.ak` (sundae-v4).
 //!
 //! Every function here mirrors the module exactly, rounding included. Where
 //! the two disagree the chain wins and the transaction fails, so the unit
 //! tests pin the same vectors the Aiken tests use
-//! (`lib/tests/unit/banded_cl_check.ak`, `banded_cl_cs.ak`).
+//! (`lib/tests/unit/cl_check_unit.ak`, `cl_cs.ak`).
 //!
 //! The shape: a ladder of `N` bands over sqrt-price, band `i` spanning
 //! `[bands[i].start, bands[i+1].start)` and the last band ending at
@@ -27,7 +27,7 @@
 //!     and the chain will reject every transaction built from it.
 
 use crate::bigint::BigInt;
-use crate::sundaev4::types::{BandSpec, BandedCLConfig, PoolDatum, Rational};
+use crate::sundaev4::types::{BandSpec, CLConfig, PoolDatum, Rational};
 use num_traits::{Signed, Zero};
 
 /// `ceil(n / d)` for `n >= 0`, `d > 0`.
@@ -41,11 +41,11 @@ pub fn delta(lo: &Rational, hi: &Rational) -> BigInt {
 }
 
 /// Band `i`'s UPPER edge: the next band's start, or `closing` for the last.
-pub fn upper_edge(cfg: &BandedCLConfig, i: usize) -> &Rational {
+pub fn upper_edge(cfg: &CLConfig, i: usize) -> &Rational {
     cfg.bands.get(i + 1).map(|b| &b.start).unwrap_or(&cfg.closing)
 }
 
-/// The ladder evaluated at one witness `(x, k)`: `banded_cl_check.LadderState`.
+/// The ladder evaluated at one witness `(x, k)`: `cl_check.LadderState`.
 #[derive(Debug, Clone)]
 pub struct LadderState {
     /// `C_A(X, k)`: the A held by the bands ABOVE the active one.
@@ -64,7 +64,7 @@ pub struct LadderState {
 }
 
 /// `a_sat_i(x) = ceil(w_i * x * D_i / (W * p_{i-1} * p_i))`.
-fn a_sat(cfg: &BandedCLConfig, x: &BigInt, i: usize) -> BigInt {
+fn a_sat(cfg: &CLConfig, x: &BigInt, i: usize) -> BigInt {
     let lo = &cfg.bands[i].start;
     let hi = upper_edge(cfg, i);
     let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * x;
@@ -73,7 +73,7 @@ fn a_sat(cfg: &BandedCLConfig, x: &BigInt, i: usize) -> BigInt {
 }
 
 /// `b_sat_i(x) = ceil(w_i * x * D_i / (W * q_{i-1} * q_i))`.
-fn b_sat(cfg: &BandedCLConfig, x: &BigInt, i: usize) -> BigInt {
+fn b_sat(cfg: &CLConfig, x: &BigInt, i: usize) -> BigInt {
     let lo = &cfg.bands[i].start;
     let hi = upper_edge(cfg, i);
     let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * x;
@@ -95,7 +95,7 @@ pub fn fixed_one() -> BigInt {
 /// that does not depend on the counter, in fixed point and rounded UP.
 ///
 ///     a_sat_i = ceil(coeff_a_i * X / 2^64)   with the aggregate rounding
-fn coeff_a(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
+fn coeff_a(cfg: &CLConfig, i: usize, scale: &BigInt) -> BigInt {
     let lo = &cfg.bands[i].start;
     let hi = upper_edge(cfg, i);
     let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * scale;
@@ -104,7 +104,7 @@ fn coeff_a(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
 }
 
 /// The same on the B side.
-fn coeff_b(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
+fn coeff_b(cfg: &CLConfig, i: usize, scale: &BigInt) -> BigInt {
     let lo = &cfg.bands[i].start;
     let hi = upper_edge(cfg, i);
     let num = &(&cfg.bands[i].weight * &delta(lo, hi)) * scale;
@@ -118,7 +118,7 @@ fn coeff_b(cfg: &BandedCLConfig, i: usize, scale: &BigInt) -> BigInt {
 /// `cfg.index` is ignored; this derives it from the bands, which is exactly
 /// what `Create` pins (V13). Build a config with `with_index` rather than
 /// calling this directly.
-pub fn build_index(cfg: &BandedCLConfig) -> Vec<(BigInt, BigInt)> {
+pub fn build_index(cfg: &CLConfig) -> Vec<(BigInt, BigInt)> {
     let n = cfg.bands.len();
     let scale = fixed_one();
     let a: Vec<BigInt> = (0..n).map(|i| coeff_a(cfg, i, &scale)).collect();
@@ -142,10 +142,10 @@ pub fn build_index(cfg: &BandedCLConfig) -> Vec<(BigInt, BigInt)> {
 /// A four-field config with its index derived from its bands. Every
 /// constructor goes through here: a config whose index does not match its
 /// bands fails `Create` and bricks every spend of a pool that already has
-/// one. `BandedCLConfig::with_void_ext` gives the five-field form of the
+/// one. `CLConfig::with_void_ext` gives the five-field form of the
 /// same ladder, which is the form the module reads.
-pub fn with_index(bands: Vec<BandSpec>, closing: Rational, weight_total: BigInt) -> BandedCLConfig {
-    let mut cfg = BandedCLConfig {
+pub fn with_index(bands: Vec<BandSpec>, closing: Rational, weight_total: BigInt) -> CLConfig {
+    let mut cfg = CLConfig {
         bands,
         index: vec![],
         closing,
@@ -157,7 +157,7 @@ pub fn with_index(bands: Vec<BandSpec>, closing: Rational, weight_total: BigInt)
 }
 
 /// One pass over the ladder at `(x, k)`. `Err` when `k` is out of range.
-pub fn ladder_at(cfg: &BandedCLConfig, x: &BigInt, k: usize) -> Result<LadderState, String> {
+pub fn ladder_at(cfg: &CLConfig, x: &BigInt, k: usize) -> Result<LadderState, String> {
     let n = cfg.bands.len();
     if k >= n {
         return Err(format!("band {k} out of range for a {n}-band ladder"));
@@ -216,7 +216,7 @@ pub fn g_of(st: &LadderState, ra: &BigInt, rb: &BigInt, l: &BigInt) -> BigInt {
     }
 }
 
-/// The band proof P2-P7 (`banded_cl_check.band_proof`). P1 (`x >= W`) is the
+/// The band proof P2-P7 (`cl_check.band_proof`). P1 (`x >= W`) is the
 /// caller's. `tight` selects P7, which the chain evaluates unconditionally.
 pub fn band_proof(a: &BigInt, b: &BigInt, st: &LadderState, tight: bool) -> bool {
     let ra = a - &st.ca;
@@ -246,7 +246,7 @@ pub struct Witness {
 }
 
 /// P1 and the full band proof at `(x, k)`.
-pub fn is_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: usize) -> bool {
+pub fn is_witness(cfg: &CLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: usize) -> bool {
     if x < &cfg.weight_total {
         return false;
     }
@@ -262,7 +262,7 @@ pub fn is_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, x: &BigInt, k: u
 /// finds its end. Integer rounding can displace the witness by a few, so a
 /// short scan follows. `None` when the reserves sit on no point of the
 /// ladder; the chain would reject them too. Mirrors `banded-math.ts`.
-pub fn find_witness(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+pub fn find_witness(cfg: &CLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
     if let Some(hit) = memo_get(cfg, a, b) {
         note_memo_hit();
         return hit;
@@ -297,12 +297,12 @@ const MEMO_STATES: usize = 8192;
 type MemoStates = BTreeMap<(BigInt, BigInt), Option<Witness>>;
 
 thread_local! {
-    static WITNESS_MEMO: RefCell<Vec<(BandedCLConfig, MemoStates)>> =
+    static WITNESS_MEMO: RefCell<Vec<(CLConfig, MemoStates)>> =
         const { RefCell::new(Vec::new()) };
     static MEMO_HITS: RefCell<u64> = const { RefCell::new(0) };
 }
 
-fn memo_get(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Option<Witness>> {
+fn memo_get(cfg: &CLConfig, a: &BigInt, b: &BigInt) -> Option<Option<Witness>> {
     WITNESS_MEMO.with(|m| {
         m.borrow()
             .iter()
@@ -311,7 +311,7 @@ fn memo_get(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Option<Witne
     })
 }
 
-fn memo_put(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, out: &Option<Witness>) {
+fn memo_put(cfg: &CLConfig, a: &BigInt, b: &BigInt, out: &Option<Witness>) {
     WITNESS_MEMO.with(|m| {
         let mut m = m.borrow_mut();
         // Bounded in both dimensions. A scooper sees a few dozen ladders,
@@ -354,7 +354,7 @@ pub fn clear_witness_memo() {
     WITNESS_MEMO.with(|m| m.borrow_mut().clear());
 }
 
-fn find_witness_inner(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+fn find_witness_inner(cfg: &CLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
     // Try to start from where this ladder was last seen before falling back
     // to the exhaustive search. See `seeded_find` for why this is safe.
     if let Some(w) = seeded_find(cfg, a, b) {
@@ -406,8 +406,8 @@ pub fn drain_witness_times() -> Vec<f64> {
 // search, a bisection and a scan of 800 counters, each of those a full
 // band proof in bignums. Measured on the ladders the traffic simulator
 // provisions: 159ms for a 16-band ladder, 92ms for an 8-band one. The
-// router calls this once per banded pool per graph build and TWICE per
-// step evaluation in `compute_fee_budget`, so a handful of banded pools on
+// router calls this once per CL pool per graph build and TWICE per
+// step evaluation in `compute_fee_budget`, so a handful of CL pools on
 // traded pairs takes the scooper from scooping every block to a minute and
 // a half per order. That is not a tuning problem, it is the difference
 // between working and not.
@@ -440,7 +440,7 @@ thread_local! {
 /// more, so this does not need to be a hash of the whole config.
 type LadderKey = (usize, String, String, String);
 
-fn ladder_key(cfg: &BandedCLConfig) -> LadderKey {
+fn ladder_key(cfg: &CLConfig) -> LadderKey {
     (
         cfg.bands.len(),
         cfg.weight_total.to_string(),
@@ -449,7 +449,7 @@ fn ladder_key(cfg: &BandedCLConfig) -> LadderKey {
     )
 }
 
-fn remember_witness(cfg: &BandedCLConfig, w: &Witness) {
+fn remember_witness(cfg: &CLConfig, w: &Witness) {
     LAST_WITNESS.with(|m| {
         let mut m = m.borrow_mut();
         // Bounded: a scooper sees a few dozen ladders, and dropping the map
@@ -469,7 +469,7 @@ pub fn clear_witness_seeds() {
     clear_witness_memo();
 }
 
-fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
+fn seeded_find(cfg: &CLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> {
     let prev = LAST_WITNESS.with(|m| m.borrow().get(&ladder_key(cfg)).cloned())?;
     let n = cfg.bands.len();
     // The active band moves by one as a swap crosses an edge, so the last
@@ -492,12 +492,7 @@ fn seeded_find(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<Witness> 
     None
 }
 
-pub fn find_witness_scan(
-    cfg: &BandedCLConfig,
-    a: &BigInt,
-    b: &BigInt,
-    scan: u32,
-) -> Option<Witness> {
+pub fn find_witness_scan(cfg: &CLConfig, a: &BigInt, b: &BigInt, scan: u32) -> Option<Witness> {
     let n = cfg.bands.len();
     let Some(range) = candidate_bands(cfg, a, b) else {
         return (0..n).find_map(|k| find_witness_in_band(cfg, a, b, k, scan));
@@ -567,7 +562,7 @@ const SLACK: i64 = 4;
 /// `None` when the ladder index is not monotone, which means the caller
 /// must search every band: the binary searches below assume monotonicity
 /// and a malformed config would make them drop the right band.
-fn candidate_bands(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<std::ops::Range<usize>> {
+fn candidate_bands(cfg: &CLConfig, a: &BigInt, b: &BigInt) -> Option<std::ops::Range<usize>> {
     let n = cfg.bands.len();
     if n == 0 || cfg.index.len() != n {
         return None;
@@ -610,7 +605,7 @@ fn candidate_bands(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt) -> Option<std::
 /// The larger of the two, and `None` when neither side gives a positive
 /// one. This is a search start, not a claim about the witness: the band
 /// search validates it and falls back when it does not hold.
-fn counter_floor(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, k: usize) -> Option<BigInt> {
+fn counter_floor(cfg: &CLConfig, a: &BigInt, b: &BigInt, k: usize) -> Option<BigInt> {
     let (ca_coeff, cb_coeff) = cfg.index.get(k)?;
     let scale = fixed_one();
     let slack = BigInt::from(SLACK);
@@ -668,7 +663,7 @@ fn first_false(n: usize, pred: impl Fn(usize) -> bool) -> usize {
 /// order. The reference the pruned search is tested against.
 #[cfg(test)]
 pub fn find_witness_scan_every_band(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     scan: u32,
@@ -680,7 +675,7 @@ pub fn find_witness_scan_every_band(
 /// sits on a band edge can have a witness in both neighbouring bands; the
 /// step planner uses this to continue in the band it is crossing into.
 pub fn find_witness_in_band(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     k: usize,
@@ -694,7 +689,7 @@ pub fn find_witness_in_band(
 /// from 1. Falls back to the unseeded search when the hint does not satisfy
 /// the sign and curve predicates.
 pub fn find_witness_in_band_from(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     k: usize,
@@ -859,7 +854,7 @@ pub fn next_band(k: usize, is_a_input: bool, n: usize) -> Option<usize> {
 /// ladder runs out before `dx` is consumed, or when no next-band witness
 /// exists for an edge state.
 pub fn swap_steps(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     is_a_input: bool,
@@ -872,7 +867,7 @@ pub fn swap_steps(
 /// step skips the unseeded search and every later step is seeded by the one
 /// before it.
 pub fn swap_steps_from(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     is_a_input: bool,
@@ -894,7 +889,7 @@ pub fn swap_steps_from(
     while remaining.is_positive() {
         guard -= 1;
         if guard == 0 {
-            return Err("banded swap plan did not converge".into());
+            return Err("CL swap plan did not converge".into());
         }
         let before = match known.take() {
             Some(w) => w,
@@ -984,12 +979,7 @@ pub struct BandView {
     pub fee_sell: Rational,
 }
 
-pub fn band_view(
-    cfg: &BandedCLConfig,
-    a: &BigInt,
-    b: &BigInt,
-    w: &Witness,
-) -> Result<BandView, String> {
+pub fn band_view(cfg: &CLConfig, a: &BigInt, b: &BigInt, w: &Witness) -> Result<BandView, String> {
     let st = ladder_at(cfg, &w.x, w.k)?;
     Ok(BandView {
         ra: a - &st.ca,
@@ -1019,7 +1009,7 @@ pub fn band_fee(dx: &BigInt, fee_r: &Rational) -> BigInt {
 }
 
 /// The output the active band pays for `dx` of the input asset, before the
-/// band's capacity is considered. `banded_cl_check.banded_swap` step 8:
+/// band's capacity is considered. `cl_check.cl_swap` step 8:
 /// the CL output pair on the residuals' virtual reserves, or the CS bin's
 /// pair. Both floor in the pool's favour. The fee rounds up (`band_fee`).
 pub fn band_output(v: &BandView, is_a_input: bool, dx: &BigInt) -> BigInt {
@@ -1111,7 +1101,7 @@ pub fn max_dx_in_band(v: &BandView, is_a_input: bool) -> BigInt {
 /// `dx`.
 #[cfg(test)]
 pub fn view_after_from(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     is_a_input: bool,
@@ -1137,12 +1127,12 @@ pub fn view_after_from(
 /// The largest input the whole ladder absorbs in one direction: the sum of
 /// every band's capacity from the active band to the ladder's end.
 #[cfg(test)]
-pub fn ladder_capacity(cfg: &BandedCLConfig, a: &BigInt, b: &BigInt, is_a_input: bool) -> BigInt {
+pub fn ladder_capacity(cfg: &CLConfig, a: &BigInt, b: &BigInt, is_a_input: bool) -> BigInt {
     ladder_capacity_from(cfg, a, b, is_a_input, None)
 }
 
 pub fn ladder_capacity_from(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     is_a_input: bool,
@@ -1243,7 +1233,7 @@ pub fn fee_value_budget(
 /// does not enter. `Err` when the step is not a swap or the witness is out
 /// of range.
 pub fn swap_fee_budget(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a0: &BigInt,
     b0: &BigInt,
     a1: &BigInt,
@@ -1270,7 +1260,7 @@ pub fn swap_fee_budget(
 /// after witness and the fee budget the entry must declare.
 #[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct BandedSwapResult {
+pub struct CLSwapResult {
     pub dy: BigInt,
     pub a_after: BigInt,
     pub b_after: BigInt,
@@ -1285,13 +1275,13 @@ pub struct BandedSwapResult {
 /// have no witness.
 #[cfg(test)]
 pub fn swap_step(
-    cfg: &BandedCLConfig,
+    cfg: &CLConfig,
     a: &BigInt,
     b: &BigInt,
     lp: &BigInt,
     is_a_input: bool,
     dx: &BigInt,
-) -> Result<BandedSwapResult, String> {
+) -> Result<CLSwapResult, String> {
     if !dx.is_positive() {
         return Err("swap input is not positive".into());
     }
@@ -1329,7 +1319,7 @@ pub fn swap_step(
             before.x, after.x
         ));
     }
-    Ok(BandedSwapResult {
+    Ok(CLSwapResult {
         dy,
         a_after,
         b_after,
@@ -1342,15 +1332,15 @@ pub fn swap_step(
 // ─── Config hashing and shape ───────────────────────────────────────────────
 
 /// `module_state` slot value: `blake2b_256(serialise_data(config))`.
-pub fn config_hash(cfg: &BandedCLConfig) -> Vec<u8> {
+pub fn config_hash(cfg: &CLConfig) -> Vec<u8> {
     use plutus_parser::AsPlutus;
     let cbor = minicbor::to_vec(cfg.clone().to_plutus()).expect("PlutusData encodes");
     pallas_crypto::hash::Hasher::<256>::hash(&cbor).to_vec()
 }
 
-/// True when `cfg` is the preimage of the banded slot in `datum`'s
+/// True when `cfg` is the preimage of the CL slot in `datum`'s
 /// `module_state`.
-pub fn config_matches_datum(cfg: &BandedCLConfig, datum: &PoolDatum, module_hash: &[u8]) -> bool {
+pub fn config_matches_datum(cfg: &CLConfig, datum: &PoolDatum, module_hash: &[u8]) -> bool {
     datum
         .module_state
         .iter()
@@ -1376,9 +1366,9 @@ fn check_fee(f: &Rational, what: &str) -> Result<(), String> {
 }
 
 /// V1 to V9 and V13 of the spec: the Create-time shape checks
-/// (`banded_cl_check.check_shape`). A config that fails these did not come
+/// (`cl_check.check_shape`). A config that fails these did not come
 /// from a real pool.
-pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
+pub fn check_shape(cfg: &CLConfig) -> Result<(), String> {
     let cap = rational_bound();
     if cfg.bands.is_empty() {
         return Err("empty ladder".into());
@@ -1428,7 +1418,7 @@ pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
         ));
     }
     // V14: the reserved `ext` field is `Void`.
-    if cfg.ext.as_ref().is_some_and(|e| *e != BandedCLConfig::void_data()) {
+    if cfg.ext.as_ref().is_some_and(|e| *e != CLConfig::void_data()) {
         return Err("config ext is not Void".into());
     }
     Ok(())
@@ -1440,18 +1430,14 @@ pub fn check_shape(cfg: &BandedCLConfig) -> Result<(), String> {
 /// slot and to no redeemer (sundae-v4
 /// `testnet_governor_launch_candidate`), so it can only be derived.
 /// Callers accept a form only when it hashes to the pool's slot.
-pub fn config_forms(cfg: &BandedCLConfig) -> impl Iterator<Item = BandedCLConfig> {
+pub fn config_forms(cfg: &CLConfig) -> impl Iterator<Item = CLConfig> {
     let void = cfg.with_void_ext();
     std::iter::once(cfg.clone()).chain(void)
 }
 
 /// The form of `cfg` (`config_forms`) that is the preimage of the pool's
 /// slot for `module_hash`, if one is.
-pub fn matching_form(
-    cfg: &BandedCLConfig,
-    datum: &PoolDatum,
-    module_hash: &[u8],
-) -> Option<BandedCLConfig> {
+pub fn matching_form(cfg: &CLConfig, datum: &PoolDatum, module_hash: &[u8]) -> Option<CLConfig> {
     config_forms(cfg).find(|c| config_matches_datum(c, datum, module_hash))
 }
 
@@ -1476,9 +1462,9 @@ mod tests {
         }
     }
 
-    /// The eight equal-weight arcs of `lib/tests/unit/banded_cl_check.ak`:
+    /// The eight equal-weight arcs of `lib/tests/unit/cl_check_unit.ak`:
     /// sqrt-price 1.00 .. 1.08 in steps of 0.01, fee 0.3%.
-    fn eq8() -> BandedCLConfig {
+    fn eq8() -> CLConfig {
         with_index(
             (0..8).map(|i| band(1_000_000 + 10_000 * i, 1_000_000, 0, (3, 1000))).collect(),
             r(1_080_000, 1_000_000),
@@ -1490,7 +1476,7 @@ mod tests {
     const RESERVE_B: i64 = 624_999;
 
     /// `cfg` in the five-field form the module reads.
-    fn r2(cfg: BandedCLConfig) -> BandedCLConfig {
+    fn r2(cfg: CLConfig) -> CLConfig {
         cfg.with_void_ext().expect("a with_index config has four fields")
     }
 
@@ -1510,8 +1496,8 @@ mod tests {
         assert_eq!(f4.len(), 4);
         assert_eq!(f5.len(), 5);
         assert_eq!(f4[..], f5[..4]);
-        assert_eq!(f5[4], BandedCLConfig::void_data());
-        let back = BandedCLConfig::from_plutus(five.clone().to_plutus()).unwrap();
+        assert_eq!(f5[4], CLConfig::void_data());
+        let back = CLConfig::from_plutus(five.clone().to_plutus()).unwrap();
         assert_eq!(back, five);
         assert_ne!(config_hash(&four), config_hash(&five));
         assert!(check_shape(&five).is_ok());
@@ -1570,7 +1556,7 @@ mod tests {
         assert_eq!(s.fee_budget, BigInt::from(213));
     }
 
-    /// The proportional deposit of `banded_walk_accepts_swap_then_deposit`:
+    /// The proportional deposit of `cl_walk_accepts_swap_then_deposit`:
     /// doubling the pool lands on counter 2_000_000_000.
     #[test]
     fn doubled_pool_has_the_aiken_counter() {
@@ -1585,7 +1571,7 @@ mod tests {
         assert_eq!(w.k, 0);
     }
 
-    /// `lib/tests/unit/banded_cl_cs.ak`: one constant-sum bin over sqrt-price
+    /// `lib/tests/unit/cl_cs.ak`: one constant-sum bin over sqrt-price
     /// 2..3 prices at 6/1. Buying A with 1e6 B pays 166_166 A; selling 1e6 A
     /// pays 5_982_000 B. Fee budgets 2 and 18 at total_lp 1e6: the fee's LP
     /// worth at the bin's price (SV4-001b). The counter ratio booked 3 and 18.
@@ -1617,7 +1603,7 @@ mod tests {
     }
 
     /// A mixed ladder (arc, bin, arc) with the price in the bin, from
-    /// `banded_cl_cs.ak`: the witness is at band 1, counter 1_000_000_001.
+    /// `cl_cs.ak`: the witness is at band 1, counter 1_000_000_001.
     #[test]
     fn mixed_ladder_witness_is_in_the_bin() {
         let cfg = with_index(
@@ -2055,7 +2041,7 @@ mod witness_cost {
     use super::*;
     use crate::sundaev4::types::BandSpec;
 
-    fn ladder(n: i64, lo: i64, hi: i64, den: i64, weights: &[i64]) -> BandedCLConfig {
+    fn ladder(n: i64, lo: i64, hi: i64, den: i64, weights: &[i64]) -> CLConfig {
         let r = |num: i64, d: i64| Rational {
             num: BigInt::from(num),
             den: BigInt::from(d),
@@ -2081,7 +2067,7 @@ mod witness_cost {
     #[ignore]
     fn time_find_witness() {
         // The creamery's shapes, at the counters it actually used.
-        let cases: Vec<(&str, BandedCLConfig, BigInt)> = vec![
+        let cases: Vec<(&str, CLConfig, BigInt)> = vec![
             (
                 "wide 16 bands flat, X=1.45e12",
                 ladder(16, 938_083_152, 1_058_300_524, 1_000_000_000, &[1; 16]),
@@ -2236,7 +2222,7 @@ mod witness_pruning_tests {
         den: i64,
         weights: &[i64],
         cs_at: Option<usize>,
-    ) -> BandedCLConfig {
+    ) -> CLConfig {
         let step = (hi - lo) / n as i64;
         let w_total: i64 = weights.iter().take(n).sum();
         with_index(
@@ -2255,7 +2241,7 @@ mod witness_pruning_tests {
     }
 
     /// The ladders the creamery provisions, by archetype.
-    fn archetypes() -> Vec<(&'static str, BandedCLConfig)> {
+    fn archetypes() -> Vec<(&'static str, CLConfig)> {
         vec![
             (
                 "tight 8 bell",
@@ -2337,7 +2323,7 @@ mod witness_pruning_tests {
     /// Reserves that lie ON the ladder: pick a counter and a band, then
     /// read the saturated state back out. A state built this way has a
     /// witness, so a search that returns `None` for it is a defect.
-    fn on_ladder(cfg: &BandedCLConfig, x: &BigInt, k: usize) -> Option<(BigInt, BigInt)> {
+    fn on_ladder(cfg: &CLConfig, x: &BigInt, k: usize) -> Option<(BigInt, BigInt)> {
         let st = ladder_at(cfg, x, k).ok()?;
         // Mid-band: half of each side's saturation on top of the prefix.
         let two = BigInt::from(2);
@@ -2351,7 +2337,7 @@ mod witness_pruning_tests {
     /// side costs 90-160ms per state in a debug build, so the always-run
     /// test takes a slice and the ignored one takes the lot.
     fn sweep(
-        archs: &[(&str, BandedCLConfig)],
+        archs: &[(&str, CLConfig)],
         counters: &[u64],
         deltas: &[(i64, i64)],
         band_step: usize,
@@ -2435,7 +2421,7 @@ mod witness_pruning_tests {
         // Every band of three shapes, at one counter, with the offsets
         // that straddle a band edge.
         let archs = archetypes();
-        let slice: Vec<(&str, BandedCLConfig)> = archs
+        let slice: Vec<(&str, CLConfig)> = archs
             .iter()
             .filter(|(n, _)| matches!(*n, "tight 8 bell" | "pegged 10 with a cs bin" | "two bands"))
             .cloned()
@@ -2541,9 +2527,9 @@ mod witness_pruning_tests {
         }
     }
 
-    /// The eight equal arcs of `lib/tests/unit/banded_cl_check.ak`:
+    /// The eight equal arcs of `lib/tests/unit/cl_check_unit.ak`:
     /// sqrt-price 1.00 .. 1.08 in steps of 0.01, weight 1, fee 0.3%.
-    fn eq8() -> BandedCLConfig {
+    fn eq8() -> CLConfig {
         with_index(
             (0..8)
                 .map(|i| BandSpec {

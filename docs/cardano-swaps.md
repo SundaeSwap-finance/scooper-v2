@@ -130,8 +130,8 @@ lands the residual of `inputs − outputs − fee` on the pool output, and the
 transaction pays for itself: the scooper fronts nothing.
 
 Every pool family is eligible — constant product, constant sum, stableswap,
-and banded concentrated liquidity — each sized by its own curve; a banded
-ladder is walked through the router's cached view. A stableswap or banded
+and concentrated liquidity — each sized by its own curve; a CL
+ladder is walked through the router's cached view. A stableswap or CL
 pool whose hash-pinned config the scooper has not indexed is skipped, as the
 builder would refuse it. `min-pool-lovelace` applies to constant-product
 pools only: their curve quotes a meaningless price when the declared ADA

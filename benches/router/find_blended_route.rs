@@ -1,8 +1,8 @@
-//! Criterion benchmark of `find_blended_route` on a synthetic banded market,
+//! Criterion benchmark of `find_blended_route` on a synthetic CL market,
 //! at the pool caps K the route-quality benchmark uses. Ported from
 //! scooper-v2 PR #99, whose market was a ladder of single-range CL pools per
-//! pair; the scooper now prices a pair's ladder as one banded pool, so each
-//! pair here is one `BandedConcentratedLiquidity` pool whose bands carry the
+//! pair; the scooper now prices a pair's ladder as one CL pool, so each
+//! pair here is one `ConcentratedLiquidity` pool whose bands carry the
 //! same Gaussian spread of value.
 //!
 //! Built as the `router` bench, which recompiles the crate's modules (see
@@ -21,10 +21,10 @@ use criterion::{BenchmarkId, Criterion, criterion_group};
 use crate::bigint::BigInt;
 use crate::cardano_types::{AssetClass, TransactionInput, Value};
 use crate::sundaev3::Ident;
-use crate::sundaev4::banded_math::{build_index, check_shape, find_witness};
+use crate::sundaev4::cl_math::{build_index, check_shape, find_witness};
 use crate::sundaev4::router::{RoutingLimits, find_blended_route};
 use crate::sundaev4::{
-    BandSpec, BandedCLConfig, PoolDatum, PoolType, Rational, SundaeV4Pool, plutus_void,
+    BandSpec, CLConfig, PoolDatum, PoolType, Rational, SundaeV4Pool, plutus_void,
 };
 
 /// Shape of the synthetic market. Every token has the same reference price
@@ -67,7 +67,7 @@ fn sqrt_price(s: f64) -> Rational {
 /// the mass is scaled to a thousand and floored at one). Band `k` covers
 /// log-price `[(k - 1/2)·h, (k + 1/2)·h]`; `closing` is the last band's upper
 /// edge.
-fn ladder(shape: &MarketShape) -> BandedCLConfig {
+fn ladder(shape: &MarketShape) -> CLConfig {
     let h = shape.width.ln_1p();
     let ks: Vec<i32> = (-shape.bands_per_side..=shape.bands_per_side).collect();
     let mass = |k: i32| (-(k as f64 * h).powi(2) / (2.0 * shape.sigma.powi(2))).exp();
@@ -87,7 +87,7 @@ fn ladder(shape: &MarketShape) -> BandedCLConfig {
         .collect();
     let weight_total = bands.iter().fold(BigInt::from(0), |acc, b| &acc + &b.weight);
     let last = *ks.last().expect("at least the centre band");
-    let mut cfg = BandedCLConfig {
+    let mut cfg = CLConfig {
         bands,
         index: vec![],
         closing: sqrt_price(((last as f64 + 0.5) * h).exp().sqrt()),
@@ -99,10 +99,10 @@ fn ladder(shape: &MarketShape) -> BandedCLConfig {
     cfg
 }
 
-/// One banded pool for the pair (a, b), holding `value` split evenly at
+/// One CL pool for the pair (a, b), holding `value` split evenly at
 /// price 1. The witness search must place the reserves on the ladder, as
 /// the router's own ladder view will.
-fn banded_pool(index: usize, a: &AssetClass, b: &AssetClass, shape: &MarketShape) -> SundaeV4Pool {
+fn cl_pool(index: usize, a: &AssetClass, b: &AssetClass, shape: &MarketShape) -> SundaeV4Pool {
     let cfg = ladder(shape);
     let half = BigInt::from((shape.pair_value / 2.0) as u64);
     find_witness(&cfg, &half, &half).expect("balanced reserves sit on the ladder");
@@ -127,13 +127,13 @@ fn banded_pool(index: usize, a: &AssetClass, b: &AssetClass, shape: &MarketShape
             min_surplus: BigInt::from(0),
             extension: plutus_void(),
         },
-        pool_type: PoolType::BandedConcentratedLiquidity { config: cfg },
+        pool_type: PoolType::ConcentratedLiquidity { config: cfg },
         slot: 100,
         fee_split_config: None,
     }
 }
 
-/// Every pair (i < j) gets one banded pool, oriented (T_i, T_j).
+/// Every pair (i < j) gets one CL pool, oriented (T_i, T_j).
 fn market(shape: &MarketShape) -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
     let mut pools = BTreeMap::new();
     for i in 0..shape.tokens {
@@ -150,7 +150,7 @@ fn add_pool(
     b: &AssetClass,
     shape: &MarketShape,
 ) {
-    let pool = banded_pool(pools.len(), a, b, shape);
+    let pool = cl_pool(pools.len(), a, b, shape);
     pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
 }
 
@@ -158,7 +158,7 @@ fn add_pool(
 /// four thin paths can absorb together.
 const CROWDED_AMOUNT: u64 = 1_000_000_000_000;
 
-/// First pool index of `crowded_market`. The router caches a banded pool's
+/// First pool index of `crowded_market`. The router caches a CL pool's
 /// ladder by (ident, reserves), not by config: a `crowded` pool with the
 /// ident and reserves of a pool of the main market, routed first, would be
 /// priced with that pool's ladder (its 0.3 % fee instead of the deep pool's).
@@ -196,7 +196,7 @@ fn crowded_market() -> BTreeMap<Ident, Arc<SundaeV4Pool>> {
     }
     let mut pools = BTreeMap::new();
     for (a, b, shape) in pairs {
-        let pool = banded_pool(CROWDED_FIRST_INDEX + pools.len(), &a, &b, shape);
+        let pool = cl_pool(CROWDED_FIRST_INDEX + pools.len(), &a, &b, shape);
         pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
     }
     pools

@@ -243,6 +243,7 @@ pub async fn admin_server(
     v4_routing_costs: Option<(u64, u64)>,
     v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: ModuleStatePreimages,
+    v4_module_scripts: Option<Arc<crate::sundaev4::ModuleScripts>>,
     v4_protocol_share: Option<(u64, u64)>,
     v4_dao: Option<Arc<dyn crate::persistence::IndexerDao>>,
     resync_tx: tokio::sync::broadcast::Sender<()>,
@@ -262,6 +263,7 @@ pub async fn admin_server(
         v4_routing_costs,
         v4_pool_allowlists,
         v4_module_preimages: Arc::new(v4_module_preimages),
+        v4_module_scripts,
         v4_protocol_share,
         v4_dao,
         resync_tx,
@@ -511,6 +513,10 @@ struct AdminServer {
     /// listings and intent probes agree with what dispatch will do.
     v4_pool_allowlists: Arc<crate::sundaev4::access::PoolAllowlists>,
     v4_module_preimages: Arc<ModuleStatePreimages>,
+    /// The configured module scripts, mirrored from the execution config.
+    /// The pool listings use them to report a pool whose curve module the
+    /// config does not list.
+    v4_module_scripts: Option<Arc<crate::sundaev4::ModuleScripts>>,
     /// The scooper's configured protocol share of pool fees, reported on the
     /// dashboard's Protocol tab. Pools may override it per pool on chain.
     v4_protocol_share: Option<(u64, u64)>,
@@ -1604,23 +1610,42 @@ impl AdminServer {
 
     // ── V4 helpers ──────────────────────────────────────────────────────
 
+    /// The hex module hashes that make a pool unclassifiable under the
+    /// instance's config, or `None` when the config classifies the pool.
+    /// The indexer stores a `ConstantProduct` placeholder as the type of
+    /// such a pool and does not scoop it. The listings must not show the
+    /// placeholder as the pool's type.
+    fn v4_unknown_modules(&self, pool: &crate::sundaev4::SundaeV4Pool) -> Option<Vec<String>> {
+        let unknown =
+            self.v4_module_scripts.as_ref()?.unknown_invariant_modules(&pool.pool_datum)?;
+        Some(unknown.iter().map(hex::encode).collect())
+    }
+
     /// Serialize a V4 pool to JSON, enriching `module_state` with preimage values.
+    /// `unknown_modules` is the result of `v4_unknown_modules` for the pool.
     fn v4_pool_json(
         pool: &crate::sundaev4::SundaeV4Pool,
         preimages: &ModuleStatePreimages,
+        unknown_modules: Option<Vec<String>>,
     ) -> serde_json::Value {
         let mut pool_json = serde_json::to_value(pool).unwrap_or_default();
+        if let (Some(modules), Some(obj)) = (unknown_modules, pool_json.as_object_mut()) {
+            obj.insert(
+                "pool_type".into(),
+                serde_json::json!({ "UnknownModule": { "modules": modules } }),
+            );
+        }
         // A stableswap pool's config is per pool (and its rates move on
         // chain), so its preimage comes from the pool record, not the
         // startup map.
-        // The same holds for a banded ladder, whose config is per pool.
+        // The same holds for a CL ladder, whose config is per pool.
         let ss_preimage: Option<(Vec<u8>, Vec<u8>)> = {
             use plutus_parser::AsPlutus;
             let cbor = match &pool.pool_type {
                 crate::sundaev4::PoolType::StableSwap { config } => {
                     Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
                 }
-                crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } => {
+                crate::sundaev4::PoolType::ConcentratedLiquidity { config } => {
                     Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
                 }
                 _ => None,
@@ -1652,14 +1677,14 @@ impl AdminServer {
             }
             *obj = serde_json::Value::Object(enriched);
         }
-        // Banded pools: the ladder witness (counter X, active band k) is
+        // CL pools: the ladder witness (counter X, active band k) is
         // derived from the reserves, never stored, so compute it here for
         // the dashboard along with the active band's price edges and the
         // input each direction can still absorb.
-        if let crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type
+        if let crate::sundaev4::PoolType::ConcentratedLiquidity { config } = &pool.pool_type
             && pool.pool_datum.assets.len() == 2
         {
-            use crate::sundaev4::banded_math as bm;
+            use crate::sundaev4::cl_math as bm;
             let (a, b) = (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1);
             let band_state = match bm::find_witness(config, a, b) {
                 Some(w) => {
@@ -1752,7 +1777,11 @@ impl AdminServer {
         }
 
         let response = serde_json::json!({
-            "pool": Self::v4_pool_json(&pool, &self.v4_module_preimages),
+            "pool": Self::v4_pool_json(
+                &pool,
+                &self.v4_module_preimages,
+                self.v4_unknown_modules(&pool),
+            ),
             "executable": executable,
             "non_executable": non_executable,
         });
@@ -1852,11 +1881,15 @@ impl AdminServer {
         let mut empty_pools = 0u64;
         let mut restricted_pools = 0u64;
         for (ident, pool) in &state.pools {
+            let unknown_modules = self.v4_unknown_modules(pool);
             let kind = match &pool.pool_type {
+                // The type of a pool with an unknown curve module is a
+                // placeholder. Do not count the pool as a CP pool.
+                _ if unknown_modules.is_some() => "unknown",
                 PoolType::ConstantProduct { .. } => "cp",
                 PoolType::ConstantSum { .. } => "cs",
                 PoolType::StableSwap { .. } => "ss",
-                PoolType::BandedConcentratedLiquidity { .. } => "bcl",
+                PoolType::ConcentratedLiquidity { .. } => "cl",
             };
             *by_type.entry(kind).or_default() += 1;
             if self.v4_pool_allowlists.is_restricted(ident) {
@@ -1895,6 +1928,7 @@ impl AdminServer {
             pool_rows.push(serde_json::json!({
                 "pool_id": hex::encode(ident.to_bytes()),
                 "pool_type": kind,
+                "unknown_modules": unknown_modules,
                 "reserves": asset_list(pd.assets.iter().cloned().collect()),
                 "total_lp": pd.total_lp.to_string(),
                 "protocol_lp": protocol_lp.to_string(),
@@ -2067,7 +2101,11 @@ impl AdminServer {
 
         for (ident, pool) in &state.pools {
             let ident_hex = hex::encode(ident.to_bytes());
-            let mut json = Self::v4_pool_json(pool, &self.v4_module_preimages);
+            let mut json = Self::v4_pool_json(
+                pool,
+                &self.v4_module_preimages,
+                self.v4_unknown_modules(pool),
+            );
             if self.v4_pool_allowlists.is_restricted(ident)
                 && let Some(obj) = json.as_object_mut()
             {
@@ -2264,6 +2302,7 @@ mod protocol_stats_tests {
             v4_routing_costs: None,
             v4_pool_allowlists: Arc::default(),
             v4_module_preimages: Arc::default(),
+            v4_module_scripts: None,
             v4_protocol_share: Some((1, 2)),
             v4_dao: None,
             resync_tx,
@@ -2333,6 +2372,111 @@ mod protocol_stats_tests {
 
         assert_eq!(v["activity"]["records_available"], false);
         assert_eq!(v["fees"]["protocol_share"], serde_json::json!([1, 2]));
+    }
+
+    fn cl_pool(env: &TestEnv) -> Arc<crate::sundaev4::SundaeV4Pool> {
+        make_cl_pool(
+            env,
+            0xC1,
+            vec![(token_a(), 4_000_000), (token_b(), 4_000_000)],
+            cl_eq8_config(crate::sundaev4::Rational {
+                num: 3.into(),
+                den: 1000.into(),
+            }),
+        )
+    }
+
+    /// The names a CL pool has on the status endpoints. Releases to 0.8.0
+    /// wrote `BandedConcentratedLiquidity` and `bcl`; the dashboard reads
+    /// both forms.
+    #[tokio::test]
+    async fn a_cl_pool_is_named_cl_on_the_status_endpoints() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
+        let pool = cl_pool(&env);
+        let id = hex::encode(pool.pool_datum.identifier.to_bytes());
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool);
+        let mut server = server_over(state);
+        server.v4_module_scripts = Some(Arc::new(env.exec.module_scripts.clone()));
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_list_pools().await).unwrap();
+        let pool_type = v[&id]["pool_type"].as_object().unwrap();
+        assert_eq!(
+            pool_type.keys().collect::<Vec<_>>(),
+            ["ConcentratedLiquidity"]
+        );
+        assert!(v[&id]["band_state"]["active_band"].is_number());
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_protocol_stats().await).unwrap();
+        assert_eq!(v["pools"]["by_type"], serde_json::json!({ "cl": 1 }));
+        assert_eq!(v["protocol_equity"]["pools"][0]["pool_type"], "cl");
+        assert!(v["protocol_equity"]["pools"][0]["unknown_modules"].is_null());
+    }
+
+    /// A pool whose curve module the config does not list keeps its
+    /// `ConstantProduct` placeholder in the state. The status endpoints
+    /// show it as an unknown module with the hash, and not as a CP pool.
+    #[tokio::test]
+    async fn a_pool_with_an_unlisted_curve_module_is_shown_as_unknown() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
+        let unlisted = vec![0xEE; 28];
+        let mut pool = (*cl_pool(&env)).clone();
+        for action in pool.pool_datum.actions.iter_mut() {
+            action.modules[0] = unlisted.clone();
+        }
+        // What the indexer stores for this datum.
+        pool.pool_type = crate::sundaev4::detect_pool_type(
+            &pool.pool_datum,
+            Some(&env.exec),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            pool.pool_type,
+            crate::sundaev4::PoolType::ConstantProduct { .. }
+        ));
+        let id = hex::encode(pool.pool_datum.identifier.to_bytes());
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.pools.insert(pool.pool_datum.identifier.clone(), Arc::new(pool));
+        let mut server = server_over(state);
+        server.v4_module_scripts = Some(Arc::new(env.exec.module_scripts.clone()));
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_list_pools().await).unwrap();
+        let modules = &v[&id]["pool_type"]["UnknownModule"]["modules"];
+        assert!(
+            modules.as_array().unwrap().contains(&hex::encode(&unlisted).into()),
+            "{modules}"
+        );
+        assert!(v[&id]["pool_type"].get("ConstantProduct").is_none());
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_protocol_stats().await).unwrap();
+        assert_eq!(v["pools"]["by_type"], serde_json::json!({ "unknown": 1 }));
+        let row = &v["protocol_equity"]["pools"][0];
+        assert_eq!(row["pool_type"], "unknown");
+        assert!(
+            row["unknown_modules"].as_array().unwrap().contains(&hex::encode(&unlisted).into())
+        );
+    }
+
+    /// An operator can open the dashboard of this release on an instance
+    /// of release 0.8.0 through a proxy, so the dashboard reads the CL
+    /// names of both. This test pins that the script reads each name; it
+    /// does not run the script.
+    #[test]
+    fn the_dashboard_reads_the_cl_names_of_both_releases() {
+        let html = include_str!("../static/dashboard.html");
+        for name in [
+            "pt.ConcentratedLiquidity",
+            "pt.BandedConcentratedLiquidity",
+            "bt.cl",
+            "bt.bcl",
+            "typeBadge.bcl",
+            "pt.UnknownModule",
+        ] {
+            assert!(html.contains(name), "the dashboard does not read {name}");
+        }
     }
 
     #[tokio::test]
@@ -2494,6 +2638,7 @@ mod listener_tests {
             v4_routing_costs: None,
             v4_pool_allowlists: Arc::default(),
             v4_module_preimages: Arc::default(),
+            v4_module_scripts: None,
             v4_protocol_share: None,
             v4_dao: None,
             resync_tx,

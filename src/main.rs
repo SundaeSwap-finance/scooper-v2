@@ -273,6 +273,7 @@ async fn run() -> Result<()> {
         .as_ref()
         .map(|e| server::compute_module_state_preimages(e.fee, e.protocol_share))
         .unwrap_or_default();
+    let v4_module_scripts = v4_execution.as_ref().map(|e| Arc::new(e.module_scripts.clone()));
     let paused = Arc::new(AtomicBool::new(false));
     let metrics = Arc::new(metrics::Metrics::new());
     // Mempool monitor (phase 1: observation only): mirrors the local node's
@@ -324,6 +325,7 @@ async fn run() -> Result<()> {
         v4_routing_costs,
         v4_pool_allowlists,
         v4_module_preimages,
+        v4_module_scripts,
         v4_protocol_share,
         v4_state.as_ref().map(|_| Arc::from(persistence.indexer_dao("sundae_v4"))),
         resync_tx,

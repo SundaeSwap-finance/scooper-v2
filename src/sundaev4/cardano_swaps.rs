@@ -783,7 +783,7 @@ pub struct ForeignFillPlan {
 
 /// Whether the scooper holds the config a pool's module hashes into its
 /// datum. Constant-product and constant-sum carry theirs in the pool type;
-/// stableswap and banded pools pin a preimage by hash, and the indexer
+/// stableswap and CL pools pin a preimage by hash, and the indexer
 /// substitutes a placeholder when it has none.
 fn pool_config_known(pool: &crate::sundaev4::types::SundaeV4Pool) -> bool {
     let slot_holds = |hash: Vec<u8>| pool.pool_datum.module_state.iter().any(|(_, s)| *s == hash);
@@ -791,9 +791,8 @@ fn pool_config_known(pool: &crate::sundaev4::types::SundaeV4Pool) -> bool {
         PoolType::StableSwap { config } => {
             slot_holds(crate::sundaev4::ss_math::config_hash(config))
         }
-        PoolType::BandedConcentratedLiquidity { config } => {
-            !config.bands.is_empty()
-                && slot_holds(crate::sundaev4::banded_math::config_hash(config))
+        PoolType::ConcentratedLiquidity { config } => {
+            !config.bands.is_empty() && slot_holds(crate::sundaev4::cl_math::config_hash(config))
         }
         PoolType::ConstantProduct { .. } | PoolType::ConstantSum { .. } => true,
     }
@@ -824,7 +823,7 @@ impl CardanoSwapsRuntime {
         use num_traits::ToPrimitive;
         let cfg = self.foreign_fills.as_ref().ok_or("foreign fills disabled")?;
         // Every family's own math sizes the step. A pool whose config the
-        // scooper does not hold yet (a stableswap rate set or a banded ladder
+        // scooper does not hold yet (a stableswap rate set or a CL ladder
         // whose preimage was never indexed) carries a placeholder the builder
         // would refuse; skip it here rather than plan against it.
         if !pool_config_known(pool) {
@@ -859,15 +858,15 @@ impl CardanoSwapsRuntime {
         if available == 0 {
             return Err("order has nothing left to offer".into());
         }
-        // A banded ladder is walked through the router's cached view with the
+        // A CL ladder is walked through the router's cached view with the
         // witness found once; walking it from scratch per probe (and
         // re-finding the witness each time) made one search take minutes.
         let ladder = match &pool.pool_type {
-            PoolType::BandedConcentratedLiquidity { config } => {
+            PoolType::ConcentratedLiquidity { config } => {
                 let (a, b) = (&assets[0].1, &assets[1].1);
-                let witness = crate::sundaev4::banded_math::find_witness(config, a, b)
-                    .ok_or("no banded witness for the pool's reserves")?;
-                Some(crate::sundaev4::router::BandedLadder::new(
+                let witness = crate::sundaev4::cl_math::find_witness(config, a, b)
+                    .ok_or("no CL witness for the pool's reserves")?;
+                Some(crate::sundaev4::router::CLLadder::new(
                     config.clone(),
                     a.clone(),
                     b.clone(),
@@ -1090,7 +1089,7 @@ mod foreign_fill_tests {
     use super::*;
     use crate::sundaev4::batch::{Batch, BatchOp, ScoopPlan};
     use crate::sundaev4::test_harness::{
-        TestEnv, ada, bcl_eq8_config, make_bcl_pool, make_cs_pool, make_pool, make_settings,
+        TestEnv, ada, cl_eq8_config, make_cl_pool, make_cs_pool, make_pool, make_settings,
         make_ss_pool, ss_config,
     };
     use crate::sundaev4::types::Rational;
@@ -1211,18 +1210,18 @@ mod foreign_fill_tests {
         surplus
     }
 
-    /// A banded ladder walks its own steps and witnesses; the fill is one
+    /// A CL ladder walks its own steps and witnesses; the fill is one
     /// more served order to the module.
     #[test]
-    fn banded_pool_fill_lands_surplus() {
+    fn cl_pool_fill_lands_surplus() {
         let mut env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let snap = env.enable_cardano_swaps().clone();
         // Ladder around 1 USDM per ADA; the order sells ADA at 0.23.
-        let pool = make_bcl_pool(
+        let pool = make_cl_pool(
             &env,
             0xF5,
             vec![(ada(), 6_161_607_000), (usdm(), 6_469_719_000)],
-            bcl_eq8_config(Rational {
+            cl_eq8_config(Rational {
                 num: BigInt::from(3),
                 den: BigInt::from(1000),
             }),
@@ -1310,8 +1309,8 @@ mod foreign_fill_tests {
             "rates the datum does not pin"
         );
         let mut unknown = (*known).clone();
-        unknown.pool_type = PoolType::BandedConcentratedLiquidity {
-            config: crate::sundaev4::types::BandedCLConfig {
+        unknown.pool_type = PoolType::ConcentratedLiquidity {
+            config: crate::sundaev4::types::CLConfig {
                 bands: vec![],
                 index: vec![],
                 closing: Rational {

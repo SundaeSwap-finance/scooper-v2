@@ -887,8 +887,10 @@
     document.getElementById('protocol-pool-cards').innerHTML =
       statCard('Constant Product', bt.cp || 0) +
       statCard('Constant Sum', bt.cs || 0) +
-      statCard('Banded CL', bt.bcl || 0) +
+      // `bcl` is the key that releases to 0.8.0 emit for the CL pools.
+      statCard('Concentrated Liquidity', (bt.cl || 0) + (bt.bcl || 0)) +
       statCard('StableSwap', bt.ss || 0) +
+      (bt.unknown ? statCard('Unknown Module', bt.unknown) : '') +
       statCard('Empty Reserve', pools.empty || 0) +
       statCard('Allowlisted', pools.restricted || 0);
 
@@ -949,7 +951,8 @@
     assetRows('protocol-tvl-body', pools.tvl);
 
     var typeBadge = { cp: '<span class="badge badge-blue">CP</span>', cs: '<span class="badge badge-green">CS</span>',
-                      bcl: '<span class="badge badge-accent">BCL</span>', ss: '<span class="badge badge-green">SS</span>' };
+                      cl: '<span class="badge badge-accent">CL</span>', ss: '<span class="badge badge-green">SS</span>' };
+    typeBadge.bcl = typeBadge.cl;  // the name in releases to 0.8.0
     var prow = (eq.pools || []).slice();
     prow.forEach(function(p) { p._tvl = usdOf(p.reserves).usd; p._eq = usdOf(p.protocol_equity).usd; });
     prow.sort(function(a, b) { return b._tvl - a._tvl; });
@@ -958,7 +961,7 @@
       var share = p.protocol_share ? parseBigint(p.protocol_share.num) + '/' + parseBigint(p.protocol_share.den) : shareText;
       var reserves = (p.reserves || []).map(function(e) { return formatAssetClass(e.asset) + ': ' + fmtQty(wholeUnits(e.asset, e.amount)); }).join(' / ');
       tr.innerHTML = '<td>' + copyable(truncate(p.pool_id, 16), p.pool_id) + (p.restricted ? ' <span class="badge badge-yellow">allowlist</span>' : '') + '</td>' +
-        '<td>' + (typeBadge[p.pool_type] || p.pool_type) + '</td>' +
+        '<td>' + (p.pool_type === 'unknown' ? unknownModuleBadge(p.unknown_modules) : (typeBadge[p.pool_type] || escapeHtml(p.pool_type))) + '</td>' +
         '<td>' + reserves + '</td>' + usdCell(p.reserves) + usdCell(p.protocol_equity) +
         '<td class="num" title="' + escapeHtml('raw ' + Number(p.surplus_lovelace || 0).toLocaleString() + ' lovelace · min_surplus floor ' + fmtQty(Number(p.min_surplus || 0) / 1e6) + ' ADA') + '">' + fmtQty(Number(p.surplus_lovelace || 0) / 1e6) + '</td>' +
         '<td class="num">' + share + '</td>';
@@ -1491,13 +1494,23 @@
     return formatAssetClass(a) + ' / ' + formatAssetClass(b);
   }
 
+  // A pool whose curve module the instance's config does not list. The
+  // scooper does not scoop it.
+  function unknownModuleBadge(modules) {
+    var title = 'The config of this instance does not list the curve module of this pool. The pool is not scooped.';
+    if (modules && modules.length) title += ' Module hash: ' + modules.join(', ');
+    return '<span class="badge badge-yellow" title="' + escapeHtml(title) + '">? unknown module</span>';
+  }
+
   function formatPoolType(pt, bandState) {
     if (!pt) return '<span class="badge badge-yellow">?</span>';
+    if (pt.UnknownModule) return unknownModuleBadge(pt.UnknownModule.modules);
     if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
     if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
     if (pt.StableSwap) return '<span class="badge badge-green">SS</span>';
-    if (pt.BandedConcentratedLiquidity) {
-      var badge = '<span class="badge badge-accent">BCL</span>';
+    // `BandedConcentratedLiquidity` is the name in releases to 0.8.0.
+    if (pt.ConcentratedLiquidity || pt.BandedConcentratedLiquidity) {
+      var badge = '<span class="badge badge-accent">CL</span>';
       if (bandState && bandState.bands != null) {
         var title = 'ladder counter ' + bandState.counter +
           '; active band sqrt-price [' + bandState.sqrt_price_lo + ', ' + bandState.sqrt_price_hi + ')' +

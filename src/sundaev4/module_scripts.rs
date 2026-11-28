@@ -70,7 +70,7 @@ impl ModuleKind {
             ModuleKind::ConstantProduct => "constant-product",
             ModuleKind::ConstantSum => "constant-sum",
             ModuleKind::Stableswap => "stableswap",
-            ModuleKind::ConcentratedLiquidity => "banded-concentrated-liquidity",
+            ModuleKind::ConcentratedLiquidity => "concentrated-liquidity",
             ModuleKind::FeeSplit => "fee-split",
             ModuleKind::Fairness => "fairness",
             ModuleKind::Oracle => "oracle",
@@ -83,10 +83,11 @@ impl ModuleKind {
         }
     }
 
-    /// The kind a config key names. `concentrated-liquidity` is an alias of
-    /// `banded-concentrated-liquidity`.
+    /// The kind a config key names. `banded-concentrated-liquidity` is the
+    /// name of the CL role in releases to 0.8.0. Operator configs hold it,
+    /// so it stays an alias of `concentrated-liquidity`.
     pub fn from_config_key(key: &str) -> Option<ModuleKind> {
-        if key == "concentrated-liquidity" {
+        if key == "banded-concentrated-liquidity" {
             return Some(ModuleKind::ConcentratedLiquidity);
         }
         ModuleKind::ALL.into_iter().find(|k| k.config_key() == key)
@@ -490,6 +491,37 @@ impl ModuleScripts {
     pub fn pool_invariant(&self, pool_datum: &PoolDatum) -> Option<(ModuleKind, ScriptHash)> {
         let first = self.scoop_action(pool_datum)?.modules.first()?;
         Some((self.kind_of(first)?, hash_of_slice(first)?))
+    }
+
+    /// The first-module hashes of the pool's enabled actions, when the
+    /// config registers no invariant module for the pool. `None` when the
+    /// pool has a scoop action, and `None` when only a disabled action names
+    /// a registered invariant module (an emergency-disabled pool: its
+    /// modules are known).
+    ///
+    /// The scooper cannot classify such a pool and does not scoop it.
+    /// `detect_pool_type` gives it a `ConstantProduct` placeholder. The
+    /// status endpoints call this function to show the pool as an unknown
+    /// module and not as a CP pool.
+    pub fn unknown_invariant_modules(&self, pool_datum: &PoolDatum) -> Option<Vec<Vec<u8>>> {
+        if self.pool_invariant(pool_datum).is_some() {
+            return None;
+        }
+        let mut all_enabled = pool_datum.clone();
+        for a in all_enabled.actions.iter_mut() {
+            a.enabled = true;
+        }
+        if self.pool_invariant(&all_enabled).is_some() {
+            return None;
+        }
+        Some(
+            pool_datum
+                .actions
+                .iter()
+                .filter(|a| a.enabled)
+                .filter_map(|a| a.modules.first().cloned())
+                .collect(),
+        )
     }
 
     /// The hash of the first module of `kind` that the pool's scoop action

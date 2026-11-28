@@ -450,7 +450,7 @@
             "hash": "f47f6594cab956302f7f1cd81ac4122e9ee128146102497feca1a79f",
             "ref-utxo": "419cbf3bc96169d0a46cc9d5a122e8a9ee1f4b1f71625911def64294468dfc8d#0"
           },
-          "banded-concentrated-liquidity": {
+          "concentrated-liquidity": {
             "hash": "5c1ec4813a3d5575d521d03682a36b43b8122a4a99c4f2cdcd742194",
             "ref-utxo": "461468832c5ae18b43d70d630c3d6413e2d8b67000e49f05bd77abfea791af96#0"
           }

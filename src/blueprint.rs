@@ -293,17 +293,23 @@ impl Blueprint {
         )
         .ok();
 
-        // Banded concentrated liquidity (optional — only present once deployed).
-        let banded_concentrated_liquidity = make_info(
+        // Concentrated liquidity (optional — only present once deployed).
+        // The `banded` names are those of blueprints written before the
+        // module was renamed; they keep those files loadable.
+        let concentrated_liquidity = make_info(
             self,
             &[
+                "concentrated_liquidity.withdraw",
+                "concentrated_liquidity_module",
+                "concentrated_liquidity",
+                "concentratedLiquidity",
                 "banded_concentrated_liquidity.withdraw",
                 "banded_concentrated_liquidity_module",
                 "banded_concentrated_liquidity",
                 "bandedConcentratedLiquidity",
             ],
-            "banded_concentrated_liquidity.withdraw",
-            "banded_concentrated_liquidity",
+            "concentrated_liquidity.withdraw",
+            "concentrated_liquidity",
         )
         .ok();
         // The general price oracle module (optional).
@@ -354,10 +360,7 @@ impl Blueprint {
         add(ModuleKind::ConstantSum, constant_sum)?;
         add(ModuleKind::FeeConstraint, fee_constraint)?;
         add(ModuleKind::Stableswap, stableswap)?;
-        add(
-            ModuleKind::ConcentratedLiquidity,
-            banded_concentrated_liquidity,
-        )?;
+        add(ModuleKind::ConcentratedLiquidity, concentrated_liquidity)?;
         add(ModuleKind::Oracle, oracle)?;
         add(ModuleKind::SwapOrder, swap_order)?;
         add(ModuleKind::BasicOrder, basic_order)?;
@@ -476,6 +479,26 @@ mod tests {
             !modules.modules.has_kind(ModuleKind::ConstantProduct),
             "cs-launch scope does not publish CP"
         );
+    }
+
+    /// A blueprint written before the CL module was renamed names it
+    /// `bandedConcentratedLiquidity`. It resolves to the same CL script.
+    #[test]
+    fn the_old_cl_validator_name_still_resolves() {
+        use crate::sundaev4::ModuleKind;
+        let data = std::fs::read_to_string("test/fixtures/preview-audited-blueprint.json").unwrap();
+        assert_eq!(data.matches("\"concentratedLiquidity\"").count(), 2);
+        let cl = |data: &str| {
+            let bp: Blueprint = serde_json::from_str(data).unwrap();
+            let ms = bp.to_v4_module_scripts().expect("module scripts resolve");
+            let cl = ms.of_kind(ModuleKind::ConcentratedLiquidity).next().expect("a CL module");
+            (cl.hash, cl.ref_utxo.clone())
+        };
+        let old = data.replace(
+            "\"concentratedLiquidity\"",
+            "\"bandedConcentratedLiquidity\"",
+        );
+        assert_eq!(cl(&old), cl(&data));
     }
 
     #[test]
