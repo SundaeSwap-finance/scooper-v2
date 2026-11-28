@@ -154,7 +154,7 @@ config in two places:
 
 1. Add the concentrated-liquidity entry:
    ```json
-   "banded-concentrated-liquidity": {
+   "concentrated-liquidity": {
      "hash": "5c1ec4813a3d5575d521d03682a36b43b8122a4a99c4f2cdcd742194",
      "ref-utxo": "461468832c5ae18b43d70d630c3d6413e2d8b67000e49f05bd77abfea791af96#0"
    }
@@ -183,8 +183,9 @@ entry. Concentrated-liquidity pools name the second one.
 If you install 0.8.0 and do not change the config, it scoops the pools it
 scooped before, and it does not scoop concentrated-liquidity pools.
 
-`concentrated-liquidity` is accepted as a name for the
-`banded-concentrated-liquidity` role.
+Releases to 0.8.0 named this role `banded-concentrated-liquidity`. A
+config that has the old name continues to work. You do not have to change
+it.
 
 ## Recover a scooper
 

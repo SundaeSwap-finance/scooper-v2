@@ -665,15 +665,15 @@ pub enum PoolType {
     StableSwap {
         config: StableSwapConfig,
     },
-    /// Banded concentrated liquidity
-    /// (`validators/modules/banded_concentrated_liquidity.ak`): a ladder of
+    /// Concentrated liquidity
+    /// (`validators/modules/concentrated_liquidity.ak`): a ladder of
     /// price bands, each a CL arc or a constant-sum bin, sharing one
     /// liquidity counter that IS the pool's `total_lp`. Like stableswap the
     /// whole config preimage rides along: every Operate entry re-sends it and
     /// the datum's `module_state` slot is its hash. Unlike stableswap it never
     /// changes after Create.
-    BandedConcentratedLiquidity {
-        config: BandedCLConfig,
+    ConcentratedLiquidity {
+        config: CLConfig,
     },
 }
 
@@ -704,7 +704,7 @@ pub struct ConstantProductConfig {
     pub fee: Rational,
 }
 
-/// One band of a ladder (`types/banded_cl.BandSpec`). `start` is the band's
+/// One band of a ladder (`types/cl.BandSpec`). `start` is the band's
 /// LOWER sqrt-price edge; its upper edge is the next band's `start`, or the
 /// config's `closing` for the last band. `curve` is 0 for a CL arc and 1 for
 /// a constant-sum bin. `fee_buy` applies when the trade buys asset A (pays
@@ -727,16 +727,16 @@ pub struct BandSpec {
 /// `ext` is `Some` for the five-field config the module reads. `None` is
 /// the four-field config of the pre-audit preview modules. The scooper
 /// decodes that form only to recover a ladder from chain history
-/// (`banded_math::config_forms`); it never scoops a pool that stores it.
+/// (`cl_math::config_forms`); it never scoops a pool that stores it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct BandedCLConfig {
+pub struct CLConfig {
     pub bands: Vec<BandSpec>,
     /// The ladder index (sundae-v4 spec section 2.3): one entry per band,
     /// each the pair of cumulative saturation coefficients for the bands
     /// ABOVE and BELOW it, in fixed point at `2^64` and rounded up. `Create`
     /// pins it against `bands` (V13) and a spend reads one entry instead of
     /// walking the ladder, so the prefix sums round up ONCE rather than once
-    /// per band. Build it with `banded_math::build_index`; never write one by
+    /// per band. Build it with `cl_math::build_index`; never write one by
     /// hand.
     pub index: Vec<(BigInt, BigInt)>,
     pub closing: Rational,
@@ -747,7 +747,7 @@ pub struct BandedCLConfig {
     pub ext: Option<PlutusData>,
 }
 
-impl BandedCLConfig {
+impl CLConfig {
     /// `Void`: `Constr 0 []`.
     pub fn void_data() -> PlutusData {
         plutus_parser::create_constr(0, vec![])
@@ -768,7 +768,7 @@ impl BandedCLConfig {
     }
 }
 
-impl AsPlutus for BandedCLConfig {
+impl AsPlutus for CLConfig {
     fn from_plutus(data: PlutusData) -> Result<Self, plutus_parser::DecodeError> {
         let (variant, fields) = plutus_parser::parse_constr(data)?;
         if variant != 0 {
@@ -1112,21 +1112,21 @@ pub struct SSOperateEntry {
 //
 // `Operate` here is the pre-audit form, one config per entry. The scooper
 // reads it from chain history and uses it as the decoded form of both
-// redeemers (`from_plutus_any_form`); it writes `BandedCLTableRedeemer`
-// (`BandedCLRedeemer::operate`).
+// redeemers (`from_plutus_any_form`); it writes `CLTableRedeemer`
+// (`CLRedeemer::operate`).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub enum BandedCLRedeemer {
+pub enum CLRedeemer {
     /// `initial_state` stays field 0 (pool_mint hashes it for module_state).
     /// `initial_band` is the band holding the launch price; the counter is
     /// the pool's `total_lp` and has no field.
     Create {
-        initial_state: BandedCLConfig,
+        initial_state: CLConfig,
         pool_output_index: u64,
         initial_band: u64,
     },
     Operate {
-        entries: Vec<BandedOperateEntry>,
+        entries: Vec<CLOperateEntry>,
     },
     /// SUN-103/ADR-0006 teardown; parsed only.
     Destroy {
@@ -1134,56 +1134,56 @@ pub enum BandedCLRedeemer {
     },
 }
 
-/// One pool's entry in `BandedCLRedeemer::Operate`. `config` is the ladder
+/// One pool's entry in `CLRedeemer::Operate`. `config` is the ladder
 /// as stored in the pool INPUT's `module_state`; `counter` / `active_band`
 /// are the witness pair for the pool input's reserves, which the walk's
-/// first step re-derives and checks (`banded_cl_check.band_proof`).
+/// first step re-derives and checks (`cl_check.band_proof`).
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct BandedOperateEntry {
+pub struct CLOperateEntry {
     pub pool_oref: OutputRef,
-    pub config: BandedCLConfig,
+    pub config: CLConfig,
     pub counter: BigInt,
     pub active_band: BigInt,
 }
 
 /// `ConcentratedLiquidityRedeemer` (sundae-v4 115f19d), the form the
-/// scooper writes. `Create` and `Destroy` are those of `BandedCLRedeemer`.
+/// scooper writes. `Create` and `Destroy` are those of `CLRedeemer`.
 /// `Operate` carries each ladder once in `configs` (d09ab60); an entry
 /// names its ladder by position. The module
 /// hashes the config at that position and compares the hash with the
 /// pool's own `module_state` slot, so a wrong index fails on chain.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub enum BandedCLTableRedeemer {
+pub enum CLTableRedeemer {
     Create {
-        initial_state: BandedCLConfig,
+        initial_state: CLConfig,
         pool_output_index: u64,
         initial_band: u64,
     },
     Operate {
-        entries: Vec<BandedTableEntry>,
-        configs: Vec<BandedCLConfig>,
+        entries: Vec<CLTableEntry>,
+        configs: Vec<CLConfig>,
     },
     Destroy {
         entries: Vec<PlutusData>,
     },
 }
 
-/// One pool's entry in `BandedCLTableRedeemer::Operate`.
+/// One pool's entry in `CLTableRedeemer::Operate`.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct BandedTableEntry {
+pub struct CLTableEntry {
     pub pool_oref: OutputRef,
     pub config_index: u64,
     pub counter: BigInt,
     pub active_band: BigInt,
 }
 
-impl BandedCLRedeemer {
+impl CLRedeemer {
     /// The `Operate` redeemer for `entries` in batch order, in the form the
-    /// module reads (`BandedCLTableRedeemer`). Equal ladders share one
+    /// module reads (`CLTableRedeemer`). Equal ladders share one
     /// table position, in order of first use.
-    pub fn operate(entries: Vec<BandedOperateEntry>) -> PlutusData {
-        let mut configs: Vec<BandedCLConfig> = vec![];
+    pub fn operate(entries: Vec<CLOperateEntry>) -> PlutusData {
+        let mut configs: Vec<CLConfig> = vec![];
         let entries = entries
             .into_iter()
             .map(|e| {
@@ -1194,7 +1194,7 @@ impl BandedCLRedeemer {
                         configs.len() - 1
                     }
                 };
-                BandedTableEntry {
+                CLTableEntry {
                     pool_oref: e.pool_oref,
                     config_index: config_index as u64,
                     counter: e.counter,
@@ -1202,7 +1202,7 @@ impl BandedCLRedeemer {
                 }
             })
             .collect();
-        BandedCLTableRedeemer::Operate { entries, configs }.to_plutus()
+        CLTableRedeemer::Operate { entries, configs }.to_plutus()
     }
 
     /// Decode either redeemer form: the table form the module reads, or
@@ -1211,21 +1211,21 @@ impl BandedCLRedeemer {
     /// resolved from the table. `Err` when the data is
     /// neither form, or when an entry's index is past the table.
     pub fn from_plutus_any_form(data: PlutusData) -> Result<Self, String> {
-        if let Ok(r) = BandedCLRedeemer::from_plutus(data.clone()) {
+        if let Ok(r) = CLRedeemer::from_plutus(data.clone()) {
             return Ok(r);
         }
-        match BandedCLTableRedeemer::from_plutus(data).map_err(|e| e.to_string())? {
-            BandedCLTableRedeemer::Create {
+        match CLTableRedeemer::from_plutus(data).map_err(|e| e.to_string())? {
+            CLTableRedeemer::Create {
                 initial_state,
                 pool_output_index,
                 initial_band,
-            } => Ok(BandedCLRedeemer::Create {
+            } => Ok(CLRedeemer::Create {
                 initial_state,
                 pool_output_index,
                 initial_band,
             }),
-            BandedCLTableRedeemer::Destroy { entries } => Ok(BandedCLRedeemer::Destroy { entries }),
-            BandedCLTableRedeemer::Operate { entries, configs } => {
+            CLTableRedeemer::Destroy { entries } => Ok(CLRedeemer::Destroy { entries }),
+            CLTableRedeemer::Operate { entries, configs } => {
                 let entries = entries
                     .into_iter()
                     .map(|e| {
@@ -1237,7 +1237,7 @@ impl BandedCLRedeemer {
                                     configs.len()
                                 )
                             })?;
-                        Ok(BandedOperateEntry {
+                        Ok(CLOperateEntry {
                             pool_oref: e.pool_oref,
                             config,
                             counter: e.counter,
@@ -1245,44 +1245,44 @@ impl BandedCLRedeemer {
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                Ok(BandedCLRedeemer::Operate { entries })
+                Ok(CLRedeemer::Operate { entries })
             }
         }
     }
 }
 
-/// The pre-V13 ladder: `BandedCLConfig` without the index (spec section
+/// The pre-V13 ladder: `CLConfig` without the index (spec section
 /// 2.3). Pools created before the index carry this form in their `Create`
 /// redeemer. The index is a pure function of the bands, so
-/// `banded_math::with_index` rebuilds the current config from this one; the
+/// `cl_math::with_index` rebuilds the current config from this one; the
 /// indexer uses that to recover the config of a pool an index-swap governor
 /// migrated. Parsed only; the scooper never writes this form.
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct LegacyBandedCLConfig {
+pub struct LegacyCLConfig {
     pub bands: Vec<BandSpec>,
     pub closing: Rational,
     pub weight_total: BigInt,
 }
 
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub struct LegacyBandedOperateEntry {
+pub struct LegacyCLOperateEntry {
     pub pool_oref: OutputRef,
-    pub config: LegacyBandedCLConfig,
+    pub config: LegacyCLConfig,
     pub counter: BigInt,
     pub active_band: BigInt,
 }
 
-/// `BandedCLRedeemer` in its pre-V13 form. See `LegacyBandedCLConfig`.
+/// `CLRedeemer` in its pre-V13 form. See `LegacyCLConfig`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, AsPlutus, Clone, PartialEq, Eq)]
-pub enum LegacyBandedCLRedeemer {
+pub enum LegacyCLRedeemer {
     Create {
-        initial_state: LegacyBandedCLConfig,
+        initial_state: LegacyCLConfig,
         pool_output_index: u64,
         initial_band: u64,
     },
     Operate {
-        entries: Vec<LegacyBandedOperateEntry>,
+        entries: Vec<LegacyCLOperateEntry>,
     },
     Destroy {
         entries: Vec<PlutusData>,

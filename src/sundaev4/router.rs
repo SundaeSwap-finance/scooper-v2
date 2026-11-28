@@ -18,7 +18,7 @@ use crate::sundaev4::types::SundaeV4Pool;
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// Pool-type-specific parameters for the router.
-// The banded variant is large; boxing it would change every construction
+// The CL variant is large; boxing it would change every construction
 // site for no measured gain, so the size difference is accepted.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
@@ -52,7 +52,7 @@ pub enum PoolViewType {
         rate_out: BigInt,
         d: BigInt,
     },
-    /// One band of a banded concentrated-liquidity ladder, direction-
+    /// One band of a concentrated-liquidity ladder, direction-
     /// oriented. The view's `reserve_in` / `reserve_out` are the band's
     /// RESIDUAL reserves (what the active band itself holds), its
     /// `fee_num/fee_den` the band's fee for this direction, and `band`
@@ -60,13 +60,13 @@ pub enum PoolViewType {
     /// out more than the residual leaves the band, which is a second
     /// transcript step this scooper does not build, so `reserve_out` is the
     /// edge's hard capacity.
-    Banded {
+    ConcentratedLiquidity {
         is_a_input: bool,
         /// The active band at the pool's current reserves: the cheap path
         /// for inputs the band can absorb.
-        band: crate::sundaev4::banded_math::BandView,
+        band: crate::sundaev4::cl_math::BandView,
         /// The whole ladder, for inputs that cross band edges.
-        ladder: std::sync::Arc<BandedLadder>,
+        ladder: std::sync::Arc<CLLadder>,
     },
 }
 
@@ -76,19 +76,19 @@ pub enum PoolViewType {
 type AfterCache = std::sync::Mutex<
     std::collections::BTreeMap<
         (bool, BigInt),
-        Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)>,
+        Option<(BigInt, BigInt, crate::sundaev4::cl_math::BandView)>,
     >,
 >;
 
-/// A banded pool's ladder and reserves, enough to plan multi-band swaps.
+/// A CL pool's ladder and reserves, enough to plan multi-band swaps.
 /// Caches what the route search asks for repeatedly: the ladder capacity per
 /// direction and the state after each input amount.
 #[derive(Debug)]
-pub struct BandedLadder {
-    pub cfg: crate::sundaev4::types::BandedCLConfig,
+pub struct CLLadder {
+    pub cfg: crate::sundaev4::types::CLConfig,
     pub a: BigInt,
     pub b: BigInt,
-    pub witness: crate::sundaev4::banded_math::Witness,
+    pub witness: crate::sundaev4::cl_math::Witness,
     capacity: [std::sync::OnceLock<BigInt>; 2],
     #[cfg(test)]
     after: AfterCache,
@@ -102,18 +102,18 @@ pub struct BandedLadder {
 /// each doing ladder math in bignums, with a cache keyed on the exact `dx`
 /// that the bisection never probes twice. Measured on 12-band ladders:
 /// 38.7ms for 4 pools, 809ms for 31, 1307ms for 48 — superlinear past
-/// about 16 pools. Preview reached 31 banded pools and the scooper pegged
+/// about 16 pools. Preview reached 31 CL pools and the scooper pegged
 /// a core at 100%, dispatching one order every 16-63 seconds and starving
 /// its own metrics listener.
 ///
 /// The sequence of bands a fill walks through does NOT depend on lambda.
 /// Lambda only decides where the walk STOPS. So the walk is done once per
-/// pool per direction and shared through the `Arc<BandedLadder>` across
+/// pool per direction and shared through the `Arc<CLLadder>` across
 /// every order in the cycle.
 #[derive(Debug, Clone)]
 pub struct FillStep {
     /// The band's view at the point the fill reaches it.
-    pub view: crate::sundaev4::banded_math::BandView,
+    pub view: crate::sundaev4::cl_math::BandView,
     /// Input that fills this band completely.
     pub cap: BigInt,
     /// Marginal out-per-in at the band's OPENING: the best price it offers.
@@ -128,12 +128,12 @@ pub struct FillStep {
     pub before_out: BigInt,
 }
 
-impl BandedLadder {
+impl CLLadder {
     pub fn new(
-        cfg: crate::sundaev4::types::BandedCLConfig,
+        cfg: crate::sundaev4::types::CLConfig,
         a: BigInt,
         b: BigInt,
-        witness: crate::sundaev4::banded_math::Witness,
+        witness: crate::sundaev4::cl_math::Witness,
     ) -> Self {
         Self {
             cfg,
@@ -178,7 +178,7 @@ impl BandedLadder {
     /// per curve on preview, and 85% of all routing time once every order
     /// in a cycle saw the previous order's predicted pool states.
     fn build_fill_curve(&self, is_a_input: bool) -> Vec<FillStep> {
-        use crate::sundaev4::banded_math as bm;
+        use crate::sundaev4::cl_math as bm;
         let mut out: Vec<FillStep> = Vec::new();
         let cfg = &self.cfg;
         let n = cfg.bands.len();
@@ -218,8 +218,8 @@ impl BandedLadder {
             };
             if cap.is_positive() && dy.is_positive() {
                 out.push(FillStep {
-                    marginal_open: banded_marginal(&view, is_a_input, &BigInt::from(0)),
-                    marginal_full: banded_marginal(&view, is_a_input, &cap),
+                    marginal_open: cl_marginal(&view, is_a_input, &BigInt::from(0)),
+                    marginal_full: cl_marginal(&view, is_a_input, &cap),
                     cap: cap.clone(),
                     view,
                     before_in: cum.clone(),
@@ -249,7 +249,7 @@ impl BandedLadder {
     pub fn capacity(&self, is_a_input: bool) -> BigInt {
         self.capacity[usize::from(is_a_input)]
             .get_or_init(|| {
-                crate::sundaev4::banded_math::ladder_capacity_from(
+                crate::sundaev4::cl_math::ladder_capacity_from(
                     &self.cfg,
                     &self.a,
                     &self.b,
@@ -276,7 +276,7 @@ impl BandedLadder {
             let end = &step.before_in + &step.cap;
             if dx <= &end {
                 let within = dx - &step.before_in;
-                let dy = crate::sundaev4::banded_math::band_output(&step.view, is_a_input, &within);
+                let dy = crate::sundaev4::cl_math::band_output(&step.view, is_a_input, &within);
                 // A remainder that pays nothing in its band fails the step
                 // planner (it carries the remainder on and no later band
                 // pays for it either), so the ladder cannot absorb `dx`.
@@ -310,12 +310,12 @@ impl BandedLadder {
         &self,
         is_a_input: bool,
         dx: &BigInt,
-    ) -> Option<(BigInt, BigInt, crate::sundaev4::banded_math::BandView)> {
+    ) -> Option<(BigInt, BigInt, crate::sundaev4::cl_math::BandView)> {
         let key = (is_a_input, dx.clone());
         if let Some(v) = self.after.lock().unwrap().get(&key) {
             return v.clone();
         }
-        let v = crate::sundaev4::banded_math::view_after_from(
+        let v = crate::sundaev4::cl_math::view_after_from(
             &self.cfg,
             &self.a,
             &self.b,
@@ -334,12 +334,12 @@ impl BandedLadder {
 
 /// Marginal output per unit input (scaled by `scale()`) on one band view
 /// after `raw_allocated` has already gone in, with that band's own fee.
-fn banded_marginal(
-    band: &crate::sundaev4::banded_math::BandView,
+fn cl_marginal(
+    band: &crate::sundaev4::cl_math::BandView,
     is_a_input: bool,
     raw_allocated: &BigInt,
 ) -> BigInt {
-    let fee = crate::sundaev4::banded_math::fee_for(band, is_a_input);
+    let fee = crate::sundaev4::cl_math::fee_for(band, is_a_input);
     let fee_num = fee.num.clone();
     let fee_den = fee.den.clone();
     let fee_mult = &fee_den - &fee_num;
@@ -355,7 +355,7 @@ fn banded_marginal(
     }
     let va0 = &(&band.ra * spb_num) + &(&band.l * spb_den);
     let vb0 = &(&band.rb * spa_den) + &(&band.l * spa_num);
-    let dx_eff = raw_allocated - &crate::sundaev4::banded_math::band_fee(raw_allocated, fee);
+    let dx_eff = raw_allocated - &crate::sundaev4::cl_math::band_fee(raw_allocated, fee);
     if is_a_input {
         let va = &va0 + &(&dx_eff * spb_num);
         let denom = &fee_den * spa_den * &va * &va;
@@ -379,13 +379,13 @@ fn banded_marginal(
 ///
 /// `cap` is the band's `max_dx_in_band`, passed in because it is a
 /// bisection on `band_output` and the fill curve already holds it.
-fn banded_alloc_in_band(
-    band: &crate::sundaev4::banded_math::BandView,
+fn cl_alloc_in_band(
+    band: &crate::sundaev4::cl_math::BandView,
     is_a_input: bool,
     lambda: &BigInt,
     cap: BigInt,
 ) -> (BigInt, BigInt) {
-    let fee = crate::sundaev4::banded_math::fee_for(band, is_a_input);
+    let fee = crate::sundaev4::cl_math::fee_for(band, is_a_input);
     let fee_num = fee.num.clone();
     let fee_den = fee.den.clone();
     let fee_mult = &fee_den - &fee_num;
@@ -591,14 +591,14 @@ pub struct RoutingPlan {
 
 /// Whether a pool can absorb a given dx without its dy exceeding actual
 /// reserve_out. Always true for CP/CS (their dy is bounded by reserve_out
-/// naturally — CP — or by the input value — CS). A banded band is capped at
+/// naturally — CP — or by the input value — CS). A CL band is capped at
 /// its residual output reserve.
 fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
     match pool_absorb_cap(pool) {
         // Unbounded (CP): always absorbs.
         None => true,
         // Bounded: dx must fit under the cap. `Some(0)`/negative cap ⇒ nothing
-        // fits (a saturated CS or banded pool, or one whose max_dx solver bailed).
+        // fits (a saturated CS or CL pool, or one whose max_dx solver bailed).
         Some(cap) => dx <= &cap,
     }
 }
@@ -611,7 +611,7 @@ fn pool_can_absorb(pool: &PoolView, dx: &BigInt) -> bool {
 fn pool_absorb_cap(pool: &PoolView) -> Option<BigInt> {
     match &pool.view_type {
         PoolViewType::ConstantProduct => None,
-        PoolViewType::Banded {
+        PoolViewType::ConcentratedLiquidity {
             is_a_input, ladder, ..
         } => Some(ladder.capacity(*is_a_input)),
         // The curve is asymptotic in the out reserve: the pinned output is
@@ -669,7 +669,7 @@ fn clamp_to_absorb(pool: &PoolView, dx: &BigInt) -> BigInt {
 fn pool_output(pool: &PoolView, dx: &BigInt) -> BigInt {
     bump(&ROUTER_PROFILE.pool_outputs, 1);
     let raw = match &pool.view_type {
-        PoolViewType::Banded {
+        PoolViewType::ConcentratedLiquidity {
             is_a_input,
             band,
             ladder,
@@ -753,7 +753,7 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             &fee_mult * &pool.reserve_in * &pool.reserve_out * &scale()
                 / &(&fee_den * &denom * &denom)
         }
-        PoolViewType::Banded {
+        PoolViewType::ConcentratedLiquidity {
             is_a_input,
             band,
             ladder,
@@ -762,12 +762,12 @@ fn marginal_at_allocation(pool: &PoolView, raw_allocated: &BigInt) -> BigInt {
             // it ends there, read off the fill curve.
             let curve = ladder.fill_curve(*is_a_input);
             if curve.is_empty() {
-                return banded_marginal(band, *is_a_input, raw_allocated);
+                return cl_marginal(band, *is_a_input, raw_allocated);
             }
             for step in curve {
                 if raw_allocated <= &(&step.before_in + &step.cap) {
                     let within = raw_allocated - &step.before_in;
-                    return banded_marginal(&step.view, *is_a_input, &within);
+                    return cl_marginal(&step.view, *is_a_input, &within);
                 }
             }
             BigInt::from(0)
@@ -855,7 +855,7 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
             let fee_mult = &fee_den - &fee_num;
 
             match &pool.view_type {
-                PoolViewType::Banded {
+                PoolViewType::ConcentratedLiquidity {
                     is_a_input,
                     band,
                     ladder,
@@ -879,8 +879,8 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                     if curve.is_empty() {
                         // No curve (a state off the ladder): fall back to
                         // the direct solve on the active band.
-                        let cap = crate::sundaev4::banded_math::max_dx_in_band(band, *is_a_input);
-                        return banded_alloc_in_band(band, *is_a_input, lambda, cap).0;
+                        let cap = crate::sundaev4::cl_math::max_dx_in_band(band, *is_a_input);
+                        return cl_alloc_in_band(band, *is_a_input, lambda, cap).0;
                     }
                     let mut total = BigInt::from(0);
                     for step in curve {
@@ -892,7 +892,7 @@ fn allocations_for_lambda(pools: &[PoolView], lambda: &BigInt) -> Vec<BigInt> {
                             continue;
                         }
                         let (alloc, _) =
-                            banded_alloc_in_band(&step.view, *is_a_input, lambda, step.cap.clone());
+                            cl_alloc_in_band(&step.view, *is_a_input, lambda, step.cap.clone());
                         if alloc.is_positive() {
                             total = &total + &alloc;
                         }
@@ -1061,7 +1061,7 @@ fn optimize_split_inner(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEn
         return vec![];
     }
     if pools.len() == 1 {
-        // Clamp to the pool's absorb cap: a lone CS or banded pool can't take the full
+        // Clamp to the pool's absorb cap: a lone CS or CL pool can't take the full
         // input if that would drive its dy past reserve_out. An undersized
         // result lets `evaluate_path` reject the path (sum < input) rather than
         // handing the accumulator an over-draining leg.
@@ -1165,7 +1165,7 @@ fn optimize_split_inner(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEn
         // this loop. Only the under side may stop: an over-allocation was
         // rescaled to the input, so its sum says nothing about λ.
         //
-        // Banded pools fill band by band, so their sum jumps at band edges
+        // CL pools fill band by band, so their sum jumps at band edges
         // and may never land within tolerance; for them the bracket on λ
         // is the stop. 24 bits of relative width is ~6e-8, two orders of
         // magnitude under the 0.05% the blend tests hold the output to.
@@ -1229,7 +1229,7 @@ fn optimize_split_inner(pools: &[PoolView], total_input: &BigInt) -> Vec<SplitEn
     // Build results. Clamp each allocation to the pool's absorb cap as a final
     // backstop: whatever the bisection/scaling produced, no SplitEntry may carry
     // an input whose dy would exceed reserve_out. `pool_output` masks over-drains
-    // (it clamps the *output* at reserve_out), so an over-allocated banded pool would
+    // (it clamps the *output* at reserve_out), so an over-allocated CL pool would
     // otherwise slip through here looking optimal and over-drain at accumulate
     // time. An undersized sum is caught by `evaluate_path` (path rejected).
     let mut results = Vec::new();
@@ -1267,19 +1267,19 @@ pub fn conversion_ident(key: &str) -> Ident {
 
 type ViewTypeFn = Box<dyn Fn(usize, usize) -> PoolViewType>;
 
-/// A `BandedLadder` for one pool at one set of reserves, reused across
+/// A `CLLadder` for one pool at one set of reserves, reused across
 /// every order in the cycle.
 ///
 /// `build_graph` runs once per ORDER, and used to construct a fresh
-/// `Arc<BandedLadder>` for every banded pool each time. Every cache on it
+/// `Arc<CLLadder>` for every CL pool each time. Every cache on it
 /// — the band views, and now the fill curve — therefore started empty for
 /// every order, was filled during that order's `optimize_split`, and was
 /// then dropped. The scooper paid first-call cost on every pool on every
 /// order, forever.
 ///
-/// Measured on 12-band ladders, 31 banded pools: 809ms cold against 85ms
+/// Measured on 12-band ladders, 31 CL pools: 809ms cold against 85ms
 /// warm. That 9.5x was not an algorithmic problem, it was the same work
-/// being redone. Preview reached 31 banded pools and the scooper pegged a
+/// being redone. Preview reached 31 CL pools and the scooper pegged a
 /// core, taking 16-63 seconds per order.
 ///
 /// The key carries the RESERVES, so it cannot serve a stale ladder: a
@@ -1287,18 +1287,18 @@ type ViewTypeFn = Box<dyn Fn(usize, usize) -> PoolViewType>;
 /// simply ages out. This is the same argument the witness memo rests on.
 fn ladder_for(
     ident: &Ident,
-    cfg: &crate::sundaev4::types::BandedCLConfig,
+    cfg: &crate::sundaev4::types::CLConfig,
     a: &BigInt,
     b: &BigInt,
-    w: &crate::sundaev4::banded_math::Witness,
-) -> std::sync::Arc<BandedLadder> {
+    w: &crate::sundaev4::cl_math::Witness,
+) -> std::sync::Arc<CLLadder> {
     type Key = (Ident, BigInt, BigInt);
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeMap<Key, std::sync::Arc<BandedLadder>>>,
+        std::sync::Mutex<std::collections::BTreeMap<Key, std::sync::Arc<CLLadder>>>,
     > = std::sync::OnceLock::new();
     // One live entry per pool: a new state for a pool supersedes its old
     // ones, which are dropped on insert (an in-flight route holds its own
-    // Arc). The map then holds about as many entries as there are banded
+    // Arc). The map then holds about as many entries as there are CL
     // pools, and MAX is a backstop that costs cold ladders, nothing else.
     // It was 512 with a wholesale clear, which past 512 pool-states would
     // have rebuilt every ladder on every order.
@@ -1312,12 +1312,7 @@ fn ladder_for(
         return l.clone();
     }
     let t0 = std::time::Instant::now();
-    let built = std::sync::Arc::new(BandedLadder::new(
-        cfg.clone(),
-        a.clone(),
-        b.clone(),
-        w.clone(),
-    ));
+    let built = std::sync::Arc::new(CLLadder::new(cfg.clone(), a.clone(), b.clone(), w.clone()));
     bump(&ROUTER_PROFILE.ladder_builds, 1);
     bump(
         &ROUTER_PROFILE.ladder_build_ns,
@@ -1352,18 +1347,18 @@ fn build_graph(
     for (ident, pool) in pools {
         let assets = &pool.pool_datum.assets;
 
-        // A banded ladder's two edges price on the ACTIVE band's residuals
+        // A CL ladder's two edges price on the ACTIVE band's residuals
         // with that band's direction fee, so they are built here rather than
         // through the shared single-fee closure below.
-        if let PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type {
-            use crate::sundaev4::banded_math::{band_view, fee_for, find_witness};
+        if let PoolType::ConcentratedLiquidity { config } = &pool.pool_type {
+            use crate::sundaev4::cl_math::{band_view, fee_for, find_witness};
             if assets.len() != 2 {
-                tracing::warn!(pool = %ident, "banded pool skipped by the router: not two assets");
+                tracing::warn!(pool = %ident, "CL pool skipped by the router: not two assets");
                 continue;
             }
             let (a, b) = (&assets[0].1, &assets[1].1);
             let Some(w) = find_witness(config, a, b) else {
-                tracing::warn!(pool = %ident, "banded pool skipped by the router: no ladder witness");
+                tracing::warn!(pool = %ident, "CL pool skipped by the router: no ladder witness");
                 continue;
             };
             let Ok(view) = band_view(config, a, b, &w) else {
@@ -1392,7 +1387,7 @@ fn build_graph(
                         reserve_out,
                         fee_num: fee.num.clone().unwrap().to_u64().unwrap_or(0),
                         fee_den: fee.den.clone().unwrap().to_u64().unwrap_or(1),
-                        view_type: PoolViewType::Banded {
+                        view_type: PoolViewType::ConcentratedLiquidity {
                             is_a_input,
                             band: view.clone(),
                             ladder: ladder.clone(),
@@ -1449,8 +1444,8 @@ fn build_graph(
                     }),
                 )
             }
-            // Handled above: a banded pool builds its own two edges.
-            PoolType::BandedConcentratedLiquidity { .. } => continue,
+            // Handled above: a CL pool builds its own two edges.
+            PoolType::ConcentratedLiquidity { .. } => continue,
         };
 
         // Create edges for all (i, j) pairs
@@ -1610,7 +1605,7 @@ fn evaluate_path(
         let splits = if hop.pools.len() == 1 || max_splits_here == 1 {
             // Single-pool hop OR budget allows only one split: pick the
             // best single pool for current_amount and route everything
-            // through it. For a banded band, this guards against
+            // through it. For a CL band, this guards against
             // overrun; CP/CS pass unconditionally.
             let candidates: Vec<&PoolView> =
                 hop.pools.iter().filter(|p| pool_can_absorb(p, &current_amount)).collect();
@@ -3235,9 +3230,9 @@ mod tests {
 
 #[cfg(test)]
 mod split_cost {
-    //! How `optimize_split` scales with the number of banded pools.
+    //! How `optimize_split` scales with the number of CL pools.
     //!
-    //! Preview, 2026-10-07: the banded pool count went from about 12 to 31
+    //! Preview, 2026-10-07: the CL pool count went from about 12 to 31
     //! and the scooper went from 9 orders/min at 3-48% CPU to 3 orders/min
     //! pegged at 100%, with 16-63 seconds between order dispatches. The
     //! process showed 601s of user time against 0.8s of system time, so it
@@ -3253,10 +3248,10 @@ mod split_cost {
     //!
     //! Ignored by default; run with --ignored --nocapture.
     use super::*;
-    use crate::sundaev4::banded_math::{band_view, find_witness, with_index};
+    use crate::sundaev4::cl_math::{band_view, find_witness, with_index};
     use crate::sundaev4::types::BandSpec;
 
-    fn ladder_cfg(n: usize, lo: i64, hi: i64, den: i64) -> crate::sundaev4::types::BandedCLConfig {
+    fn ladder_cfg(n: usize, lo: i64, hi: i64, den: i64) -> crate::sundaev4::types::CLConfig {
         let r = |num: i64, d: i64| crate::sundaev4::types::Rational {
             num: BigInt::from(num),
             den: BigInt::from(d),
@@ -3277,25 +3272,25 @@ mod split_cost {
         )
     }
 
-    /// One banded pool at a mid-ladder state, as a routable view.
-    fn banded_pool(idx: usize, bands: usize) -> Option<PoolView> {
+    /// One CL pool at a mid-ladder state, as a routable view.
+    fn cl_pool(idx: usize, bands: usize) -> Option<PoolView> {
         let cfg = ladder_cfg(bands, 950_000_000, 1_050_000_000, 1_000_000_000);
         let x = BigInt::from(80_279_049_977_900u64);
         let k = bands / 2;
-        let st = crate::sundaev4::banded_math::ladder_at(&cfg, &x, k).ok()?;
+        let st = crate::sundaev4::cl_math::ladder_at(&cfg, &x, k).ok()?;
         let two = BigInt::from(2);
         let a = &st.ca + &(&st.a_sat_k / &two);
         let b = &st.cb + &(&st.b_sat_k / &two);
         let w = find_witness(&cfg, &a, &b)?;
         let view = band_view(&cfg, &a, &b, &w).ok()?;
-        let ladder = std::sync::Arc::new(BandedLadder::new(cfg, a.clone(), b.clone(), w));
+        let ladder = std::sync::Arc::new(CLLadder::new(cfg, a.clone(), b.clone(), w));
         Some(PoolView {
             ident: Ident::new(format!("{idx:056x}").as_bytes()),
             reserve_in: a,
             reserve_out: b,
             fee_num: 3,
             fee_den: 1000,
-            view_type: PoolViewType::Banded {
+            view_type: PoolViewType::ConcentratedLiquidity {
                 is_a_input: true,
                 band: view,
                 ladder,
@@ -3313,7 +3308,7 @@ mod split_cost {
         println!("  per-order cost: build_graph + optimize_split, {bands}-band ladders");
         println!("  {:>6} {:>14} {:>14}", "pools", "per order", "per pool");
         for n in [4usize, 16, 31, 48] {
-            let pools: Vec<PoolView> = (0..n).filter_map(|i| banded_pool(i, bands)).collect();
+            let pools: Vec<PoolView> = (0..n).filter_map(|i| cl_pool(i, bands)).collect();
             if pools.len() < n {
                 continue;
             }
@@ -3324,7 +3319,7 @@ mod split_cost {
                 pools
                     .iter()
                     .map(|p| {
-                        let PoolViewType::Banded {
+                        let PoolViewType::ConcentratedLiquidity {
                             is_a_input,
                             band,
                             ladder,
@@ -3345,7 +3340,7 @@ mod split_cost {
                             reserve_out: p.reserve_out.clone(),
                             fee_num: p.fee_num,
                             fee_den: p.fee_den,
-                            view_type: PoolViewType::Banded {
+                            view_type: PoolViewType::ConcentratedLiquidity {
                                 is_a_input: *is_a_input,
                                 band: band.clone(),
                                 ladder: l,
@@ -3373,10 +3368,10 @@ mod split_cost {
     fn fill_curve_output_equals_the_ladder_walk() {
         let mut checked = 0u64;
         for i in 0..1usize {
-            let Some(pool) = banded_pool(i, 12) else {
+            let Some(pool) = cl_pool(i, 12) else {
                 continue;
             };
-            let PoolViewType::Banded {
+            let PoolViewType::ConcentratedLiquidity {
                 ladder, is_a_input, ..
             } = &pool.view_type
             else {
@@ -3406,7 +3401,7 @@ mod split_cost {
 
     #[test]
     #[ignore = "a cost curve, not a check; run with --ignored --nocapture"]
-    fn split_cost_against_banded_pool_count() {
+    fn split_cost_against_cl_pool_count() {
         let bands = 12;
         println!("  optimize_split, {bands}-band ladders, MAX_ITER={}", 200);
         println!(
@@ -3415,7 +3410,7 @@ mod split_cost {
         );
         let mut base: Option<f64> = None;
         for n in [4usize, 8, 12, 16, 24, 31, 48] {
-            let pools: Vec<PoolView> = (0..n).filter_map(|i| banded_pool(i, bands)).collect();
+            let pools: Vec<PoolView> = (0..n).filter_map(|i| cl_pool(i, bands)).collect();
             if pools.len() < n {
                 println!("  {n:>6}  (could not build {n} pools)");
                 continue;
@@ -3449,10 +3444,8 @@ mod split_cost {
 mod depth_fallback {
     use super::*;
     use crate::cardano_types::{TransactionInput, Value};
-    use crate::sundaev4::banded_math::{build_index, check_shape, find_witness};
-    use crate::sundaev4::types::{
-        BandSpec, BandedCLConfig, PoolDatum, PoolType, Rational, plutus_void,
-    };
+    use crate::sundaev4::cl_math::{build_index, check_shape, find_witness};
+    use crate::sundaev4::types::{BandSpec, CLConfig, PoolDatum, PoolType, Rational, plutus_void};
 
     /// One pair's pool, as the bench's `MarketShape` describes it.
     struct PairShape {
@@ -3481,7 +3474,7 @@ mod depth_fallback {
 
     /// The bench's `ladder`: 2·n + 1 bands of geometric width around price 1,
     /// weighted by the Gaussian mass of their log-price.
-    fn ladder(shape: &PairShape) -> BandedCLConfig {
+    fn ladder(shape: &PairShape) -> CLConfig {
         let h = BAND_WIDTH.ln_1p();
         let ks: Vec<i32> = (-BANDS_PER_SIDE..=BANDS_PER_SIDE).collect();
         let mass = |k: i32| (-(k as f64 * h).powi(2) / (2.0 * shape.sigma.powi(2))).exp();
@@ -3500,7 +3493,7 @@ mod depth_fallback {
             })
             .collect();
         let weight_total = bands.iter().fold(BigInt::from(0), |sum, band| &sum + &band.weight);
-        let mut config = BandedCLConfig {
+        let mut config = CLConfig {
             bands,
             index: vec![],
             closing: sqrt_price(((BANDS_PER_SIDE as f64 + 0.5) * h).exp().sqrt()),
@@ -3512,15 +3505,10 @@ mod depth_fallback {
         config
     }
 
-    /// The bench's `banded_pool`: the pair's `value` split evenly at price 1.
+    /// The bench's `cl_pool`: the pair's `value` split evenly at price 1.
     /// Idents use their own prefix: the router caches ladders by (ident,
     /// reserves), not by config, so they must not collide with other tests'.
-    fn banded_pool(
-        index: u16,
-        a: &AssetClass,
-        b: &AssetClass,
-        shape: &PairShape,
-    ) -> Arc<SundaeV4Pool> {
+    fn cl_pool(index: u16, a: &AssetClass, b: &AssetClass, shape: &PairShape) -> Arc<SundaeV4Pool> {
         let config = ladder(shape);
         let half = BigInt::from((shape.value / 2.0) as u64);
         find_witness(&config, &half, &half).expect("balanced reserves sit on the ladder");
@@ -3544,7 +3532,7 @@ mod depth_fallback {
                 min_surplus: BigInt::from(0),
                 extension: plutus_void(),
             },
-            pool_type: PoolType::BandedConcentratedLiquidity { config },
+            pool_type: PoolType::ConcentratedLiquidity { config },
             slot: 100,
             fee_split_config: None,
         })
@@ -3583,14 +3571,14 @@ mod depth_fallback {
         };
         let order_amount = BigInt::from(1_000_000_000_000u64);
 
-        let deep_pool = banded_pool(0, &token(0), &token(1), &deep);
+        let deep_pool = cl_pool(0, &token(0), &token(1), &deep);
         let mut market = BTreeMap::from([(deep_pool.pool_datum.identifier.clone(), deep_pool)]);
         let output_without_thin_paths = route_output(&market, &order_amount);
 
         for intermediate in 2..6 {
             for (a, b) in [(0, intermediate), (intermediate, 1)] {
                 let index = u16::try_from(market.len()).expect("a few pools");
-                let pool = banded_pool(index, &token(a), &token(b), &thin);
+                let pool = cl_pool(index, &token(a), &token(b), &thin);
                 market.insert(pool.pool_datum.identifier.clone(), pool);
             }
         }

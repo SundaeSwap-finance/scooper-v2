@@ -70,7 +70,7 @@ impl ModuleKind {
             ModuleKind::ConstantProduct => "constant-product",
             ModuleKind::ConstantSum => "constant-sum",
             ModuleKind::Stableswap => "stableswap",
-            ModuleKind::ConcentratedLiquidity => "banded-concentrated-liquidity",
+            ModuleKind::ConcentratedLiquidity => "concentrated-liquidity",
             ModuleKind::FeeSplit => "fee-split",
             ModuleKind::Fairness => "fairness",
             ModuleKind::Oracle => "oracle",
@@ -83,10 +83,11 @@ impl ModuleKind {
         }
     }
 
-    /// The kind a config key names. `concentrated-liquidity` is an alias of
-    /// `banded-concentrated-liquidity`.
+    /// The kind a config key names. `banded-concentrated-liquidity` is the
+    /// name of the CL role in releases to 0.8.0. Operator configs hold it,
+    /// so it stays an alias of `concentrated-liquidity`.
     pub fn from_config_key(key: &str) -> Option<ModuleKind> {
-        if key == "concentrated-liquidity" {
+        if key == "banded-concentrated-liquidity" {
             return Some(ModuleKind::ConcentratedLiquidity);
         }
         ModuleKind::ALL.into_iter().find(|k| k.config_key() == key)

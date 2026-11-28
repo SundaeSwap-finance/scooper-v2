@@ -1613,14 +1613,14 @@ impl AdminServer {
         // A stableswap pool's config is per pool (and its rates move on
         // chain), so its preimage comes from the pool record, not the
         // startup map.
-        // The same holds for a banded ladder, whose config is per pool.
+        // The same holds for a CL ladder, whose config is per pool.
         let ss_preimage: Option<(Vec<u8>, Vec<u8>)> = {
             use plutus_parser::AsPlutus;
             let cbor = match &pool.pool_type {
                 crate::sundaev4::PoolType::StableSwap { config } => {
                     Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
                 }
-                crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } => {
+                crate::sundaev4::PoolType::ConcentratedLiquidity { config } => {
                     Some(minicbor::to_vec(config.clone().to_plutus()).unwrap_or_default())
                 }
                 _ => None,
@@ -1652,14 +1652,14 @@ impl AdminServer {
             }
             *obj = serde_json::Value::Object(enriched);
         }
-        // Banded pools: the ladder witness (counter X, active band k) is
+        // CL pools: the ladder witness (counter X, active band k) is
         // derived from the reserves, never stored, so compute it here for
         // the dashboard along with the active band's price edges and the
         // input each direction can still absorb.
-        if let crate::sundaev4::PoolType::BandedConcentratedLiquidity { config } = &pool.pool_type
+        if let crate::sundaev4::PoolType::ConcentratedLiquidity { config } = &pool.pool_type
             && pool.pool_datum.assets.len() == 2
         {
-            use crate::sundaev4::banded_math as bm;
+            use crate::sundaev4::cl_math as bm;
             let (a, b) = (&pool.pool_datum.assets[0].1, &pool.pool_datum.assets[1].1);
             let band_state = match bm::find_witness(config, a, b) {
                 Some(w) => {
@@ -1856,7 +1856,7 @@ impl AdminServer {
                 PoolType::ConstantProduct { .. } => "cp",
                 PoolType::ConstantSum { .. } => "cs",
                 PoolType::StableSwap { .. } => "ss",
-                PoolType::BandedConcentratedLiquidity { .. } => "bcl",
+                PoolType::ConcentratedLiquidity { .. } => "cl",
             };
             *by_type.entry(kind).or_default() += 1;
             if self.v4_pool_allowlists.is_restricted(ident) {
@@ -2333,6 +2333,61 @@ mod protocol_stats_tests {
 
         assert_eq!(v["activity"]["records_available"], false);
         assert_eq!(v["fees"]["protocol_share"], serde_json::json!([1, 2]));
+    }
+
+    fn cl_pool(env: &TestEnv) -> Arc<crate::sundaev4::SundaeV4Pool> {
+        make_cl_pool(
+            env,
+            0xC1,
+            vec![(token_a(), 4_000_000), (token_b(), 4_000_000)],
+            cl_eq8_config(crate::sundaev4::Rational {
+                num: 3.into(),
+                den: 1000.into(),
+            }),
+        )
+    }
+
+    /// The names a CL pool has on the status endpoints. Releases to 0.8.0
+    /// wrote `BandedConcentratedLiquidity` and `bcl`; the dashboard reads
+    /// both forms.
+    #[tokio::test]
+    async fn a_cl_pool_is_named_cl_on_the_status_endpoints() {
+        let env = TestEnv::from_blueprint_file("test/fixtures/preview-audited-blueprint.json");
+        let pool = cl_pool(&env);
+        let id = hex::encode(pool.pool_datum.identifier.to_bytes());
+        let mut state = crate::sundaev4::SundaeV4State::default();
+        state.pools.insert(pool.pool_datum.identifier.clone(), pool);
+        let server = server_over(state);
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_list_pools().await).unwrap();
+        let pool_type = v[&id]["pool_type"].as_object().unwrap();
+        assert_eq!(
+            pool_type.keys().collect::<Vec<_>>(),
+            ["ConcentratedLiquidity"]
+        );
+        assert!(v[&id]["band_state"]["active_band"].is_number());
+
+        let v: serde_json::Value = serde_json::from_str(&server.v4_protocol_stats().await).unwrap();
+        assert_eq!(v["pools"]["by_type"], serde_json::json!({ "cl": 1 }));
+        assert_eq!(v["protocol_equity"]["pools"][0]["pool_type"], "cl");
+    }
+
+    /// An operator can open the dashboard of this release on an instance
+    /// of release 0.8.0 through a proxy, so the dashboard reads the CL
+    /// names of both. This test pins that the script reads each name; it
+    /// does not run the script.
+    #[test]
+    fn the_dashboard_reads_the_cl_names_of_both_releases() {
+        let html = include_str!("../static/dashboard.html");
+        for name in [
+            "pt.ConcentratedLiquidity",
+            "pt.BandedConcentratedLiquidity",
+            "bt.cl",
+            "bt.bcl",
+            "typeBadge.bcl",
+        ] {
+            assert!(html.contains(name), "the dashboard does not read {name}");
+        }
     }
 
     #[tokio::test]

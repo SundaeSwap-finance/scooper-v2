@@ -1694,7 +1694,7 @@ impl Scooper {
                                 effective_pool.pool_type,
                                 crate::sundaev4::PoolType::ConstantSum { .. }
                                     | crate::sundaev4::PoolType::StableSwap { .. }
-                                    | crate::sundaev4::PoolType::BandedConcentratedLiquidity { .. }
+                                    | crate::sundaev4::PoolType::ConcentratedLiquidity { .. }
                             ) {
                                 // A two-asset deposit is rejected on chain by
                                 // cp_check, which reads both reserves rising as
@@ -1704,7 +1704,7 @@ impl Scooper {
                                 // turn a cheap skip into a build failure, and a
                                 // lone order failing to build is quarantined
                                 // for good.
-                                Err("only constant-sum, stableswap and banded pools zap: \
+                                Err("only constant-sum, stableswap and CL pools zap: \
                                      constant product rejects the deposit step \
                                      on chain"
                                     .to_string())
@@ -2882,16 +2882,16 @@ impl Scooper {
             ) + 1000; // +1000 lovelace buffer for any encoding-size jitter
 
             // Drain the witness-search timings this cycle accumulated. The
-            // router calls find_witness once per banded pool per graph build
+            // router calls find_witness once per CL pool per graph build
             // and twice per step evaluation, so a cycle produces many
             // observations; this is where they become a histogram.
-            for secs in crate::sundaev4::banded_math::drain_witness_times() {
+            for secs in crate::sundaev4::cl_math::drain_witness_times() {
                 self.metrics.witness_latency.observe(secs);
             }
             // Calls the memo answered. The histogram above only sees the
             // searches that ran, so without this the per-call cost reads
             // far higher than it is.
-            let memo_hits = crate::sundaev4::banded_math::drain_witness_memo_hits();
+            let memo_hits = crate::sundaev4::cl_math::drain_witness_memo_hits();
             if memo_hits > 0 {
                 self.metrics
                     .witness_memo_hits
@@ -2907,7 +2907,7 @@ impl Scooper {
 
             // Record the budget against the Conway per-tx limits. This is
             // the only continuous measurement of how close a scoop runs to
-            // the ceiling; without it, "four banded pools is the practical
+            // the ceiling; without it, "four CL pools is the practical
             // limit" is an inference from a stale manual measurement.
             {
                 let transcript_steps: u64 = final_plan
@@ -3234,8 +3234,8 @@ impl Scooper {
                         }
                         PoolType::ConstantSum { .. } => crate::metrics::PoolFamily::ConstantSum,
                         PoolType::StableSwap { .. } => crate::metrics::PoolFamily::StableSwap,
-                        PoolType::BandedConcentratedLiquidity { .. } => {
-                            crate::metrics::PoolFamily::BandedConcentratedLiquidity
+                        PoolType::ConcentratedLiquidity { .. } => {
+                            crate::metrics::PoolFamily::ConcentratedLiquidity
                         }
                     };
                     let n = (batch.swaps.len()

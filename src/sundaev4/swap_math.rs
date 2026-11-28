@@ -92,7 +92,7 @@ pub fn cs_swap_result(
 
 /// Largest constant-sum input `dx` whose output `dy` does not exceed the pool's
 /// output reserve, so a fill can never drain the pool negative. Mirrors
-/// the banded band cap. Returns `None` if the fee makes the swap
+/// the CL band cap. Returns `None` if the fee makes the swap
 /// ill-defined (`fee_den <= fee_num`) or the input price is non-positive.
 ///
 /// `dy = (dx·p_in − floor(dx·p_in·fee_num/fee_den)) / p_out ≤ reserve_out`
@@ -252,14 +252,14 @@ pub fn compute_fee_budget(
                 }
             }
         }
-        super::types::PoolType::BandedConcentratedLiquidity { config } => {
+        super::types::PoolType::ConcentratedLiquidity { config } => {
             // cl_check.fee_value_pair: `bp - lp_before =
             // floor(lp_before * fee_value / pool_value)` with `bp = lp_after
             // + fee_budget`, at the before witness's band price (sundae-v4
             // SV4-001b). This prices the change as ONE transcript step. A
             // non-swap step must declare 0.
             if assets_before.len() != 2 || assets_after.len() != 2 {
-                warn!("banded fee_budget: pool does not hold two assets");
+                warn!("CL fee_budget: pool does not hold two assets");
                 return BigInt::from(0);
             }
             let (a0, b0) = (&assets_before[0].1, &assets_before[1].1);
@@ -268,14 +268,14 @@ pub fn compute_fee_budget(
             if !is_swap {
                 return BigInt::from(0);
             }
-            let Some(before) = super::banded_math::find_witness(config, a0, b0) else {
-                warn!("banded fee_budget: no ladder witness for the step's before reserves");
+            let Some(before) = super::cl_math::find_witness(config, a0, b0) else {
+                warn!("CL fee_budget: no ladder witness for the step's before reserves");
                 return BigInt::from(0);
             };
-            match super::banded_math::swap_fee_budget(config, a0, b0, a1, b1, &before, lp_before) {
+            match super::cl_math::swap_fee_budget(config, a0, b0, a1, b1, &before, lp_before) {
                 Ok(fb) => fb,
                 Err(e) => {
-                    warn!("banded fee_budget: {e}");
+                    warn!("CL fee_budget: {e}");
                     BigInt::from(0)
                 }
             }
@@ -732,19 +732,18 @@ mod tests {
         assert_eq!(fb, BigInt::from(15));
     }
 
-    /// The banded arm books the fee's LP worth (sundae-v4 SV4-001b,
+    /// The CL arm books the fee's LP worth (sundae-v4 SV4-001b,
     /// `cl_check_unit.ak`): 624 B in on the eq8 ladder, 615 A out, total_lp
     /// 1e9, fee 2 B. The module pins 213. The counter ratio
     /// `floor(1e9 * 1_000_000_062 / 999_999_813) - 1e9` gave 249, and a
     /// scoop that declared it was rejected.
     #[test]
-    fn banded_fee_budget_is_the_fee_value() {
-        let cfg = crate::sundaev4::test_harness::bcl_eq8_config(crate::sundaev4::types::Rational {
+    fn cl_fee_budget_is_the_fee_value() {
+        let cfg = crate::sundaev4::test_harness::cl_eq8_config(crate::sundaev4::types::Rational {
             num: BigInt::from(3),
             den: BigInt::from(1000),
         });
-        let pool_type =
-            crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { config: cfg };
+        let pool_type = crate::sundaev4::types::PoolType::ConcentratedLiquidity { config: cfg };
         let ca = crate::cardano_types::AssetClass::from_pair((vec![0xaa; 28], b"A".to_vec()));
         let cb = crate::cardano_types::AssetClass::from_pair((vec![0xbb; 28], b"B".to_vec()));
         let before = vec![

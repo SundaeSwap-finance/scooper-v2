@@ -151,8 +151,8 @@ pub struct PoolModuleConfigCache {
     /// Stableswap configs carry the pool's current `rates`; a tag-7 update
     /// replaces the entry (the persisted row is upserted).
     pub ss: BTreeMap<Ident, crate::sundaev4::types::StableSwapConfig>,
-    /// Banded ladders: hash-pinned like stableswap, but fixed after Create.
-    pub bcl: BTreeMap<Ident, crate::sundaev4::types::BandedCLConfig>,
+    /// CL ladders: hash-pinned like stableswap, but fixed after Create.
+    pub cl: BTreeMap<Ident, crate::sundaev4::types::CLConfig>,
     pub fee_split: BTreeMap<Ident, crate::sundaev4::types::FeeSplitConfig>,
 }
 
@@ -278,9 +278,9 @@ impl SundaeV4Indexer {
                     cache.ss.insert(Ident::new(&cfg.pool_id), parsed);
                 }
                 ModuleKind::ConcentratedLiquidity => {
-                    let parsed = crate::sundaev4::types::BandedCLConfig::from_plutus(pd)
-                        .context("could not parse persisted BandedCLConfig")?;
-                    cache.bcl.insert(Ident::new(&cfg.pool_id), parsed);
+                    let parsed = crate::sundaev4::types::CLConfig::from_plutus(pd)
+                        .context("could not parse persisted CLConfig")?;
+                    cache.cl.insert(Ident::new(&cfg.pool_id), parsed);
                 }
                 _ => {}
             }
@@ -289,7 +289,7 @@ impl SundaeV4Indexer {
             cs = cache.cs.len(),
             cp = cache.cp.len(),
             ss = cache.ss.len(),
-            bcl = cache.bcl.len(),
+            cl = cache.cl.len(),
             fs = cache.fee_split.len(),
             "v4: hydrated per-module pool configs from DB",
         );
@@ -320,14 +320,14 @@ impl SundaeV4Indexer {
             };
             let mut pool = (**existing).clone();
             let ss = self.cached_ss_config(&pool.pool_datum, &cache);
-            let bcl = self.cached_bcl_config(&pool.pool_datum, &cache);
+            let cl = self.cached_cl_config(&pool.pool_datum, &cache);
             pool.pool_type = detect_pool_type(
                 &pool.pool_datum,
                 self.protocol.execution.as_ref(),
                 cache.cs.get(ident),
                 cache.cp.get(ident),
                 ss.as_ref(),
-                bcl.as_ref(),
+                cl.as_ref(),
             );
             pool.fee_split_config = cache.fee_split.get(ident).cloned();
             s.pools.insert(ident.clone(), Arc::new(pool));
@@ -666,33 +666,33 @@ impl SundaeV4Indexer {
         let cs = cache.cs.get(&pool_datum.identifier);
         let cp = cache.cp.get(&pool_datum.identifier);
         let ss = self.cached_ss_config(pool_datum, cache);
-        let bcl = self.cached_bcl_config(pool_datum, cache);
+        let cl = self.cached_cl_config(pool_datum, cache);
         detect_pool_type(
             pool_datum,
             self.protocol.execution.as_ref(),
             cs,
             cp,
             ss.as_ref(),
-            bcl.as_ref(),
+            cl.as_ref(),
         )
     }
 
-    /// The cached banded ladder for a pool, only when its hash is the one
+    /// The cached CL ladder for a pool, only when its hash is the one
     /// the datum's `module_state` names.
-    fn cached_bcl_config(
+    fn cached_cl_config(
         &self,
         pool_datum: &PoolDatum,
         cache: &PoolModuleConfigCache,
-    ) -> Option<crate::sundaev4::types::BandedCLConfig> {
+    ) -> Option<crate::sundaev4::types::CLConfig> {
         let h = self.pool_invariant_hash(
             pool_datum,
             crate::sundaev4::ModuleKind::ConcentratedLiquidity,
         )?;
-        resolve_bcl_config(
+        resolve_cl_config(
             pool_datum,
             h.as_ref(),
             &[],
-            cache.bcl.get(&pool_datum.identifier),
+            cache.cl.get(&pool_datum.identifier),
         )
     }
 
@@ -1115,7 +1115,7 @@ pub fn extract_ss_config_candidates(
     }
 }
 
-/// Every banded ladder a transaction vouches for: a `Create`'s
+/// Every CL ladder a transaction vouches for: a `Create`'s
 /// `initial_state`, and each `Operate` entry's `config`.
 ///
 /// The caller accepts a candidate only when it hashes to the pool datum's
@@ -1123,32 +1123,32 @@ pub fn extract_ss_config_candidates(
 /// two things beyond reading the current module's own withdrawal redeemer:
 ///
 ///  1. It reads EVERY withdrawal redeemer in the transaction, not only the
-///     one at `bcl_script_hash`. A pool created under an earlier banded
+///     one at `cl_script_hash`. A pool created under an earlier CL
 ///     module hash keeps its ladder; the hash the config must match is in
 ///     the pool datum, not in the withdrawal.
 ///  2. It parses the pre-V13 redeemer form as well, and rebuilds the index
-///     from the bands (`banded_math::with_index`). An index-swap governor
+///     from the bands (`cl_math::with_index`). An index-swap governor
 ///     adds the index in place without writing the new config to any
 ///     redeemer, so the derived form is the only way to recover the config
 ///     of a migrated pool from chain history.
 ///  3. After each four-field candidate it adds the same ladder with
-///     `ext = Void` (`banded_math::config_forms`). The preview governor
+///     `ext = Void` (`cl_math::config_forms`). The preview governor
 ///     migration of 2026-11-14 wrote that five-field config's hash to the
 ///     pool's slot and the config itself to no redeemer.
 ///  4. It reads both `Operate` forms: the config table the module reads,
 ///     and the one-config-per-entry form of the pre-audit preview modules
-///     (`BandedCLRedeemer::from_plutus_any_form`).
+///     (`CLRedeemer::from_plutus_any_form`).
 ///
 /// All four rules only ADD candidates. The hash pin rejects anything wrong.
-pub fn extract_bcl_config_candidates(
+pub fn extract_cl_config_candidates(
     tx: &MultiEraTx,
-    bcl_script_hash: &ScriptHash,
-) -> Vec<crate::sundaev4::types::BandedCLConfig> {
-    use crate::sundaev4::banded_math::with_index;
-    use crate::sundaev4::types::{BandedCLRedeemer, LegacyBandedCLRedeemer};
+    cl_script_hash: &ScriptHash,
+) -> Vec<crate::sundaev4::types::CLConfig> {
+    use crate::sundaev4::cl_math::with_index;
+    use crate::sundaev4::types::{CLRedeemer, LegacyCLRedeemer};
     // Read the configured module's redeemer first, so its candidates come
     // first in the list; then every other withdrawal redeemer.
-    let preferred = withdrawal_index_of_script(tx, bcl_script_hash).map(|i| i as u32);
+    let preferred = withdrawal_index_of_script(tx, cl_script_hash).map(|i| i as u32);
     let mut redeemers: Vec<_> =
         tx.redeemers().into_iter().filter(|r| r.tag() == RedeemerTag::Reward).collect();
     redeemers.sort_by_key(|r| (Some(r.index()) != preferred, r.index()));
@@ -1157,59 +1157,57 @@ pub fn extract_bcl_config_candidates(
     for redeemer in redeemers {
         let data = redeemer.data().clone();
         let out = &mut found;
-        if let Ok(parsed) = BandedCLRedeemer::from_plutus_any_form(data.clone()) {
+        if let Ok(parsed) = CLRedeemer::from_plutus_any_form(data.clone()) {
             match parsed {
-                BandedCLRedeemer::Create { initial_state, .. } => out.push(initial_state),
-                BandedCLRedeemer::Operate { entries } => {
+                CLRedeemer::Create { initial_state, .. } => out.push(initial_state),
+                CLRedeemer::Operate { entries } => {
                     out.extend(entries.into_iter().map(|e| e.config))
                 }
-                BandedCLRedeemer::Destroy { .. } => {}
+                CLRedeemer::Destroy { .. } => {}
             }
             continue;
         }
-        let Ok(parsed) = LegacyBandedCLRedeemer::from_plutus(data) else {
+        let Ok(parsed) = LegacyCLRedeemer::from_plutus(data) else {
             continue;
         };
-        let rebuild = |c: crate::sundaev4::types::LegacyBandedCLConfig| {
+        let rebuild = |c: crate::sundaev4::types::LegacyCLConfig| {
             with_index(c.bands, c.closing, c.weight_total)
         };
         match parsed {
-            LegacyBandedCLRedeemer::Create { initial_state, .. } => {
-                out.push(rebuild(initial_state))
-            }
-            LegacyBandedCLRedeemer::Operate { entries } => {
+            LegacyCLRedeemer::Create { initial_state, .. } => out.push(rebuild(initial_state)),
+            LegacyCLRedeemer::Operate { entries } => {
                 out.extend(entries.into_iter().map(|e| rebuild(e.config)))
             }
-            LegacyBandedCLRedeemer::Destroy { .. } => {}
+            LegacyCLRedeemer::Destroy { .. } => {}
         }
     }
-    found.iter().flat_map(crate::sundaev4::banded_math::config_forms).collect()
+    found.iter().flat_map(crate::sundaev4::cl_math::config_forms).collect()
 }
 
-/// The banded ladder for `pool_datum`: the first of `candidates`, else
-/// a form of `cached` (`banded_math::config_forms`), whose hash the datum's
-/// banded `module_state` slot names, and which passes the module's
+/// The CL ladder for `pool_datum`: the first of `candidates`, else
+/// a form of `cached` (`cl_math::config_forms`), whose hash the datum's
+/// CL `module_state` slot names, and which passes the module's
 /// Create-time shape checks. `None` when nothing matches; the tx builder
 /// then refuses the pool.
 ///
 /// The cached config's `ext = Void` form is how a pool that a governor has
 /// just migrated from the four-field config is recovered while indexing:
 /// the migration transaction holds no CL redeemer.
-pub fn resolve_bcl_config(
+pub fn resolve_cl_config(
     pool_datum: &PoolDatum,
-    bcl_module_hash: &[u8],
-    candidates: &[crate::sundaev4::types::BandedCLConfig],
-    cached: Option<&crate::sundaev4::types::BandedCLConfig>,
-) -> Option<crate::sundaev4::types::BandedCLConfig> {
-    use crate::sundaev4::banded_math::{check_shape, config_matches_datum};
-    let accepted = |c: &crate::sundaev4::types::BandedCLConfig| -> bool {
-        config_matches_datum(c, pool_datum, bcl_module_hash)
+    cl_module_hash: &[u8],
+    candidates: &[crate::sundaev4::types::CLConfig],
+    cached: Option<&crate::sundaev4::types::CLConfig>,
+) -> Option<crate::sundaev4::types::CLConfig> {
+    use crate::sundaev4::cl_math::{check_shape, config_matches_datum};
+    let accepted = |c: &crate::sundaev4::types::CLConfig| -> bool {
+        config_matches_datum(c, pool_datum, cl_module_hash)
             && match check_shape(c) {
                 Ok(()) => true,
                 Err(e) => {
                     warn!(
                         pool = %hex::encode(pool_datum.identifier.to_bytes()),
-                        "v4: banded config hashes to module_state but fails the module's shape checks: {e}"
+                        "v4: CL config hashes to module_state but fails the module's shape checks: {e}"
                     );
                     false
                 }
@@ -1218,7 +1216,7 @@ pub fn resolve_bcl_config(
     if let Some(c) = candidates.iter().find(|c| accepted(c)) {
         return Some(c.clone());
     }
-    cached.and_then(|c| crate::sundaev4::banded_math::config_forms(c).find(|c| accepted(c)))
+    cached.and_then(|c| crate::sundaev4::cl_math::config_forms(c).find(|c| accepted(c)))
 }
 
 /// The stableswap config for `pool_datum`: the first of `candidates`, else
@@ -1421,7 +1419,7 @@ impl ChainIndex for SundaeV4Indexer {
                     let cs_module_hash = invariant_hash(ModuleKind::ConstantSum);
                     let cp_module_hash = invariant_hash(ModuleKind::ConstantProduct);
                     let ss_module_hash = invariant_hash(ModuleKind::Stableswap);
-                    let bcl_module_hash = invariant_hash(ModuleKind::ConcentratedLiquidity);
+                    let cl_module_hash = invariant_hash(ModuleKind::ConcentratedLiquidity);
                     let fs_module_hash =
                         scripts.and_then(|m| m.pool_module_of_kind(&pd, ModuleKind::FeeSplit));
                     // CS, CP and fee_split: a Create or Operate config
@@ -1462,15 +1460,15 @@ impl ChainIndex for SundaeV4Indexer {
                             .zip(ss_module_hash)
                             .map(|(m, h)| extract_ss_config_candidates_any(&tx, m, &h))
                             .unwrap_or_default();
-                    // Banded: the ladder a Create pins or an Operate entry re-sends.
-                    let bcl_candidates_from_tx: Vec<crate::sundaev4::types::BandedCLConfig> =
-                        bcl_module_hash
-                            .map(|h| extract_bcl_config_candidates(&tx, &h))
+                    // CL: the ladder a Create pins or an Operate entry re-sends.
+                    let cl_candidates_from_tx: Vec<crate::sundaev4::types::CLConfig> =
+                        cl_module_hash
+                            .map(|h| extract_cl_config_candidates(&tx, &h))
                             .unwrap_or_default();
                     let cs_module_hash_bytes = cs_module_hash.map(|h| h.as_ref().to_vec());
                     let cp_module_hash_bytes = cp_module_hash.map(|h| h.as_ref().to_vec());
                     let ss_module_hash_bytes = ss_module_hash.map(|h| h.as_ref().to_vec());
-                    let bcl_module_hash_bytes = bcl_module_hash.map(|h| h.as_ref().to_vec());
+                    let cl_module_hash_bytes = cl_module_hash.map(|h| h.as_ref().to_vec());
                     let fs_module_hash_bytes = fs_module_hash.map(|h| h.as_ref().to_vec());
                     // Resolution priority for the CS/CP branch inside detect_pool_type:
                     //   1. config-file override (consulted internally)
@@ -1492,12 +1490,12 @@ impl ChainIndex for SundaeV4Indexer {
                             module_cache.ss.get(&pool_id),
                         )
                     });
-                    let resolved_bcl = bcl_module_hash_bytes.as_ref().and_then(|h| {
-                        resolve_bcl_config(
+                    let resolved_cl = cl_module_hash_bytes.as_ref().and_then(|h| {
+                        resolve_cl_config(
                             &pd,
                             h,
-                            &bcl_candidates_from_tx,
-                            module_cache.bcl.get(&pool_id),
+                            &cl_candidates_from_tx,
+                            module_cache.cl.get(&pool_id),
                         )
                     });
                     let pool_type = detect_pool_type(
@@ -1506,28 +1504,28 @@ impl ChainIndex for SundaeV4Indexer {
                         resolved_cs,
                         resolved_cp,
                         resolved_ss.as_ref(),
-                        resolved_bcl.as_ref(),
+                        resolved_cl.as_ref(),
                     );
 
-                    // Banded: persist on first sight. The ladder is fixed
+                    // CL: persist on first sight. The ladder is fixed
                     // after Create, so a row never changes.
-                    if let (Some(cfg), Some(bcl_hash)) =
-                        (resolved_bcl.as_ref(), bcl_module_hash_bytes.as_ref())
-                        && module_cache.bcl.get(&pool_id) != Some(cfg)
+                    if let (Some(cfg), Some(cl_hash)) =
+                        (resolved_cl.as_ref(), cl_module_hash_bytes.as_ref())
+                        && module_cache.cl.get(&pool_id) != Some(cfg)
                     {
                         let cbor = minicbor::to_vec(cfg.clone().to_plutus())
-                            .context("encode BandedCLConfig CBOR")?;
+                            .context("encode CLConfig CBOR")?;
                         changes.module_configs.push(PersistedModuleConfig {
                             pool_id: pool_id.to_bytes().to_vec(),
-                            module_hash: bcl_hash.clone(),
+                            module_hash: cl_hash.clone(),
                             config_cbor: cbor,
                             created_slot: slot,
                         });
-                        module_cache.bcl.insert(pool_id.clone(), cfg.clone());
+                        module_cache.cl.insert(pool_id.clone(), cfg.clone());
                         info!(
                             pool = %hex::encode(pool_id.to_bytes()),
                             bands = cfg.bands.len(),
-                            "v4: persisted banded pool config from redeemer"
+                            "v4: persisted CL pool config from redeemer"
                         );
                     }
 
@@ -2395,9 +2393,7 @@ pub fn module_configs_match_datum(
             balance_fee: balance_fee.clone(),
         }),
         PoolType::StableSwap { config } => crate::sundaev4::ss_math::config_hash(config),
-        PoolType::BandedConcentratedLiquidity { config } => {
-            crate::sundaev4::banded_math::config_hash(config)
-        }
+        PoolType::ConcentratedLiquidity { config } => crate::sundaev4::cl_math::config_hash(config),
     };
     let check = |module: &str, h: &ScriptHash, expected: &[u8]| -> Result<(), String> {
         match module_slot(datum, h.as_ref()) {
@@ -2437,7 +2433,7 @@ pub fn detect_pool_type(
     cs_config_from_tx: Option<&crate::sundaev4::types::ConstantSumConfig>,
     cp_config_from_tx: Option<&crate::sundaev4::types::ConstantProductConfig>,
     ss_config: Option<&crate::sundaev4::types::StableSwapConfig>,
-    bcl_config: Option<&crate::sundaev4::types::BandedCLConfig>,
+    cl_config: Option<&crate::sundaev4::types::CLConfig>,
 ) -> crate::sundaev4::types::PoolType {
     use crate::bigint::BigInt;
     use crate::sundaev4::types::{PoolType, Rational};
@@ -2599,13 +2595,13 @@ pub fn detect_pool_type(
         // The module hashes five fields. A four-field config is the
         // pre-audit form: no implemented module reads it, so it cannot be
         // the config of a pool the scooper can scoop.
-        if let Some(cfg) = bcl_config {
+        if let Some(cfg) = cl_config {
             if cfg.ext.is_some() {
-                return PoolType::BandedConcentratedLiquidity {
+                return PoolType::ConcentratedLiquidity {
                     config: cfg.clone(),
                 };
             }
-            warn!(pool = %ident_hex, "banded pool's config has four fields; it is refused");
+            warn!(pool = %ident_hex, "CL pool's config has four fields; it is refused");
         }
         // No preimage that hashes to the datum's module_state slot, and no
         // operator override: the ladder is hash-pinned and the module reads
@@ -2613,12 +2609,12 @@ pub fn detect_pool_type(
         // builder's hash check, so the pool is skipped loudly.
         warn!(
             pool = %ident_hex,
-            "banded pool has no config preimage matching its module_state (not yet indexed from \
+            "CL pool has no config preimage matching its module_state (not yet indexed from \
              a Create/Operate redeemer); scoops against it are refused until it is recovered — \
              a restart recovers from the pool's tx history"
         );
-        return PoolType::BandedConcentratedLiquidity {
-            config: crate::sundaev4::types::BandedCLConfig {
+        return PoolType::ConcentratedLiquidity {
+            config: crate::sundaev4::types::CLConfig {
                 bands: vec![],
                 index: vec![],
                 closing: Rational {
@@ -2770,34 +2766,33 @@ mod mainnet_create_tx_tests {
 }
 
 #[cfg(test)]
-mod preview_banded_recovery_tests {
+mod preview_cl_recovery_tests {
     //! Preview pool 622cee5f…, Create transaction c601f694…. The pool was
-    //! created under banded module 0977898c… with the pre-V13 config, and an
+    //! created under CL module 0977898c… with the pre-V13 config, and an
     //! index-swap governor later rewrote its `module_state` to the indexed
     //! config 361006908c…. The governor derives the new config on chain, so
     //! no redeemer anywhere holds it. Recovery must therefore read a
     //! withdrawal of a module hash it is not configured with, parse the old
     //! config form, and rebuild the index from the bands.
     use super::*;
-    use crate::sundaev4::banded_math::config_hash;
+    use crate::sundaev4::cl_math::config_hash;
 
-    const CREATE_TX_HEX: &str =
-        include_str!("../../test/fixtures/preview-banded-create-c601f694.hex");
-    /// The banded module the scooper is configured with today.
-    const NEW_BCL_HASH: &str = "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18";
-    /// The pool datum's banded `module_state` slot after the migration.
+    const CREATE_TX_HEX: &str = include_str!("../../test/fixtures/preview-cl-create-c601f694.hex");
+    /// The CL module the scooper is configured with today.
+    const NEW_CL_HASH: &str = "33485bba2689d4b82b412fb683f07474b9c6c042778d3b9d2b691f18";
+    /// The pool datum's CL `module_state` slot after the migration.
     const MIGRATED_STATE: &str = "361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9";
 
     #[test]
     fn recovers_the_migrated_config_from_the_legacy_create_redeemer() {
         let cbor = hex::decode(CREATE_TX_HEX.trim()).expect("fixture is hex");
         let tx = MultiEraTx::decode(&cbor).expect("fixture decodes");
-        let configured: ScriptHash = hex::decode(NEW_BCL_HASH).expect("hex").as_slice().into();
+        let configured: ScriptHash = hex::decode(NEW_CL_HASH).expect("hex").as_slice().into();
 
-        let candidates = extract_bcl_config_candidates(&tx, &configured);
+        let candidates = extract_cl_config_candidates(&tx, &configured);
         assert!(
             !candidates.is_empty(),
-            "no banded candidate recovered from the Create tx"
+            "no CL candidate recovered from the Create tx"
         );
         let want = hex::decode(MIGRATED_STATE).expect("hex");
         assert!(
@@ -2902,6 +2897,60 @@ mod load_tests {
             "the resync lost the pool the node had indexed"
         );
     }
+
+    /// A CL config row that release 0.8.0 wrote must hydrate after an
+    /// upgrade that keeps the database. The row holds the module hash and
+    /// the config as Plutus data CBOR. It holds no type name, so the rename
+    /// of the Rust type to `CLConfig` changes nothing that is stored. The
+    /// fixture is the row value that the 0.8.0 code (commit 95f5fa3) wrote
+    /// for the ladder that `cl_eq8_config(3/1000)` builds.
+    #[tokio::test]
+    async fn a_cl_config_row_of_release_0_8_0_hydrates() {
+        use crate::persistence::TxChanges;
+        use crate::sundaev4::test_harness::{PREVIEW_FIXTURE, TestEnv, cl_eq8_config};
+        let row = hex::decode(include_str!("../../test/fixtures/cl-config-row-v0.8.0.hex").trim())
+            .unwrap();
+        let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
+        let cl_hash = env
+            .exec
+            .module_scripts
+            .of_kind(crate::sundaev4::ModuleKind::ConcentratedLiquidity)
+            .next()
+            .expect("the fixture has a CL module")
+            .hash;
+        let pool_id = vec![0xC1; 28];
+
+        let persistence = connect(&PersistenceConfig::default()).await.unwrap();
+        let mut changes = TxChanges::new(1, 1);
+        changes.module_configs.push(PersistedModuleConfig {
+            pool_id: pool_id.clone(),
+            module_hash: cl_hash.to_vec(),
+            config_cbor: row.clone(),
+            created_slot: 1,
+        });
+        persistence.indexer_dao("sundae_v4").apply_tx_changes(changes).await.unwrap();
+
+        let mut protocol = protocol();
+        protocol.execution = Some(env.exec.clone());
+        let (event_tx, _) = broadcast::channel(16);
+        let mut indexer = SundaeV4Indexer::new(
+            Arc::new(Mutex::new(SundaeV4HistoricalState::new())),
+            event_tx,
+            protocol,
+            2160,
+            persistence.indexer_dao("sundae_v4"),
+        );
+        indexer.load().await.unwrap();
+
+        let want = cl_eq8_config(crate::sundaev4::Rational {
+            num: 3.into(),
+            den: 1000.into(),
+        });
+        let cache = indexer.module_configs.lock().await;
+        assert_eq!(cache.cl.get(&Ident::new(&pool_id)), Some(&want));
+        // The renamed type writes the same row value.
+        assert_eq!(minicbor::to_vec(want.to_plutus()).unwrap(), row);
+    }
 }
 
 #[cfg(test)]
@@ -2911,10 +2960,9 @@ mod steelswap_quote_dump {
     //! 6,249,988 tOKENC). Ignored by default; run with --ignored.
     use super::*;
     use crate::bigint::BigInt;
-    use crate::sundaev4::banded_math::{config_hash, find_witness, swap_steps};
+    use crate::sundaev4::cl_math::{config_hash, find_witness, swap_steps};
 
-    const CREATE_TX_HEX: &str =
-        include_str!("../../test/fixtures/preview-banded-create-c601f694.hex");
+    const CREATE_TX_HEX: &str = include_str!("../../test/fixtures/preview-cl-create-c601f694.hex");
 
     #[test]
     #[ignore]
@@ -2928,7 +2976,7 @@ mod steelswap_quote_dump {
                 .into();
         let want = hex::decode("361006908c76928585007cd24aeec231db3d571df4d04a76be5c6b8f0f4313c9")
             .unwrap();
-        let cfg = extract_bcl_config_candidates(&tx, &configured)
+        let cfg = extract_cl_config_candidates(&tx, &configured)
             .into_iter()
             .find(|c| config_hash(c) == want)
             .unwrap();

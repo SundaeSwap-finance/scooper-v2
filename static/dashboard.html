@@ -887,7 +887,8 @@
     document.getElementById('protocol-pool-cards').innerHTML =
       statCard('Constant Product', bt.cp || 0) +
       statCard('Constant Sum', bt.cs || 0) +
-      statCard('Banded CL', bt.bcl || 0) +
+      // `bcl` is the key that releases to 0.8.0 emit for the CL pools.
+      statCard('Concentrated Liquidity', (bt.cl || 0) + (bt.bcl || 0)) +
       statCard('StableSwap', bt.ss || 0) +
       statCard('Empty Reserve', pools.empty || 0) +
       statCard('Allowlisted', pools.restricted || 0);
@@ -949,7 +950,8 @@
     assetRows('protocol-tvl-body', pools.tvl);
 
     var typeBadge = { cp: '<span class="badge badge-blue">CP</span>', cs: '<span class="badge badge-green">CS</span>',
-                      bcl: '<span class="badge badge-accent">BCL</span>', ss: '<span class="badge badge-green">SS</span>' };
+                      cl: '<span class="badge badge-accent">CL</span>', ss: '<span class="badge badge-green">SS</span>' };
+    typeBadge.bcl = typeBadge.cl;  // the name in releases to 0.8.0
     var prow = (eq.pools || []).slice();
     prow.forEach(function(p) { p._tvl = usdOf(p.reserves).usd; p._eq = usdOf(p.protocol_equity).usd; });
     prow.sort(function(a, b) { return b._tvl - a._tvl; });
@@ -1496,8 +1498,9 @@
     if (pt.ConstantProduct) return '<span class="badge badge-blue">CP</span>';
     if (pt.ConstantSum) return '<span class="badge badge-green">CS</span>';
     if (pt.StableSwap) return '<span class="badge badge-green">SS</span>';
-    if (pt.BandedConcentratedLiquidity) {
-      var badge = '<span class="badge badge-accent">BCL</span>';
+    // `BandedConcentratedLiquidity` is the name in releases to 0.8.0.
+    if (pt.ConcentratedLiquidity || pt.BandedConcentratedLiquidity) {
+      var badge = '<span class="badge badge-accent">CL</span>';
       if (bandState && bandState.bands != null) {
         var title = 'ladder counter ' + bandState.counter +
           '; active band sqrt-price [' + bandState.sqrt_price_lo + ', ' + bandState.sqrt_price_hi + ')' +

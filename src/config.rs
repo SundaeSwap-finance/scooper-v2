@@ -289,6 +289,41 @@ mod tests {
         );
     }
 
+    /// Releases to 0.8.0 named the CL role `banded-concentrated-liquidity`,
+    /// and operator configs hold that name. A config with the old name loads
+    /// through config-rs to the same module set as the shipped config.
+    #[test]
+    fn the_old_cl_role_name_still_loads() {
+        use crate::sundaev4::ModuleKind;
+        let shipped = std::fs::read_to_string("config/mainnet-v4.json").unwrap();
+        assert_eq!(shipped.matches("\"concentrated-liquidity\"").count(), 1);
+        let old = shipped.replace(
+            "\"concentrated-liquidity\"",
+            "\"banded-concentrated-liquidity\"",
+        );
+        let path = std::env::temp_dir().join(format!(
+            "scooper-old-cl-role-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, old).unwrap();
+        let config = load_config([path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        let modules = |config: AppConfig| {
+            let exec = config.protocol.v4.and_then(|v4| v4.execution).expect("v4 execution");
+            let mut hashes: Vec<_> =
+                exec.module_scripts.modules.iter().map(|e| (e.kind, e.script.hash)).collect();
+            hashes.sort_by_key(|(_, h)| *h);
+            hashes
+        };
+        let old = modules(config.expect("the old name loads"));
+        let new = modules(load_config(["config/mainnet-v4.json"]).expect("config loads"));
+        assert_eq!(old, new);
+        assert_eq!(
+            old.iter().filter(|(k, _)| *k == ModuleKind::ConcentratedLiquidity).count(),
+            1
+        );
+    }
+
     /// An uppercase blacklist entry loads through config-rs and still
     /// blacklists the pool.
     #[test]

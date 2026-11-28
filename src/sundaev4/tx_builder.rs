@@ -142,17 +142,17 @@ fn ss_swap_op_data(
     .to_plutus())
 }
 
-/// `[X, k, attribution]` for a banded ladder entry: the witness pair of the
-/// reserves the entry leaves (`banded_cl_check.decode_entry` reads the first
+/// `[X, k, attribution]` for a CL ladder entry: the witness pair of the
+/// reserves the entry leaves (`cl_check.decode_entry` reads the first
 /// two positionally), plus the serving order's reference for the indexer.
 /// A state with no witness cannot be the after state of a valid step, so
 /// the tx is refused rather than built.
-/// The banded entry's operation_data for a known after-witness: `[X, k]`
+/// The CL entry's operation_data for a known after-witness: `[X, k]`
 /// plus the attribution. The list is exactly three items
 /// (`cl_check.decode_entry`), so a step that serves no order writes `Void`
 /// in the third.
-fn banded_op_data_for(
-    w: &crate::sundaev4::banded_math::Witness,
+fn cl_op_data_for(
+    w: &crate::sundaev4::cl_math::Witness,
     attribution: Option<pallas_primitives::PlutusData>,
 ) -> pallas_primitives::PlutusData {
     let mut items = vec![
@@ -161,7 +161,7 @@ fn banded_op_data_for(
     ];
     match attribution {
         Some(a) => items.push(a),
-        None => items.push(crate::sundaev4::types::BandedCLConfig::void_data()),
+        None => items.push(crate::sundaev4::types::CLConfig::void_data()),
     }
     pallas_primitives::PlutusData::Array(pallas_codec::utils::MaybeIndefArray::Indef(items))
 }
@@ -184,36 +184,36 @@ struct WalkPoolState<'a> {
     transcript: &'a mut Vec<TranscriptEntry>,
 }
 
-/// Apply a banded swap of `dx` as in-band steps. Every step but the last is
+/// Apply a CL swap of `dx` as in-band steps. Every step but the last is
 /// accrued and pushed as its own transcript entry here; the last step's
 /// deltas are applied and its gross fee budget and after-witness returned,
 /// so the caller's common tail emits it like any other op. Returns
 /// `(total dy, gross fee budget of the last step, after-witness)`.
-fn walk_banded_swap(
-    config: &crate::sundaev4::types::BandedCLConfig,
+fn walk_cl_swap(
+    config: &crate::sundaev4::types::CLConfig,
     st: &mut WalkPoolState<'_>,
     input_idx: usize,
     dx: &BigInt,
     swap_tag: &BigInt,
     attribution: pallas_primitives::PlutusData,
-) -> Result<(BigInt, BigInt, crate::sundaev4::banded_math::Witness)> {
-    use crate::sundaev4::banded_math;
+) -> Result<(BigInt, BigInt, crate::sundaev4::cl_math::Witness)> {
+    use crate::sundaev4::cl_math;
     use num_traits::Signed;
     if st.running_assets.len() != 2 || input_idx > 1 {
-        bail!("banded pool must hold exactly two assets");
+        bail!("CL pool must hold exactly two assets");
     }
     let is_a_input = input_idx == 0;
-    let steps = banded_math::swap_steps(
+    let steps = cl_math::swap_steps(
         config,
         &st.running_assets[0].1,
         &st.running_assets[1].1,
         is_a_input,
         dx,
     )
-    .map_err(|e| anyhow::anyhow!("banded swap plan: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("CL swap plan: {e}"))?;
     let n = steps.len();
     let mut total_dy = BigInt::from(0);
-    let mut last: Option<(BigInt, banded_math::Witness)> = None;
+    let mut last: Option<(BigInt, cl_math::Witness)> = None;
     for (i, step) in steps.iter().enumerate() {
         let (a0, b0) = (
             st.running_assets[0].1.clone(),
@@ -227,7 +227,7 @@ fn walk_banded_swap(
         // The fee's LP worth at the before witness (sundae-v4 SV4-001b);
         // the module pins `lp_after + fee_budget - lp_before` to it
         // exactly.
-        let gross_fb = banded_math::swap_fee_budget(
+        let gross_fb = cl_math::swap_fee_budget(
             config,
             &a0,
             &b0,
@@ -236,9 +236,9 @@ fn walk_banded_swap(
             &step.before,
             st.running_total_lp,
         )
-        .map_err(|e| anyhow::anyhow!("banded step fee budget: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("CL step fee budget: {e}"))?;
         if gross_fb.is_negative() {
-            bail!("banded step books a negative fee budget ({gross_fb})");
+            bail!("CL step books a negative fee budget ({gross_fb})");
         }
         if is_a_input {
             st.running_assets[0].1 = &st.running_assets[0].1 + &step.dx;
@@ -268,7 +268,7 @@ fn walk_banded_swap(
             band_before = step.before.k,
             band_after = step.after.k,
             fee_budget = %gross_fb,
-            "streaming walk: banded crossing step",
+            "streaming walk: CL crossing step",
         );
         st.transcript.push(TranscriptEntry {
             state_after: PoolState {
@@ -279,30 +279,31 @@ fn walk_banded_swap(
             },
             fee_budget: submitted_fee_budget,
             operation_tag: swap_tag.clone(),
-            operation_data: banded_op_data_for(&step.after, Some(attribution.clone())),
+            operation_data: cl_op_data_for(&step.after, Some(attribution.clone())),
         });
     }
     let (gross_fb, after) = last.expect("swap_steps returns at least one step");
     Ok((total_dy, gross_fb, after))
 }
 
-fn banded_op_data(
-    config: &crate::sundaev4::types::BandedCLConfig,
+fn cl_op_data(
+    config: &crate::sundaev4::types::CLConfig,
     after: &[(AssetClass, BigInt)],
     attribution: Option<pallas_primitives::PlutusData>,
 ) -> Result<pallas_primitives::PlutusData> {
     if after.len() != 2 {
-        bail!("banded pool must hold exactly two assets");
+        bail!("CL pool must hold exactly two assets");
     }
-    let w = crate::sundaev4::banded_math::find_witness(config, &after[0].1, &after[1].1)
-        .ok_or_else(|| {
+    let w = crate::sundaev4::cl_math::find_witness(config, &after[0].1, &after[1].1).ok_or_else(
+        || {
             anyhow::anyhow!(
-                "banded entry leaves reserves ({}, {}) that sit on no point of the ladder",
+                "CL entry leaves reserves ({}, {}) that sit on no point of the ladder",
                 after[0].1,
                 after[1].1
             )
-        })?;
-    Ok(banded_op_data_for(&w, attribution))
+        },
+    )?;
+    Ok(cl_op_data_for(&w, attribution))
 }
 
 /// `LiquidityStep { target_delta_d, next_sum_invariant, attribution }` for
@@ -783,7 +784,7 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_SWAP)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { .. } => {
+            PoolType::ConcentratedLiquidity { .. } => {
                 cl_operation_tag(crate::sundaev4::types::TAG_SWAP)
             }
         })
@@ -799,7 +800,7 @@ pub fn build_multi_pool_scoop_tx(
                 BigInt::from(crate::sundaev4::types::TAG_DEPOSIT)
             }
             PoolType::ConstantProduct { .. } => BigInt::from(100),
-            PoolType::BandedConcentratedLiquidity { .. } => {
+            PoolType::ConcentratedLiquidity { .. } => {
                 cl_operation_tag(crate::sundaev4::types::TAG_DEPOSIT)
             }
         })
@@ -877,9 +878,9 @@ pub fn build_multi_pool_scoop_tx(
         // Claims carry a BountyClaim as operation_data; everything else
         // uses the void placeholder.
         let mut op_data_override: Option<pallas_primitives::PlutusData> = None;
-        // Set by banded swap arms: the planned after-witness of the final
+        // Set by CL swap arms: the planned after-witness of the final
         // step, which the entry's operation_data must name.
-        let mut banded_after: Option<crate::sundaev4::banded_math::Witness> = None;
+        let mut cl_after: Option<crate::sundaev4::cl_math::Witness> = None;
         let (operation_tag, gross_fb) = match op {
             crate::sundaev4::batch::BatchOp::Claim(i) => {
                 // CS bounty claim (cs_check tag 5): the reserve vector moves by
@@ -941,10 +942,10 @@ pub fn build_multi_pool_scoop_tx(
                 // the indexer can tell this step served a Cardano-Swaps order.
                 op_data_override = Some(order_ref_to_plutus(&f.attribution));
                 let dx = f.dx.clone();
-                // Same step as a Sundae swap: the banded ladder walks its own
+                // Same step as a Sundae swap: the CL ladder walks its own
                 // state and transcript, every other family is one curve call.
-                let mut banded_fb: Option<BigInt> = None;
-                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                let mut cl_fb: Option<BigInt> = None;
+                let dy = if let PoolType::ConcentratedLiquidity { config } = &pool_type {
                     let mut wst = WalkPoolState {
                         running_assets,
                         running_total_lp,
@@ -955,7 +956,7 @@ pub fn build_multi_pool_scoop_tx(
                         cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
                         transcript: &mut per_pool_transcripts[batch_idx],
                     };
-                    let (dy, fb, after) = walk_banded_swap(
+                    let (dy, fb, after) = walk_cl_swap(
                         config,
                         &mut wst,
                         f.input_idx,
@@ -963,8 +964,8 @@ pub fn build_multi_pool_scoop_tx(
                         &per_pool_swap_tag[batch_idx],
                         order_ref_to_plutus(&f.attribution),
                     )?;
-                    banded_fb = Some(fb);
-                    banded_after = Some(after);
+                    cl_fb = Some(fb);
+                    cl_after = Some(after);
                     dy
                 } else {
                     let dy = crate::sundaev4::batch::compute_swap_result(
@@ -994,7 +995,7 @@ pub fn build_multi_pool_scoop_tx(
                     dx = %dx, dy = %dy,
                     "streaming walk: foreign-order fill",
                 );
-                let fb = banded_fb.unwrap_or_else(|| {
+                let fb = cl_fb.unwrap_or_else(|| {
                     swap_math::compute_fee_budget(
                         &pool_type,
                         &prev_assets,
@@ -1017,8 +1018,8 @@ pub fn build_multi_pool_scoop_tx(
                 let dx = s.dx.clone();
                 // dy: recompute fresh against the current pool state
                 // (including any LP bumps from prior entries).
-                let mut banded_fb: Option<BigInt> = None;
-                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                let mut cl_fb: Option<BigInt> = None;
+                let dy = if let PoolType::ConcentratedLiquidity { config } = &pool_type {
                     let mut wst = WalkPoolState {
                         running_assets,
                         running_total_lp,
@@ -1029,7 +1030,7 @@ pub fn build_multi_pool_scoop_tx(
                         cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
                         transcript: &mut per_pool_transcripts[batch_idx],
                     };
-                    let (dy, fb, after) = walk_banded_swap(
+                    let (dy, fb, after) = walk_cl_swap(
                         config,
                         &mut wst,
                         s.input_idx,
@@ -1037,8 +1038,8 @@ pub fn build_multi_pool_scoop_tx(
                         &per_pool_swap_tag[batch_idx],
                         order_ref_to_plutus(&s.order.input),
                     )?;
-                    banded_fb = Some(fb);
-                    banded_after = Some(after);
+                    cl_fb = Some(fb);
+                    cl_after = Some(after);
                     dy
                 } else {
                     let dy = crate::sundaev4::batch::compute_swap_result(
@@ -1074,7 +1075,7 @@ pub fn build_multi_pool_scoop_tx(
                         rs.final_output = &rs.final_output + &dy;
                     }
                 }
-                let fb = banded_fb.unwrap_or_else(|| {
+                let fb = cl_fb.unwrap_or_else(|| {
                     swap_math::compute_fee_budget(
                         &pool_type,
                         &prev_assets,
@@ -1116,8 +1117,8 @@ pub fn build_multi_pool_scoop_tx(
                         c.dx.clone()
                     }
                 };
-                let mut banded_fb: Option<BigInt> = None;
-                let dy = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                let mut cl_fb: Option<BigInt> = None;
+                let dy = if let PoolType::ConcentratedLiquidity { config } = &pool_type {
                     let mut wst = WalkPoolState {
                         running_assets,
                         running_total_lp,
@@ -1128,7 +1129,7 @@ pub fn build_multi_pool_scoop_tx(
                         cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
                         transcript: &mut per_pool_transcripts[batch_idx],
                     };
-                    let (dy, fb, after) = walk_banded_swap(
+                    let (dy, fb, after) = walk_cl_swap(
                         config,
                         &mut wst,
                         c.input_idx,
@@ -1136,8 +1137,8 @@ pub fn build_multi_pool_scoop_tx(
                         &per_pool_swap_tag[batch_idx],
                         order_ref_to_plutus(&route.order.input),
                     )?;
-                    banded_fb = Some(fb);
-                    banded_after = Some(after);
+                    cl_fb = Some(fb);
+                    cl_after = Some(after);
                     dy
                 } else {
                     let dy = crate::sundaev4::batch::compute_swap_result(
@@ -1170,7 +1171,7 @@ pub fn build_multi_pool_scoop_tx(
                 } else {
                     rs.final_output = &rs.final_output + &dy;
                 }
-                let fb = banded_fb.unwrap_or_else(|| {
+                let fb = cl_fb.unwrap_or_else(|| {
                     swap_math::compute_fee_budget(
                         &pool_type,
                         &prev_assets,
@@ -1183,7 +1184,7 @@ pub fn build_multi_pool_scoop_tx(
             crate::sundaev4::batch::BatchOp::ZapSwap(i) => {
                 let z = &batch.zaps[*i];
                 op_data_override = Some(order_ref_to_plutus(&z.order.input));
-                let fb = if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+                let fb = if let PoolType::ConcentratedLiquidity { config } = &pool_type {
                     let in_idx = z
                         .swap_deltas
                         .iter()
@@ -1199,7 +1200,7 @@ pub fn build_multi_pool_scoop_tx(
                         cum_protocol_lp: &mut per_pool_cum_protocol_lp[batch_idx],
                         transcript: &mut per_pool_transcripts[batch_idx],
                     };
-                    let (dy, fb, after) = walk_banded_swap(
+                    let (dy, fb, after) = walk_cl_swap(
                         config,
                         &mut wst,
                         in_idx,
@@ -1213,7 +1214,7 @@ pub fn build_multi_pool_scoop_tx(
                             -&z.swap_deltas[1 - in_idx]
                         );
                     }
-                    banded_after = Some(after);
+                    cl_after = Some(after);
                     fb
                 } else {
                     for (idx, amt) in running_assets.iter_mut().enumerate() {
@@ -1294,7 +1295,7 @@ pub fn build_multi_pool_scoop_tx(
                 );
                 let wd_tag = match &pool_type {
                     PoolType::ConstantProduct { .. } => BigInt::from(100),
-                    PoolType::BandedConcentratedLiquidity { .. } => {
+                    PoolType::ConcentratedLiquidity { .. } => {
                         cl_operation_tag(crate::sundaev4::types::TAG_WITHDRAW)
                     }
                     PoolType::ConstantSum { .. } | PoolType::StableSwap { .. } => {
@@ -1373,13 +1374,13 @@ pub fn build_multi_pool_scoop_tx(
             });
         }
 
-        // Banded entries carry the AFTER state's witness pair `[X, k]` in
+        // CL entries carry the AFTER state's witness pair `[X, k]` in
         // operation_data: the ladder walk decodes it positionally from every
-        // entry, swap or not (banded_cl_check.decode_entry), and threads it
+        // entry, swap or not (cl_check.decode_entry), and threads it
         // into the next step's before pair. A third element, the serving
         // order's reference, rides along for the indexer; the walk reads
         // only the first two.
-        if let PoolType::BandedConcentratedLiquidity { config } = &pool_type {
+        if let PoolType::ConcentratedLiquidity { config } = &pool_type {
             use crate::sundaev4::batch::BatchOp;
             let served_order = match op {
                 BatchOp::Swap(i) => Some(&batch.swaps[*i].order.input),
@@ -1392,9 +1393,9 @@ pub fn build_multi_pool_scoop_tx(
                 BatchOp::Foreign(i) => Some(&batch.foreign[*i].attribution),
                 BatchOp::Claim(_) => bail!("bounty claims are constant-sum only"),
             };
-            op_data_override = Some(match &banded_after {
-                Some(w) => banded_op_data_for(w, served_order.map(order_ref_to_plutus)),
-                None => banded_op_data(
+            op_data_override = Some(match &cl_after {
+                Some(w) => cl_op_data_for(w, served_order.map(order_ref_to_plutus)),
+                None => cl_op_data(
                     config,
                     running_assets,
                     served_order.map(order_ref_to_plutus),
@@ -1825,7 +1826,7 @@ pub fn build_multi_pool_scoop_tx(
             PoolType::ConstantProduct { .. } => ModuleKind::ConstantProduct,
             PoolType::ConstantSum { .. } => ModuleKind::ConstantSum,
             PoolType::StableSwap { .. } => ModuleKind::Stableswap,
-            PoolType::BandedConcentratedLiquidity { .. } => ModuleKind::ConcentratedLiquidity,
+            PoolType::ConcentratedLiquidity { .. } => ModuleKind::ConcentratedLiquidity,
         };
         if kind_of_type != invariant_kind {
             bail!(
@@ -1949,19 +1950,19 @@ pub fn build_multi_pool_scoop_tx(
                     }),
                 )?;
             }
-            PoolType::BandedConcentratedLiquidity { config } => {
+            PoolType::ConcentratedLiquidity { config } => {
                 // The entry re-sends the ladder and the witness pair for the
                 // pool INPUT's reserves. The module checks the preimage
                 // against both datums' module_state and re-derives the pair
                 // in the walk's first step, so refuse to build on a stale or
                 // unknown config rather than fail on chain.
-                let bcl_cred = invariant_hash.as_ref();
+                let cl_cred = invariant_hash.as_ref();
                 let stored = batch
                     .pool
                     .pool_datum
                     .module_state
                     .iter()
-                    .find(|(cred, _)| cred.as_slice() == bcl_cred)
+                    .find(|(cred, _)| cred.as_slice() == cl_cred)
                     .map(|(_, h)| h.clone());
                 // The module hashes five fields. A four-field config is the
                 // pre-audit form, and no implemented module reads it.
@@ -1969,13 +1970,13 @@ pub fn build_multi_pool_scoop_tx(
                     bail!(
                         "pool {}: the CL config has four fields; module {} reads five",
                         batch.pool.pool_datum.identifier,
-                        hex::encode(bcl_cred),
+                        hex::encode(cl_cred),
                     );
                 }
-                let expected = crate::sundaev4::banded_math::config_hash(config);
+                let expected = crate::sundaev4::cl_math::config_hash(config);
                 if stored.as_deref() != Some(expected.as_slice()) {
                     bail!(
-                        "pool {}: banded config preimage hash {} does not match the pool's \
+                        "pool {}: CL config preimage hash {} does not match the pool's \
                          module_state {:?}; the config is unknown or stale",
                         batch.pool.pool_datum.identifier,
                         hex::encode(&expected),
@@ -1985,29 +1986,28 @@ pub fn build_multi_pool_scoop_tx(
                 let assets = &batch.pool.pool_datum.assets;
                 if assets.len() != 2 {
                     bail!(
-                        "pool {}: banded pool must hold exactly two assets",
+                        "pool {}: CL pool must hold exactly two assets",
                         batch.pool.pool_datum.identifier
                     );
                 }
-                let w =
-                    crate::sundaev4::banded_math::find_witness(config, &assets[0].1, &assets[1].1)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "pool {}: no ladder witness for reserves ({}, {})",
-                                batch.pool.pool_datum.identifier,
-                                assets[0].1,
-                                assets[1].1
-                            )
-                        })?;
+                let w = crate::sundaev4::cl_math::find_witness(config, &assets[0].1, &assets[1].1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pool {}: no ladder witness for reserves ({}, {})",
+                            batch.pool.pool_datum.identifier,
+                            assets[0].1,
+                            assets[1].1
+                        )
+                    })?;
                 tracing::debug!(
                     pool = %batch.pool.pool_datum.identifier,
                     counter = %w.x,
                     active_band = w.k,
-                    "banded redeemer witness",
+                    "CL redeemer witness",
                 );
                 push_entry(
                     invariant_hash,
-                    PoolModuleEntry::Cl(crate::sundaev4::types::BandedOperateEntry {
+                    PoolModuleEntry::Cl(crate::sundaev4::types::CLOperateEntry {
                         pool_oref: pool_oref_plutus.clone(),
                         config: config.clone(),
                         counter: w.x,
@@ -4460,7 +4460,7 @@ enum PoolModuleEntry {
     Cp(CPOperateEntry),
     Cs(CSOperateEntry),
     Ss(crate::sundaev4::types::SSOperateEntry),
-    Cl(crate::sundaev4::types::BandedOperateEntry),
+    Cl(crate::sundaev4::types::CLOperateEntry),
     FeeSplit(FSOperateEntry),
     Fairness(FairnessOperateEntry),
     Oracle(crate::sundaev4::types::OracleEntry),
@@ -4533,7 +4533,7 @@ impl PoolModuleEntries {
             }
             .to_plutus(),
             ModuleKind::ConcentratedLiquidity => {
-                crate::sundaev4::types::BandedCLRedeemer::operate(collect!(Cl))
+                crate::sundaev4::types::CLRedeemer::operate(collect!(Cl))
             }
             ModuleKind::FeeSplit => FeeSplitRedeemer::Operate {
                 entries: collect!(FeeSplit),

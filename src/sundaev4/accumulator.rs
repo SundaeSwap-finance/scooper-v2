@@ -22,7 +22,7 @@ use crate::sundaev4::types::SundaeV4Pool;
 /// Per-pool running state within a multi-pool tx being built incrementally.
 ///
 /// The accumulator mirrors the tx-builder's streaming walk so that
-/// LP-dependent swap math (the banded ladder reads `total_lp` as its counter) gives the
+/// LP-dependent swap math (the CL ladder reads `total_lp` as its counter) gives the
 /// *same* dy at accumulation time as at tx-build time. Without this, the
 /// router would route against the accumulator's projection and the tx-builder
 /// would compute different dys, leading to value-conservation failures.
@@ -167,13 +167,13 @@ impl PoolAccum {
     }
 }
 
-/// Apply a banded swap of `dx` to a running pool state as in-band steps,
+/// Apply a CL swap of `dx` to a running pool state as in-band steps,
 /// accruing each step's fee budget and protocol LP exactly as the tx walk
 /// does, so a deposit pinned after the swap sees the walk's `total_lp`.
 /// Returns the total output.
 #[allow(clippy::too_many_arguments)]
-pub fn accrue_banded_swap(
-    cfg: &crate::sundaev4::types::BandedCLConfig,
+pub fn accrue_cl_swap(
+    cfg: &crate::sundaev4::types::CLConfig,
     assets: &mut [(AssetClass, BigInt)],
     total_lp: &mut BigInt,
     ps: &(BigInt, BigInt),
@@ -182,13 +182,13 @@ pub fn accrue_banded_swap(
     input_idx: usize,
     dx: &BigInt,
 ) -> Result<BigInt, String> {
-    use crate::sundaev4::banded_math;
+    use crate::sundaev4::cl_math;
     use num_traits::Signed;
     if assets.len() != 2 || input_idx > 1 {
-        return Err("banded swap needs a two-asset pool".into());
+        return Err("CL swap needs a two-asset pool".into());
     }
     let is_a_input = input_idx == 0;
-    let steps = banded_math::swap_steps(cfg, &assets[0].1, &assets[1].1, is_a_input, dx)?;
+    let steps = cl_math::swap_steps(cfg, &assets[0].1, &assets[1].1, is_a_input, dx)?;
     let mut total_dy = BigInt::from(0);
     for st in &steps {
         let (a0, b0) = (assets[0].1.clone(), assets[1].1.clone());
@@ -197,11 +197,11 @@ pub fn accrue_banded_swap(
         } else {
             (&a0 - &st.dy, &b0 + &st.dx)
         };
-        // The same number `tx_builder::walk_banded_swap` declares: the fee's
+        // The same number `tx_builder::walk_cl_swap` declares: the fee's
         // LP worth (sundae-v4 SV4-001b).
-        let fb = banded_math::swap_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, total_lp)?;
+        let fb = cl_math::swap_fee_budget(cfg, &a0, &b0, &a1, &b1, &st.before, total_lp)?;
         if fb.is_negative() {
-            return Err(format!("banded step books a negative fee budget ({fb})"));
+            return Err(format!("CL step books a negative fee budget ({fb})"));
         }
         if is_a_input {
             assets[0].1 = &assets[0].1 + &st.dx;
@@ -441,13 +441,13 @@ impl Accumulator {
         let mut lp_at_deposit = lp_before.clone();
         let mut cum_gross_fb = cum_gross_fb_before.clone();
         let mut new_cum_protocol_lp = cum_protocol_lp_before.clone();
-        if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { config } =
+        if let crate::sundaev4::types::PoolType::ConcentratedLiquidity { config } =
             &effective_pool.pool_type
         {
             let Some(in_idx) = swap_deltas.iter().position(|d| d.is_positive()) else {
                 return Err("zap swap pays nothing in".into());
             };
-            let dy = accrue_banded_swap(
+            let dy = accrue_cl_swap(
                 config,
                 &mut after_swap,
                 &mut lp_at_deposit,
@@ -1224,14 +1224,13 @@ impl Accumulator {
                     proportional
                 };
 
-                let dy = if let crate::sundaev4::types::PoolType::BandedConcentratedLiquidity {
-                    config,
-                } = &effective_pool.pool_type
+                let dy = if let crate::sundaev4::types::PoolType::ConcentratedLiquidity { config } =
+                    &effective_pool.pool_type
                 {
                     // Several in-band steps, each accruing its own fee
                     // budget, exactly as the tx walk emits them.
                     let ps = accum.ps.clone();
-                    let dy = accrue_banded_swap(
+                    let dy = accrue_cl_swap(
                         config,
                         &mut accum.running_assets,
                         &mut accum.running_total_lp,

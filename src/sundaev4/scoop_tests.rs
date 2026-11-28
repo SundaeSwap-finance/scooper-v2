@@ -1136,15 +1136,15 @@ mod tests {
         }
     }
 
-    fn two_bcl_pools_with_circulating_lp(
+    fn two_cl_pools_with_circulating_lp(
         env: &TestEnv,
         ids: [u8; 2],
         circulating: i64,
     ) -> Vec<std::sync::Arc<crate::sundaev4::SundaeV4Pool>> {
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         ids.iter()
             .map(|&id| {
-                let p = make_bcl_pool(
+                let p = make_cl_pool(
                     env,
                     id,
                     vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1165,13 +1165,13 @@ mod tests {
     /// One order offers the LP of two pools and asks for the pool assets:
     /// two withdraw legs, one fulfillment carrying both payouts.
     #[test]
-    fn bcl_multi_withdrawal_evaluates() {
+    fn cl_multi_withdrawal_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::batch;
         use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pools = two_bcl_pools_with_circulating_lp(&env, [0x72, 0x73], 20_000_000);
+        let pools = two_cl_pools_with_circulating_lp(&env, [0x72, 0x73], 20_000_000);
         let lp_x = lp_asset_for(&env, 0x72);
         let lp_y = lp_asset_for(&env, 0x73);
         let order = make_basic_lp_order(
@@ -1222,13 +1222,13 @@ mod tests {
     /// One order offers both pool assets and asks for the LP of two pools:
     /// the basket is split equally, two deposit legs, one fulfillment.
     #[test]
-    fn bcl_multi_deposit_evaluates() {
+    fn cl_multi_deposit_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::batch;
         use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let pools = two_bcl_pools_with_circulating_lp(&env, [0x74, 0x75], 0);
+        let pools = two_cl_pools_with_circulating_lp(&env, [0x74, 0x75], 0);
         let lp_x = lp_asset_for(&env, 0x74);
         let lp_y = lp_asset_for(&env, 0x75);
         let order = make_basic_lp_order(
@@ -1286,21 +1286,21 @@ mod tests {
         }
     }
 
-    /// Preview repro: a 312-unit B -> E route through two banded pools
+    /// Preview repro: a 312-unit B -> E route through two CL pools
     /// under budget-derived limits (2 pools, 4 steps).
     #[test]
-    fn small_two_hop_route_between_banded_pools() {
+    fn small_two_hop_route_between_cl_pools() {
         use crate::sundaev4::router;
         use std::collections::BTreeMap;
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let x = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let x = make_cl_pool(
             &env,
             0x78,
             vec![(token_a(), 6_161_607), (token_b(), 6_469_719)],
             cfg.clone(),
         );
-        let y = make_bcl_pool(
+        let y = make_cl_pool(
             &env,
             0x79,
             vec![(token_a(), 5_952_381), (token_e(), 6_250_000)],
@@ -1327,13 +1327,13 @@ mod tests {
     /// output for every input, in band and across bands.
     #[test]
     fn ladder_output_matches_step_planner() {
-        use crate::sundaev4::banded_math::{find_witness, swap_steps};
-        use crate::sundaev4::router::BandedLadder;
-        let cfg = bcl_eq8_config(ss_fee_3());
+        use crate::sundaev4::cl_math::{find_witness, swap_steps};
+        use crate::sundaev4::router::CLLadder;
+        let cfg = cl_eq8_config(ss_fee_3());
         for (a, b) in [(8_637_368i64, 624_999i64), (12_000_000, 2_400_000)] {
             let (a, b) = (BigInt::from(a), BigInt::from(b));
             let w = find_witness(&cfg, &a, &b).unwrap();
-            let ladder = BandedLadder::new(cfg.clone(), a.clone(), b.clone(), w);
+            let ladder = CLLadder::new(cfg.clone(), a.clone(), b.clone(), w);
             for dx in [
                 10_000i64, 300_000, 626_881, 626_882, 1_266_849, 1_759_892, 2_130_380, 2_500_000,
             ] {
@@ -1347,28 +1347,28 @@ mod tests {
         }
     }
 
-    /// Two banded pools in different states, one order big enough that
+    /// Two CL pools in different states, one order big enough that
     /// each side must cross a band. The blended route must split across
     /// both, each pool's walk must emit several steps, and the total
     /// output must be within rounding of the best split found by brute
     /// force over the step planner.
     #[test]
-    fn blended_split_across_two_banded_pools_with_crossings() {
+    fn blended_split_across_two_cl_pools_with_crossings() {
         use crate::sundaev4::accumulator::Accumulator;
-        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band, swap_steps};
+        use crate::sundaev4::cl_math::{band_view, find_witness, max_dx_in_band, swap_steps};
         use crate::sundaev4::router;
         use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         // X at the Aiken vector; Y deeper and further along the ladder.
-        let x = make_bcl_pool(
+        let x = make_cl_pool(
             &env,
             0x7A,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
             cfg.clone(),
         );
-        let y = make_bcl_pool(
+        let y = make_cl_pool(
             &env,
             0x7B,
             vec![(token_a(), 12_000_000), (token_b(), 2_400_000)],
@@ -1503,16 +1503,16 @@ mod tests {
     /// asked. The scooper withdraws (A, B), routes B -> E (B -> A through
     /// the source pool, A -> E through the target), and deposits (A, E).
     #[test]
-    fn bcl_cross_pair_movement_evaluates() {
+    fn cl_cross_pair_movement_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::batch;
         use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         let burn = 10_000_000i64;
         let pool_x = {
-            let p = make_bcl_pool(
+            let p = make_cl_pool(
                 &env,
                 0x76,
                 vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1527,7 +1527,7 @@ mod tests {
             p.value.insert(&lp, &held - &c);
             std::sync::Arc::new(p)
         };
-        let pool_y = make_bcl_pool(
+        let pool_y = make_cl_pool(
             &env,
             0x77,
             vec![(token_a(), 8_637_368), (token_e(), 624_999)],
@@ -1586,22 +1586,22 @@ mod tests {
         }
     }
 
-    /// A liquidity movement between two banded pools: one basic order offers
+    /// A liquidity movement between two CL pools: one basic order offers
     /// pool A's LP and asks pool B's LP. The scooper burns the offered LP in
     /// A, deposits the payout into B and pays the user B's LP plus any
     /// leftover reserve, in one transaction against the real validators.
     #[test]
-    fn bcl_movement_between_pools() {
+    fn cl_movement_between_pools() {
         use crate::sundaev4::accumulator::Accumulator;
         use crate::sundaev4::batch;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
         let burn = 10_000_000i64;
         // Pool A has LP in circulation, which the order offers back.
         let pool_a = {
-            let p = make_bcl_pool(&env, 0x6C, reserves.clone(), cfg.clone());
+            let p = make_cl_pool(&env, 0x6C, reserves.clone(), cfg.clone());
             let lp = lp_asset_for(&env, 0x6C);
             let mut p = (*p).clone();
             let circulating = BigInt::from(2 * burn);
@@ -1611,7 +1611,7 @@ mod tests {
             p.value.insert(&lp, &held - &circulating);
             std::sync::Arc::new(p)
         };
-        let pool_b = make_bcl_pool(&env, 0x6D, reserves, cfg);
+        let pool_b = make_cl_pool(&env, 0x6D, reserves, cfg);
         let a_ident = pool_a.pool_datum.identifier.clone();
         let b_ident = pool_b.pool_datum.identifier.clone();
         let lp_a = lp_asset_for(&env, 0x6C);
@@ -1633,7 +1633,7 @@ mod tests {
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
             .try_add_move(&order, &a_ident, &pool_a, &b_ident, &pool_b)
-            .expect("movement between two banded pools should resolve");
+            .expect("movement between two CL pools should resolve");
         let plan = accum.into_plan();
         assert_eq!(plan.moves.len(), 1);
         assert_eq!(plan.batches.len(), 2, "one batch per pool");
@@ -1700,13 +1700,13 @@ mod tests {
     /// A zap whose rebalancing swap is larger than the active band: the
     /// swap half crosses an edge (several entries), then the deposit pins.
     #[test]
-    fn bcl_zap_crossing_a_band_evaluates() {
+    fn cl_zap_crossing_a_band_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
-        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+        use crate::sundaev4::cl_math::{band_view, find_witness, max_dx_in_band};
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool(
             &env,
             0x71,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1723,7 +1723,7 @@ mod tests {
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
             .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
-            .expect("large single-asset banded deposit should fill as a zap");
+            .expect("large single-asset CL deposit should fill as a zap");
         let plan = accum.into_plan();
         let zap = &plan.batches[0].zaps[0];
         assert!(zap.swap_deltas[1] > cap0, "the swap half crosses band 0");
@@ -1742,16 +1742,16 @@ mod tests {
         );
     }
 
-    /// A single-asset deposit into a banded pool fills as a zap: an in-band
+    /// A single-asset deposit into a CL pool fills as a zap: an in-band
     /// swap step rebalances the basket, then a proportional deposit step
     /// mints LP. Both are ordinary transcript steps for the module.
     #[test]
-    fn bcl_zap_single_asset_evaluates() {
+    fn cl_zap_single_asset_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool(
             &env,
             0x6E,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1763,7 +1763,7 @@ mod tests {
         let mut accum = Accumulator::new(env.exec.protocol_share);
         accum
             .try_add_zap(&order, &pool.pool_datum.identifier.clone(), &pool)
-            .expect("single-asset banded deposit should fill as a zap");
+            .expect("single-asset CL deposit should fill as a zap");
         let plan = accum.into_plan();
         let batch = &plan.batches[0];
         assert_eq!(batch.zaps.len(), 1);
@@ -1783,7 +1783,7 @@ mod tests {
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
             .build_and_eval_plan(&plan, &settings, 1000)
-            .expect("banded zap should evaluate against the real validators");
+            .expect("CL zap should evaluate against the real validators");
         assert!(!eval.budgets.is_empty());
         let after = &result.predicted_pools[0].2;
         assert_eq!(
@@ -1796,15 +1796,15 @@ mod tests {
     /// whole ladder, the accumulator accrues each in-band step, and the
     /// walk emits them; all three must agree with the module.
     #[test]
-    fn bcl_routed_swap_crossing_bands_evaluates() {
+    fn cl_routed_swap_crossing_bands_evaluates() {
         use crate::sundaev4::accumulator::Accumulator;
-        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+        use crate::sundaev4::cl_math::{band_view, find_witness, max_dx_in_band};
         use crate::sundaev4::router;
         use std::collections::BTreeMap;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool(
             &env,
             0x70,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1874,12 +1874,12 @@ mod tests {
     /// transcript steps: the first drains band 0, the second continues in
     /// band 1. The module walks both with chained witnesses.
     #[test]
-    fn bcl_swap_crossing_a_band_evaluates() {
-        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+    fn cl_swap_crossing_a_band_evaluates() {
+        use crate::sundaev4::cl_math::{band_view, find_witness, max_dx_in_band};
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool(
             &env,
             0x6F,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1945,19 +1945,19 @@ mod tests {
         assert_eq!(after.pool_datum.assets[0].1, &a - &dy);
     }
 
-    /// The banded case of `cs_swap_draining_the_output_reserve_builds`: a
+    /// The CL case of `cs_swap_draining_the_output_reserve_builds`: a
     /// swap sized to the ladder's whole capacity takes every band's B, so the
     /// pool output must hold no B at all. The witness search places the
     /// drained reserves on the ladder's end, and every validator accepts the
     /// step sequence.
     #[test]
-    fn bcl_swap_draining_the_ladder_builds() {
-        use crate::sundaev4::banded_math::{ladder_capacity, swap_steps};
+    fn cl_swap_draining_the_ladder_builds() {
+        use crate::sundaev4::cl_math::{ladder_capacity, swap_steps};
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         let (a, b) = (BigInt::from(8_637_368), BigInt::from(624_999));
-        let pool = make_bcl_pool(
+        let pool = make_cl_pool(
             &env,
             0x6E,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -1996,16 +1996,16 @@ mod tests {
         );
     }
 
-    /// A banded pool that also lists the oracle module: the scoop carries the
+    /// A CL pool that also lists the oracle module: the scoop carries the
     /// oracle Operate entry and rewrites the accumulator slot from the
     /// transcript. Two scoops in a row exercise initialise and advance.
     #[test]
-    fn bcl_oracle_pool_scoops_and_advances_the_slot() {
+    fn cl_oracle_pool_scoops_and_advances_the_slot() {
         use crate::sundaev4::types::OracleSlot;
 
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool_with_oracle(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool_with_oracle(
             &env,
             0x7C,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -2040,7 +2040,7 @@ mod tests {
             .count();
         assert!(
             rewards >= 4,
-            "expected banded + fee_split + fairness + oracle withdrawals, got {rewards}"
+            "expected CL + fee_split + fairness + oracle withdrawals, got {rewards}"
         );
         let after1 = result.predicted_pools[0].2.clone();
         let s1 = OracleSlot::decode(&slot_of(&after1)).expect("128-byte slot");
@@ -2081,11 +2081,11 @@ mod tests {
         );
     }
 
-    /// Where the memory goes: per-redeemer budgets for a CS scoop, a banded
-    /// scoop, a two-step banded scoop and a two-pool banded scoop.
+    /// Where the memory goes: per-redeemer budgets for a CS scoop, a CL
+    /// scoop, a two-step CL scoop and a two-pool CL scoop.
     #[test]
-    fn budget_profile_banded_vs_cs() {
-        use crate::sundaev4::banded_math::{band_view, find_witness, max_dx_in_band};
+    fn budget_profile_cl_vs_cs() {
+        use crate::sundaev4::cl_math::{band_view, find_witness, max_dx_in_band};
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
         let settings = make_settings(&env, &env.scooper_keyhash());
         let report = |label: &str, eval: &crate::sundaev4::evaluator::EvalResult| {
@@ -2101,7 +2101,7 @@ mod tests {
                 eprintln!("   {k:<12} mem {m:>9} steps {s:>12}");
             }
         };
-        let cfg = bcl_eq8_config(ss_fee_3());
+        let cfg = cl_eq8_config(ss_fee_3());
         // CS reference.
         let cs = make_cs_pool(
             &env,
@@ -2120,8 +2120,8 @@ mod tests {
         .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
         report("constant sum, one swap", &e);
-        // Banded, one step.
-        let p = make_bcl_pool(
+        // CL, one step.
+        let p = make_cl_pool(
             &env,
             0x81,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -2136,13 +2136,13 @@ mod tests {
         )
         .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
-        report("banded, one in-band step", &e);
-        // Banded, crossing (two steps).
+        report("CL, one in-band step", &e);
+        // CL, crossing (two steps).
         let (a, bb) = (BigInt::from(8_637_368), BigInt::from(624_999));
         let w = find_witness(&cfg, &a, &bb).unwrap();
         let cap = max_dx_in_band(&band_view(&cfg, &a, &bb, &w).unwrap(), false);
         let dx: i64 = (&cap + &BigInt::from(50_000)).to_string().parse().unwrap();
-        let p2 = make_bcl_pool(
+        let p2 = make_cl_pool(
             &env,
             0x82,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -2157,15 +2157,15 @@ mod tests {
         )
         .unwrap();
         let (_, e) = env.build_and_eval(&[b], &settings, 1000).unwrap();
-        report("banded, two steps (crossing)", &e);
-        // Two banded pools, one order each.
-        let p3 = make_bcl_pool(
+        report("CL, two steps (crossing)", &e);
+        // Two CL pools, one order each.
+        let p3 = make_cl_pool(
             &env,
             0x83,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
             cfg.clone(),
         );
-        let p4 = make_bcl_pool(
+        let p4 = make_cl_pool(
             &env,
             0x84,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -2188,20 +2188,20 @@ mod tests {
         )
         .unwrap();
         let (_, e) = env.build_and_eval(&[b3, b4], &settings, 1000).unwrap();
-        report("two banded pools, one step each", &e);
+        report("two CL pools, one step each", &e);
     }
 
-    /// The Aiken vector of `lib/tests/unit/banded_cl_check.ak` through the
+    /// The Aiken vector of `lib/tests/unit/cl_check_unit.ak` through the
     /// whole pipeline against the real validators: on the eight-band ladder
     /// at reserves (8_637_368 A, 624_999 B) the counter is 999_999_813 in
     /// band 0; 624 B in pays 615 A out (the fee rounds up to 2), the counter
     /// moves to 1_000_000_062 and the step's fee budget is 213 LP, the fee's
     /// LP worth (sundae-v4 SV4-006, SV4-001b).
     #[test]
-    fn bcl_single_order() {
+    fn cl_single_order() {
         let env = TestEnv::from_blueprint_file(BLUEPRINT_PATH);
-        let cfg = bcl_eq8_config(ss_fee_3());
-        let pool = make_bcl_pool(
+        let cfg = cl_eq8_config(ss_fee_3());
+        let pool = make_cl_pool(
             &env,
             0x6B,
             vec![(token_a(), 8_637_368), (token_b(), 624_999)],
@@ -2216,7 +2216,7 @@ mod tests {
             env.exec.protocol_share,
             &BatchLimits::default(),
         )
-        .expect("banded batch assembly should succeed");
+        .expect("CL batch assembly should succeed");
         assert_eq!(batch.swaps.len(), 1);
         // The fee rounds up to 2, so 624 B pays 615 A.
         assert_eq!(batch.swaps[0].dy, BigInt::from(615));
@@ -2224,7 +2224,7 @@ mod tests {
         let settings = make_settings(&env, &env.scooper_keyhash());
         let (result, eval) = env
             .build_and_eval(&[batch], &settings, 1000)
-            .expect("banded build_and_eval should succeed");
+            .expect("CL build_and_eval should succeed");
         let rewards = eval
             .budgets
             .iter()
@@ -2232,7 +2232,7 @@ mod tests {
             .count();
         assert!(
             rewards >= 3,
-            "expected banded + fee_split + fairness withdrawals, got {rewards}"
+            "expected CL + fee_split + fairness withdrawals, got {rewards}"
         );
         // The entry's operation_data opens with the after witness pair.
         let step = result
@@ -2250,7 +2250,7 @@ mod tests {
             .expect("pool spend redeemer")
             .remove(0);
         let pair = Vec::<pallas_primitives::PlutusData>::from_plutus(step.operation_data)
-            .expect("banded entry carries a list");
+            .expect("CL entry carries a list");
         assert_eq!(
             BigInt::from_plutus(pair[0].clone()).unwrap(),
             BigInt::from(1_000_000_062i64)
@@ -2264,15 +2264,15 @@ mod tests {
             .redeemers
             .iter()
             .filter(|(k, _, _)| k.tag == pallas_primitives::conway::RedeemerTag::Reward)
-            .find_map(|(_, data, _)| {
-                match crate::sundaev4::types::BandedCLRedeemer::from_plutus_any_form(data.clone()) {
-                    Ok(crate::sundaev4::types::BandedCLRedeemer::Operate { entries }) => {
-                        Some(entries)
-                    }
+            .find_map(
+                |(_, data, _)| match crate::sundaev4::types::CLRedeemer::from_plutus_any_form(
+                    data.clone(),
+                ) {
+                    Ok(crate::sundaev4::types::CLRedeemer::Operate { entries }) => Some(entries),
                     _ => None,
-                }
-            })
-            .expect("banded withdrawal redeemer")
+                },
+            )
+            .expect("CL withdrawal redeemer")
             .remove(0);
         assert_eq!(entry.counter, BigInt::from(999_999_813i64));
         assert_eq!(entry.active_band, BigInt::from(0));
@@ -5100,7 +5100,7 @@ mod blend_cost {
     use crate::bigint::BigInt;
     use crate::sundaev4::SundaeV4Pool;
     use crate::sundaev4::router::{self, RoutingLimits};
-    use crate::sundaev4::test_harness::{TestEnv, bcl_eq8_config, make_bcl_pool, token};
+    use crate::sundaev4::test_harness::{TestEnv, cl_eq8_config, make_cl_pool, token};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -5111,10 +5111,10 @@ mod blend_cost {
         token(0x10 + i as u8, 0x20 + i as u8)
     }
 
-    /// `n` banded pools over 13 tokens: a hub (token 0) plus a ring, so
+    /// `n` CL pools over 13 tokens: a hub (token 0) plus a ring, so
     /// every pair is reachable and most have several 2-4 hop paths.
     fn graph(env: &TestEnv, n: usize) -> BTreeMap<crate::sundaev3::Ident, Arc<SundaeV4Pool>> {
-        let cfg = bcl_eq8_config(crate::sundaev4::types::Rational {
+        let cfg = cl_eq8_config(crate::sundaev4::types::Rational {
             num: BigInt::from(3),
             den: BigInt::from(1000),
         });
@@ -5136,7 +5136,7 @@ mod blend_cost {
             }
             let ra = 6_000_000 + (i as i64 * 37_123) % 900_000;
             let rb = 6_200_000 + (i as i64 * 51_427) % 900_000;
-            let p = make_bcl_pool(env, i as u8, vec![(tok(a), ra), (tok(b), rb)], cfg.clone());
+            let p = make_cl_pool(env, i as u8, vec![(tok(a), ra), (tok(b), rb)], cfg.clone());
             out.insert(p.pool_datum.identifier.clone(), p);
         }
         out
@@ -5633,13 +5633,13 @@ mod cl_module_tests {
     fn cl_entries(
         build: &crate::sundaev4::tx_builder::MultiPoolBuildResult,
         hash: &[u8],
-    ) -> Vec<BandedOperateEntry> {
-        match BandedCLRedeemer::from_plutus_any_form(
+    ) -> Vec<CLOperateEntry> {
+        match CLRedeemer::from_plutus_any_form(
             reward_redeemer_of(build, hash).expect("CL withdrawal"),
         )
         .expect("CL redeemer decodes")
         {
-            BandedCLRedeemer::Operate { entries } => entries,
+            CLRedeemer::Operate { entries } => entries,
             other => panic!("expected Operate, got {other:?}"),
         }
     }
@@ -5675,12 +5675,12 @@ mod cl_module_tests {
             num: BigInt::from(5),
             den: BigInt::from(1000),
         };
-        let shared = bcl_eq8_config(fee_3());
-        let other = bcl_eq8_config(other_fee);
+        let shared = cl_eq8_config(fee_3());
+        let other = cl_eq8_config(other_fee);
         assert_ne!(shared, other);
-        let pa = make_bcl_pool(&env, 0xC1, reserves.clone(), shared.clone());
-        let pb = make_bcl_pool(&env, 0xC2, reserves.clone(), other.clone());
-        let pc = make_bcl_pool(&env, 0xC3, reserves, shared.clone());
+        let pa = make_cl_pool(&env, 0xC1, reserves.clone(), shared.clone());
+        let pb = make_cl_pool(&env, 0xC2, reserves.clone(), other.clone());
+        let pc = make_cl_pool(&env, 0xC3, reserves, shared.clone());
         let batches = vec![
             swap_batch(&pa, &env, 1),
             swap_batch(&pb, &env, 2),
@@ -5706,8 +5706,8 @@ mod cl_module_tests {
         // Three entries, two configs. Each entry names the config of its
         // own pool.
         let raw = reward_redeemer_of(&build, cl.as_ref()).expect("CL withdrawal");
-        let BandedCLTableRedeemer::Operate { entries, configs } =
-            BandedCLTableRedeemer::from_plutus(raw.clone()).expect("the table form decodes")
+        let CLTableRedeemer::Operate { entries, configs } =
+            CLTableRedeemer::from_plutus(raw.clone()).expect("the table form decodes")
         else {
             panic!("expected Operate");
         };
@@ -5732,7 +5732,7 @@ mod cl_module_tests {
         assert_eq!(shared_uses, 2);
         // The pre-audit form, one config per entry, does not decode this
         // redeemer. The any-form decoder returns each entry with its config.
-        assert!(BandedCLRedeemer::from_plutus(raw).is_err());
+        assert!(CLRedeemer::from_plutus(raw).is_err());
         assert_eq!(cl_entries(&build, cl.as_ref()).len(), 3);
     }
 
@@ -5744,15 +5744,14 @@ mod cl_module_tests {
     /// pool then scoops on the audited module.
     #[test]
     fn a_migrated_preview_pool_is_recovered_and_scoops() {
-        use crate::sundaev4::banded_math::config_hash;
+        use crate::sundaev4::cl_math::config_hash;
         let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
         let cl = env.cl_script().hash;
-        let cbor = hex::decode(
-            include_str!("../../test/fixtures/preview-banded-create-c601f694.hex").trim(),
-        )
-        .unwrap();
+        let cbor =
+            hex::decode(include_str!("../../test/fixtures/preview-cl-create-c601f694.hex").trim())
+                .unwrap();
         let tx = pallas_traverse::MultiEraTx::decode(&cbor).unwrap();
-        let candidates = crate::sundaev4::extract_bcl_config_candidates(&tx, &cl);
+        let candidates = crate::sundaev4::extract_cl_config_candidates(&tx, &cl);
         let four = candidates
             .iter()
             .find(|c| {
@@ -5768,7 +5767,7 @@ mod cl_module_tests {
         );
         // The preview reserves of pool 622cee5f... (steelswap_quote_dump).
         let reserves = vec![(token_a(), 5_953_003), (token_b(), 6_249_988)];
-        let pool = make_bcl_pool(&env, 0xF2, reserves, five.clone());
+        let pool = make_cl_pool(&env, 0xF2, reserves, five.clone());
         assert!(
             pool.pool_datum
                 .module_state
@@ -5781,7 +5780,7 @@ mod cl_module_tests {
         // where the migration tx holds no CL redeemer).
         for (cands, cached) in [(&candidates[..], None), (&[][..], Some(&four))] {
             let got =
-                crate::sundaev4::resolve_bcl_config(&pool.pool_datum, cl.as_ref(), cands, cached)
+                crate::sundaev4::resolve_cl_config(&pool.pool_datum, cl.as_ref(), cands, cached)
                     .expect("the migrated config resolves");
             assert_eq!(config_hash(&got), config_hash(&five));
             match crate::sundaev4::detect_pool_type(
@@ -5792,7 +5791,7 @@ mod cl_module_tests {
                 None,
                 Some(&got),
             ) {
-                PoolType::BandedConcentratedLiquidity { config } => assert_eq!(config, five),
+                PoolType::ConcentratedLiquidity { config } => assert_eq!(config, five),
                 other => panic!("expected CL, got {other:?}"),
             }
         }
@@ -5818,8 +5817,8 @@ mod cl_module_tests {
     fn a_four_field_config_is_refused() {
         let env = TestEnv::from_blueprint_file(PREVIEW_FIXTURE);
         let reserves = vec![(token_a(), 8_637_368), (token_b(), 624_999)];
-        let pool = make_bcl_pool(&env, 0xC9, reserves, bcl_eq8_config(fee_3()));
-        let four = bcl_eq8_config_four_fields(fee_3());
+        let pool = make_cl_pool(&env, 0xC9, reserves, cl_eq8_config(fee_3()));
+        let four = cl_eq8_config_four_fields(fee_3());
         match crate::sundaev4::detect_pool_type(
             &pool.pool_datum,
             Some(&env.exec),
@@ -5828,7 +5827,7 @@ mod cl_module_tests {
             None,
             Some(&four),
         ) {
-            PoolType::BandedConcentratedLiquidity { config } => {
+            PoolType::ConcentratedLiquidity { config } => {
                 assert!(
                     config.bands.is_empty(),
                     "the refused config is replaced by the empty placeholder"
@@ -5837,7 +5836,7 @@ mod cl_module_tests {
             other => panic!("expected CL, got {other:?}"),
         }
         let mut p = (*pool).clone();
-        p.pool_type = PoolType::BandedConcentratedLiquidity { config: four };
+        p.pool_type = PoolType::ConcentratedLiquidity { config: four };
         let p = Arc::new(p);
         let batch = swap_batch(&p, &env, 1);
         let settings = make_settings(&env, &env.scooper_keyhash());

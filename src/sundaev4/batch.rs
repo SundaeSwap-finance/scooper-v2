@@ -778,7 +778,7 @@ pub fn try_execute_order(
 }
 
 /// Dispatch swap result computation based on pool type. `total_lp` is only
-/// used by the banded ladder (CP/CS swap math doesn't depend on LP);
+/// used by the CL ladder (CP/CS swap math doesn't depend on LP);
 /// callers should pass the pool's current `total_lp` so the ladder math can
 /// derive its counter.
 ///
@@ -873,7 +873,7 @@ pub fn explain_swap_result(
                 Err(e) => Err(format!("stableswap: {e}")),
             }
         }
-        PoolType::BandedConcentratedLiquidity { config } => {
+        PoolType::ConcentratedLiquidity { config } => {
             // One ladder step inside the active band. A step the band cannot
             // hold (the output would exceed the band's residual) is
             // unfillable here: crossing into the next band is a second
@@ -881,20 +881,15 @@ pub fn explain_swap_result(
             // message names the largest input the band does fill.
             if assets.len() != 2 || input_idx > 1 || output_idx > 1 || input_idx == output_idx {
                 return Err(format!(
-                    "banded pool has {} assets; swap {input_idx} -> {output_idx} is not a pair",
+                    "CL pool has {} assets; swap {input_idx} -> {output_idx} is not a pair",
                     assets.len()
                 ));
             }
             let _ = total_lp;
-            match super::banded_math::swap_steps(
-                config,
-                &assets[0].1,
-                &assets[1].1,
-                input_idx == 0,
-                dx,
-            ) {
+            match super::cl_math::swap_steps(config, &assets[0].1, &assets[1].1, input_idx == 0, dx)
+            {
                 Ok(steps) => Ok(steps.iter().fold(BigInt::from(0), |acc, s| &acc + &s.dy)),
-                Err(e) => Err(format!("banded: {e}")),
+                Err(e) => Err(format!("CL: {e}")),
             }
         }
     }
@@ -1167,7 +1162,7 @@ pub fn plan_zap_swap(
             Ok((0..n).map(|i| &give[i] - &pay[i]).collect())
         }
         PoolType::ConstantProduct { .. }
-        | PoolType::BandedConcentratedLiquidity { .. }
+        | PoolType::ConcentratedLiquidity { .. }
         | PoolType::StableSwap { .. } => {
             // Stableswap's deposit pin mints floor(lp · t / D) with
             // t = min_i floor(have_i · D / r_i), so the LP minted after a
@@ -1372,12 +1367,12 @@ pub fn resolve_deposit_basket(
         // to the worst offered ratio makes `a1·L0 >= a0·L1` hold PER ASSET:
         //   minted  = min_i floor(offered_i·L0/r_i)
         //   delta_i = ceil(r_i·minted/L0)
-        // A banded ladder's non-swap step is `check_proportional` too
-        // (banded_cl_check.banded_step_raw): every reserve must move at
+        // A CL ladder's non-swap step is `check_proportional` too
+        // (cl_check.cl_step_raw): every reserve must move at
         // least in proportion to total_lp, and `X` follows because the
         // prefix sums and `L_i` are degree-1 homogeneous in it.
         crate::sundaev4::types::PoolType::ConstantProduct { .. }
-        | crate::sundaev4::types::PoolType::BandedConcentratedLiquidity { .. } => {
+        | crate::sundaev4::types::PoolType::ConcentratedLiquidity { .. } => {
             let mut minted: Option<BigInt> = None;
             for (off, r) in offered_per_pool.iter().zip(reserves.iter()) {
                 if r.is_zero() {
@@ -1398,7 +1393,7 @@ pub fn resolve_deposit_basket(
             let minted = minted.unwrap_or_else(|| BigInt::from(0));
             if !minted.is_positive() {
                 return Err("deposit can't be filled — a constant-product or \
-                     banded deposit must offer every pool \
+                     CL deposit must offer every pool \
                      asset in proportion"
                     .into());
             }
